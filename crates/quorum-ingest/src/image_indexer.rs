@@ -56,7 +56,21 @@ pub struct ImageMetadata {
     /// Visual description produced by a local vision model (query-time or reindex enrichment).
     #[serde(default)]
     pub visual_description: Option<String>,
+    /// Whether OCR text was extracted from this image.
+    #[serde(default)]
+    pub has_ocr: bool,
+    /// Explicit flag marking chunk as image document.
+    #[serde(default = "default_true")]
+    pub is_image: bool,
+    /// Verbatim text extracted by OCR engine.
+    #[serde(default)]
+    pub ocr_text: Option<String>,
 }
+
+fn default_true() -> bool {
+    true
+}
+
 
 /// Image Indexing Engine handling all Magika-classified images.
 pub struct ImageIndexer;
@@ -188,6 +202,40 @@ impl ImageIndexer {
             }
         }
 
+        let mut visual_description = None;
+        let mut ocr_text = None;
+
+        // Run native OCR and vision on raster images
+        if matches!(
+            identity.label.as_str(),
+            "png" | "jpeg" | "jpg" | "webp" | "gif" | "bmp" | "tiff"
+        ) || identity.mime_type.starts_with("image/")
+        {
+            if let Some(ocr) = Self::run_native_windows_ocr(bytes) {
+                let trimmed = ocr.trim();
+                if !trimmed.is_empty() {
+                    ocr_text = Some(trimmed.to_string());
+                }
+            }
+            #[cfg(windows)]
+            if ocr_text.is_none() {
+                if let Some(ocr) = Self::run_powershell_winrt_ocr(path) {
+                    let trimmed = ocr.trim();
+                    if !trimmed.is_empty() {
+                        ocr_text = Some(trimmed.to_string());
+                    }
+                }
+            }
+            if let Some(vis) = Self::extract_vision_description(bytes) {
+                let trimmed = vis.trim();
+                if !trimmed.is_empty() {
+                    visual_description = Some(trimmed.to_string());
+                }
+            }
+        }
+
+        let has_ocr = ocr_text.is_some() || exif.extracted_text.is_some();
+
         ImageMetadata {
             mime_type: identity.mime_type.clone(),
             format_name: identity.label.to_uppercase(),
@@ -216,9 +264,13 @@ impl ImageIndexer {
             location_name,
             location_source,
             location_tokens,
-            visual_description: None,
+            visual_description,
+            has_ocr,
+            is_image: true,
+            ocr_text,
         }
     }
+
 
     /// Pure-Rust PNG Header & Chunk Parser (`IHDR`, `tEXt`).
     fn parse_png(bytes: &[u8]) -> (u32, u32, u8, u8, ParsedExif) {
@@ -465,6 +517,18 @@ impl ImageIndexer {
             meta.size_bytes / 1024
         ));
 
+        // Format verbatim [OCR Text]
+        if let Some(ref ocr) = meta.ocr_text {
+            lines.push(format!("[OCR Text]\n{}", ocr.trim()));
+        } else if let Some(ref text) = meta.extracted_text {
+            lines.push(format!("[OCR Text]\n{}", text.trim()));
+        }
+
+        // Format [Visual Description]
+        if let Some(ref vis) = meta.visual_description {
+            lines.push(format!("[Visual Description]\n{}", vis.trim()));
+        }
+
         if let Some(ref make) = meta.camera_make {
             lines.push(format!("Camera Hardware: {}", make));
         }
@@ -524,9 +588,6 @@ impl ImageIndexer {
         if !meta.keywords.is_empty() {
             lines.push(format!("Keywords: {}", meta.keywords.join(", ")));
         }
-        if let Some(ref vis) = meta.visual_description {
-            lines.push(format!("Visual Description: {}", vis));
-        }
 
         if !meta.path_tokens.is_empty() {
             lines.push(format!("Path Tags: {}", meta.path_tokens.join(", ")));
@@ -575,7 +636,279 @@ impl ImageIndexer {
             Some(metadata_json),
         )
     }
+
+    /// Convenience wrapper matching the `SCOPE.md` interface contract.
+    pub fn index_image_with_ocr(
+        path: &Path,
+        bytes: &[u8],
+        identity: &FileIdentity,
+        access_tier: u8,
+        embedding_generator: &dyn EmbeddingGenerator,
+    ) -> Result<DocumentChunk, TypeError> {
+        Self::index_image(path, bytes, identity, access_tier, embedding_generator)
+    }
+
+    /// Native Windows OCR using Windows.Media.Ocr.OcrEngine with Session 0 language fallback.
+    #[cfg(windows)]
+    pub fn run_native_windows_ocr(bytes: &[u8]) -> Option<String> {
+        use windows::Graphics::Imaging::BitmapDecoder;
+        use windows::Media::Ocr::OcrEngine;
+        use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+
+        if bytes.len() < 16 {
+            return None;
+        }
+
+        let run_ocr = || -> windows::core::Result<Option<String>> {
+            let stream = InMemoryRandomAccessStream::new()?;
+            let writer = DataWriter::CreateDataWriter(&stream)?;
+            writer.WriteBytes(bytes)?;
+            writer.StoreAsync()?.get()?;
+            writer.FlushAsync()?.get()?;
+            stream.Seek(0)?;
+
+            let decoder = BitmapDecoder::CreateAsync(&stream)?.get()?;
+            let bitmap = decoder.GetSoftwareBitmapAsync()?.get()?;
+
+            let engine = OcrEngine::TryCreateFromUserProfileLanguages().ok().or_else(|| {
+                let langs = OcrEngine::AvailableRecognizerLanguages().ok()?;
+                if langs.Size().unwrap_or(0) > 0 {
+                    let first = langs.GetAt(0).ok()?;
+                    OcrEngine::TryCreateFromLanguage(&first).ok()
+                } else {
+                    None
+                }
+            });
+
+            let Some(engine) = engine else {
+                return Ok(None);
+            };
+
+            let result = engine.RecognizeAsync(&bitmap)?.get()?;
+            let text = result.Text()?.to_string();
+            let normalized = Self::normalize_ocr_text(&text);
+            let trimmed = normalized.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        };
+
+        run_ocr().ok().flatten()
+    }
+
+    /// Normalizes typographic dashes (em-dash, en-dash, minus, non-breaking hyphen)
+    /// to standard ASCII hyphens for exact token matching (e.g. CVE-2026-99137).
+    pub fn normalize_ocr_text(s: &str) -> String {
+        s.replace(
+            [
+                '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}',
+                '\u{2212}',
+            ],
+            "-",
+        )
+    }
+
+
+    #[cfg(not(windows))]
+    pub fn run_native_windows_ocr(_bytes: &[u8]) -> Option<String> {
+        None
+    }
+
+    /// PowerShell WinRT fallback for Windows when in-process COM apartment or stream parsing needs an external runner.
+    #[cfg(windows)]
+    pub fn run_powershell_winrt_ocr(path: &Path) -> Option<String> {
+        use std::process::Command;
+
+        if !path.exists() {
+            return None;
+        }
+
+        let script = r#"
+param([string]$ImagePath)
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name.StartsWith('IAsyncOperation') })[0]
+function AwaitTask($WinRtTask, $ResultType) {
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $null = $netTask.Wait(5000)
+    return $netTask.Result
 }
+[Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+[Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime] | Out-Null
+[Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime] | Out-Null
+$absPath = (Resolve-Path $ImagePath).Path
+$file = AwaitTask ([Windows.Storage.StorageFile]::GetFileFromPathAsync($absPath)) ([Windows.Storage.StorageFile])
+$stream = AwaitTask ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = AwaitTask ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$bitmap = AwaitTask ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+if (-not $engine) {
+    $langs = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
+    if ($langs -and $langs.Count -gt 0) {
+        $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($langs[0])
+    }
+}
+if ($engine) {
+    $ocrResult = AwaitTask ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+    Write-Output "EXTRACTED_OCR_START"
+    Write-Output $ocrResult.Text
+    Write-Output "EXTRACTED_OCR_END"
+}
+"#;
+        let child = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script, "-ImagePath"])
+            .arg(path.as_os_str())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+
+        let output = child.wait_with_output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        if let Some(start) = out_str.find("EXTRACTED_OCR_START") {
+            if let Some(end) = out_str.find("EXTRACTED_OCR_END") {
+                let slice = out_str[start + "EXTRACTED_OCR_START".len()..end].trim();
+                let normalized = Self::normalize_ocr_text(slice);
+                let trimmed = normalized.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(windows))]
+    pub fn run_powershell_winrt_ocr(_path: &Path) -> Option<String> {
+        None
+    }
+
+    /// Ingest-time bounded Ollama vision inspection (moondream:latest / llava:7b).
+    pub fn extract_vision_description(bytes: &[u8]) -> Option<String> {
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+        use std::time::Duration;
+
+        const MAX_VISION_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+        if bytes.is_empty() || bytes.len() > MAX_VISION_IMAGE_BYTES {
+            return None;
+        }
+
+        let addr: SocketAddr = "127.0.0.1:11434".parse().ok()?;
+        let encoded = Self::base64_encode(bytes);
+
+        // Preference order: lightweight moondream first, then llava
+        let models = ["moondream:latest", "moondream", "llava:7b", "llava"];
+
+        for model in models {
+            let payload = serde_json::json!({
+                "model": model,
+                "prompt": "Describe this image concisely in 2 to 3 sentences: subjects, scene layout, key colors, and visible text.",
+                "images": [&encoded],
+                "stream": false,
+                "keep_alive": "10m",
+                "options": { "temperature": 0.1, "num_predict": 120 }
+            })
+            .to_string();
+
+            let request = format!(
+                "POST /api/generate HTTP/1.0\r\nHost: 127.0.0.1:11434\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+
+            let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+                return None; // Ollama daemon not running on port 11434; fail fast
+            };
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
+
+            if stream.write_all(request.as_bytes()).is_err() {
+                continue;
+            }
+
+            let mut raw = Vec::new();
+            if stream.read_to_end(&mut raw).is_err() {
+                continue;
+            }
+
+            let text = String::from_utf8_lossy(&raw);
+            if !text.lines().next().map_or(false, |l| l.contains(" 200")) {
+                continue;
+            }
+
+            let body_at = text.find("\r\n\r\n").map(|i| i + 4).or_else(|| text.find("\n\n").map(|i| i + 2));
+            let Some(body_at) = body_at else { continue; };
+
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(text[body_at..].trim()) {
+                if let Some(desc) = val.get("response").and_then(|r| r.as_str()) {
+                    let normalized = Self::normalize_ocr_text(desc);
+                    let trimmed = normalized.trim();
+                    if trimmed.len() >= 10 {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+
+    /// Universal OCR entry point for a file on disk.
+    pub fn run_ocr_on_file(path: &Path) -> Option<String> {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Some(text) = Self::run_native_windows_ocr(&bytes) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            if let Some(text) = Self::run_powershell_winrt_ocr(path) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Some(text) = Self::extract_vision_description(&bytes) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// RFC 4648 standard base64 encoding.
+    pub fn base64_encode(data: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+        for chunk in data.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+}
+
 
 #[derive(Debug, Default, Clone)]
 struct ParsedExif {

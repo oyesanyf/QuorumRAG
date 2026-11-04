@@ -30,9 +30,24 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
+tempfile = { workspace = true }
+
 # Error Handling & Tracing
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+] }
+
+
 [dev-dependencies]
 tempfile = { workspace = true }
+
