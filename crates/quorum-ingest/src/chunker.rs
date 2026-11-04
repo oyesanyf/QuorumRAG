@@ -171,10 +171,12 @@ impl TextChunker {
         let mut document_chunks = Vec::with_capacity(raw_chunks.len());
 
         let path_str = path.to_string_lossy().to_string();
+        let header = build_contextual_header(path, content);
 
         for raw in raw_chunks {
-            let chunk_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-            let vector = vector_provider(raw.text_slice, &chunk_b3);
+            let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
+            let chunk_content = prepend_contextual_header(&header, raw.text_slice);
+            let vector = vector_provider(raw.text_slice, &raw_b3);
             let chunk_id = format!("{}:{}", file_blake3, raw.chunk_index);
 
             let metadata_json = serde_json::json!({
@@ -192,7 +194,7 @@ impl TextChunker {
                 raw.line_end,
                 access_tier,
                 vector,
-                raw.text_slice,
+                &chunk_content,
                 Some(metadata_json),
             )?;
 
@@ -200,5 +202,98 @@ impl TextChunker {
         }
 
         Ok(document_chunks)
+    }
+}
+
+/// Derives document metadata and builds the contextual header:
+/// `[Document: "{doc_title}" | Author: {doc_authors} | Kind: {doc_kind} | File: {file_name}]`
+pub fn build_contextual_header(path: &Path, content: &str) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document");
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // 1. Title derivation
+    let mut doc_title = String::new();
+    for line in content.lines().take(20) {
+        let trimmed = line.trim();
+        if let Some(t) = trimmed.strip_prefix("Title: ") {
+            if !t.trim().is_empty() {
+                doc_title = t.trim().to_string();
+                break;
+            }
+        }
+    }
+    if doc_title.is_empty() {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled Document");
+        doc_title = stem.replace(['_', '-'], " ").trim().to_string();
+    }
+
+    // 2. Author derivation (strictly within first 2KB before Abstract/Introduction)
+    let mut doc_authors = "Unknown".to_string();
+    let header_preview = &content[..content.len().min(2048)];
+    for line in header_preview.lines() {
+        let trimmed = line.trim();
+        if let Some(a) = trimmed.strip_prefix("Author: ") {
+            if !a.trim().is_empty() {
+                doc_authors = a.trim().to_string();
+                break;
+            }
+        } else if let Some(a) = trimmed.strip_prefix("by ") {
+            if !a.trim().is_empty() && a.len() < 80 {
+                doc_authors = a.trim().to_string();
+                break;
+            }
+        } else if let Some(a) = trimmed.strip_prefix("By: ") {
+            if !a.trim().is_empty() && a.len() < 80 {
+                doc_authors = a.trim().to_string();
+                break;
+            }
+        }
+    }
+
+    // 3. Kind derivation
+    let doc_kind = match ext.as_str() {
+        "pdf" | "docx" | "doc" | "odt" | "rtf" | "tex" | "html" | "htm" => {
+            let lower_preview = header_preview.to_ascii_lowercase();
+            if lower_preview.contains("abstract")
+                || lower_preview.contains("doi:")
+                || lower_preview.contains("arxiv")
+                || lower_preview.contains("ieee")
+            {
+                "research_paper".to_string()
+            } else if lower_preview.contains("curriculum vitae") || lower_preview.contains("resume") {
+                "resume_cv".to_string()
+            } else {
+                "article".to_string()
+            }
+        }
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" => "image_ocr".to_string(),
+        "mp3" | "wav" | "m4a" | "flac" => "audio".to_string(),
+        "rs" | "py" | "js" | "ts" | "c" | "cpp" | "go" | "java" => "source_code".to_string(),
+        _ => "general_doc".to_string(),
+    };
+
+    format!(
+        "[Document: \"{}\" | Author: {} | Kind: {} | File: {}]",
+        doc_title, doc_authors, doc_kind, file_name
+    )
+}
+
+/// Prepends the contextual header to raw slice if not already present.
+pub fn prepend_contextual_header(header: &str, raw_slice: &str) -> String {
+    if raw_slice.starts_with("[Document:") {
+        raw_slice.to_string()
+    } else {
+        format!("{}\n\n{}", header, raw_slice)
     }
 }

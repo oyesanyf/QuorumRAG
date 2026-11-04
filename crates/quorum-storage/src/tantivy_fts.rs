@@ -3,13 +3,14 @@
 //! # Invariant: Absolute Arrow Isolation
 //! All types and internal Tantivy dependencies are strictly `pub(crate)`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::create_dir_all;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
 use quorum_types::{DocumentChunk, ScoredChunk};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::merge_policy::NoMergePolicy;
@@ -67,6 +68,21 @@ pub(crate) struct TantivyFtsIndex {
     field_text_content: Field,
     field_metadata_json: Field,
     field_vector_bytes: Field,
+    field_doc_title: Option<Field>,
+    field_doc_authors: Option<Field>,
+}
+
+/// Distinct work hit representing a collapsed work cluster from BM25 search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistinctWorkHit {
+    pub work_cluster_id: String,
+    pub canonical_file_path: String,
+    pub document_id: String,
+    pub doc_title: String,
+    pub doc_authors: String,
+    pub doc_kind: String,
+    pub max_score: f32,
+    pub matching_chunks_count: usize,
 }
 
 impl TantivyFtsIndex {
@@ -137,11 +153,17 @@ impl TantivyFtsIndex {
         let field_text_content = builder.add_text_field("text_content", TEXT | STORED);
         let field_metadata_json = builder.add_text_field("metadata_json", STRING | STORED);
         let field_vector_bytes = builder.add_bytes_field("vector_bytes", STORED);
+        let _field_doc_title = builder.add_text_field("doc_title", TEXT | STORED);
+        let _field_doc_authors = builder.add_text_field("doc_authors", TEXT | STORED);
         let schema = builder.build();
 
         let index = Index::open_in_dir(path)
-            .or_else(|_| Index::create_in_dir(path, schema))
+            .or_else(|_| Index::create_in_dir(path, schema.clone()))
             .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+
+        let schema_ref = index.schema();
+        let field_doc_title = schema_ref.get_field("doc_title").ok();
+        let field_doc_authors = schema_ref.get_field("doc_authors").ok();
 
         let writer = Self::create_writer_inner(&index)?;
 
@@ -180,6 +202,8 @@ impl TantivyFtsIndex {
             field_text_content,
             field_metadata_json,
             field_vector_bytes,
+            field_doc_title,
+            field_doc_authors,
         })
     }
 
@@ -200,6 +224,15 @@ impl TantivyFtsIndex {
         doc.add_u64(self.field_access_tier, c.access_tier as u64);
         doc.add_text(self.field_text_content, &c.text_content);
         doc.add_text(self.field_metadata_json, &c.metadata_json);
+
+        if let Some(f) = self.field_doc_title {
+            let title = crate::document_catalog::extract_title_from_chunk(&c.text_content, &c.file_path);
+            doc.add_text(f, &title);
+        }
+        if let Some(f) = self.field_doc_authors {
+            let author = crate::document_catalog::extract_author_from_chunk(&c.text_content);
+            doc.add_text(f, &author);
+        }
 
         let mut vec_bytes = Vec::with_capacity(c.vector.len() * 4);
         for &f in &c.vector {
@@ -322,11 +355,25 @@ impl TantivyFtsIndex {
         if searcher.num_docs() == 0 {
             return Ok(Vec::new());
         }
+        let mut search_fields = vec![self.field_text_content, self.field_file_path_text];
+        if let Some(f) = self.field_doc_title {
+            search_fields.push(f);
+        }
+        if let Some(f) = self.field_doc_authors {
+            search_fields.push(f);
+        }
         let mut query_parser = QueryParser::for_index(
             &self.index,
-            vec![self.field_text_content, self.field_file_path_text],
+            search_fields,
         );
-        query_parser.set_field_boost(self.field_file_path_text, 3.0);
+        query_parser.set_field_boost(self.field_text_content, 1.5);
+        query_parser.set_field_boost(self.field_file_path_text, 0.75);
+        if let Some(f) = self.field_doc_title {
+            query_parser.set_field_boost(f, 2.8);
+        }
+        if let Some(f) = self.field_doc_authors {
+            query_parser.set_field_boost(f, 3.5);
+        }
 
         let has_explicit_syntax = trimmed.contains(':')
             || trimmed.contains('"')
@@ -337,7 +384,7 @@ impl TantivyFtsIndex {
             const QUESTION_STOPWORDS: &[&str] = &[
                 "what", "does", "do", "did", "where", "when", "who", "how", "why",
                 "is", "are", "was", "were", "the", "a", "an", "to", "for", "of",
-                "in", "on", "at", "with", "from", "by", "about", "go", "fo", "went",
+                "in", "on", "at", "with", "from", "about", "go", "fo", "went",
                 "attend", "attended", "tell", "me", "can", "you", "please", "his", "her", "their",
             ];
             // Remove conversational framing ("show me the file that contains a ...",
@@ -410,7 +457,7 @@ impl TantivyFtsIndex {
                 .doc(doc_address)
                 .map_err(|e| StorageError::Tantivy(format!("Failed to retrieve document: {}", e)))?;
 
-            let chunk = self.doc_to_chunk(&doc);
+            let chunk = self.doc_to_chunk_fast(&doc);
             let path_l = chunk.file_path.to_ascii_lowercase();
             let file_l = std::path::Path::new(&chunk.file_path)
                 .file_name()
@@ -498,6 +545,18 @@ impl TantivyFtsIndex {
         self.reload_with_retry(SyncCheck::None)?;
         let searcher = self.reader.searcher();
         let term = Term::from_field_text(self.field_blake3_hash, blake3_hash);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let hits = searcher
+            .search(&query, &TopDocs::with_limit(1).order_by_score())
+            .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+        Ok(!hits.is_empty())
+    }
+
+    /// Checks if a chunk_id already exists in the Tantivy index.
+    pub(crate) fn has_chunk_id(&self, chunk_id: &str) -> Result<bool, StorageError> {
+        self.reload_with_retry(SyncCheck::None)?;
+        let searcher = self.reader.searcher();
+        let term = Term::from_field_text(self.field_chunk_id, chunk_id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
         let hits = searcher
             .search(&query, &TopDocs::with_limit(1).order_by_score())
@@ -646,7 +705,17 @@ impl TantivyFtsIndex {
     }
 
     /// Converts a retrieved TantivyDocument into a domain DocumentChunk.
+    /// Fast chunk decoding omitting vector_bytes decoding (used for lexical searches).
+    pub(crate) fn doc_to_chunk_fast(&self, doc: &TantivyDocument) -> DocumentChunk {
+        self.doc_to_chunk_internal(doc, false)
+    }
+
+    /// Full chunk decoding including vector_bytes decoding.
     pub(crate) fn doc_to_chunk(&self, doc: &TantivyDocument) -> DocumentChunk {
+        self.doc_to_chunk_internal(doc, true)
+    }
+
+    fn doc_to_chunk_internal(&self, doc: &TantivyDocument, include_vector: bool) -> DocumentChunk {
         let chunk_id = doc
             .get_first(self.field_chunk_id)
             .and_then(|v| v.as_str())
@@ -690,13 +759,17 @@ impl TantivyFtsIndex {
             .unwrap_or_default()
             .to_string();
 
-        let vector = if let Some(bytes) = doc.get_first(self.field_vector_bytes).and_then(|v| v.as_bytes()) {
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes(*b))
-                .collect()
+        let vector = if include_vector {
+            if let Some(bytes) = doc.get_first(self.field_vector_bytes).and_then(|v| v.as_bytes()) {
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -713,6 +786,65 @@ impl TantivyFtsIndex {
             text_content,
             metadata_json,
         }
+    }
+
+    /// Enumerates distinct works matching a query collapsed across up to `max_hits` chunk matches.
+    pub(crate) fn enumerate_distinct_works(
+        &self,
+        query_text: &str,
+        max_tier: u8,
+        max_hits: usize,
+    ) -> Result<Vec<DistinctWorkHit>, StorageError> {
+        let candidate_chunks = self.search(query_text, max_tier, max_hits.clamp(1, 10_000))?;
+        let mut work_clusters: HashMap<String, DistinctWorkHit> = HashMap::new();
+
+        for scored in candidate_chunks {
+            let cluster_id = crate::document_catalog::derive_work_cluster_id(&scored.chunk.file_path);
+            let entry = work_clusters.entry(cluster_id.clone()).or_insert_with(|| {
+                DistinctWorkHit {
+                    work_cluster_id: cluster_id,
+                    canonical_file_path: scored.chunk.file_path.clone(),
+                    document_id: scored.chunk.document_id.clone(),
+                    doc_title: crate::document_catalog::extract_title_from_chunk(&scored.chunk.text_content, &scored.chunk.file_path),
+                    doc_authors: crate::document_catalog::extract_author_from_chunk(&scored.chunk.text_content),
+                    doc_kind: crate::document_catalog::extract_kind_from_chunk(&scored.chunk.text_content, &scored.chunk.file_path),
+                    max_score: scored.score,
+                    matching_chunks_count: 0,
+                }
+            });
+            entry.matching_chunks_count += 1;
+            if scored.score > entry.max_score {
+                entry.max_score = scored.score;
+            }
+        }
+
+        let mut distinct: Vec<DistinctWorkHit> = work_clusters.into_values().collect();
+        distinct.sort_by(|a, b| b.max_score.partial_cmp(&a.max_score).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(distinct)
+    }
+
+    /// Fast scan of all chunks without decoding vector_bytes.
+    pub(crate) fn scan_all_chunks_fast(&self) -> Result<Vec<DocumentChunk>, StorageError> {
+        self.reload_with_retry(SyncCheck::None)?;
+        let searcher = self.reader.searcher();
+        let query = tantivy::query::AllQuery;
+        let num_docs = searcher.num_docs() as usize;
+        if num_docs == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch_limit = num_docs.clamp(10_000, 500_000);
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(fetch_limit).order_by_score())
+            .map_err(|e| StorageError::Tantivy(format!("Scan search failed: {}", e)))?;
+
+        let mut chunks = Vec::with_capacity(top_docs.len());
+        for (_score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher
+                .doc(doc_address)
+                .map_err(|e| StorageError::Tantivy(format!("Failed to retrieve document: {}", e)))?;
+            chunks.push(self.doc_to_chunk_fast(&doc));
+        }
+        Ok(chunks)
     }
 
     /// Scans all stored chunks in Tantivy.

@@ -545,23 +545,33 @@ async fn test_tier5_level2_blake3_dedup_exactness_under_massive_identical_payloa
     let identical_text = "Universal immutable deterministic payload repeated across multiple files";
     let canonical_hash = DocumentChunk::compute_blake3_hash(identical_text);
 
-    // Create 40 chunks with different chunk_ids and different file_paths, but identical text
-    let mut batch = Vec::with_capacity(40);
-    for i in 0..40 {
-        let id = format!("dup_chunk_{}", i);
-        let path = format!("src/dup/file_{}.rs", i);
+    // 1. Create 40 duplicate chunks for the same document chunk_id (testing intra-batch deduplication)
+    let mut dup_batch = Vec::with_capacity(40);
+    for _ in 0..40 {
         let vec = make_unit_vector(768, 1);
-        batch.push(make_tier5_chunk(&id, "doc_dup", &path, 1, 10, 0, vec, identical_text));
+        dup_batch.push(make_tier5_chunk("dup_chunk_shared", "doc_dup", "src/dup/file_shared.rs", 1, 10, 0, vec, identical_text));
     }
 
-    // Only 1 chunk should be inserted due to Level-2 BLAKE3 deduplication
-    let inserted = engine.insert_chunks(&batch).await.unwrap();
-    assert_eq!(inserted, 1, "Level-2 deduplication must accept exactly 1 unique chunk");
+    // Only 1 chunk should be inserted due to chunk_id deduplication
+    let inserted = engine.insert_chunks(&dup_batch).await.unwrap();
+    assert_eq!(inserted, 1, "Deduplication must accept exactly 1 unique chunk for duplicate chunk_ids");
     assert_eq!(engine.count().await.unwrap(), 1);
     assert!(engine.has_chunk_hash(&canonical_hash).await.unwrap());
 
     // Submitting the exact same batch again must insert 0 chunks
-    let inserted_second = engine.insert_chunks(&batch).await.unwrap();
+    let inserted_second = engine.insert_chunks(&dup_batch).await.unwrap();
     assert_eq!(inserted_second, 0, "Second insertion of identical chunks must insert 0");
     assert_eq!(engine.count().await.unwrap(), 1);
+
+    // 2. Chunks from distinct files with identical text must NOT be dropped (fixing M20 713k chunk drop bug)
+    let mut multi_file_batch = Vec::with_capacity(5);
+    for i in 1..=5 {
+        let id = format!("file_{}_chunk_0", i);
+        let path = format!("src/dup/distinct_file_{}.rs", i);
+        let vec = make_unit_vector(768, 1);
+        multi_file_batch.push(make_tier5_chunk(&id, &format!("doc_{}", i), &path, 1, 10, 0, vec, identical_text));
+    }
+    let inserted_multi = engine.insert_chunks(&multi_file_batch).await.unwrap();
+    assert_eq!(inserted_multi, 5, "Chunks from distinct files must be preserved without silent drop");
+    assert_eq!(engine.count().await.unwrap(), 6);
 }

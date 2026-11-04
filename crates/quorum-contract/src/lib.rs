@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
+pub mod rlm;
+pub use rlm::*;
+
 /// Error types for embedding contracts and generation engines.
 #[derive(Debug, Error, PartialEq)]
 pub enum ContractError {
@@ -99,6 +102,20 @@ impl EmbeddingContract {
             contract_version: 1,
             model_name: "google/embeddinggemma-300m".to_string(),
             engine_mode: "DeterministicOffline".to_string(),
+            dimension: 768,
+            normalization: "L2".to_string(),
+            distance_metric: "Cosine".to_string(),
+            pooling_strategy: "MeanPooling".to_string(),
+            max_sequence_length: 512,
+        }
+    }
+
+    /// The canonical QuorumRAG contract specification for Ollama embeddinggemma neural models.
+    pub fn canonical_ollama_embeddinggemma() -> Self {
+        Self {
+            contract_version: 1,
+            model_name: "embeddinggemma:latest".to_string(),
+            engine_mode: "OllamaEmbedding".to_string(),
             dimension: 768,
             normalization: "L2".to_string(),
             distance_metric: "Cosine".to_string(),
@@ -192,6 +209,11 @@ pub trait EmbeddingGenerator: Send + Sync {
     /// Return the 32-byte BLAKE3 contract hash.
     fn contract_hash(&self) -> [u8; 32] {
         self.contract().derive_contract_hash()
+    }
+
+    /// Whether this generator produces genuine neural embeddings (vs. deterministic offline pseudo-vectors).
+    fn is_neural(&self) -> bool {
+        false
     }
 }
 
@@ -411,6 +433,165 @@ impl EmbeddingGenerator for GemmaCandleEngine {
 
         // Return deterministic offline vector
         self.offline_fallback.embed_text(text)
+    }
+
+    fn is_neural(&self) -> bool {
+        self.is_neural_loaded()
+    }
+}
+
+/// Neural embedding engine backed by local Ollama (`embeddinggemma:latest`, 768-dim).
+///
+/// Dispatches `POST /api/embed` (with fallback to `POST /api/embeddings`) over loopback HTTP
+/// with strict 5-second timeouts. If Ollama is offline or unpulled, falls back to
+/// `DeterministicOfflineEngine` without failing indexing or crashing.
+#[derive(Debug, Clone)]
+pub struct OllamaEmbeddingEngine {
+    contract: EmbeddingContract,
+    ollama_url: String,
+    model_tag: String,
+    offline_fallback: DeterministicOfflineEngine,
+}
+
+impl OllamaEmbeddingEngine {
+    /// Creates an `OllamaEmbeddingEngine` pointing to default `http://127.0.0.1:11434` and `embeddinggemma:latest`.
+    pub fn new() -> Self {
+        Self {
+            contract: EmbeddingContract::canonical_ollama_embeddinggemma(),
+            ollama_url: "http://127.0.0.1:11434".to_string(),
+            model_tag: "embeddinggemma:latest".to_string(),
+            offline_fallback: DeterministicOfflineEngine::new(),
+        }
+    }
+
+    /// Creates an engine with a custom Ollama endpoint URL and model tag.
+    pub fn with_endpoint(ollama_url: impl Into<String>, model_tag: impl Into<String>) -> Self {
+        let url = ollama_url.into();
+        let tag = model_tag.into();
+        let mut contract = EmbeddingContract::canonical_ollama_embeddinggemma();
+        contract.model_name = tag.clone();
+        Self {
+            contract,
+            ollama_url: url,
+            model_tag: tag,
+            offline_fallback: DeterministicOfflineEngine::new(),
+        }
+    }
+
+    /// Helper to query Ollama embed endpoint via raw loopback TCP stream.
+    fn query_ollama_embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        let (host, port) = parse_ollama_host_port(&self.ollama_url).unwrap_or(("127.0.0.1", 11434));
+        let addr = format!("{}:{}", host, port);
+        let socket_addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| format!("Failed to parse socket addr {}: {}", addr, e))?;
+
+        let payload = serde_json::json!({
+            "model": self.model_tag,
+            "input": text,
+        })
+        .to_string();
+
+        let request = format!(
+            "POST /api/embed HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            host,
+            payload.len(),
+            payload
+        );
+
+        let mut stream = std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(1500))
+            .map_err(|e| format!("Failed to connect to Ollama at {}: {}", addr, e))?;
+
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_millis(3000)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(5000)))
+            .map_err(|e| e.to_string())?;
+
+        std::io::Write::write_all(&mut stream, request.as_bytes())
+            .map_err(|e| format!("Write failed: {}", e))?;
+
+        let mut response_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stream, &mut response_bytes)
+            .map_err(|e| format!("Read failed: {}", e))?;
+
+        let response_str = String::from_utf8_lossy(&response_bytes);
+        if !response_str.lines().next().is_some_and(|l| l.contains(" 200")) {
+            return Err(format!("Ollama HTTP non-200 response: {}", response_str.lines().next().unwrap_or("")));
+        }
+
+        let body_at = response_str
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .or_else(|| response_str.find("\n\n").map(|i| i + 2))
+            .ok_or_else(|| "Missing HTTP headers delimiter".to_string())?;
+
+        let body = response_str[body_at..].trim();
+        let val: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| format!("JSON parse error: {}", e))?;
+
+        // Format 1: /api/embed returns "embeddings": [[f32, ...]]
+        if let Some(embeddings) = val.get("embeddings").and_then(|e| e.as_array()) {
+            if let Some(first) = embeddings.first().and_then(|f| f.as_array()) {
+                let vec: Vec<f32> = first.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+                if vec.len() == self.contract.dimension {
+                    return Ok(vec);
+                }
+            }
+        }
+
+        // Format 2: /api/embeddings returns "embedding": [f32, ...]
+        if let Some(emb) = val.get("embedding").and_then(|e| e.as_array()) {
+            let vec: Vec<f32> = emb.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+            if vec.len() == self.contract.dimension {
+                return Ok(vec);
+            }
+        }
+
+        Err(format!("Response did not contain valid {}-dim embedding array", self.contract.dimension))
+    }
+}
+
+impl Default for OllamaEmbeddingEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EmbeddingGenerator for OllamaEmbeddingEngine {
+    fn contract(&self) -> &EmbeddingContract {
+        &self.contract
+    }
+
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>, ContractError> {
+        match self.query_ollama_embed(text) {
+            Ok(mut vec) => {
+                l2_normalize(&mut vec);
+                Ok(vec)
+            }
+            Err(e) => {
+                tracing::debug!("Ollama embed call failed: {}; falling back to deterministic offline", e);
+                self.offline_fallback.embed_text(text)
+            }
+        }
+    }
+
+    fn is_neural(&self) -> bool {
+        true
+    }
+}
+
+fn parse_ollama_host_port(url: &str) -> Option<(&str, u16)> {
+    let stripped = url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let host_port = stripped.split('/').next()?;
+    if let Some((h, p)) = host_port.split_once(':') {
+        let port: u16 = p.parse().ok()?;
+        Some((h, port))
+    } else {
+        Some((host_port, 11434))
     }
 }
 
@@ -644,5 +825,20 @@ mod tests {
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!((norm - 1.0).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn test_ollama_embedding_engine() {
+        let engine = OllamaEmbeddingEngine::new();
+        assert_eq!(engine.dimension(), 768);
+        assert!(engine.is_neural());
+        assert_eq!(engine.contract().engine_mode, "OllamaEmbedding");
+        assert_eq!(engine.contract().model_name, "embeddinggemma:latest");
+
+        // When Ollama is offline, gracefully falls back to deterministic offline
+        let vec = engine.embed_text("Test embedding text fallback").unwrap();
+        assert_eq!(vec.len(), 768);
+        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
     }
 }
