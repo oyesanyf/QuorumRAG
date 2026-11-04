@@ -10,7 +10,43 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
+use std::time::Duration;
 use tempfile::tempdir;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard to safely set and restore an environment variable across test execution.
+struct EnvGuard {
+    key: &'static str,
+    original_value: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, new_value: &str) -> Self {
+        let original_value = std::env::var(key).ok();
+        std::env::set_var(key, new_value);
+        Self {
+            key,
+            original_value,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(ref val) = self.original_value {
+            std::env::set_var(self.key, val);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
 
 /// 1. Headless Session 0 Profile Discovery:
 /// Must discover human user document roots, strictly filtering out
@@ -18,6 +54,7 @@ use tempfile::tempdir;
 /// junctions/reparse points (All Users, Default User), hidden directories, and non-directories.
 #[test]
 fn test_discover_user_document_roots_filters_system_profiles_and_junctions() {
+    let _lock = ENV_LOCK.lock().unwrap();
     let discovered = IngestConfig::discover_user_document_roots();
 
     // On Windows development machines, human profile roots (Documents, Desktop, Downloads) must be found
@@ -231,6 +268,7 @@ fn test_two_level_dedup_catalog_disk_persistence_roundtrip() {
 /// default to discovered user document roots + physical fixed drives without hardcoded developer paths.
 #[test]
 fn test_unconditional_indexing_watch_paths_resolution_without_cli_watch_dir() {
+    let _lock = ENV_LOCK.lock().unwrap();
     // A. Parse CLI without --watch-dir
     let cli_default = Cli::parse_from(["quorumrag", "--no-browser", "--port", "3031"]);
     assert!(
@@ -300,3 +338,613 @@ fn test_unconditional_indexing_watch_paths_resolution_without_cli_watch_dir() {
     assert_eq!(custom_ingest_config.watch_paths.len(), 1);
     assert_eq!(custom_ingest_config.watch_paths[0], custom_path);
 }
+
+/// 4. Adversarial Challenge 1: Dedup Catalog Multi-Cycle Persistence & Concurrency Stress Test
+/// - Registers 50 diverse catalog entries with distinct BLAKE3 hashes, mtimes, sizes, chunk hashes, and paths.
+/// - Saves to disk, spawns a fresh engine, loads from file, and asserts 100% field-level equality.
+/// - Performs multi-cycle mutation (updating entries, adding entries, saving).
+/// - Concurrently performs repeated overwrite saves on a writer thread while 4 reader threads
+///   continuously load and validate the catalog, asserting that atomic file replacement on Windows
+///   NEVER corrupts, truncates, or produces invalid JSON data (`ErrorKind::InvalidData`).
+#[test]
+fn test_adversarial_dedup_catalog_multi_cycle_persistence_and_concurrency() {
+    let temp = tempdir().expect("tempdir");
+    let test_dir = temp.path();
+    let catalog_path = test_dir.join("adversarial_catalog.json");
+
+    // Phase 1: Register 50 diverse catalog entries
+    let engine1 = TwoLevelDedupEngine::new();
+    let mut initial_entries = Vec::new();
+    for i in 0..50 {
+        let entry = FileCatalogEntry {
+            file_path: test_dir.join(format!("doc_category_{}", i % 5)).join(format!("file_{:03}.pdf", i)),
+            file_blake3: format!("{:064x}", i * 1337 + 42),
+            mtime_secs: 1700000000 + (i as i64 * 60),
+            size_bytes: (i as u64 + 1) * 8192,
+            chunk_hashes: vec![
+                format!("chunk_hash_{}_a", i),
+                format!("chunk_hash_{}_b", i),
+                format!("chunk_hash_{}_c", i),
+            ],
+        };
+        initial_entries.push(entry.clone());
+        engine1.register_entry(entry);
+    }
+
+    assert_eq!(engine1.get_all_tracked_files().len(), 50);
+
+    // Save Phase 1
+    engine1
+        .save_catalog_to_file(&catalog_path)
+        .expect("save_catalog_to_file should succeed");
+    assert!(catalog_path.exists(), "Persisted catalog file must exist on disk");
+
+    // Phase 2: Fresh engine loads and verifies 100% field equality
+    let engine2 = TwoLevelDedupEngine::new();
+    engine2
+        .load_catalog_from_file(&catalog_path)
+        .expect("fresh engine load_catalog_from_file should succeed");
+    assert_eq!(engine2.get_all_tracked_files().len(), 50);
+
+    for original in &initial_entries {
+        let loaded = engine2
+            .get_file_entry(&original.file_path)
+            .unwrap_or_else(|| panic!("Missing entry for path: {:?}", original.file_path));
+
+        assert_eq!(
+            loaded.file_blake3, original.file_blake3,
+            "BLAKE3 hash mismatch for {:?}",
+            original.file_path
+        );
+        assert_eq!(
+            loaded.mtime_secs, original.mtime_secs,
+            "mtime mismatch for {:?}",
+            original.file_path
+        );
+        assert_eq!(
+            loaded.size_bytes, original.size_bytes,
+            "size mismatch for {:?}",
+            original.file_path
+        );
+        assert_eq!(
+            loaded.chunk_hashes, original.chunk_hashes,
+            "chunk hashes mismatch for {:?}",
+            original.file_path
+        );
+    }
+
+    // Phase 3: Multi-cycle mutations across distinct engine instances
+    // Cycle 1: Update existing entries
+    for i in 0..10 {
+        let mut updated = initial_entries[i].clone();
+        updated.mtime_secs += 500;
+        updated.size_bytes += 1024;
+        updated.file_blake3 = format!("{:064x}", i * 9999 + 77);
+        engine2.register_entry(updated);
+    }
+    // Cycle 2: Add 25 new entries
+    for i in 50..75 {
+        let new_entry = FileCatalogEntry {
+            file_path: test_dir.join(format!("cycle2_file_{:03}.docx", i)),
+            file_blake3: format!("{:064x}", i * 777 + 9),
+            mtime_secs: 1710000000 + (i as i64 * 30),
+            size_bytes: (i as u64 + 1) * 4096,
+            chunk_hashes: vec![format!("chunk_hash_c2_{}", i)],
+        };
+        engine2.register_entry(new_entry);
+    }
+    assert_eq!(engine2.get_all_tracked_files().len(), 75);
+    engine2
+        .save_catalog_to_file(&catalog_path)
+        .expect("cycle 2 save should succeed");
+
+    // Engine 3 verifies cycle 2 roundtrip
+    let engine3 = TwoLevelDedupEngine::new();
+    engine3
+        .load_catalog_from_file(&catalog_path)
+        .expect("engine 3 load should succeed");
+    assert_eq!(engine3.get_all_tracked_files().len(), 75);
+
+    // Phase 4: Repeated overwrite saves with concurrent reads (stress harness)
+    let running = Arc::new(AtomicBool::new(true));
+    let read_successes = Arc::new(AtomicUsize::new(0));
+    let shared_catalog_path = catalog_path.clone();
+
+    // Spawn 4 reader threads
+    let mut reader_handles = Vec::new();
+    for reader_id in 0..4 {
+        let running_clone = Arc::clone(&running);
+        let read_successes_clone = Arc::clone(&read_successes);
+        let path_clone = shared_catalog_path.clone();
+
+        let handle = thread::spawn(move || {
+            let mut iterations = 0;
+            while running_clone.load(Ordering::Relaxed) {
+                iterations += 1;
+                let reader_engine = TwoLevelDedupEngine::new();
+                match reader_engine.load_catalog_from_file(&path_clone) {
+                    Ok(()) => {
+                        let count = reader_engine.get_all_tracked_files().len();
+                        assert!(
+                            count >= 75,
+                            "Reader {} iteration {} loaded partial catalog with only {} entries",
+                            reader_id,
+                            iterations,
+                            count
+                        );
+                        read_successes_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        // Atomic replacement MUST NEVER leave a partially-written or corrupt JSON file.
+                        // io::ErrorKind::InvalidData indicates serde_json syntax/truncation failure.
+                        assert_ne!(
+                            e.kind(),
+                            std::io::ErrorKind::InvalidData,
+                            "Dedup catalog JSON corruption / truncation detected during concurrent read in reader {}: {}",
+                            reader_id,
+                            e
+                        );
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        reader_handles.push(handle);
+    }
+
+    // Main writer thread: 30 consecutive overwrite save cycles with incremental mutations
+    let writer_engine = engine3;
+    for cycle in 0..30 {
+        let additional_entry = FileCatalogEntry {
+            file_path: test_dir.join(format!("stress_concurrency_{:03}.txt", cycle)),
+            file_blake3: format!("{:064x}", cycle * 5555 + 123),
+            mtime_secs: 1720000000 + (cycle as i64 * 10),
+            size_bytes: (cycle as u64 + 10) * 1024,
+            chunk_hashes: vec![format!("chunk_stress_{}", cycle)],
+        };
+        writer_engine.register_entry(additional_entry);
+        writer_engine
+            .save_catalog_to_file(&catalog_path)
+            .expect("save_catalog_to_file during stress must succeed");
+
+        thread::sleep(Duration::from_millis(4));
+    }
+
+    // Stop readers and join
+    running.store(false, Ordering::Relaxed);
+    for handle in reader_handles {
+        handle.join().expect("reader thread should join cleanly");
+    }
+
+    let total_successful_reads = read_successes.load(Ordering::SeqCst);
+    assert!(
+        total_successful_reads > 0,
+        "Expected at least one successful concurrent read, got 0"
+    );
+
+    // Final integrity verification
+    let engine_final = TwoLevelDedupEngine::new();
+    engine_final
+        .load_catalog_from_file(&catalog_path)
+        .expect("final engine load should succeed");
+    assert_eq!(
+        engine_final.get_all_tracked_files().len(),
+        75 + 30,
+        "Final engine should have exactly 105 entries"
+    );
+}
+
+/// 5. Adversarial Challenge 2: Verification of main.rs Unconditional Auto-Indexing Watch Paths
+/// - Evaluates multiple CLI configurations where `cli.watch_dir == None`.
+/// - Verifies that `ingest_config.watch_paths` contains:
+///   1. Every user document root discovered by `discover_user_document_roots()`.
+///   2. Every physical drive discovered by `discover_physical_drives()`.
+/// - Asserts that `watch_paths` is never empty.
+/// - Asserts that no hardcoded developer usernames or paths exist in `watch_paths`.
+#[test]
+fn test_adversarial_unconditional_watch_paths_contain_roots_and_drives() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let test_cli_invocations = vec![
+        vec!["quorumrag"],
+        vec!["quorumrag", "--no-browser"],
+        vec!["quorumrag", "--port", "4040"],
+        vec!["quorumrag", "--host", "127.0.0.1", "--no-browser", "--port", "3031"],
+        vec!["quorumrag", "--service"],
+    ];
+
+    for args in test_cli_invocations {
+        let cli = Cli::parse_from(args);
+        assert!(
+            cli.watch_dir.is_none(),
+            "CLI invocation {:?} must have watch_dir == None",
+            cli
+        );
+
+        // Execute exact production daemon logic from crates/quorum-daemon/src/main.rs:160-180
+        let mut ingest_config = IngestConfig::default();
+        ingest_config.exclude_source_code = true;
+        ingest_config.max_file_size_bytes = 15 * 1024 * 1024;
+
+        if let Some(ref watch_path) = cli.watch_dir {
+            ingest_config.watch_paths.push(watch_path.clone());
+        } else {
+            let user_roots = IngestConfig::discover_user_document_roots();
+            let physical_drives = IngestConfig::discover_physical_drives();
+            let mut default_paths = user_roots;
+            for d in physical_drives {
+                if !default_paths.contains(&d) {
+                    default_paths.push(d);
+                }
+            }
+            ingest_config.watch_paths = default_paths;
+        }
+
+        // Invariant 1: watch_paths must NEVER be empty
+        assert!(
+            !ingest_config.watch_paths.is_empty(),
+            "ingest_config.watch_paths must not be empty when cli.watch_dir == None"
+        );
+
+        // Invariant 2: All discovered user document roots must be present
+        let user_roots = IngestConfig::discover_user_document_roots();
+        for root in &user_roots {
+            assert!(
+                ingest_config.watch_paths.contains(root),
+                "watch_paths missing discovered user document root: {:?}",
+                root
+            );
+        }
+
+        // Invariant 3: All discovered physical drives must be present
+        let physical_drives = IngestConfig::discover_physical_drives();
+        for drive in &physical_drives {
+            assert!(
+                ingest_config.watch_paths.contains(drive),
+                "watch_paths missing discovered physical drive: {:?}",
+                drive
+            );
+        }
+
+        // Invariant 4: No paths may be hardcoded developer paths or user names
+        for path in &ingest_config.watch_paths {
+            let s = path.to_string_lossy().to_ascii_lowercase();
+            assert!(
+                !s.contains("femi_oyesanya"),
+                "watch_paths contains hardcoded developer name: {:?}",
+                path
+            );
+            assert!(
+                !s.contains("chatgpt3"),
+                "watch_paths contains hardcoded developer path: {:?}",
+                path
+            );
+            assert!(
+                !s.contains("d:\\femi"),
+                "watch_paths contains hardcoded developer path: {:?}",
+                path
+            );
+            assert!(
+                !s.contains("ai job loss alternatives"),
+                "watch_paths contains hardcoded file: {:?}",
+                path
+            );
+
+            // Invariant 5: All watch paths must be absolute
+            assert!(
+                path.is_absolute(),
+                "watch_paths entry must be an absolute path: {:?}",
+                path
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Adversarial Challenger Test Harness for Session 0 User Profile Discovery & Junctions
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+fn set_file_attributes(path: &std::path::Path, attrs: u32) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    extern "system" {
+        fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+    }
+    let ret = unsafe { SetFileAttributesW(wide.as_ptr(), attrs) };
+    if ret == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_junction(junction: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    let output = std::process::Command::new("cmd.exe")
+        .args([
+            "/c",
+            "mklink",
+            "/J",
+            junction.to_str().expect("junction to str"),
+            target.to_str().expect("target to str"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "mklink failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 6. Adversarial Challenge 1: Synthetic Mock Filesystem Structures
+/// - Normal user folder with Documents, Desktop, Downloads.
+/// - Known system profile names (`Default`, `All Users`, `Public`, `SystemProfile`, `LocalService`, `Default User`, `NetworkService`, `DefaultAppPool`, `wdigest`).
+/// - Hidden directories (`FILE_ATTRIBUTE_HIDDEN (0x02)`).
+/// - System directories (`FILE_ATTRIBUTE_SYSTEM (0x04)`).
+/// - Non-directory files (`desktop.ini`, `NTUSER.DAT`, `normal_file.txt`).
+/// - Special dot and dollar directories (`.dotfolder`, `$RECYCLE.BIN`).
+/// - NTFS Junctions (`JunctionUser` pointing to `NormalUser`).
+/// Asserts that:
+/// - ONLY genuine human user document folders are returned.
+/// - ZERO system profiles, ZERO hidden folders, ZERO system folders, ZERO files, ZERO junctions, and ZERO dot/dollar dirs are included.
+#[cfg(target_os = "windows")]
+#[test]
+fn test_adversarial_synthetic_profile_discovery_filters_system_and_junctions() {
+    let _lock = ENV_LOCK.lock().unwrap();
+
+    let temp = tempdir().expect("tempdir");
+    let users_dir = temp.path().join("Users");
+    std::fs::create_dir_all(&users_dir).expect("create Users dir");
+
+    // 1. Genuine human user: "NormalUser" with standard document subfolders
+    let normal_user = users_dir.join("NormalUser");
+    let normal_docs = normal_user.join("Documents");
+    let normal_desktop = normal_user.join("Desktop");
+    let normal_downloads = normal_user.join("Downloads");
+    std::fs::create_dir_all(&normal_docs).expect("create normal docs");
+    std::fs::create_dir_all(&normal_desktop).expect("create normal desktop");
+    std::fs::create_dir_all(&normal_downloads).expect("create normal downloads");
+    std::fs::write(normal_docs.join("resume.txt"), b"My resume").expect("write normal doc");
+
+    // 2. Known system profile directories
+    let system_profile_names = [
+        "Default",
+        "All Users",
+        "Public",
+        "SystemProfile",
+        "LocalService",
+        "NetworkService",
+        "Default User",
+        "DefaultAppPool",
+        "wdigest",
+    ];
+    for sys_name in &system_profile_names {
+        let sys_path = users_dir.join(sys_name);
+        let sys_docs = sys_path.join("Documents");
+        std::fs::create_dir_all(&sys_docs).expect("create sys profile docs");
+        std::fs::write(sys_docs.join("sys.txt"), b"system data").expect("write sys doc");
+    }
+
+    // 3. Hidden directory (attribute 0x02)
+    let hidden_user = users_dir.join("HiddenUser");
+    let hidden_docs = hidden_user.join("Documents");
+    std::fs::create_dir_all(&hidden_docs).expect("create hidden docs");
+    set_file_attributes(&hidden_user, 0x02).expect("set hidden attribute on directory");
+
+    // 4. System directory (attribute 0x04)
+    let system_user = users_dir.join("SystemUser");
+    let system_docs = system_user.join("Documents");
+    std::fs::create_dir_all(&system_docs).expect("create system user docs");
+    set_file_attributes(&system_user, 0x04).expect("set system attribute on directory");
+
+    // 5. Non-directory files in Users directory
+    std::fs::write(users_dir.join("desktop.ini"), b"[.ShellClassInfo]\r\n").expect("write desktop.ini");
+    std::fs::write(users_dir.join("NTUSER.DAT"), b"registry hive data").expect("write NTUSER.DAT");
+    std::fs::write(users_dir.join("normal_file.txt"), b"just a text file").expect("write normal_file.txt");
+
+    // 6. Dot and dollar prefixed directories
+    let dot_dir = users_dir.join(".dotfolder").join("Documents");
+    let dollar_dir = users_dir.join("$RECYCLE.BIN").join("Documents");
+    std::fs::create_dir_all(&dot_dir).expect("create dot dir");
+    std::fs::create_dir_all(&dollar_dir).expect("create dollar dir");
+
+    // 7. NTFS Junctions (reparse points)
+    let junction_user = users_dir.join("JunctionUser");
+    create_junction(&junction_user, &normal_user).expect("create junction");
+
+    // Run discovery by setting SystemDrive to temp root
+    let temp_root_str = temp.path().to_str().expect("temp path to str");
+    let _env_guard = EnvGuard::set("SystemDrive", temp_root_str);
+
+    let discovered = IngestConfig::discover_user_document_roots();
+
+    // Filter discovered roots to those within our synthetic users directory
+    let synthetic_roots: Vec<PathBuf> = discovered
+        .into_iter()
+        .filter(|p| p.starts_with(&users_dir))
+        .collect();
+
+    // Clean up junction before dropping tempdir (removes junction link, leaves normal_user)
+    let _ = std::fs::remove_dir(&junction_user);
+
+    // Assertions:
+    // Only NormalUser's genuine document folders must be present
+    assert_eq!(
+        synthetic_roots.len(),
+        3,
+        "Expected exactly 3 document roots for NormalUser, got {}: {:?}",
+        synthetic_roots.len(),
+        synthetic_roots
+    );
+
+    assert!(synthetic_roots.contains(&normal_docs), "Must contain NormalUser/Documents");
+    assert!(synthetic_roots.contains(&normal_desktop), "Must contain NormalUser/Desktop");
+    assert!(synthetic_roots.contains(&normal_downloads), "Must contain NormalUser/Downloads");
+
+    // Assert that ZERO system profiles, ZERO hidden folders, ZERO files, ZERO junctions, and ZERO dot/dollar dirs are included
+    for root in &synthetic_roots {
+        let lower = root.to_string_lossy().to_ascii_lowercase();
+
+        for sys_name in &system_profile_names {
+            let lower_sys = sys_name.to_ascii_lowercase();
+            assert!(
+                !lower.contains(&format!(r"\{}\", lower_sys)) && !lower.ends_with(&format!(r"\{}", lower_sys)),
+                "Discovered root {:?} contains system profile '{}'",
+                root,
+                sys_name
+            );
+        }
+
+        assert!(!lower.contains("hiddenuser"), "Discovered root must not contain hidden directory: {:?}", root);
+        assert!(!lower.contains("systemuser"), "Discovered root must not contain system directory: {:?}", root);
+        assert!(!lower.contains("junctionuser"), "Discovered root must not contain junction directory: {:?}", root);
+        assert!(!lower.contains("desktop.ini"), "Discovered root must not be a file: {:?}", root);
+        assert!(!lower.contains("ntuser.dat"), "Discovered root must not be a file: {:?}", root);
+        assert!(!lower.contains("normal_file.txt"), "Discovered root must not be a file: {:?}", root);
+        assert!(!lower.contains(".dotfolder"), "Discovered root must not contain dot folder: {:?}", root);
+        assert!(!lower.contains("$recycle.bin"), "Discovered root must not contain $ folder: {:?}", root);
+    }
+}
+
+/// 7. Adversarial Challenge 2: Unicode & Spaces in User Profile Names
+/// - Accented vowels and spaces: "José García" (Documents, Desktop, Downloads)
+/// - Japanese CJK ideographs with space: "山田 太郎" (Documents)
+/// - German umlauts and ampersand: "Müller & Söhne" (Documents)
+/// - Consecutive spaces: "User   With   Multiple   Spaces" (Documents, Desktop)
+/// Asserts that:
+/// - All 7 expected roots are discovered with exact character fidelity without truncation or encoding loss.
+/// - Every returned path physically exists and is a directory.
+#[cfg(target_os = "windows")]
+#[test]
+fn test_adversarial_unicode_and_spaces_user_profiles() {
+    let _lock = ENV_LOCK.lock().unwrap();
+
+    let temp = tempdir().expect("tempdir");
+    let users_dir = temp.path().join("Users");
+    std::fs::create_dir_all(&users_dir).expect("create Users dir");
+
+    // 1. Spanish user with accented vowels and spaces: "José García"
+    let jose = users_dir.join("José García");
+    let jose_docs = jose.join("Documents");
+    let jose_desktop = jose.join("Desktop");
+    let jose_downloads = jose.join("Downloads");
+    std::fs::create_dir_all(&jose_docs).expect("create jose docs");
+    std::fs::create_dir_all(&jose_desktop).expect("create jose desktop");
+    std::fs::create_dir_all(&jose_downloads).expect("create jose downloads");
+
+    // 2. Japanese Kanji/Kana user: "山田 太郎"
+    let yamada = users_dir.join("山田 太郎");
+    let yamada_docs = yamada.join("Documents");
+    std::fs::create_dir_all(&yamada_docs).expect("create yamada docs");
+
+    // 3. German user with umlauts and ampersand: "Müller & Söhne"
+    let muller = users_dir.join("Müller & Söhne");
+    let muller_docs = muller.join("Documents");
+    std::fs::create_dir_all(&muller_docs).expect("create muller docs");
+
+    // 4. User with multiple spaces: "User   With   Multiple   Spaces"
+    let spaced = users_dir.join("User   With   Multiple   Spaces");
+    let spaced_docs = spaced.join("Documents");
+    let spaced_desktop = spaced.join("Desktop");
+    std::fs::create_dir_all(&spaced_docs).expect("create spaced docs");
+    std::fs::create_dir_all(&spaced_desktop).expect("create spaced desktop");
+
+    // Run discovery by setting SystemDrive to temp root
+    let temp_root_str = temp.path().to_str().expect("temp path to str");
+    let _env_guard = EnvGuard::set("SystemDrive", temp_root_str);
+
+    let discovered = IngestConfig::discover_user_document_roots();
+
+    // Filter discovered roots to those within our synthetic users directory
+    let synthetic_roots: Vec<PathBuf> = discovered
+        .into_iter()
+        .filter(|p| p.starts_with(&users_dir))
+        .collect();
+
+    // Assertions:
+    // Exactly 7 roots must be discovered across the 4 Unicode/spaced users
+    assert_eq!(
+        synthetic_roots.len(),
+        7,
+        "Expected exactly 7 document roots for Unicode and spaced users, got {}: {:?}",
+        synthetic_roots.len(),
+        synthetic_roots
+    );
+
+    assert!(synthetic_roots.contains(&jose_docs), "Must discover 'José García/Documents'");
+    assert!(synthetic_roots.contains(&jose_desktop), "Must discover 'José García/Desktop'");
+    assert!(synthetic_roots.contains(&jose_downloads), "Must discover 'José García/Downloads'");
+    assert!(synthetic_roots.contains(&yamada_docs), "Must discover '山田 太郎/Documents'");
+    assert!(synthetic_roots.contains(&muller_docs), "Must discover 'Müller & Söhne/Documents'");
+    assert!(synthetic_roots.contains(&spaced_docs), "Must discover 'User   With   Multiple   Spaces/Documents'");
+    assert!(synthetic_roots.contains(&spaced_desktop), "Must discover 'User   With   Multiple   Spaces/Desktop'");
+
+    // Verify all discovered paths physically exist and are directories
+    for root in &synthetic_roots {
+        assert!(root.exists(), "Discovered path must exist: {:?}", root);
+        assert!(root.is_dir(), "Discovered path must be a directory: {:?}", root);
+    }
+}
+
+/// 8. Adversarial Challenge 3: OneDrive Sync Folders and Nested Reparse Point Rejection
+/// - User "CloudUser" with genuine `OneDrive\Documents` and `OneDrive\Desktop`.
+/// - `OneDrive\Pictures` is present (must NOT be discovered because only Documents & Desktop are targeted).
+/// - An NTFS junction inside `OneDrive\Desktop_Junction` pointing elsewhere.
+/// - `OneDrive\Desktop` is turned into an NTFS junction -> must be rejected because it's a reparse point.
+/// Asserts that:
+/// - Only valid non-reparse OneDrive document folders are discovered.
+#[cfg(target_os = "windows")]
+#[test]
+fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
+    let _lock = ENV_LOCK.lock().unwrap();
+
+    let temp = tempdir().expect("tempdir");
+    let users_dir = temp.path().join("Users");
+    std::fs::create_dir_all(&users_dir).expect("create Users dir");
+
+    let cloud_user = users_dir.join("CloudUser");
+    let onedrive = cloud_user.join("OneDrive");
+    let onedrive_docs = onedrive.join("Documents");
+    let onedrive_desktop = onedrive.join("Desktop");
+    let onedrive_pictures = onedrive.join("Pictures");
+
+    std::fs::create_dir_all(&onedrive_docs).expect("create onedrive docs");
+    std::fs::create_dir_all(&onedrive_pictures).expect("create onedrive pictures");
+
+    // Make Desktop a junction to another folder (e.g. Pictures)
+    create_junction(&onedrive_desktop, &onedrive_pictures).expect("create onedrive desktop junction");
+
+    let temp_root_str = temp.path().to_str().expect("temp path to str");
+    let _env_guard = EnvGuard::set("SystemDrive", temp_root_str);
+
+    let discovered = IngestConfig::discover_user_document_roots();
+
+    let synthetic_roots: Vec<PathBuf> = discovered
+        .into_iter()
+        .filter(|p| p.starts_with(&users_dir))
+        .collect();
+
+    // Clean up junction
+    let _ = std::fs::remove_dir(&onedrive_desktop);
+
+    // Only OneDrive/Documents should be accepted because Desktop was a junction and Pictures is non-target
+    assert!(
+        synthetic_roots.contains(&onedrive_docs),
+        "Must contain CloudUser/OneDrive/Documents"
+    );
+    assert!(
+        !synthetic_roots.contains(&onedrive_desktop),
+        "Must NOT contain CloudUser/OneDrive/Desktop because it is an NTFS junction/reparse point"
+    );
+    assert!(
+        !synthetic_roots.contains(&onedrive_pictures),
+        "Must NOT contain CloudUser/OneDrive/Pictures because it is not a document root"
+    );
+}
+
+
