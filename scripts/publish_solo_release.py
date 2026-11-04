@@ -10,6 +10,7 @@ Modeled directly on OshoosiClaw's EDR solo-developer release workflow:
 5. Optionally tags HEAD as `quorumrag-v<version>` and pushes to origin to trigger native multi-OS CI builds
 """
 
+import re
 import argparse
 import hashlib
 import os
@@ -301,6 +302,31 @@ def run_local_witness_bundle(root: Path, artifacts: list[Path]) -> Path:
     return bundle_out
 
 
+EXPECTED_REPO_SLUG = "oyesanyf/QuorumRAG"
+
+
+def assert_repo_boundary(root: Path) -> None:
+    """Fail closed unless `root` is the top level of the standalone QuorumRAG repo
+    whose origin is github.com/oyesanyf/QuorumRAG. QuorumRAG must never be tagged,
+    released or pushed from a parent/monorepo such as oyesanyf/MusicFusion."""
+    top = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, encoding="utf-8",
+    ).stdout.strip()
+    if not top or Path(top).resolve() != root.resolve():
+        raise SystemExit(
+            f"REPOSITORY BOUNDARY VIOLATION: git top-level '{top}' is not the QuorumRAG repo root '{root}'."
+        )
+    origin = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        capture_output=True, text=True, encoding="utf-8",
+    ).stdout.strip()
+    if not re.fullmatch(r"(https://github\.com/|git@github\.com:)oyesanyf/QuorumRAG(\.git)?/?", origin):
+        raise SystemExit(
+            f"REPOSITORY BOUNDARY VIOLATION: origin '{origin}' is not github.com/{EXPECTED_REPO_SLUG}."
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="QuorumRAG Solo-Developer Release Publisher")
     parser.add_argument("--version", default="0.1.0", help="Semantic version (default: 0.1.0)")
@@ -312,6 +338,7 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
+    assert_repo_boundary(root)
     deploy_root = root / "deploy"
     deploy_root.mkdir(parents=True, exist_ok=True)
 

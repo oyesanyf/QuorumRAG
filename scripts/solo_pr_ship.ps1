@@ -35,6 +35,28 @@ if (-not (Test-Path $gitExe)) {
 }
 function git { & $gitExe @args }
 
+# ---------------------------------------------------------------------------
+# REPOSITORY BOUNDARY GUARD (fail closed)
+# QuorumRAG ships ONLY from its own repository root to github.com/oyesanyf/QuorumRAG.
+# Never commit, push, tag or open PRs for QuorumRAG in any parent/monorepo
+# (e.g. oyesanyf/MusicFusion). Abort before touching git state otherwise.
+# ---------------------------------------------------------------------------
+$ExpectedRepoSlug = "oyesanyf/QuorumRAG"
+$ScriptRepoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$GitTopLevelRaw = (& $gitExe -C $ScriptRepoRoot rev-parse --show-toplevel 2>$null)
+$GitTopLevelFull = if ($GitTopLevelRaw) { [System.IO.Path]::GetFullPath($GitTopLevelRaw.Trim()) } else { "" }
+if ($GitTopLevelFull -ne $ScriptRepoRoot) {
+    Write-Error "REPOSITORY BOUNDARY VIOLATION: git top-level '$GitTopLevelFull' is not the QuorumRAG repo root '$ScriptRepoRoot'. Refusing to ship."
+    exit 1
+}
+$OriginUrlRaw = (& $gitExe -C $ScriptRepoRoot remote get-url origin 2>$null)
+$OriginUrlTrim = if ($OriginUrlRaw) { $OriginUrlRaw.Trim() } else { "" }
+if ($OriginUrlTrim -notmatch '^(https://github\.com/|git@github\.com:)oyesanyf/QuorumRAG(\.git)?/?$') {
+    Write-Error "REPOSITORY BOUNDARY VIOLATION: origin '$OriginUrlTrim' is not github.com/$ExpectedRepoSlug. Refusing to ship."
+    exit 1
+}
+Set-Location $ScriptRepoRoot
+
 # Guard against recursive hook invocation
 $env:QUORUMRAG_SKIP_POST_COMMIT_HOOK = "1"
 
@@ -142,7 +164,11 @@ $originUrl = (git remote get-url origin).Trim()
 $repoSlug = if ($originUrl -match 'github\.com[/:]([^/]+)/([^/\.]+?)(?:\.git)?$') {
     "$($matches[1])/$($matches[2])"
 } else {
-    "oyesanyf/QuorumRAG"
+    ""
+}
+if ($repoSlug -ne $ExpectedRepoSlug) {
+    Write-Error "REPOSITORY BOUNDARY VIOLATION: resolved repository '$repoSlug' is not $ExpectedRepoSlug. Refusing to open a PR."
+    exit 1
 }
 Write-Host "Target repository: $repoSlug" -ForegroundColor Cyan
 
