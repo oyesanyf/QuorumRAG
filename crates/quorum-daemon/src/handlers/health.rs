@@ -132,17 +132,77 @@ pub async fn models_handler(
         .iter()
         .any(|m| m.eq_ignore_ascii_case("gemma4:26b") || m.to_ascii_lowercase().starts_with("gemma4:26b"));
 
+    let calibrated_target = if gemma4_installed && gemma4_eligible {
+        "gemma4:26b".to_string()
+    } else if let Some(matched) = quorum_coordinator::AutoFusionRouter::find_best_installed_chat_model(
+        Some(&qwen_tag),
+        &hw,
+        &installed,
+    ) {
+        matched
+    } else {
+        qwen_tag.clone()
+    };
+
+    let mut calibrated_pills = Vec::new();
+    // 1. Auto-Fusion pill reflecting calibrated host target
+    calibrated_pills.push(serde_json::json!({
+        "id": "AutoFusion",
+        "name": format!("✨ Auto ({})", calibrated_target),
+        "model_tag": calibrated_target,
+        "description": format!("Auto-Fusion dynamic router sized to {} based on available memory", calibrated_target),
+        "is_installed": true,
+        "memory_eligible": true,
+        "category": "auto"
+    }));
+
+    // 2. Installed models categorised and filtered
+    for model in &installed {
+        let is_embed = quorum_coordinator::AutoFusionRouter::is_embedding_model(model);
+        let is_vis = quorum_coordinator::AutoFusionRouter::is_vision_model(model);
+        let fits_mem = quorum_coordinator::AutoFusionRouter::model_fits_free_memory(model, &hw);
+
+        if is_embed {
+            continue; // Pure embedding models excluded from chat synthesis pills
+        }
+
+        if is_vis {
+            calibrated_pills.push(serde_json::json!({
+                "id": model,
+                "name": format!("👁️ {} (Vision Specialist)", model),
+                "model_tag": model,
+                "description": "Multimodal vision specialist model",
+                "is_installed": true,
+                "memory_eligible": fits_mem,
+                "category": "vision"
+            }));
+        } else {
+            calibrated_pills.push(serde_json::json!({
+                "id": model,
+                "name": model,
+                "model_tag": model,
+                "description": if fits_mem { "Chat-capable synthesis model" } else { "Model exceeds safe runtime available memory" },
+                "is_installed": true,
+                "memory_eligible": fits_mem,
+                "category": "chat"
+            }));
+        }
+    }
+
     Json(serde_json::json!({
         "active_family": format!("{:?}", state.default_model_family),
         "ollama_online": !installed.is_empty(),
+        "auto_model": format!("Auto ({})", calibrated_target),
+        "calibrated_target": calibrated_target,
+        "calibrated_pills": calibrated_pills,
         "installed_models": installed,
         "gemma4_26b_installed": gemma4_installed,
         "gemma4_26b_memory_eligible": gemma4_eligible,
         "available_families": [
             {
                 "id": "AutoFusion",
-                "name": "Auto-Fusion Dynamic Router",
-                "description": "Automatically selects Gemma 4 26B, GLM-4-9B, or Qwen 2.5 based on AST code content and runtime free RAM/VRAM."
+                "name": format!("Auto-Fusion ({})", calibrated_target),
+                "description": format!("Automatically routes to {} based on query AST and runtime free RAM/VRAM.", calibrated_target)
             },
             {
                 "id": "Gemma4_26b",
@@ -168,16 +228,12 @@ pub async fn models_handler(
         "hardware_recommendation": {
             "free_ram_gb": hw.free_ram_gb,
             "free_vram_mb": hw.free_vram_mb,
+            "total_vram_mb": hw.total_vram_mb,
+            "gpu_count": hw.gpu_count,
             "gpu_name": hw.gpu_name,
             "recommended_qwen_tier": qwen_tag,
             "recommended_gemma_tier": gemma_tag,
-            "default_synthesis_tier": if gemma4_installed && gemma4_eligible {
-                "gemma4:26b"
-            } else if hw.free_ram_gb >= 12.0 || hw.free_vram_mb >= 4500 {
-                "glm4:9b"
-            } else {
-                "gemma2:2b"
-            }
+            "default_synthesis_tier": calibrated_target
         }
     }))
 }

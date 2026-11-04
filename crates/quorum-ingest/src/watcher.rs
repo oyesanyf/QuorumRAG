@@ -237,7 +237,9 @@ impl WatcherHandle {
                 ))
             })?;
 
-        let mut paths = self.active_paths.write().unwrap();
+        let mut paths = self.active_paths.write().map_err(|_| {
+            IngestError::WatcherError("Active watch-path lock poisoned".into())
+        })?;
         paths.insert(path);
         Ok(())
     }
@@ -260,7 +262,9 @@ impl WatcherHandle {
                 ))
             })?;
 
-        let mut paths = self.active_paths.write().unwrap();
+        let mut paths = self.active_paths.write().map_err(|_| {
+            IngestError::WatcherError("Active watch-path lock poisoned".into())
+        })?;
         paths.remove(path);
         Ok(())
     }

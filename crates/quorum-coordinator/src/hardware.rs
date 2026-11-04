@@ -8,6 +8,10 @@ pub struct HardwareTelemetry {
     pub cpu_cores: usize,
     pub gpu_name: Option<String>,
     pub free_vram_mb: u64,
+    #[serde(default)]
+    pub total_vram_mb: u64,
+    #[serde(default)]
+    pub gpu_count: usize,
 }
 
 impl Default for HardwareTelemetry {
@@ -18,6 +22,8 @@ impl Default for HardwareTelemetry {
             cpu_cores: 8,
             gpu_name: None,
             free_vram_mb: 0,
+            total_vram_mb: 0,
+            gpu_count: 0,
         }
     }
 }
@@ -49,7 +55,7 @@ impl HardwareTelemetry {
             .unwrap_or(8)
             .max(1);
 
-        let (gpu_name, free_vram_mb) = Self::probe_gpu();
+        let (gpu_name, free_vram_mb, total_vram_mb, gpu_count) = Self::probe_gpu();
 
         let fresh = Self {
             total_ram_gb,
@@ -57,6 +63,8 @@ impl HardwareTelemetry {
             cpu_cores,
             gpu_name,
             free_vram_mb,
+            total_vram_mb,
+            gpu_count,
         };
 
         if let Ok(mut guard) = cache_mutex.lock() {
@@ -66,25 +74,114 @@ impl HardwareTelemetry {
         fresh
     }
 
-    fn probe_gpu() -> (Option<String>, u64) {
+    /// Parses multi-line `nvidia-smi` CSV output line-by-line.
+    /// Handles both 3-column (`name,memory.total,memory.free`) and 2-column (`name,memory.free`) formats.
+    /// Sums free and total VRAM across all detected discrete GPUs and formats compound GPU names cleanly.
+    pub fn parse_nvidia_smi_output(stdout: &str) -> (Option<String>, u64, u64, usize) {
+        let mut gpu_names: Vec<String> = Vec::new();
+        let mut total_vram_mb: u64 = 0;
+        let mut free_vram_mb: u64 = 0;
+
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            let parse_mb = |token: &str| -> u64 {
+                let digits: String = token
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                digits.parse::<u64>().unwrap_or(0)
+            };
+            if parts.len() >= 3 {
+                let name = parts[0].to_string();
+                let total_mb = parse_mb(parts[1]);
+                let free_mb = parse_mb(parts[2]);
+                if !name.is_empty() {
+                    gpu_names.push(name);
+                    total_vram_mb += total_mb;
+                    free_vram_mb += free_mb;
+                }
+            } else if parts.len() == 2 {
+                let name = parts[0].to_string();
+                let free_mb = parse_mb(parts[1]);
+                if !name.is_empty() {
+                    gpu_names.push(name);
+                    free_vram_mb += free_mb;
+                }
+            }
+        }
+
+        let gpu_count = gpu_names.len();
+        if gpu_count == 0 {
+            return (None, 0, 0, 0);
+        }
+
+        let formatted_name = Self::format_compound_gpu_name(&gpu_names);
+        (Some(formatted_name), free_vram_mb, total_vram_mb, gpu_count)
+    }
+
+    /// Formats compound GPU names cleanly.
+    /// If all GPU names are identical (e.g. two RTX 4090s), formats as `"2x NVIDIA GeForce RTX 4090"`.
+    /// If distinct, joins with `" + "` (e.g. `"NVIDIA RTX 4090 + RTX 3090"`).
+    pub fn format_compound_gpu_name(names: &[String]) -> String {
+        if names.is_empty() {
+            return String::new();
+        }
+        if names.len() == 1 {
+            return names[0].clone();
+        }
+        let first = &names[0];
+        if names.iter().all(|n| n == first) {
+            format!("{}x {}", names.len(), first)
+        } else {
+            names.join(" + ")
+        }
+    }
+
+    fn probe_gpu() -> (Option<String>, u64, u64, usize) {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             use std::process::Command;
 
-            let mut cmd = Command::new("nvidia-smi");
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-            cmd.args(["--query-gpu=name,memory.free", "--format=csv,noheader,nounits"]);
+            let candidate_binaries = [
+                "nvidia-smi",
+                r"C:\Windows\System32\nvidia-smi.exe",
+                r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+            ];
 
-            if let Ok(output) = cmd.output() {
-                if output.status.success() {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    let line = text.trim();
-                    let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-                    if parts.len() >= 2 {
-                        let name = parts[0].to_string();
-                        let free_mb: u64 = parts[1].parse().unwrap_or(0);
-                        return (Some(name), free_mb);
+            for binary in candidate_binaries {
+                // First attempt: 3-column query (name, memory.total, memory.free)
+                let mut cmd = Command::new(binary);
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                cmd.args(["--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"]);
+
+                if let Ok(output) = cmd.output() {
+                    if output.status.success() {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        let (name, free_mb, total_mb, count) = Self::parse_nvidia_smi_output(&text);
+                        if count > 0 {
+                            return (name, free_mb, total_mb, count);
+                        }
+                    }
+                }
+
+                // Fallback attempt: 2-column query (name, memory.free)
+                let mut cmd2 = Command::new(binary);
+                cmd2.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                cmd2.args(["--query-gpu=name,memory.free", "--format=csv,noheader,nounits"]);
+
+                if let Ok(output) = cmd2.output() {
+                    if output.status.success() {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        let (name, free_mb, total_mb, count) = Self::parse_nvidia_smi_output(&text);
+                        if count > 0 {
+                            return (name, free_mb, total_mb, count);
+                        }
                     }
                 }
             }
@@ -94,22 +191,32 @@ impl HardwareTelemetry {
         {
             use std::process::Command;
             if let Ok(output) = Command::new("nvidia-smi")
+                .args(["--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"])
+                .output()
+            {
+                if output.status.success() {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    let (name, free_mb, total_mb, count) = Self::parse_nvidia_smi_output(&text);
+                    if count > 0 {
+                        return (name, free_mb, total_mb, count);
+                    }
+                }
+            }
+
+            if let Ok(output) = Command::new("nvidia-smi")
                 .args(["--query-gpu=name,memory.free", "--format=csv,noheader,nounits"])
                 .output()
             {
                 if output.status.success() {
                     let text = String::from_utf8_lossy(&output.stdout);
-                    let line = text.trim();
-                    let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-                    if parts.len() >= 2 {
-                        let name = parts[0].to_string();
-                        let free_mb: u64 = parts[1].parse().unwrap_or(0);
-                        return (Some(name), free_mb);
+                    let (name, free_mb, total_mb, count) = Self::parse_nvidia_smi_output(&text);
+                    if count > 0 {
+                        return (name, free_mb, total_mb, count);
                     }
                 }
             }
         }
 
-        (None, 0)
+        (None, 0, 0, 0)
     }
 }

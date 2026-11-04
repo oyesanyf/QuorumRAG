@@ -201,6 +201,91 @@ impl ReindexWorker {
         }
     }
 
+    /// Scans stored chunks, identifies legacy image chunks lacking OCR text,
+    /// re-indexes them using ImageIndexer, and replaces them in storage
+    /// preserving the exact chunk ID formula {file_b3}:img:0 without re-downloading.
+    pub async fn upgrade_legacy_image_chunks(&self) -> Result<usize, IngestError> {
+        let all_chunks = self.storage.scan_all_chunks().await?;
+        let mut upgraded_count = 0;
+
+        for chunk in all_chunks {
+            let is_image = chunk.chunk_id.ends_with(":img:0")
+                || chunk.text_content.trim_start().starts_with("[Image Document:");
+            if !is_image {
+                continue;
+            }
+
+            // Check if chunk already has OCR text
+            let has_ocr = chunk.text_content.contains("[OCR Text]");
+            if has_ocr {
+                continue;
+            }
+
+            let file_path = std::path::Path::new(&chunk.file_path);
+            if !file_path.exists() {
+                continue;
+            }
+
+            let bytes = match std::fs::read(file_path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            // Verify file hash matches document_id
+            let file_b3 = blake3::hash(&bytes).to_hex().to_string();
+            if file_b3 != chunk.document_id {
+                // File content changed on disk; normal reindexer will handle it
+                continue;
+            }
+
+            let identity = match self.classifier.classify_file(file_path) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let access_tier = self.config.resolve_access_tier(file_path);
+
+            if let Ok(upgraded_chunk) = ImageIndexer::index_image(
+                file_path,
+                &bytes,
+                &identity,
+                access_tier,
+                self.embedder.as_ref(),
+            ) {
+                // Ensure chunk_id and document_id are strictly preserved
+                assert_eq!(upgraded_chunk.chunk_id, chunk.chunk_id);
+                assert_eq!(upgraded_chunk.document_id, chunk.document_id);
+
+                // Replace stale chunk in LanceDB and Tantivy
+                Self::replace_existing_file_chunks(&self.storage, std::slice::from_ref(&upgraded_chunk)).await;
+                self.storage.insert_chunks(std::slice::from_ref(&upgraded_chunk)).await?;
+
+                let mtime_secs = std::fs::metadata(file_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+
+                self.dedup.register_entry(FileCatalogEntry {
+                    file_path: file_path.to_path_buf(),
+                    file_blake3: file_b3,
+                    mtime_secs,
+                    size_bytes: bytes.len() as u64,
+                    chunk_hashes: vec![upgraded_chunk.blake3_hash],
+                });
+
+                upgraded_count += 1;
+            }
+        }
+
+        if upgraded_count > 0 {
+            let _ = self.storage.bump_index_epoch("image_chunks_ocr_upgraded");
+        }
+
+        Ok(upgraded_count)
+    }
+
+
     /// Cooperative cancellation of an ongoing reindex task.
     pub fn cancel_reindex(&self) -> bool {
         self.cancel_flag.store(true, Ordering::SeqCst);
@@ -252,7 +337,9 @@ impl ReindexWorker {
         .await?;
 
         let mut lock = progress_state.write().await;
-        let mut final_prog = lock.take().unwrap();
+        let mut final_prog = lock.take().ok_or_else(|| {
+            IngestError::WatcherError("reindex finished without a progress record".into())
+        })?;
         final_prog.phase = ReindexPhase::Completed;
         final_prog.completed_at = Some(Utc::now());
         final_prog.elapsed_secs = (Utc::now() - final_prog.started_at).num_seconds().max(0) as u64;

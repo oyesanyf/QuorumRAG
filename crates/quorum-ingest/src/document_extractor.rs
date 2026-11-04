@@ -15,7 +15,10 @@
 //! - **Network Captures & Binary Data (`pcap`, `parquet`, etc.)**: Printable strings & header summaries.
 //! - **Source Code, Markdown, Markup & Plain Text**: Full UTF-8, UTF-16LE/BE, and Latin-1/CP-1252 decoding.
 
+use crate::error::IngestError;
+use crate::image_indexer::ImageIndexer;
 use quorum_classifier::{FileCategory, FileIdentity};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::process::Command;
@@ -24,9 +27,35 @@ use std::process::Command;
 pub struct DocumentExtractor;
 
 impl DocumentExtractor {
+    /// Public entry point for PDF extraction with scanned OCR fallback,
+    /// matching the interface contract in `SCOPE.md`.
+    pub fn extract_pdf_with_ocr_fallback(path: &Path) -> Result<String, IngestError> {
+        Self::extract_pdf_text(path).map_err(IngestError::Io)
+    }
+
+    /// Determines whether the extracted text represents a scanned or image-only PDF
+    /// where genuine document body text is absent or near-zero (< 10 alphanumeric characters).
+    pub fn is_scanned_or_insufficient_text(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        // Count alphanumeric characters excluding PDF Metadata headers
+        let alnum_count = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("[PDF Metadata]"))
+            .flat_map(|line| line.chars())
+            .filter(|c| c.is_alphanumeric())
+            .count();
+
+        alnum_count < 10
+    }
+
     /// Extracts all searchable UTF-8 text from any file discovered by Magika.
     pub fn extract_text(path: &Path, identity: &FileIdentity) -> io::Result<String> {
         let ext = path
+
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
@@ -122,43 +151,273 @@ impl DocumentExtractor {
         }
     }
 
-    /// Extracts all pages, metadata, and embedded image OCR from a PDF file.
+    /// Extracts all pages, metadata, and OCR-extracted text from a PDF file.
     fn extract_pdf_text(path: &Path) -> io::Result<String> {
-        let script = [
-            "import sys, pypdf",
-            "sys.stdout.reconfigure(encoding='utf-8', errors='replace')",
-            "r = pypdf.PdfReader(sys.argv[1])",
-            "out = []",
-            "meta = r.metadata",
-            "if meta:",
-            "    m_parts = [f'{str(k)[1:]}: {v}' for k, v in meta.items() if v and str(v).strip()]",
-            "    if m_parts:",
-            "        out.append('[PDF Metadata] ' + ' | '.join(m_parts))",
-            "for idx, p in enumerate(r.pages):",
-            "    t = (p.extract_text() or '').strip()",
-            "    if t:",
-            "        out.append(f'[Page {idx+1}]\\n{t}')",
-            "print('\\n\\n'.join(out))",
-        ]
-        .join("\n");
+        // Step 1: Attempt standard text and metadata extraction via pypdf
+        let mut metadata_header = String::new();
+        let direct_text = match Self::extract_pdf_via_pypdf(path) {
+            Ok((meta, body)) => {
+                metadata_header = meta;
+                body
+            }
+            Err(_) => String::new(),
+        };
 
-        if let Ok(output) = Command::new("python")
-            .arg("-c")
-            .arg(script)
-            .arg(path.as_os_str())
-            .output()
-        {
-            if output.status.success() {
-                let extracted = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !extracted.is_empty() {
-                    return Ok(extracted);
+        // Step 2: If direct text has genuine document content (>= 10 alphanumeric chars), return it directly
+        if !Self::is_scanned_or_insufficient_text(&direct_text) {
+            if metadata_header.is_empty() {
+                return Ok(direct_text);
+            } else {
+                return Ok(format!("{}\n\n{}", metadata_header, direct_text));
+            }
+        }
+
+        tracing::info!(
+            pdf_path = %path.display(),
+            "PDF text layer is empty or scanned; triggering page image OCR fallback"
+        );
+
+        // Step 3: Run page image extraction + OCR fallback
+        if let Ok(ocr_text) = Self::extract_scanned_pdf_ocr(path) {
+            if !ocr_text.trim().is_empty() {
+                if metadata_header.is_empty() {
+                    return Ok(ocr_text);
+                } else {
+                    return Ok(format!("{}\n\n{}", metadata_header, ocr_text));
                 }
             }
         }
 
+        // Step 4: Pure-Rust fallback: scan embedded JPEG byte streams
         let bytes = std::fs::read(path)?;
-        Ok(Self::extract_pdf_streams_fallback(&bytes, path))
+        if let Ok(jpeg_ocr) = Self::extract_pdf_embedded_jpegs_ocr(&bytes) {
+            if !jpeg_ocr.trim().is_empty() {
+                if metadata_header.is_empty() {
+                    return Ok(jpeg_ocr);
+                } else {
+                    return Ok(format!("{}\n\n{}", metadata_header, jpeg_ocr));
+                }
+            }
+        }
+
+        // Step 5: Pure-Rust stream literal fallback
+        let stream_fallback = Self::extract_pdf_streams_fallback(&bytes, path);
+        if !stream_fallback.trim().is_empty() {
+            if metadata_header.is_empty() {
+                return Ok(stream_fallback);
+            } else {
+                return Ok(format!("{}\n\n{}", metadata_header, stream_fallback));
+            }
+        }
+
+        if !metadata_header.is_empty() {
+            Ok(metadata_header)
+        } else {
+            Ok(String::new())
+        }
     }
+
+    /// Extracts metadata and text layer using pypdf via python subprocess.
+    fn extract_pdf_via_pypdf(path: &Path) -> io::Result<(String, String)> {
+        let script = [
+            "import sys, pypdf",
+            "sys.stdout.reconfigure(encoding='utf-8', errors='replace')",
+            "try:",
+            "    r = pypdf.PdfReader(sys.argv[1])",
+            "except Exception:",
+            "    sys.exit(1)",
+            "meta_parts = []",
+            "if r.metadata:",
+            "    for k, v in r.metadata.items():",
+            "        if v and str(v).strip():",
+            "            meta_parts.append(f'{str(k)[1:]}: {v}')",
+            "meta_str = ('[PDF Metadata] ' + ' | '.join(meta_parts)) if meta_parts else ''",
+            "pages_out = []",
+            "for idx, p in enumerate(r.pages):",
+            "    try:",
+            "        t = (p.extract_text() or '').strip()",
+            "        if t:",
+            "            pages_out.append(f'[Page {idx+1}]\\n{t}')",
+            "    except Exception:",
+            "        pass",
+            "print('---METADATA_DIVIDER---')",
+            "print(meta_str)",
+            "print('---PAGES_DIVIDER---')",
+            "print('\\n\\n'.join(pages_out))",
+        ]
+        .join("\n");
+
+        let output = Command::new("python")
+            .arg("-c")
+            .arg(script)
+            .arg(path.as_os_str())
+            .output()?;
+
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "pypdf extraction failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut meta = String::new();
+        let mut body = String::new();
+
+        if let Some(m_idx) = stdout.find("---METADATA_DIVIDER---") {
+            if let Some(p_idx) = stdout.find("---PAGES_DIVIDER---") {
+                let m_slice = stdout[m_idx + "---METADATA_DIVIDER---".len()..p_idx].trim();
+                let b_slice = stdout[p_idx + "---PAGES_DIVIDER---".len()..].trim();
+                meta = m_slice.to_string();
+                body = b_slice.to_string();
+            }
+        } else {
+            body = stdout.trim().to_string();
+        }
+
+        Ok((meta, body))
+    }
+
+    /// Extracts embedded raster images from each PDF page and executes OCR,
+    /// formatting the output as `[Scanned PDF — OCR Extracted Text]\nPage X:\n...`.
+    fn extract_scanned_pdf_ocr(path: &Path) -> io::Result<String> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_dir_path = temp_dir.path().to_path_buf();
+
+        let script = [
+            "import sys, os, pypdf",
+            "sys.stdout.reconfigure(encoding='utf-8', errors='replace')",
+            "pdf_path = sys.argv[1]",
+            "out_dir = sys.argv[2]",
+            "try:",
+            "    r = pypdf.PdfReader(pdf_path)",
+            "except Exception:",
+            "    sys.exit(1)",
+            "manifest = []",
+            "for idx, p in enumerate(r.pages):",
+            "    page_num = idx + 1",
+            "    try:",
+            "        for img_idx, img in enumerate(p.images):",
+            "            ext = os.path.splitext(img.name)[1] or '.png'",
+            "            fname = f'page_{page_num}_img_{img_idx}{ext}'",
+            "            fpath = os.path.join(out_dir, fname)",
+            "            with open(fpath, 'wb') as f:",
+            "                f.write(img.data)",
+            "            manifest.append(f'{page_num}\\t{fpath}')",
+            "    except Exception:",
+            "        pass",
+            "print('\\n'.join(manifest))",
+        ]
+        .join("\n");
+
+        let output = Command::new("python")
+            .arg("-c")
+            .arg(script)
+            .arg(path.as_os_str())
+            .arg(temp_dir_path.as_os_str())
+            .output()?;
+
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "Failed to extract page images: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        let manifest = String::from_utf8_lossy(&output.stdout);
+        let mut pages_map: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+
+        for line in manifest.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() == 2 {
+                if let Ok(page_num) = parts[0].parse::<usize>() {
+                    let img_path = Path::new(parts[1]);
+                    if img_path.exists() {
+                        if let Some(ocr_text) = ImageIndexer::run_ocr_on_file(img_path) {
+                            let trimmed = ocr_text.trim();
+                            if !trimmed.is_empty() {
+                                pages_map.entry(page_num).or_default().push(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if pages_map.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut out = Vec::new();
+        out.push("[Scanned PDF — OCR Extracted Text]".to_string());
+        for (page_num, texts) in pages_map {
+            out.push(format!("Page {}:\n{}", page_num, texts.join("\n")));
+        }
+
+        Ok(out.join("\n\n"))
+    }
+
+    /// Pure-Rust scanner extracting raw embedded JPEG byte slices from PDF byte streams.
+    pub fn extract_embedded_jpegs_from_pdf_bytes(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut jpegs = Vec::new();
+        let mut idx = 0;
+        while idx + 3 < bytes.len() {
+            if bytes[idx] == 0xFF && bytes[idx + 1] == 0xD8 && bytes[idx + 2] == 0xFF {
+                let start = idx;
+                let mut search = start + 3;
+                let mut found_eoi = None;
+                while search + 1 < bytes.len() {
+                    if bytes[search] == 0xFF && bytes[search + 1] == 0xD9 {
+                        found_eoi = Some(search + 2);
+                        break;
+                    }
+                    search += 1;
+                }
+                if let Some(end) = found_eoi {
+                    let slice = &bytes[start..end];
+                    if slice.len() >= 100 {
+                        jpegs.push(slice.to_vec());
+                    }
+                    idx = end;
+                    continue;
+                }
+            }
+            idx += 1;
+        }
+        jpegs
+    }
+
+    /// Pure-Rust fallback: writes extracted JPEG byte streams to temporary files and executes OCR.
+    fn extract_pdf_embedded_jpegs_ocr(bytes: &[u8]) -> io::Result<String> {
+        let jpegs = Self::extract_embedded_jpegs_from_pdf_bytes(bytes);
+        if jpegs.is_empty() {
+            return Ok(String::new());
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let mut out_pages = Vec::new();
+
+        for (idx, jpeg_data) in jpegs.iter().enumerate() {
+            let img_path = temp_dir.path().join(format!("embedded_page_{}.jpg", idx + 1));
+            std::fs::write(&img_path, jpeg_data)?;
+            if let Some(text) = ImageIndexer::run_ocr_on_file(&img_path) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    out_pages.push(format!("Page {}:\n{}", idx + 1, trimmed));
+                }
+            }
+        }
+
+        if out_pages.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut result = Vec::new();
+        result.push("[Scanned PDF — OCR Extracted Text]".to_string());
+        result.extend(out_pages);
+        Ok(result.join("\n\n"))
+    }
+
 
     /// Extracts all paragraphs, tables, headers, and footers from `.docx`, `.doc`, or `.odt`.
     fn extract_word_or_odt_text(path: &Path, ext: &str) -> io::Result<String> {
