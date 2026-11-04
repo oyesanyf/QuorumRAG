@@ -347,6 +347,174 @@ impl IngestConfig {
             drives
         }
     }
+
+    /// Discovers real human user document roots across the host system in Session 0,
+    /// strictly avoiding system profiles (LocalSystem systemprofile, LocalService, NetworkService),
+    /// virtual/junction directories (All Users, Default User), hidden system profiles (Default),
+    /// and non-directory files (desktop.ini).
+    pub fn discover_user_document_roots() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::MetadataExt;
+
+            let mut candidate_user_dirs = Vec::new();
+
+            // 1. Primary Users directory on SystemDrive (usually C:\Users)
+            let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+            let primary_users = PathBuf::from(format!("{}\\Users", sys_drive));
+            if primary_users.is_dir() {
+                candidate_user_dirs.push(primary_users);
+            }
+
+            // 2. Users directory on any other fixed physical data drives
+            for drive in Self::discover_physical_drives() {
+                let users_dir = drive.join("Users");
+                if users_dir.is_dir() && !candidate_user_dirs.contains(&users_dir) {
+                    candidate_user_dirs.push(users_dir);
+                }
+            }
+
+            const SKIP_PROFILE_NAMES: &[&str] = &[
+                "all users",
+                "default",
+                "default user",
+                "public",
+                "systemprofile",
+                "localservice",
+                "networkservice",
+                "defaultapppool",
+                "wdigest",
+            ];
+
+            const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
+            const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+            for users_base in candidate_user_dirs {
+                let Ok(entries) = std::fs::read_dir(&users_base) else {
+                    continue;
+                };
+
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+
+                    if name.starts_with('.') || name.starts_with('$') {
+                        continue;
+                    }
+                    if SKIP_PROFILE_NAMES.contains(&name.as_str()) {
+                        continue;
+                    }
+
+                    // Check metadata: must be a real directory and NOT a symlink or reparse point (e.g. All Users junction)
+                    let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+
+                    if sym_meta.file_type().is_symlink() || !path.is_dir() {
+                        continue;
+                    }
+
+                    let attrs = sym_meta.file_attributes();
+                    if (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 {
+                        continue;
+                    }
+
+                    // Must be readable by service account
+                    if std::fs::read_dir(&path).is_err() {
+                        continue;
+                    }
+
+                    // Extract key document subfolders
+                    let mut user_roots = Vec::new();
+                    for sub in ["Documents", "Desktop", "Downloads"] {
+                        let sub_path = path.join(sub);
+                        if sub_path.is_dir() && std::fs::read_dir(&sub_path).is_ok() {
+                            if let Ok(meta) = std::fs::symlink_metadata(&sub_path) {
+                                if !meta.file_type().is_symlink()
+                                    && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+                                {
+                                    user_roots.push(sub_path);
+                                }
+                            }
+                        }
+                    }
+
+                    // Also check OneDrive sync directories if present
+                    let onedrive = path.join("OneDrive");
+                    if onedrive.is_dir() && std::fs::read_dir(&onedrive).is_ok() {
+                        for sub in ["Documents", "Desktop"] {
+                            let one_sub = onedrive.join(sub);
+                            if one_sub.is_dir() && std::fs::read_dir(&one_sub).is_ok() && !user_roots.contains(&one_sub) {
+                                if let Ok(meta) = std::fs::symlink_metadata(&one_sub) {
+                                    if !meta.file_type().is_symlink()
+                                        && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+                                    {
+                                        user_roots.push(one_sub);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if user_roots.is_empty() {
+                        roots.push(path);
+                    } else {
+                        roots.extend(user_roots);
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut candidate_bases = Vec::new();
+            for base in &["/home", "/Users"] {
+                let p = PathBuf::from(base);
+                if p.is_dir() {
+                    candidate_bases.push(p);
+                }
+            }
+
+            for base in candidate_bases {
+                if let Ok(entries) = std::fs::read_dir(base) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with('.') || name == "lost+found" || name == "Shared" {
+                            continue;
+                        }
+                        if path.is_dir() {
+                            let mut found_sub = false;
+                            for sub in &["Documents", "Desktop", "Downloads"] {
+                                let sub_path = path.join(sub);
+                                if sub_path.is_dir() {
+                                    roots.push(sub_path);
+                                    found_sub = true;
+                                }
+                            }
+                            if !found_sub {
+                                roots.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // De-duplicate roots while preserving order
+        let mut deduped = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for r in roots {
+            if seen.insert(r.clone()) {
+                deduped.push(r);
+            }
+        }
+
+        deduped
+    }
 }
 
 /// Configuration parameters for text chunking.
@@ -458,6 +626,22 @@ mod tests {
                 "Must discover physical NTFS drives (D:\\ and/or C:\\); got {:?}",
                 drive_strings
             );
+        }
+    }
+
+    #[test]
+    fn test_discover_user_document_roots_filters_system_profiles() {
+        let roots = IngestConfig::discover_user_document_roots();
+        #[cfg(target_os = "windows")]
+        {
+            assert!(!roots.is_empty(), "Must discover at least one user document root on Windows");
+            for r in &roots {
+                let lower = r.to_string_lossy().to_ascii_lowercase();
+                assert!(!lower.contains("systemprofile"));
+                assert!(!lower.contains("localservice"));
+                assert!(!lower.contains("networkservice"));
+                assert!(!lower.contains("desktop.ini"));
+            }
         }
     }
 }
