@@ -112,41 +112,16 @@ impl ClassifyIntentNode {
         }
 
         let requested_family = state.model_family;
-        let (family, tag, rationale) = AutoFusionRouter::select_model(
+        let installed_models = crate::offline_engine::DeterministicOfflineSynthesisEngine::probe_installed_ollama_models_default();
+        let (family, tag, rationale) = AutoFusionRouter::select_model_calibrated(
             requested_family,
             &state.original_prompt,
             &state.retrieved_chunks,
             hw,
+            &installed_models,
         );
         state.model_family = family;
         state.selected_model_tag = tag;
         state.routing_rationale = rationale;
-
-        // Live daemon upgrade: when AutoFusion is active for prose/general synthesis and runtime free memory
-        // satisfies the Gemma 4 26B gate, prefer `gemma4:26b` automatically if installed in local Ollama.
-        if requested_family == crate::types::SynthesisModelFamily::AutoFusion
-            && state.model_family != crate::types::SynthesisModelFamily::Qwen25Code
-            && AutoFusionRouter::can_run_gemma4_26b(hw)
-        {
-            let daemon_active = crate::dlp_mesh::global_mesh_dlp_controller()
-                .settings_file_path
-                .read()
-                .map(|p| p.is_some())
-                .unwrap_or(false);
-            if daemon_active {
-                let installed = crate::offline_engine::DeterministicOfflineSynthesisEngine::probe_installed_ollama_models_default();
-                if installed.iter().any(|m| {
-                    let low = m.to_ascii_lowercase();
-                    low == "gemma4:26b" || low.starts_with("gemma4:26b")
-                }) {
-                    state.model_family = crate::types::SynthesisModelFamily::Gemma4_26b;
-                    state.selected_model_tag = "gemma4:26b".to_string();
-                    state.routing_rationale = format!(
-                        "AutoFusion: Gemma 4 26B installed with {:.1} GB free RAM -> gemma4:26b",
-                        hw.free_ram_gb
-                    );
-                }
-            }
-        }
     }
 }

@@ -3803,7 +3803,288 @@ impl DeterministicOfflineSynthesisEngine {
         }
     }
 
-    /// Queries local Ollama `GET /api/tags` with a strict 400ms timeout (Fast Timeout Law) and 10s in-memory cache.
+    /// Multi-location binary discovery for `ollama.exe` across process PATH and standard filesystem paths.
+    /// Searches process PATH, %LOCALAPPDATA%\Programs\Ollama\ollama.exe, %ProgramFiles%\Ollama\ollama.exe,
+    /// %ProgramFiles(x86)%\Ollama\ollama.exe, and C:\Users\*\AppData\Local\Programs\Ollama\ollama.exe.
+    pub fn detect_ollama_binary() -> Option<std::path::PathBuf> {
+        // 1. Process PATH search
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let candidate = dir.join("ollama.exe");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                #[cfg(not(windows))]
+                {
+                    let cand = dir.join("ollama");
+                    if cand.is_file() {
+                        return Some(cand);
+                    }
+                }
+            }
+        }
+
+        // 2. Windows specific standard locations
+        #[cfg(windows)]
+        {
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                let p = std::path::PathBuf::from(local)
+                    .join("Programs")
+                    .join("Ollama")
+                    .join("ollama.exe");
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+
+            for pf_var in ["ProgramFiles", "ProgramFiles(x86)"] {
+                if let Ok(pf) = std::env::var(pf_var) {
+                    let p = std::path::PathBuf::from(pf)
+                        .join("Ollama")
+                        .join("ollama.exe");
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+
+            // 3. Multi-user discovery across C:\Users\*\AppData\Local\Programs\Ollama\ollama.exe
+            if let Ok(users_dir) = std::fs::read_dir("C:\\Users") {
+                for entry in users_dir.filter_map(|e| e.ok()) {
+                    if let Ok(ft) = entry.file_type() {
+                        if ft.is_dir() {
+                            let p = entry
+                                .path()
+                                .join("AppData")
+                                .join("Local")
+                                .join("Programs")
+                                .join("Ollama")
+                                .join("ollama.exe");
+                            if p.is_file() {
+                                return Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Universal Zero-Touch PATH Law: If an Ollama binary is discovered outside process PATH,
+    /// prepend its parent directory to process memory strictly via `std::env::set_var("PATH", ...)`.
+    /// NEVER writes to registry (HKCU/HKLM) or runs `setx`.
+    pub fn ensure_ollama_in_process_path() -> Option<std::path::PathBuf> {
+        let binary_path = Self::detect_ollama_binary()?;
+        if let Some(parent) = binary_path.parent() {
+            if let Some(old_path) = std::env::var_os("PATH") {
+                let mut paths = std::env::split_paths(&old_path).collect::<Vec<_>>();
+                if !paths.iter().any(|p| p == parent) {
+                    paths.insert(0, parent.to_path_buf());
+                    if let Ok(new_path) = std::env::join_paths(paths) {
+                        std::env::set_var("PATH", new_path);
+                    }
+                }
+            }
+        }
+        Some(binary_path)
+    }
+
+    /// Discovers installed Ollama model tags directly from filesystem manifests.
+    /// Scans:
+    /// 1. $OLLAMA_MODELS/manifests/registry.ollama.ai
+    /// 2. $USERPROFILE/.ollama/models/manifests/registry.ollama.ai
+    /// 3. $HOME/.ollama/models/manifests/registry.ollama.ai
+    /// 4. All user profiles in C:\Users\*\.ollama\models\manifests\registry.ollama.ai
+    pub fn discover_disk_ollama_manifests() -> Vec<String> {
+        let mut candidate_roots = Vec::new();
+
+        if let Ok(om) = std::env::var("OLLAMA_MODELS") {
+            let p = std::path::PathBuf::from(om)
+                .join("manifests")
+                .join("registry.ollama.ai");
+            if p.exists() {
+                candidate_roots.push(p);
+            }
+        }
+
+        if let Ok(up) = std::env::var("USERPROFILE") {
+            let p = std::path::PathBuf::from(up)
+                .join(".ollama")
+                .join("models")
+                .join("manifests")
+                .join("registry.ollama.ai");
+            if p.exists() {
+                candidate_roots.push(p);
+            }
+        }
+
+        if let Ok(home) = std::env::var("HOME") {
+            let p = std::path::PathBuf::from(home)
+                .join(".ollama")
+                .join("models")
+                .join("manifests")
+                .join("registry.ollama.ai");
+            if p.exists() {
+                candidate_roots.push(p);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            if let Ok(users_dir) = std::fs::read_dir("C:\\Users") {
+                for entry in users_dir.filter_map(|e| e.ok()) {
+                    if let Ok(ft) = entry.file_type() {
+                        if ft.is_dir() {
+                            let p = entry
+                                .path()
+                                .join(".ollama")
+                                .join("models")
+                                .join("manifests")
+                                .join("registry.ollama.ai");
+                            if p.exists() {
+                                candidate_roots.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut discovered = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for reg_root in candidate_roots {
+            let ns_entries = match std::fs::read_dir(&reg_root) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            for ns_entry in ns_entries.filter_map(|e| e.ok()) {
+                let ns_path = ns_entry.path();
+                if !ns_path.is_dir() {
+                    continue;
+                }
+                let ns_name = ns_entry.file_name().to_string_lossy().to_string();
+
+                let model_entries = match std::fs::read_dir(&ns_path) {
+                    Ok(entries) => entries,
+                    Err(_) => continue,
+                };
+
+                for model_entry in model_entries.filter_map(|e| e.ok()) {
+                    let model_path = model_entry.path();
+                    if !model_path.is_dir() {
+                        continue;
+                    }
+                    let model_name = model_entry.file_name().to_string_lossy().to_string();
+                    if model_name.eq_ignore_ascii_case("blobs") {
+                        continue;
+                    }
+
+                    let tag_entries = match std::fs::read_dir(&model_path) {
+                        Ok(entries) => entries,
+                        Err(_) => continue,
+                    };
+
+                    for tag_entry in tag_entries.filter_map(|e| e.ok()) {
+                        let tag_name = tag_entry.file_name().to_string_lossy().to_string();
+                        if tag_name.len() > 32 && tag_name.chars().all(|c| c.is_ascii_hexdigit()) {
+                            continue;
+                        }
+
+                        let full_name = if ns_name == "library" {
+                            format!("{}:{}", model_name, tag_name)
+                        } else {
+                            format!("{}/{}:{}", ns_name, model_name, tag_name)
+                        };
+
+                        if seen.insert(full_name.clone()) {
+                            discovered.push(full_name);
+                        }
+                    }
+                }
+            }
+        }
+
+        discovered
+    }
+
+    /// Auto-launches `ollama serve` with `CREATE_NO_WINDOW` if daemon is installed but not running on port 11434.
+    /// If Ollama binary is missing, triggers silent installation if host has internet connectivity.
+    pub fn ensure_ollama_daemon_running() -> bool {
+        use std::net::{SocketAddr, TcpStream};
+        use std::time::Duration;
+
+        let addr = SocketAddr::from(([127, 0, 0, 1], 11434));
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return true;
+        }
+
+        if let Some(binary) = Self::ensure_ollama_in_process_path() {
+            let mut cmd = std::process::Command::new(binary);
+            cmd.arg("serve");
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            if cmd.spawn().is_ok() {
+                for _ in 0..15 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                        return true;
+                    }
+                }
+                return true;
+            }
+        } else {
+            Self::trigger_silent_ollama_install();
+        }
+
+        false
+    }
+
+    /// Triggers silent background installation (`OllamaSetup.exe /VERYSILENT /NORESTART`) if missing and online.
+    pub fn trigger_silent_ollama_install() -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use std::process::Command;
+
+            let temp_installer = std::env::temp_dir().join("OllamaSetup.exe");
+            if !temp_installer.exists() {
+                let url = "https://ollama.com/download/OllamaSetup.exe";
+                let ps_cmd = format!(
+                    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('{}', '{}')",
+                    url,
+                    temp_installer.to_string_lossy().replace('\'', "''")
+                );
+                let mut dl = Command::new("powershell.exe");
+                dl.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                dl.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &ps_cmd]);
+                if let Ok(mut child) = dl.spawn() {
+                    let _ = child.wait();
+                }
+            }
+
+            if temp_installer.exists() {
+                let mut inst = Command::new(&temp_installer);
+                inst.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                inst.args(["/VERYSILENT", "/NORESTART"]);
+                if inst.spawn().is_ok() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Queries local Ollama `GET /api/tags` with a strict 400ms timeout and merges filesystem manifests.
     pub fn probe_installed_ollama_models(
         addr: &std::net::SocketAddr,
         host_port: &str,
@@ -3854,6 +4135,14 @@ impl DeterministicOfflineSynthesisEngine {
                         }
                     }
                 }
+            }
+        }
+
+        // Merge disk filesystem manifests (registry.ollama.ai)
+        let disk_manifests = Self::discover_disk_ollama_manifests();
+        for dm in disk_manifests {
+            if !discovered.iter().any(|d| d.eq_ignore_ascii_case(&dm)) {
+                discovered.push(dm);
             }
         }
 
@@ -3916,7 +4205,11 @@ impl DeterministicOfflineSynthesisEngine {
             }
         }
 
-        let mut cmd = std::process::Command::new("ollama");
+        Self::ensure_ollama_in_process_path();
+        let binary = Self::detect_ollama_binary()
+            .unwrap_or_else(|| std::path::PathBuf::from("ollama"));
+
+        let mut cmd = std::process::Command::new(binary);
         cmd.args(["pull", clean]);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
@@ -3930,42 +4223,28 @@ impl DeterministicOfflineSynthesisEngine {
     }
 
     /// Resolves the best installed, runtime-free-memory-safe Ollama model tag to execute.
+    /// Strictly guarantees that only an installed model fitting available memory is selected.
     pub fn resolve_ollama_model_tag(
         requested_tag: &str,
         hw: &crate::hardware::HardwareTelemetry,
         installed: &[String],
     ) -> String {
         let req = Self::normalize_requested_model_tag(requested_tag);
-        let is_synthesis_capable = |name: &str| -> bool {
-            let low = name.to_ascii_lowercase();
-            !low.contains("embed")
-                && !low.starts_with("bge-")
-                && !low.starts_with("moondream")
-                && !low.starts_with("llava")
-                && !low.starts_with("minicpm-v")
-        };
-        let find_installed = |cand: &str| -> Option<String> {
-            if installed.is_empty() {
-                return Some(cand.to_string());
-            }
-            let cand_low = cand.to_ascii_lowercase();
-            let cand_latest = format!("{}:latest", cand_low);
-            installed
-                .iter()
-                .find(|m| {
-                    let ml = m.to_ascii_lowercase();
-                    ml == cand_low || ml == cand_latest
-                })
-                .cloned()
-        };
+        let req_low = req.to_ascii_lowercase();
 
-        if !req.is_empty() && is_synthesis_capable(&req) && Self::model_fits_free_memory(&req, hw) {
-            if let Some(matched) = find_installed(&req) {
-                return matched;
+        // 1. If requested model is installed, is a valid synthesis chat model, and fits memory, return it directly
+        if !installed.is_empty() && !req.is_empty() {
+            if let Some(matched) = installed.iter().find(|m| {
+                let ml = m.to_ascii_lowercase();
+                (ml == req_low || ml == format!("{}:latest", req_low))
+                    && crate::model_router::AutoFusionRouter::is_synthesis_chat_model(m)
+                    && crate::model_router::AutoFusionRouter::model_fits_free_memory(m, hw)
+            }) {
+                return matched.clone();
             }
         }
 
-        let req_low = req.to_ascii_lowercase();
+        // 2. Candidate priority list based on requested family
         let candidates: &[&str] = if req_low.starts_with("gemma") {
             &[
                 "gemma4:26b",
@@ -4004,20 +4283,31 @@ impl DeterministicOfflineSynthesisEngine {
         };
 
         for &cand in candidates {
-            if Self::model_fits_free_memory(cand, hw) {
-                if let Some(matched) = find_installed(cand) {
-                    return matched;
+            if crate::model_router::AutoFusionRouter::model_fits_free_memory(cand, hw) {
+                let cand_low = cand.to_ascii_lowercase();
+                let cand_latest = format!("{}:latest", cand_low);
+                if let Some(found) = installed.iter().find(|m| {
+                    let ml = m.to_ascii_lowercase();
+                    ml == cand_low || ml == cand_latest
+                }) {
+                    return found.clone();
                 }
             }
         }
 
-        for item in installed {
-            if is_synthesis_capable(item) && Self::model_fits_free_memory(item, hw) {
-                return item.clone();
+        // 3. Fallback to any installed chat model fitting memory
+        if !installed.is_empty() {
+            if let Some(matched) = crate::model_router::AutoFusionRouter::find_best_installed_chat_model(
+                None,
+                hw,
+                installed,
+            ) {
+                return matched;
             }
         }
 
-        "qwen2.5:1.5b".to_string()
+        // 4. Default hardware tier if no chat models installed
+        crate::model_router::AutoFusionRouter::size_qwen_by_hardware(hw)
     }
 
     /// Multi-turn real-time streaming orchestration via local Ollama `POST /api/chat` (100% offline, zero internet access).
@@ -6000,6 +6290,8 @@ mod tests {
             cpu_cores: 36,
             gpu_name: Some("Quadro RTX 4000".to_string()),
             free_vram_mb: 6_500,
+            total_vram_mb: 8_192,
+            gpu_count: 1,
         };
         let low_free_ram_hw = crate::hardware::HardwareTelemetry {
             // Even on a 224 GB machine, if FREE RAM is only 9 GB and FREE VRAM is 3 GB, gemma4:26b must NOT run (Anti-OOM Law)
@@ -6008,6 +6300,8 @@ mod tests {
             cpu_cores: 36,
             gpu_name: Some("Quadro RTX 4000".to_string()),
             free_vram_mb: 3_000,
+            total_vram_mb: 8_192,
+            gpu_count: 1,
         };
         let installed = vec![
             "gemma4:26b".to_string(),

@@ -27,7 +27,24 @@
   let isGenerating = false;
   let reindexPollInterval = null;
   let conversationHistoryTurns = [];
-  let activeSessionId = 's-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9);
+  // Cryptographically secure helpers (window.crypto) - never Math.random() for identifiers.
+function secureRandomToken(len = 7) {
+    const alphabet = '0123456789abcdefghijklmnopqrstuvwxyz';
+    const bytes = new Uint8Array(len);
+    crypto.getRandomValues(bytes);
+    let out = '';
+    for (const b of bytes) out += alphabet[b % alphabet.length];
+    return out;
+}
+function secureRandomIndex(n) {
+    if (n <= 1) return 0;
+    const buf = new Uint32Array(1);
+    const limit = Math.floor(0x100000000 / n) * n;
+    do { crypto.getRandomValues(buf); } while (buf[0] >= limit);
+    return buf[0] % n;
+}
+
+let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   const activeSessionSeenChunkIds = new Set();
 
   // DOM Elements
@@ -192,7 +209,7 @@
 
   // 5. NEW CHAT
   btnNewChat.addEventListener('click', () => {
-    activeSessionId = 's-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9);
+    activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     activeSessionSeenChunkIds.clear();
     conversationHistoryTurns = [];
     chatStream.innerHTML = '';
@@ -334,7 +351,7 @@
       btnStop.classList.remove('hidden');
     }
     activeAbortController = new AbortController();
-    activeQueryId = 'q-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9);
+    activeQueryId = 'q-' + Date.now() + '-' + secureRandomToken(7);
     if (welcomeBanner) {
       welcomeBanner.classList.remove('hidden');
       welcomeBanner.style.display = '';
@@ -647,7 +664,7 @@
 
   function startThinkingIndicator(bodyEl) {
     stopThinkingIndicator(bodyEl);
-    let idx = Math.floor(Math.random() * THINKING_PHRASES.length);
+    let idx = secureRandomIndex(THINKING_PHRASES.length);
 
     const renderPhrase = (phrase) => {
       let textSpan = bodyEl.querySelector('.thinking-text');
@@ -667,7 +684,7 @@
       }
       let nextIdx = idx;
       while (nextIdx === idx && THINKING_PHRASES.length > 1) {
-        nextIdx = Math.floor(Math.random() * THINKING_PHRASES.length);
+        nextIdx = secureRandomIndex(THINKING_PHRASES.length);
       }
       idx = nextIdx;
       renderPhrase(THINKING_PHRASES[idx]);
@@ -1549,7 +1566,7 @@
         assistantMsg.remove();
       }
       if (chatStream && chatStream.children.length === 0) {
-        activeSessionId = 's-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9);
+        activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         activeSessionSeenChunkIds.clear();
         if (welcomeBanner) {
           welcomeBanner.classList.remove('hidden');

@@ -114,7 +114,7 @@ impl TestIngestionEngine {
                 slice,
                 None,
             )
-            .unwrap();
+            .map_err(|_| "failed to build DocumentChunk")?;
 
             chunks.push(doc_chunk);
             chunk_index += 1;
