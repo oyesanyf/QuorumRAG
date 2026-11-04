@@ -87,7 +87,14 @@ impl Level1DedupCatalog {
             serde_json::to_writer_pretty(f, self)
                 .map_err(io::Error::other)?;
         }
-        std::fs::rename(temp_path, path)?;
+        if let Err(e) = std::fs::rename(&temp_path, path) {
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+                std::fs::rename(&temp_path, path)?;
+            } else {
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
@@ -408,6 +415,24 @@ impl TwoLevelDedupEngine {
     pub fn get_all_tracked_files(&self) -> Vec<PathBuf> {
         let catalog = self.catalog.read().ok();
         catalog.map(|c| c.get_all_tracked_files()).unwrap_or_default()
+    }
+
+    /// Loads the Level-1 File Catalog from a JSON file on disk.
+    pub fn load_catalog_from_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let loaded = Level1DedupCatalog::load_from_file(path)?;
+        let mut catalog = self.catalog.write().map_err(|_| {
+            io::Error::other("Level 1 catalog lock poisoned")
+        })?;
+        *catalog = loaded;
+        Ok(())
+    }
+
+    /// Persists the Level-1 File Catalog atomically to a JSON file on disk.
+    pub fn save_catalog_to_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let catalog = self.catalog.read().map_err(|_| {
+            io::Error::other("Level 1 catalog lock poisoned")
+        })?;
+        catalog.save_to_file(path)
     }
 
     /// Hydrates deduplication state (both Level-1 File Catalog and Level-2 Chunk Cache)

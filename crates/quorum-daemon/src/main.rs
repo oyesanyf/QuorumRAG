@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub mod browser;
 pub mod cli;
@@ -106,11 +106,30 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         quorum_contract::DeterministicOfflineEngine::new()
     );
     let dedup = Arc::new(quorum_ingest::TwoLevelDedupEngine::new());
+    let catalog_path = cli.data_dir.join("dedup_catalog.json");
+    if catalog_path.exists() {
+        match dedup.load_catalog_from_file(&catalog_path) {
+            Ok(()) => {
+                let count = dedup.catalog().read().map(|c| c.len()).unwrap_or(0);
+                info!(
+                    count,
+                    path = %catalog_path.display(),
+                    "Startup: Loaded persistent Level-1 dedup catalog from disk"
+                );
+            }
+            Err(e) => {
+                warn!("Startup: Failed to load dedup catalog from disk: {}", e);
+            }
+        }
+    }
+
     let dedup_bg = Arc::clone(&dedup);
     let storage_bg = Arc::clone(&storage);
+    let catalog_path_bg = catalog_path.clone();
     tokio::spawn(async move {
         let chunk_count = storage_bg.count().await.unwrap_or(0);
-        if chunk_count > 0 && chunk_count <= 5_000 {
+        let catalog_is_empty = dedup_bg.catalog().read().map(|c| c.is_empty()).unwrap_or(true);
+        if catalog_is_empty && chunk_count > 0 && chunk_count <= 5_000 {
             match dedup_bg.hydrate_from_storage(&storage_bg).await {
                 Ok(chunks) => {
                     info!(
@@ -118,11 +137,17 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                         tracked_files = dedup_bg.catalog().read().map(|c| c.len()).unwrap_or(0),
                         "Startup deduplication hydration completed from LanceDB storage"
                     );
+                    let _ = dedup_bg.save_catalog_to_file(&catalog_path_bg);
                 }
                 Err(e) => {
                     error!("Startup deduplication hydration warning: {}", e);
                 }
             }
+        } else if !catalog_is_empty {
+            info!(
+                tracked_files = dedup_bg.catalog().read().map(|c| c.len()).unwrap_or(0),
+                "Persistent dedup catalog active with 0-disk-read fast path"
+            );
         } else {
             info!(
                 chunk_count,
@@ -131,42 +156,27 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         }
     });
 
-    // 2. Ingest Config & Workers (defaults to all physical fixed drives when --watch-dir is omitted)
+    // 2. Ingest Config & Workers (defaults to discovered user roots + fixed physical drives when --watch-dir is omitted)
     let mut ingest_config = quorum_ingest::IngestConfig::default();
     ingest_config.exclude_source_code = true;
     ingest_config.max_file_size_bytes = 15 * 1024 * 1024; // 15MB cap skips monolithic raw dumps
     if let Some(ref watch_path) = cli.watch_dir {
         ingest_config.watch_paths.push(watch_path.clone());
     } else {
-        let mut priority_paths: Vec<std::path::PathBuf> = Vec::new();
-        for dir in [
-            r"D:\femi\Femi_Oyesanya_CV_2026.pdf",
-            r"D:\chatgpt3\ChatGPT_Restored_Data\Word_Conversations\AI Job Loss Alternatives.docx",
-            r"D:\chatgpt3\ChatGPT_Restored_Data\Word_Conversations\40 Affirmations for Angela.docx",
-            r"D:\chatgpt3\ChatGPT_Restored_Data\Word_Conversations\Cigna Coverage Dispute.docx",
-            r"D:\chatgpt3\ChatGPT_Restored_Data\Word_Conversations\Breath and Hierarchy.docx",
-            r"D:\chatgpt3\ChatGPT_Restored_Data\Word_Conversations\Mineral Wealth in Ukraine.docx",
-            r"D:\chatgpt3\ChatGPT_Restored_Data\Word_Conversations",
-            r"D:\school",
-            r"D:\femi",
-            r"D:\articles",
-        ] {
-            let p = std::path::PathBuf::from(dir);
-            if p.exists() {
-                priority_paths.push(p);
-            }
-        }
+        let user_roots = quorum_ingest::IngestConfig::discover_user_document_roots();
         let physical_drives = quorum_ingest::IngestConfig::discover_physical_drives();
         info!(
+            user_roots = ?user_roots,
             drives = ?physical_drives,
-            "No --watch-dir specified; defaulting to priority user document folders + fixed physical drives"
+            "No --watch-dir specified; defaulting to discovered user document roots + fixed physical drives"
         );
+        let mut default_paths = user_roots;
         for d in physical_drives {
-            if !priority_paths.contains(&d) {
-                priority_paths.push(d);
+            if !default_paths.contains(&d) {
+                default_paths.push(d);
             }
         }
-        ingest_config.watch_paths = priority_paths;
+        ingest_config.watch_paths = default_paths;
     }
 
     let reindex_worker = Arc::new(quorum_ingest::ReindexWorker::new(
@@ -278,7 +288,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         drift_healer,
         classifier,
         embedder,
-        dedup,
+        dedup: Arc::clone(&dedup),
         swarm_handle,
         ingest_config: ingest_config.clone(),
         default_model_family,
@@ -295,57 +305,62 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     let bind_addr = format!("{}:{}", cli.host, bound_http_port);
     info!("QuorumRAG Web UI listening on http://{}", bind_addr);
 
-    // Continuously run background Magika crawl & incremental ingestion when --watch-dir is explicitly specified
-    if let Some(ref watch_path) = cli.watch_dir {
-        let bg_worker = Arc::clone(&reindex_worker);
-        let bg_paths = vec![watch_path.clone()];
-        let bg_shutdown = Arc::clone(&shutdown_notify);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            loop {
-                // Collect target watch path + any user-configured shared folders
-                let mut target_paths = bg_paths.clone();
-                if let Ok(guard) = quorum_coordinator::global_mesh_dlp_controller().settings.read() {
-                    for folder in &guard.mesh.shared_folders {
+    // Continuously run background crawl & incremental ingestion unconditionally
+    let bg_worker = Arc::clone(&reindex_worker);
+    let bg_default_paths = ingest_config.watch_paths.clone();
+    let bg_shutdown = Arc::clone(&shutdown_notify);
+    let bg_dedup = Arc::clone(&dedup);
+    let bg_catalog_path = cli.data_dir.join("dedup_catalog.json");
+
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        loop {
+            // Collect target watch path(s) + any user-configured shared folders
+            let mut target_paths = bg_default_paths.clone();
+            if let Ok(guard) = quorum_coordinator::global_mesh_dlp_controller().settings.read() {
+                for folder in &guard.mesh.shared_folders {
+                    if folder.enabled {
                         let p = std::path::PathBuf::from(&folder.path);
                         if !target_paths.contains(&p) {
                             target_paths.push(p);
                         }
                     }
                 }
+            }
 
-                let is_running = match bg_worker.get_progress().await {
-                    Some(prog) => matches!(
-                        prog.phase,
-                        quorum_ingest::ReindexPhase::ScanningFilesystem
-                            | quorum_ingest::ReindexPhase::ChunkingAndVectorizing
-                            | quorum_ingest::ReindexPhase::WritingToStorage
-                            | quorum_ingest::ReindexPhase::CompactingIndexes
-                    ),
-                    None => false,
+            let is_running = match bg_worker.get_progress().await {
+                Some(prog) => matches!(
+                    prog.phase,
+                    quorum_ingest::ReindexPhase::ScanningFilesystem
+                        | quorum_ingest::ReindexPhase::ChunkingAndVectorizing
+                        | quorum_ingest::ReindexPhase::WritingToStorage
+                        | quorum_ingest::ReindexPhase::CompactingIndexes
+                ),
+                None => false,
+            };
+
+            if !is_running {
+                let pass_options = quorum_ingest::ReindexOptions {
+                    target_paths,
+                    full_rebuild: false,
+                    force_reembed: false,
+                    batch_size: 64,
+                    num_threads: 0,
+                    dry_run: false,
                 };
-
-                if !is_running {
-                    let pass_options = quorum_ingest::ReindexOptions {
-                        target_paths,
-                        full_rebuild: false,
-                        force_reembed: false,
-                        batch_size: 64,
-                        num_threads: 0,
-                        dry_run: false,
-                    };
-                    if let Err(e) = bg_worker.start_reindex(pass_options).await {
-                        error!("Continuous background indexer pass warning: {}", e);
-                    }
-                }
-
-                tokio::select! {
-                    _ = bg_shutdown.notified() => break,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                if let Err(e) = bg_worker.start_reindex(pass_options).await {
+                    error!("Continuous background indexer pass warning: {}", e);
+                } else {
+                    let _ = bg_dedup.save_catalog_to_file(&bg_catalog_path);
                 }
             }
-        });
-    }
+
+            tokio::select! {
+                _ = bg_shutdown.notified() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            }
+        }
+    });
 
     // 5. Auto-launch browser if not disabled
     if !cli.no_browser {

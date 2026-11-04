@@ -83,5 +83,17 @@ pub async fn execute_graceful_shutdown(state: Arc<DaemonState>) {
         }
     }
 
+    // 4. Persist Level-1 deduplication catalog to disk
+    let catalog_path = state.data_dir.join("dedup_catalog.json");
+    if let Err(e) = state.dedup.save_catalog_to_file(&catalog_path) {
+        warn!("Failed to persist dedup catalog during graceful shutdown: {}", e);
+    } else {
+        info!(
+            path = %catalog_path.display(),
+            tracked_files = state.dedup.catalog().read().map(|c| c.len()).unwrap_or(0),
+            "Persisted Level-1 dedup catalog to disk during graceful shutdown"
+        );
+    }
+
     info!("QuorumRAG shutdown sequence complete. Goodbye!");
 }

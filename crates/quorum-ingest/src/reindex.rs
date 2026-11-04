@@ -699,6 +699,17 @@ impl ReindexWorker {
                 "reindex_completed"
             };
             let _ = storage.bump_index_epoch(reason)?;
+
+            let catalog_path = storage.config().storage_path.join("dedup_catalog.json");
+            if let Err(e) = dedup.save_catalog_to_file(&catalog_path) {
+                warn!("Failed to auto-save dedup catalog after reindex pass: {}", e);
+            } else {
+                info!(
+                    path = %catalog_path.display(),
+                    tracked_files = dedup.catalog().read().map(|c| c.len()).unwrap_or(0),
+                    "Auto-saved Level-1 dedup catalog to disk after reindex pass"
+                );
+            }
         }
 
         Ok(())
