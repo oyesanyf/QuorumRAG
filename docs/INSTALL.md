@@ -21,6 +21,7 @@ None of the installers modify `PATH` or any persistent environment variable.
 | Linux (any) | `quorumrag-<ver>-linux-<arch>.tar.gz` | `quorumrag.service` via `sudo ./install.sh` | as above | `sudo ./uninstall.sh` | `sudo ./uninstall.sh --purge` |
 | macOS | `QuorumRAG-<ver>-macos-universal.pkg` | LaunchDaemon `dev.quorumrag.daemon` (RunAtLoad, KeepAlive) | `/Library/Application Support/QuorumRAG`, `/Library/Logs/QuorumRAG` | `sudo /usr/local/share/quorumrag/uninstall.sh` | `... uninstall.sh --purge` |
 | macOS | `quorumrag-<ver>-macos-universal.tar.gz` | same, via `sudo ./install.sh` | as above | `sudo ./uninstall.sh` | `sudo ./uninstall.sh --purge` |
+| Docker | `ghcr.io/oyesanyf/quorumrag:<ver>` / `:latest` | container (`--restart unless-stopped`) | volume `/var/lib/quorumrag` | `docker rm -f quorumrag` | `docker volume rm quorumrag-data` |
 
 ## Windows (MSI)
 
@@ -81,3 +82,18 @@ The only supported way to get guaranteed trust is to sign with a publicly truste
   - runs `launchctl bootout` and `disable`,
   - removes the plist, `/usr/local/bin/quorumrag`, `QuorumRAG.app` and the pkg receipt (`pkgutil --forget dev.quorumrag.pkg`),
   - with `--purge`, also removes data and logs.
+
+## Docker (GitHub Packages)
+
+The multi-arch image `ghcr.io/oyesanyf/quorumrag` (linux/amd64 and linux/arm64) is built from the release's Linux binaries and published by [container-publish.yml](../.github/workflows/container-publish.yml) after every successful `quorumrag-v*` release. Before publishing, that workflow smoke-tests the image's `/api/health` endpoint and records build provenance.
+
+```bash
+docker run -d --name quorumrag --restart unless-stopped --network host \
+  -v quorumrag-data:/var/lib/quorumrag \
+  ghcr.io/oyesanyf/quorumrag:latest
+```
+
+- `--network host` (Linux) lets the default Ollama URL `http://127.0.0.1:11434` reach Ollama running on the host.
+- On Docker Desktop, publish the ports instead (`-p 3031:3031 -p 3032:3032`) and set the Ollama URL to `http://host.docker.internal:11434` in the Web UI settings.
+- Documents placed in `/var/lib/quorumrag/docs` inside the volume are watched and indexed.
+- To remove everything: `docker rm -f quorumrag && docker volume rm quorumrag-data`.

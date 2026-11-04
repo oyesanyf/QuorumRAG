@@ -30,6 +30,16 @@ Download a package from [Releases](https://github.com/oyesanyf/QuorumRAG/release
 | Debian / Ubuntu | `quorumrag_<ver>_<arch>.deb` (`quorumrag.service`) |
 | RHEL / Fedora / SUSE | `quorumrag-<ver>-1.<arch>.rpm` (`quorumrag.service`) |
 | macOS | `QuorumRAG-<ver>-macos-universal.pkg` (LaunchDaemon `dev.quorumrag.daemon`) |
+| Docker (linux/amd64, linux/arm64) | `ghcr.io/oyesanyf/quorumrag:latest` from [GitHub Packages](https://github.com/oyesanyf/QuorumRAG/pkgs/container/quorumrag) |
+
+Container:
+
+```bash
+docker run -d --name quorumrag --network host \
+  -v quorumrag-data:/var/lib/quorumrag \
+  ghcr.io/oyesanyf/quorumrag:latest
+# Web UI: http://127.0.0.1:3031/   (remove with: docker rm -f quorumrag && docker volume rm quorumrag-data)
+```
 
 Uninstalling stops the service and deletes it completely. See [docs/INSTALL.md](docs/INSTALL.md) for silent-install options, data locations, purge options and code-signing notes.
 
