@@ -11,3 +11,5 @@ data/
 .test_live_storage/
 __pycache__/
 *.py[cod]
+/logs/
+/raptor_out/

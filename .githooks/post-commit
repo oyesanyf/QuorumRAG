@@ -1,0 +1,34 @@
+#!/bin/sh
+# QuorumRAG Solo-Developer Automated PR & Bot Code-Review Hook (same model as the OsoosiEDR repo).
+# Any commit made directly on 'main' is moved to a pr/solo-* branch by scripts/solo_pr_ship.ps1,
+# which opens a PR, waits for the invariant review bot and the RAPTOR security gate, then squash-merges.
+# Enable once per clone:  git config core.hooksPath .githooks
+
+# Guard 1: never recurse when invoked from inside solo_pr_ship.ps1
+if [ "$QUORUMRAG_SKIP_POST_COMMIT_HOOK" = "1" ]; then
+    exit 0
+fi
+
+# Guard 2: only trigger on branch 'main'
+CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+if [ "$CURRENT_BRANCH" != "main" ]; then
+    exit 0
+fi
+
+# Guard 3: repository boundary - only the standalone QuorumRAG repository
+ORIGIN_URL=$(git remote get-url origin 2>/dev/null || echo "")
+case "$ORIGIN_URL" in
+    https://github.com/oyesanyf/QuorumRAG|https://github.com/oyesanyf/QuorumRAG.git|git@github.com:oyesanyf/QuorumRAG.git) ;;
+    *)
+        echo "[QuorumRAG] post-commit: origin '$ORIGIN_URL' is not oyesanyf/QuorumRAG; not shipping."
+        exit 0 ;;
+esac
+
+COMMIT_MSG=$(git log -1 --pretty=%s)
+
+echo "======================================================================"
+echo " [QuorumRAG] Solo-Developer PR Auto-Shipper Triggered on 'main'"
+echo " Commit: $COMMIT_MSG"
+echo "======================================================================"
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "scripts/solo_pr_ship.ps1" -SkipTest -Title "$COMMIT_MSG"

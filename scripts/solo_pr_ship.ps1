@@ -4,7 +4,12 @@ param(
     [string]$BodyFile = "",
     [switch]$SkipTest = $false,
     [switch]$BuildInstallers = $false,
-    [switch]$StageRepoWorkflows = $false
+    [switch]$StageRepoWorkflows = $false,
+    # Optional local RAPTOR pentest before opening the PR (D:\docker\raptor\Invoke-RaptorScan.ps1)
+    [switch]$RunRaptorLocal = $false,
+    [string]$RaptorMode = "scan",
+    # The CI RAPTOR gate is mandatory on every PR; this only bounds how long we wait for it.
+    [int]$RaptorTimeoutMinutes = 90
 )
 $ErrorActionPreference = "Continue"
 if (Test-Path Variable:\PSNativeCommandUseErrorActionPreference) {
@@ -75,6 +80,22 @@ if ($BuildInstallers -and (Test-Path "scripts\package.ps1")) {
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Installer packaging failed. Aborting PR shipping."
         exit $LASTEXITCODE
+    }
+}
+
+# [0/5] Optional local RAPTOR pentest gate (same model as the OsoosiEDR repo).
+# The GitHub Actions RAPTOR gate below is ALWAYS enforced before merge.
+if ($RunRaptorLocal -or ($env:QUORUMRAG_SOLO_RAPTOR_SCAN -eq "1")) {
+    $localRaptor = "D:\docker\raptor\Invoke-RaptorScan.ps1"
+    if (Test-Path $localRaptor) {
+        Write-Host "[0/5] Running local RAPTOR pentest gate (-Mode $RaptorMode)..." -ForegroundColor Magenta
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $localRaptor -TargetPath $ScriptRepoRoot -Mode $RaptorMode
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Local RAPTOR pentest gate failed (exit $LASTEXITCODE). Fix all findings before shipping."
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Warning "Local RAPTOR helper not found at $localRaptor; relying on the mandatory CI RAPTOR gate."
     }
 }
 
@@ -157,6 +178,7 @@ if ($uncommitted -or $workflowUncommitted) {
 }
 Remove-Item -Force $commitMsgFile -ErrorAction SilentlyContinue
 
+$prHeadSha = (git rev-parse HEAD).Trim()
 Write-Host "Pushing $branchName to origin..." -ForegroundColor Cyan
 git push -u origin $branchName
 
@@ -325,6 +347,60 @@ except Exception as e:
 if (-not $approved) {
     Write-Warning "Auto-review timed out after 150 seconds. Proceeding to attempt merge..."
 }
+
+# ---------------------------------------------------------------------------
+# MANDATORY RAPTOR SECURITY GATE (every PR, same as the OsoosiEDR repo)
+# Wait for the "RAPTOR Security Audit (SAST + Crypto + SCA)" check on the PR head
+# commit. Merge ONLY on success; on failure or timeout the PR stays open unmerged.
+# ---------------------------------------------------------------------------
+Write-Host "[4b/5] Waiting for RAPTOR Security Audit on $prHeadSha (timeout $RaptorTimeoutMinutes min)..." -ForegroundColor Magenta
+$raptorWaitHelper = @'
+import subprocess, urllib.request, urllib.error, urllib.parse, json, sys, time
+
+repo_slug, sha, timeout_min = sys.argv[1], sys.argv[2], int(sys.argv[3])
+check_name = "RAPTOR Security Audit (SAST + Crypto + SCA)"
+p = subprocess.Popen(["git", "credential", "fill"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8")
+out, _ = p.communicate("protocol=https\nhost=github.com\n\n")
+token = dict(l.split("=", 1) for l in out.splitlines() if "=" in l).get("password", "")
+headers = {"Authorization": "Bearer " + token, "User-Agent": "QuorumRAG-PR-Ship", "Accept": "application/vnd.github+json"}
+url = ("https://api.github.com/repos/" + repo_slug + "/commits/" + sha
+       + "/check-runs?check_name=" + urllib.parse.quote(check_name) + "&per_page=20")
+deadline = time.time() + timeout_min * 60
+last = ""
+while time.time() < deadline:
+    try:
+        data = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers=headers)).read().decode("utf-8"))
+        runs = data.get("check_runs", [])
+    except Exception as exc:
+        sys.stderr.write("RAPTOR check poll error: " + str(exc) + "\n")
+        runs = []
+    if runs:
+        run = sorted(runs, key=lambda r: r.get("started_at") or "")[-1]
+        status, conclusion = run.get("status"), run.get("conclusion")
+        state = str(status) + "/" + str(conclusion)
+        if state != last:
+            print("  RAPTOR: " + state + "  " + str(run.get("html_url")), flush=True)
+            last = state
+        if status == "completed":
+            print("RAPTOR_RESULT=" + str(conclusion), flush=True)
+            sys.exit(0 if conclusion == "success" else 1)
+    elif last != "absent":
+        print("  RAPTOR: check not started yet...", flush=True)
+        last = "absent"
+    time.sleep(20)
+print("RAPTOR_RESULT=timeout", flush=True)
+sys.exit(2)
+'@
+$raptorHelperFile = Join-Path ([System.IO.Path]::GetTempPath()) ("quorumrag-raptor-wait-" + [Guid]::NewGuid().ToString("N") + ".py")
+[System.IO.File]::WriteAllText($raptorHelperFile, $raptorWaitHelper, (New-Object System.Text.UTF8Encoding($false)))
+& $pythonExe $raptorHelperFile $repoSlug $prHeadSha $RaptorTimeoutMinutes
+$raptorExit = $LASTEXITCODE
+Remove-Item -Force $raptorHelperFile -ErrorAction SilentlyContinue
+if ($raptorExit -ne 0) {
+    Write-Error "RAPTOR Security Audit did not pass for PR #$prNumber (exit $raptorExit). PR left OPEN and UNMERGED: fix every RAPTOR finding, push to $branchName, and re-run."
+    exit 1
+}
+Write-Host "[4b/5] RAPTOR Security Audit PASSED for $prHeadSha." -ForegroundColor Green
 
 Write-Host "[5/5] Merging PR #$prNumber into main and syncing local branch..." -ForegroundColor Cyan
 & $pythonExe -c "
