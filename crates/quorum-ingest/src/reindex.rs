@@ -208,7 +208,7 @@ impl ReindexWorker {
         let all_chunks = self.storage.scan_all_chunks().await?;
         let mut upgraded_count = 0;
 
-        for chunk in all_chunks {
+        for chunk in &all_chunks {
             let is_image = chunk.chunk_id.ends_with(":img:0")
                 || chunk.text_content.trim_start().starts_with("[Image Document:");
             if !is_image {
@@ -255,9 +255,18 @@ impl ReindexWorker {
                 assert_eq!(upgraded_chunk.chunk_id, chunk.chunk_id);
                 assert_eq!(upgraded_chunk.document_id, chunk.document_id);
 
+                // Collect other chunks sharing this file_path so they are retained across replacement
+                let other_chunks: Vec<DocumentChunk> = all_chunks
+                    .iter()
+                    .filter(|c| c.file_path == chunk.file_path && c.chunk_id != chunk.chunk_id)
+                    .cloned()
+                    .collect();
+
                 // Replace stale chunk in LanceDB and Tantivy
                 Self::replace_existing_file_chunks(&self.storage, std::slice::from_ref(&upgraded_chunk)).await;
-                self.storage.insert_chunks(std::slice::from_ref(&upgraded_chunk)).await?;
+                let mut chunks_to_insert = vec![upgraded_chunk.clone()];
+                chunks_to_insert.extend(other_chunks);
+                self.storage.insert_chunks(&chunks_to_insert).await?;
 
                 let mtime_secs = std::fs::metadata(file_path)
                     .and_then(|m| m.modified())

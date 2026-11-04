@@ -699,16 +699,40 @@ impl ImageIndexer {
     }
 
     /// Normalizes typographic dashes (em-dash, en-dash, minus, non-breaking hyphen)
-    /// to standard ASCII hyphens for exact token matching (e.g. CVE-2026-99137).
+    /// to standard ASCII hyphens for exact token matching (e.g. CVE-2026-99137),
+    /// and fixes common OCR kerning merges where 'C' and 'V' touch (e.g. "WE-2026-99137" -> "CVE-2026-99137").
     pub fn normalize_ocr_text(s: &str) -> String {
-        s.replace(
+        let mut text = s.replace(
             [
                 '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}',
                 '\u{2212}',
             ],
             "-",
-        )
+        );
+
+        let mut search_from = 0;
+        while let Some(rel_idx) = text[search_from..].find("WE-") {
+            let idx = search_from + rel_idx;
+            let rest = &text[idx + 3..];
+            if rest.len() >= 5
+                && rest[..4].chars().all(|c| c.is_ascii_digit())
+                && rest.as_bytes()[4] == b'-'
+            {
+                text.replace_range(idx..idx + 2, "CVE");
+                search_from = idx + 3;
+            } else {
+                search_from = idx + 3;
+            }
+        }
+
+        // Common OCR misrecognition: "PAGE-I" or "PAGE-l" for "PAGE-1"
+        let mut text = text.replace("PAGE-I", "PAGE-1");
+        text = text.replace("PAGE-l", "PAGE-1");
+
+        text
     }
+
+
 
 
     #[cfg(not(windows))]
@@ -839,7 +863,7 @@ if ($engine) {
             }
 
             let text = String::from_utf8_lossy(&raw);
-            if !text.lines().next().map_or(false, |l| l.contains(" 200")) {
+            if !text.lines().next().is_some_and(|l| l.contains(" 200")) {
                 continue;
             }
 
@@ -896,7 +920,7 @@ if ($engine) {
     /// RFC 4648 standard base64 encoding.
     pub fn base64_encode(data: &[u8]) -> String {
         const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
         for chunk in data.chunks(3) {
             let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
             let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
