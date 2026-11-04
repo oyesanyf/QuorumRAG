@@ -1,5 +1,8 @@
 # QuorumRAG
 
+[![Release](https://img.shields.io/github/v/release/oyesanyf/QuorumRAG?include_prereleases&sort=semver)](https://github.com/oyesanyf/QuorumRAG/releases)
+[![Installers](https://github.com/oyesanyf/QuorumRAG/actions/workflows/quorumrag-release.yml/badge.svg)](https://github.com/oyesanyf/QuorumRAG/actions/workflows/quorumrag-release.yml)
+
 Local-first, peer-to-peer agentic Retrieval-Augmented Generation (RAG) daemon with an embedded ChatGPT-style Web UI.
 
 - Hybrid search: LanceDB vectors + Tantivy full-text.
@@ -8,6 +11,14 @@ Local-first, peer-to-peer agentic Retrieval-Augmented Generation (RAG) daemon wi
 - Ed25519-authenticated libp2p mesh between peers.
 - Exports answers as PDF and Word documents.
 - Runs fully offline against local Ollama models.
+
+## Contents
+
+- [Install](#install)
+- [Build from source](#build-from-source)
+- [Repository map](#repository-map)
+- [Workspace layout](#workspace-layout)
+- [Documentation](#documentation)
 
 ## Install
 
@@ -43,4 +54,27 @@ Linux and macOS packages: `packaging/linux/build_packages.sh` and `packaging/mac
 | `quorum-network` | libp2p peer mesh |
 | `quorum-contract` | Shared types |
 
-More docs: [PROJECT.md](PROJECT.md), [docs/MULTIMODAL.md](docs/MULTIMODAL.md), [docs/INSTALL.md](docs/INSTALL.md).
+## Repository map
+
+| Path | What is there |
+|---|---|
+| [`crates/`](crates) | Rust workspace crates (see [Workspace layout](#workspace-layout)) |
+| [`crates/quorum-daemon/src/`](crates/quorum-daemon/src) | HTTP handlers, CLI, shutdown, Windows service (`win_service.rs`) |
+| [`crates/quorum-coordinator/src/`](crates/quorum-coordinator/src) | Agentic retrieval, `answer_orchestrator.rs`, LangExtract grounding |
+| [`crates/quorum-ui/assets/`](crates/quorum-ui/assets) | Embedded Web UI |
+| [`packaging/windows/`](packaging/windows) | Launcher, open-UI and complete-uninstall scripts for the MSI and ZIP |
+| [`packaging/linux/`](packaging/linux) | deb/rpm/tarball builder, `quorumrag.service`, `quorumrag-ctl` helper |
+| [`packaging/macos/`](packaging/macos) | pkg/dmg/tarball builder, LaunchDaemon plist, install/uninstall |
+| [`wix/QuorumRAG.wxs`](wix/QuorumRAG.wxs) | WiX v5 MSI definition (auto-start service, browser launch, full removal) |
+| [`scripts/`](scripts) | `package.ps1` (Windows build), signing, release and PR shipping |
+| [`.github/workflows/`](.github/workflows) | Cross-platform installer + release pipeline, PR invariant gate |
+| [`tests/e2e/`](tests/e2e) | End-to-end tests |
+| [`policy/`](policy) | Witness / supply-chain policy templates |
+| [`docs/`](docs) | Install and multimodal documentation |
+
+## Documentation
+
+- [docs/INSTALL.md](docs/INSTALL.md): service install, silent options, uninstall and purge on every OS, code signing
+- [docs/MULTIMODAL.md](docs/MULTIMODAL.md): image/audio/document ingestion, answer orchestration, exports
+- [PROJECT.md](PROJECT.md): feature matrix and milestones
+- [AGENTS.md](AGENTS.md): rules for automated agents working on this repository
