@@ -101,7 +101,9 @@ impl TantivyFtsIndex {
         if guard.is_none() {
             *guard = Some(Self::create_writer_inner(index)?);
         }
-        Ok(guard.as_mut().expect("writer initialized"))
+        guard
+            .as_mut()
+            .ok_or_else(|| StorageError::Tantivy("index writer unavailable after initialization".into()))
     }
 
     /// Drops any existing IndexWriter to release `.tantivy-writer.lock` before creating a fresh writer.

@@ -455,6 +455,16 @@ impl AgenticStateGraphRunner {
                 }
 
                 AgenticStateName::SynthesizeWithCitations => {
+                    let installed = crate::offline_engine::DeterministicOfflineSynthesisEngine::probe_installed_ollama_models_default();
+                    if !installed.is_empty() {
+                        let verified_tag = crate::offline_engine::DeterministicOfflineSynthesisEngine::resolve_ollama_model_tag(
+                            &graph_state.selected_model_tag,
+                            &hw,
+                            &installed,
+                        );
+                        graph_state.selected_model_tag = verified_tag;
+                    }
+
                     if let Some(ref tx) = telemetry_tx {
                         if tx.is_closed() {
                             return Ok(graph_state);
