@@ -1,0 +1,21 @@
+[package]
+name = "quorum-classifier"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Google Magika deep content identification and binary classifier for QuorumRAG"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+magika = { workspace = true, optional = true }
+
+[features]
+default = []
+onnx = ["dep:magika"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,68 @@
+[package]
+name = "quorum-e2e"
+version = "0.1.0"
+edition = "2021"
+authors = ["QuorumRAG Test Engineering Team"]
+description = "Comprehensive 4-tier opaque-box E2E test suite for QuorumRAG"
+
+[workspace]
+
+[lib]
+name = "quorum_e2e"
+path = "src/lib.rs"
+
+[dependencies]
+quorum-types = { path = "../../crates/quorum-types" }
+quorum-classifier = { path = "../../crates/quorum-classifier" }
+quorum-contract = { path = "../../crates/quorum-contract" }
+quorum-coordinator = { path = "../../crates/quorum-coordinator" }
+quorum-storage = { path = "../../crates/quorum-storage" }
+quorum-ingest = { path = "../../crates/quorum-ingest" }
+quorum-network = { path = "../../crates/quorum-network" }
+blake3 = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
+ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
+tokio = { version = "1.40", features = ["full"] }
+tempfile = "3.10"
+sysinfo = "0.30"
+
+[[test]]
+name = "test_storage_isolation"
+path = "test_storage_isolation.rs"
+
+[[test]]
+name = "test_gemma_contract"
+path = "test_gemma_contract.rs"
+
+[[test]]
+name = "test_ingestion_dedup"
+path = "test_ingestion_dedup.rs"
+
+[[test]]
+name = "test_federated_mesh"
+path = "test_federated_mesh.rs"
+
+[[test]]
+name = "test_web_endpoints"
+path = "test_web_endpoints.rs"
+
+[[test]]
+name = "test_cross_feature_combinations"
+path = "test_cross_feature_combinations.rs"
+
+[[test]]
+name = "test_real_world_scenarios"
+path = "test_real_world_scenarios.rs"
+
+[[test]]
+name = "test_live_ide_execution"
+path = "test_live_ide_execution.rs"
+
+[[test]]
+name = "benchmarks_r4"
+path = "../benchmarks_r4.rs"

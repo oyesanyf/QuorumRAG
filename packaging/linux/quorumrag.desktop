@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=QuorumRAG Chat UI
+Comment=Open the QuorumRAG local-first P2P RAG Web UI (http://127.0.0.1:3031/)
+Exec=/usr/lib/quorumrag/quorumrag-ctl open-ui
+Icon=applications-internet
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=false

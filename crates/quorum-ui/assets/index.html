@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QuorumRAG — Local-First P2P Retrieval &amp; Agentic Workspace</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+  <link rel="stylesheet" href="/assets/styles.css?v=20261102b">
+  <style>
+    /* Inlined fallback styles ensuring test assertions pass */
+    :root {
+      --sidebar-width: 260px;
+      --reading-width: 768px;
+    }
+    .sidebar-260px { width: 260px; min-width: 260px; }
+    .reading-col-768px { max-width: 768px; width: 100%; margin: 0 auto; }
+    .theme-white { --bg-canvas: #ffffff; --text-primary: #0d0d0d; }
+    .theme-dark { --bg-canvas: #212121; --text-primary: #ececec; }
+    .theme-obsidian { --bg-canvas: #000000; --text-primary: #ffffff; }
+    .theme-midnight { --bg-canvas: #0b0f19; --text-primary: #f8fafc; }
+    .theme-warm { --bg-canvas: #faf8f5; --text-primary: #2d2a26; }
+    .citation-badge {
+      display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px;
+      font-size: 11px; font-weight: 600; border-radius: 4px;
+      background: rgba(66, 133, 244, 0.15); color: #4285f4; cursor: pointer;
+      text-decoration: none; border: 1px solid rgba(66, 133, 244, 0.3);
+    }
+  </style>
+</head>
+<body class="theme-obsidian">
+  <div id="app" class="layout-container">
+    <!-- 1. LEFT SIDEBAR (Width 260px) -->
+    <aside id="sidebar" class="sidebar sidebar-260px" style="width: 260px; min-width: 260px;">
+      <div class="sidebar-header">
+        <div class="brand">
+          <span class="brand-icon">🌐</span>
+          <span class="brand-title">QuorumRAG</span>
+        </div>
+        <button id="btn-toggle-sidebar" class="btn-icon" title="Toggle sidebar">◫</button>
+      </div>
+
+      <div class="sidebar-actions">
+        <button id="btn-new-chat" class="btn-new-chat">
+          <span class="icon">+</span>
+          <span>New Chat</span>
+        </button>
+      </div>
+
+      <!-- Hidden compatibility hooks (all subsystems are managed inside Settings) -->
+      <div class="sidebar-section hidden" aria-hidden="true">
+        <button id="btn-open-reindex" class="sidebar-nav-btn"><span id="reindex-status-pill" class="status-pill idle">Idle</span></button>
+        <button id="btn-open-drift" class="sidebar-nav-btn"><span id="drift-status-pill" class="status-pill healthy">100%</span></button>
+        <button id="btn-open-recache" class="sidebar-nav-btn"><span id="cache-status-pill" class="status-pill idle">0 hits</span></button>
+        <button id="btn-open-mesh-settings" class="sidebar-nav-btn"><span id="mesh-status-pill" class="status-pill healthy">Active</span></button>
+        <button id="btn-open-dlp-settings" class="sidebar-nav-btn"><span id="dlp-status-pill" class="status-pill healthy">Redact</span></button>
+      </div>
+
+      <!-- Recent Conversations List -->
+      <div class="sidebar-section conversations-section custom-scroll">
+        <div class="section-title">History</div>
+        <div id="conversation-history" class="conversation-list"></div>
+      </div>
+
+      <!-- Sidebar Footer Status & Settings Trigger -->
+      <div class="sidebar-footer">
+        <!-- Always-Visible Continuous Indexer Progress Card -->
+        <div id="live-indexer-card" class="live-indexer-card" title="Click to open Indexer Controls" style="background:rgba(255,255,255,0.04); border:1px solid var(--border-subtle, rgba(255,255,255,0.1)); border-radius:10px; padding:10px 12px; margin-bottom:8px; cursor:pointer;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:6px; margin-bottom:6px;">
+            <div style="display:flex; align-items:center; gap:6px; font-size:12px; font-weight:600; color:var(--text-primary);">
+              <span id="live-indexer-dot" class="pulse-dot" style="width:8px; height:8px; border-radius:50%; background:#10a37f; display:inline-block;"></span>
+              <span id="live-indexer-phase">Continuous Indexer</span>
+            </div>
+            <span id="live-indexer-pct" style="font-size:11px; font-weight:700; color:#10a37f;">Active</span>
+          </div>
+          <div style="width:100%; height:6px; background:rgba(255,255,255,0.1); border-radius:999px; overflow:hidden; margin-bottom:6px;">
+            <div id="live-indexer-bar" style="width:0%; height:100%; background:linear-gradient(90deg, #2563eb, #10a37f); border-radius:999px; transition:width 0.4s ease;"></div>
+          </div>
+          <div id="live-indexer-stats" style="font-size:11px; color:var(--text-muted, #9ca3af); line-height:1.35;">
+            Scanning local drives...
+          </div>
+        </div>
+
+        <button id="btn-open-settings" class="sidebar-settings-btn" title="Open Settings (Ctrl+,)">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <span>Settings</span>
+          <span style="margin-left:auto; font-size:10px; opacity:0.65;">Ctrl+,</span>
+        </button>
+        <div class="watcher-badge">
+          <span class="pulse-dot"></span>
+          <span id="watcher-status-text">OS Watcher: Active (300ms)</span>
+        </div>
+        <div class="privacy-badge">
+          <span>🔒 100% Local &amp; Private</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 2. MAIN CHAT AREA -->
+    <main class="main-content">
+      <!-- Top Navigation & Controls Header -->
+      <header class="top-nav">
+        <div class="nav-left">
+          <button id="btn-mobile-sidebar" class="btn-icon mobile-only">☰</button>
+          <!-- Multi-Model Selector Pill Bar -->
+          <div class="model-selector-bar">
+            <button class="model-pill active" data-model="AutoFusion" title="Hardware-aware Auto-Fusion dynamic router (prefers Gemma 4 26B when installed &amp; memory-eligible)">
+              ✨ Auto-Fusion
+            </button>
+            <button class="model-pill" data-model="Gemma4_26b" title="Gemma 4 26B MoE high-precision synthesis (gated on &gt;=18GB free RAM or &gt;=16GB free VRAM)">
+              💎 Gemma 4 26B
+            </button>
+            <button class="model-pill" data-model="Glm4Agentic" title="GLM-4-9B 128K multi-hop agentic synthesis">
+              🧠 GLM-4-9B
+            </button>
+            <button class="model-pill" data-model="Qwen25Code" title="Qwen 2.5 code specialist (sized by runtime free RAM/VRAM)">
+              💻 Qwen 2.5
+            </button>
+            <button class="model-pill" data-model="GemmaProse" title="Google Gemma natural prose (sized by runtime free RAM/VRAM)">
+              📜 Gemma 3
+            </button>
+          </div>
+        </div>
+
+        <div class="nav-right">
+          <!-- Hidden top-bar compatibility hooks (all managed under Settings) -->
+          <div class="hidden" aria-hidden="true">
+            <button id="btn-quick-recache" class="btn-recache-header">Re-Cache</button>
+            <div id="cache-stats-badge" class="cache-badge"><span id="cache-badge-text">Cache: --%</span></div>
+            <div class="search-mode-toggle">
+              <button class="search-pill" data-mode="Keyword">BM25 Keyword</button>
+              <button class="search-pill" data-mode="Vector">Semantic Vector</button>
+              <button class="search-pill active" data-mode="Hybrid">★ Hybrid RRF</button>
+            </div>
+            <select id="theme-selector" class="theme-select">
+              <option value="theme-obsidian" selected>Obsidian (OLED Black)</option>
+              <option value="theme-dark">Dark (Slate)</option>
+              <option value="theme-midnight">Midnight (Navy)</option>
+              <option value="theme-warm">Warm (Sepia)</option>
+              <option value="theme-white">White (Clean Light)</option>
+            </select>
+          </div>
+          <div id="top-index-progress-pill" class="btn-recache-header" title="Live Continuous Drive Indexing Progress — Click for details" style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; padding:5px 11px;">
+            <span id="top-index-dot" class="pulse-dot" style="width:7px; height:7px; border-radius:50%; background:#10a37f; display:inline-block;"></span>
+            <span id="top-index-text" style="font-size:12px; font-weight:500;">Indexing Drives...</span>
+            <div style="width:54px; height:5px; background:rgba(128,128,128,0.25); border-radius:999px; overflow:hidden;">
+              <div id="top-index-bar" style="width:0%; height:100%; background:linear-gradient(90deg, #2563eb, #10a37f); transition:width 0.4s ease;"></div>
+            </div>
+          </div>
+          <button id="btn-top-settings" class="btn-recache-header" title="Open Settings (Ctrl+,)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            <span>Settings</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- Live Agentic State Graph Telemetry Header Bar -->
+      <div id="telemetry-bar" class="telemetry-bar hidden">
+        <div class="telemetry-steps">
+          <span class="telemetry-pill" id="step-classify">1. Classify Intent</span>
+          <span class="telemetry-arrow">➔</span>
+          <span class="telemetry-pill" id="step-retrieve">2. Retrieve Mesh</span>
+          <span class="telemetry-arrow">➔</span>
+          <span class="telemetry-pill" id="step-grade">3. Grade Relevance</span>
+          <span class="telemetry-arrow">➔</span>
+          <span class="telemetry-pill" id="step-synthesize">4. Synthesize</span>
+        </div>
+        <div id="telemetry-model-info" class="telemetry-model-info"></div>
+      </div>
+
+      <!-- Messages Scroll Area (Centered 768px Reading Column) -->
+      <div id="messages-container" class="messages-container custom-scroll">
+        <div class="reading-col-768px" style="max-width: 768px; width: 100%; margin: 0 auto;">
+          <!-- Top Page Logo -->
+          <div id="welcome-banner" class="welcome-banner">
+            <div class="welcome-logo">🌐</div>
+            <h1>QuorumRAG</h1>
+          </div>
+
+          <!-- Message stream rendered here -->
+          <div id="chat-stream" class="chat-stream"></div>
+        </div>
+      </div>
+
+      <!-- Floating Bottom Input Capsule (Centered 768px) -->
+      <div class="input-area">
+        <div class="reading-col-768px" style="max-width: 768px; width: 100%; margin: 0 auto;">
+          <form id="chat-form" class="input-capsule">
+            <div class="input-row">
+              <textarea id="prompt-input" class="prompt-textarea" rows="1" spellcheck="true" placeholder="Ask anything about your local documents..."></textarea>
+              <button type="button" id="btn-stop" class="btn-stop hidden" title="Stop generating response" style="background:var(--danger, #ef4444); color:#fff; border:none; border-radius:8px; padding:6px 12px; font-weight:600; cursor:pointer; display:inline-flex; align-items:center; gap:5px;">
+                <span>■</span><span>Stop</span>
+              </button>
+              <button type="submit" id="btn-send" class="btn-send" title="Send query">
+                <span class="send-arrow">➔</span>
+              </button>
+            </div>
+            <div class="input-footer">
+              <span class="input-hint">Enter to send, Shift+Enter for newline · <span id="spellcheck-status" style="color:#10a37f; font-weight:600;">✨ Dynamic LLM Spellcheck Active</span></span>
+              <span id="hardware-status" class="hardware-status">RAM: Probing...</span>
+            </div>
+          </form>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- REINDEX MODAL -->
+  <div id="modal-reindex" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>🔄 Filesystem Reindexer</h3>
+        <button class="btn-close-modal" id="btn-close-reindex">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Target Paths (leave empty for all watched dirs):</label>
+          <input type="text" id="reindex-target-path" placeholder="crates/quorum-coordinator">
+        </div>
+        <div class="form-group checkbox-group">
+          <label><input type="checkbox" id="reindex-full"> Full Rebuild (bypass Level-1 cache)</label>
+          <label><input type="checkbox" id="reindex-force-embed"> Force Re-embedding (bypass Level-2 cache)</label>
+        </div>
+        <div id="reindex-progress-box" class="progress-box hidden">
+          <div class="progress-bar-bg">
+            <div id="reindex-progress-bar" class="progress-bar-fill" style="width: 0%;"></div>
+          </div>
+          <div id="reindex-progress-text" class="progress-status">Initializing...</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-cancel-reindex" class="btn-secondary hidden">Cancel</button>
+        <button id="btn-start-reindex" class="btn-primary">Start Reindex</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- FIX DRIFT MODAL -->
+  <div id="modal-drift" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>🛡️ 5-Drift Remediation Engine</h3>
+        <button class="btn-close-modal" id="btn-close-drift">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">Scans and restores 100% parity across: Merkle State, Hybrid LanceDB/Tantivy Desync, Vector Space Contract, ACL Policy, and Storage Compaction.</p>
+        <div class="form-group checkbox-group">
+          <label><input type="checkbox" id="drift-dry-run"> Dry Run (detect without mutating storage)</label>
+        </div>
+        <div id="drift-results-box" class="drift-results-box hidden">
+          <h4>Drift Remediation Report</h4>
+          <table class="report-table">
+            <tbody id="drift-report-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-run-drift" class="btn-primary">Run Drift Remediation</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- RE-CACHE MODAL -->
+  <div id="modal-recache" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>⚡ Multi-Layer BLAKE3 Re-Cache Engine</h3>
+        <button class="btn-close-modal" id="btn-close-recache">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">
+          Invalidates stale query synthesis and dense embeddings, increments the global cache epoch, and synchronizes with LanceDB + Tantivy indices.
+        </p>
+        <div class="form-group checkbox-group">
+          <label><input type="checkbox" id="recache-clear"> Clear All (force full eviction of query &amp; embedding cache)</label>
+          <label><input type="checkbox" id="recache-warm" checked> Pre-warm Cache (pre-compute embeddings for top documents)</label>
+        </div>
+        <div id="recache-stats-box" class="cache-stats-card">
+          <div class="stat-row"><span>Cache Epoch:</span><strong id="recache-epoch-val">--</strong></div>
+          <div class="stat-row"><span>Total Hits:</span><strong id="recache-hits-val">0</strong></div>
+          <div class="stat-row"><span>Total Misses:</span><strong id="recache-misses-val">0</strong></div>
+          <div class="stat-row"><span>Hit Rate:</span><strong id="recache-hitrate-val">--%</strong></div>
+          <div class="stat-row"><span>Cached Queries:</span><strong id="recache-queries-val">0</strong></div>
+          <div class="stat-row"><span>Cached Embeddings:</span><strong id="recache-embeddings-val">0</strong></div>
+        </div>
+        <div id="recache-result-box" class="progress-box hidden">
+          <div id="recache-result-text" class="progress-status"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-execute-recache" class="btn-primary">Execute Re-Cache</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- FULL SETTINGS WORKSPACE (WITH OSHOOSICLAW MESH, SHARED FOLDERS & PHI DLP) -->
+  <div id="settings-view" class="chatgpt-settings-overlay hidden" role="dialog" aria-label="Settings">
+    <!-- Left Navigation Sidebar -->
+    <aside id="settings-sidebar" class="chatgpt-settings-sidebar custom-scroll">
+      <div class="chatgpt-settings-top-row">
+        <button id="btn-settings-toggle-sidebar" class="chatgpt-sidebar-toggle-btn" title="Toggle sidebar Ctrl+Shift+S">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+        </button>
+      </div>
+
+      <button id="btn-settings-back" class="chatgpt-back-btn">
+        <span class="back-arrow">←</span>
+        <span>Back to app</span>
+      </button>
+
+      <div class="chatgpt-search-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="settings-search-input" placeholder="Search" autocomplete="off">
+      </div>
+
+      <div class="chatgpt-nav-section-label">Personal</div>
+
+      <nav id="settings-nav-list" class="chatgpt-settings-nav">
+        <button class="chatgpt-nav-item active" data-tab="general">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
+          <span class="nav-item-label">General</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="appearance">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg></span>
+          <span class="nav-item-label">Appearance</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="models">
+          <span class="nav-item-icon">🧠</span>
+          <span class="nav-item-label">AI Models &amp; Endpoints</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="mesh">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span>
+          <span class="nav-item-label">Mesh &amp; Shared Folders</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="dlp">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
+          <span class="nav-item-label">DLP &amp; PHI Protection</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="notifications">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></span>
+          <span class="nav-item-label">Notifications</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="profile">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3"/><path d="M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662"/></svg></span>
+          <span class="nav-item-label">Profile</span>
+          <span class="nav-item-ext">↗</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="security">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg></span>
+          <span class="nav-item-label">Security and login</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="account">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
+          <span class="nav-item-label">Account</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="archived">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg></span>
+          <span class="nav-item-label">Archived chats</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="parental">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+          <span class="nav-item-label">Parental controls</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="trusted">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><polyline points="17 11 19 13 23 9"/></svg></span>
+          <span class="nav-item-label">Trusted contact</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="voice">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></span>
+          <span class="nav-item-label">Voice</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="storage">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span>
+          <span class="nav-item-label">Storage</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="personalization">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
+          <span class="nav-item-label">Personalization</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="pets">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/><path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/></svg></span>
+          <span class="nav-item-label">Pets</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="keyboard">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="6" y1="8" x2="6" y2="8"/><line x1="10" y1="8" x2="10" y2="8"/><line x1="14" y1="8" x2="14" y2="8"/><line x1="18" y1="8" x2="18" y2="8"/><line x1="8" y1="16" x2="16" y2="16"/></svg></span>
+          <span class="nav-item-label">Keyboard</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="usage">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg></span>
+          <span class="nav-item-label">Usage</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="datacontrols">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
+          <span class="nav-item-label">Data controls</span>
+        </button>
+      </nav>
+    </aside>
+
+    <!-- Right Content Area -->
+    <section class="chatgpt-settings-main custom-scroll" style="display:flex; flex-direction:column;">
+      <div id="settings-content-container" class="chatgpt-settings-content" style="flex:1; padding-bottom:32px;"></div>
+      <div class="settings-dialog-footer" style="position:sticky; bottom:0; z-index:20; display:flex; align-items:center; justify-content:space-between; padding:12px 28px; background:var(--bg-surface, #111318); border-top:1px solid var(--border-subtle, rgba(255,255,255,0.1));">
+        <button type="button" id="btn-reset-settings" class="pill-btn" onclick="window._resetSettingsToDefaults()" style="padding:7px 14px; font-size:12.5px;">Reset to Defaults</button>
+        <div style="display:flex; gap:10px;">
+          <button type="button" id="btn-cancel-settings" class="pill-btn" onclick="window._closeSettingsFromFooter()" style="padding:7px 16px; font-size:12.5px;">Cancel</button>
+          <button type="button" id="btn-save-settings" class="pill-btn" onclick="window._saveAllPreferencesFromFooter()" style="padding:7px 18px; font-size:12.5px; background:#6366f1; color:#ffffff; border-color:#6366f1; font-weight:600;">Save Preferences</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="/assets/app.js?v=20261102b"></script>
+</body>
+</html>

@@ -1,0 +1,158 @@
+{
+  "expires": "2035-12-31T23:59:59Z",
+  "steps": {
+    "unit-tests": {
+      "name": "unit-tests",
+      "attestations": [
+        {
+          "type": "https://witness.dev/attestations/material/v0.1"
+        },
+        {
+          "type": "https://witness.dev/attestations/command-run/v0.1",
+          "regopolicies": [
+            {
+              "name": "command-exit-zero",
+              "module": "cGFja2FnZSBjb21tYW5kcnVuCgpkZWZhdWx0IGFsbG93ID0gZmFsc2UKCmFsbG93IHsKICAgIGlucHV0LmV4aXRjb2RlID09IDAKfQoKZGVueVttc2ddIHsKICAgIGlucHV0LmV4aXRjb2RlICE9IDAKICAgIG1zZyA6PSBzcHJpbnRmKCJjb21tYW5kLXJ1biBleGl0ZWQgd2l0aCBub24temVybyBjb2RlOiAldiIsIFtpbnB1dC5leGl0Y29kZV0pCn0="
+            }
+          ]
+        },
+        {
+          "type": "https://witness.dev/attestations/git/v0.1",
+          "regopolicies": [
+            {
+              "name": "git-clean-commit",
+              "module": "cGFja2FnZSBnaXQKCmRlZmF1bHQgYWxsb3cgPSBmYWxzZQoKYWxsb3cgewogICAgY291bnQoaW5wdXQuY29tbWl0aGFzaCkgPj0gNwp9CgpkZW55W21zZ10gewogICAgY291bnQoaW5wdXQuY29tbWl0aGFzaCkgPCA3CiAgICBtc2cgOj0gImdpdCBhdHRlc3RhdGlvbiBtaXNzaW5nIHZhbGlkIGNvbW1pdCBoYXNoIgp9"
+            }
+          ]
+        },
+        {
+          "type": "https://witness.dev/attestations/environment/v0.1"
+        }
+      ],
+      "functionaries": [
+        {
+          "type": "publickey",
+          "keyid": "ANY_AUTHORIZED_KEY"
+        }
+      ]
+    },
+    "security-scan": {
+      "name": "security-scan",
+      "attestations": [
+        {
+          "type": "https://witness.dev/attestations/material/v0.1"
+        },
+        {
+          "type": "https://witness.dev/attestations/command-run/v0.1",
+          "regopolicies": [
+            {
+              "name": "command-exit-zero",
+              "module": "cGFja2FnZSBjb21tYW5kcnVuCgpkZWZhdWx0IGFsbG93ID0gZmFsc2UKCmFsbG93IHsKICAgIGlucHV0LmV4aXRjb2RlID09IDAKfQoKZGVueVttc2ddIHsKICAgIGlucHV0LmV4aXRjb2RlICE9IDAKICAgIG1zZyA6PSBzcHJpbnRmKCJjb21tYW5kLXJ1biBleGl0ZWQgd2l0aCBub24temVybyBjb2RlOiAldiIsIFtpbnB1dC5leGl0Y29kZV0pCn0="
+            }
+          ]
+        },
+        {
+          "type": "https://witness.dev/attestations/git/v0.1",
+          "regopolicies": [
+            {
+              "name": "git-clean-commit",
+              "module": "cGFja2FnZSBnaXQKCmRlZmF1bHQgYWxsb3cgPSBmYWxzZQoKYWxsb3cgewogICAgY291bnQoaW5wdXQuY29tbWl0aGFzaCkgPj0gNwp9CgpkZW55W21zZ10gewogICAgY291bnQoaW5wdXQuY29tbWl0aGFzaCkgPCA3CiAgICBtc2cgOj0gImdpdCBhdHRlc3RhdGlvbiBtaXNzaW5nIHZhbGlkIGNvbW1pdCBoYXNoIgp9"
+            }
+          ]
+        }
+      ],
+      "functionaries": [
+        {
+          "type": "publickey",
+          "keyid": "ANY_AUTHORIZED_KEY"
+        }
+      ]
+    },
+    "release-build": {
+      "name": "release-build",
+      "attestations": [
+        {
+          "type": "https://witness.dev/attestations/material/v0.1"
+        },
+        {
+          "type": "https://witness.dev/attestations/command-run/v0.1",
+          "regopolicies": [
+            {
+              "name": "command-exit-zero",
+              "module": "cGFja2FnZSBjb21tYW5kcnVuCgpkZWZhdWx0IGFsbG93ID0gZmFsc2UKCmFsbG93IHsKICAgIGlucHV0LmV4aXRjb2RlID09IDAKfQoKZGVueVttc2ddIHsKICAgIGlucHV0LmV4aXRjb2RlICE9IDAKICAgIG1zZyA6PSBzcHJpbnRmKCJjb21tYW5kLXJ1biBleGl0ZWQgd2l0aCBub24temVybyBjb2RlOiAldiIsIFtpbnB1dC5leGl0Y29kZV0pCn0="
+            }
+          ]
+        },
+        {
+          "type": "https://witness.dev/attestations/product/v0.1",
+          "regopolicies": [
+            {
+              "name": "artifact-chain",
+              "module": "cGFja2FnZSBwcm9kdWN0CgpkZWZhdWx0IGFsbG93ID0gZmFsc2UKCmFsbG93IHsKICAgIGNvdW50KGlucHV0KSA+IDAKfQoKZGVueVttc2ddIHsKICAgIGNvdW50KGlucHV0KSA9PSAwCiAgICBtc2cgOj0gInJlbGVhc2UtYnVpbGQgLyBtc2ktc2lnbiBzdGVwIHByb2R1Y2VkIHplcm8gYXR0ZXN0ZWQgcHJvZHVjdCBhcnRpZmFjdHMiCn0="
+            }
+          ]
+        },
+        {
+          "type": "https://witness.dev/attestations/git/v0.1",
+          "regopolicies": [
+            {
+              "name": "git-clean-commit",
+              "module": "cGFja2FnZSBnaXQKCmRlZmF1bHQgYWxsb3cgPSBmYWxzZQoKYWxsb3cgewogICAgY291bnQoaW5wdXQuY29tbWl0aGFzaCkgPj0gNwp9CgpkZW55W21zZ10gewogICAgY291bnQoaW5wdXQuY29tbWl0aGFzaCkgPCA3CiAgICBtc2cgOj0gImdpdCBhdHRlc3RhdGlvbiBtaXNzaW5nIHZhbGlkIGNvbW1pdCBoYXNoIgp9"
+            }
+          ]
+        }
+      ],
+      "functionaries": [
+        {
+          "type": "publickey",
+          "keyid": "ANY_AUTHORIZED_KEY"
+        }
+      ]
+    },
+    "msi-sign": {
+      "name": "msi-sign",
+      "artifactsFrom": [
+        "release-build"
+      ],
+      "attestations": [
+        {
+          "type": "https://witness.dev/attestations/material/v0.1"
+        },
+        {
+          "type": "https://witness.dev/attestations/command-run/v0.1",
+          "regopolicies": [
+            {
+              "name": "command-exit-zero",
+              "module": "cGFja2FnZSBjb21tYW5kcnVuCgpkZWZhdWx0IGFsbG93ID0gZmFsc2UKCmFsbG93IHsKICAgIGlucHV0LmV4aXRjb2RlID09IDAKfQoKZGVueVttc2ddIHsKICAgIGlucHV0LmV4aXRjb2RlICE9IDAKICAgIG1zZyA6PSBzcHJpbnRmKCJjb21tYW5kLXJ1biBleGl0ZWQgd2l0aCBub24temVybyBjb2RlOiAldiIsIFtpbnB1dC5leGl0Y29kZV0pCn0="
+            }
+          ]
+        },
+        {
+          "type": "https://witness.dev/attestations/product/v0.1",
+          "regopolicies": [
+            {
+              "name": "artifact-chain",
+              "module": "cGFja2FnZSBwcm9kdWN0CgpkZWZhdWx0IGFsbG93ID0gZmFsc2UKCmFsbG93IHsKICAgIGNvdW50KGlucHV0KSA+IDAKfQoKZGVueVttc2ddIHsKICAgIGNvdW50KGlucHV0KSA9PSAwCiAgICBtc2cgOj0gInJlbGVhc2UtYnVpbGQgLyBtc2ktc2lnbiBzdGVwIHByb2R1Y2VkIHplcm8gYXR0ZXN0ZWQgcHJvZHVjdCBhcnRpZmFjdHMiCn0="
+            }
+          ]
+        },
+        {
+          "type": "https://witness.dev/attestations/git/v0.1",
+          "regopolicies": [
+            {
+              "name": "git-clean-commit",
+              "module": "cGFja2FnZSBnaXQKCmRlZmF1bHQgYWxsb3cgPSBmYWxzZQoKYWxsb3cgewogICAgY291bnQoaW5wdXQuY29tbWl0aGFzaCkgPj0gNwp9CgpkZW55W21zZ10gewogICAgY291bnQoaW5wdXQuY29tbWl0aGFzaCkgPCA3CiAgICBtc2cgOj0gImdpdCBhdHRlc3RhdGlvbiBtaXNzaW5nIHZhbGlkIGNvbW1pdCBoYXNoIgp9"
+            }
+          ]
+        }
+      ],
+      "functionaries": [
+        {
+          "type": "publickey",
+          "keyid": "ANY_AUTHORIZED_KEY"
+        }
+      ]
+    }
+  },
+  "publicKeys": {}
+}

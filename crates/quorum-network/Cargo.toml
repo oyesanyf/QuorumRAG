@@ -1,0 +1,54 @@
+[package]
+name = "quorum-network"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "rust-libp2p 0.57.1 Swarm, dual transports (QUIC/TCP), mDNS, Kademlia, GossipSub, and CBOR Request-Response"
+
+[dependencies]
+# Pure domain types & contracts (ZERO Arrow/Lance leakage)
+quorum-types = { workspace = true }
+quorum-contract = { workspace = true }
+
+# rust-libp2p 0.57.1 with exact features
+libp2p = { version = "0.57.1", features = [
+    "tokio",
+    "quic",
+    "tcp",
+    "noise",
+    "yamux",
+    "mdns",
+    "kad",
+    "gossipsub",
+    "request-response",
+    "cbor",
+    "identify",
+    "macros",
+    "ed25519",
+    "dns",
+] }
+
+# Async & Networking
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Cryptography & Security
+ed25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+subtle = { workspace = true }
+
+# Serialization & Core
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error Handling & Tracing
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

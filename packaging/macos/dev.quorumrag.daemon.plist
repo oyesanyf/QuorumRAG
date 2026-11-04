@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.quorumrag.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/quorumrag</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>3031</string>
+        <string>--p2p-port</string>
+        <string>3032</string>
+        <string>--data-dir</string>
+        <string>/Library/Application Support/QuorumRAG/data</string>
+        <string>--watch-dir</string>
+        <string>/Library/Application Support/QuorumRAG/docs</string>
+        <string>--no-browser</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Library/Application Support/QuorumRAG</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/QuorumRAG/quorumrag.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/QuorumRAG/quorumrag.err.log</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>

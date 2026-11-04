@@ -1,0 +1,28 @@
+[package]
+name = "quorum-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Embedded LanceDB and Tantivy hybrid storage engine with strict Arrow type isolation"
+
+[dependencies]
+quorum-types = { workspace = true }
+lancedb = "0.41.0"
+tantivy = "0.27.0"
+arrow-array = "58.4"
+arrow-schema = "58.4"
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+blake3 = { workspace = true }
+chrono = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }

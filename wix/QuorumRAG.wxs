@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?ifndef ProductVersion ?>
+<?define ProductVersion = "0.1.0" ?>
+<?endif ?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+    <Package Name="QuorumRAG P2P Agentic RAG"
+             Manufacturer="Oshoosi Security"
+             Version="$(var.ProductVersion)"
+             UpgradeCode="6c84d2a1-9f3b-47e2-b815-3d9a7e4c102f"
+             Scope="perMachine">
+
+        <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+        <MediaTemplate EmbedCab="yes" />
+
+        <!-- Universal Zero-Touch PATH Law:
+             Strictly ZERO WiX Environment XML elements anywhere in this manifest.
+             Launching relies exclusively on [INSTALLFOLDER] shortcuts and process-scoped launcher scripts. -->
+
+        <StandardDirectory Id="ProgramFiles64Folder">
+            <Directory Id="INSTALLFOLDER" Name="QuorumRAG">
+                <Component Id="MainExecutable" Guid="a41f9c28-52d1-4b87-9e36-8172b5d409e1" Bitness="always64">
+                    <File Id="QuorumRagExe" Source="target\release\quorumrag.exe" KeyPath="yes" />
+                    <ServiceInstall Id="QuorumRagServiceInstall"
+                                    Name="QuorumRAGDaemon"
+                                    DisplayName="QuorumRAG Local-First P2P RAG Service"
+                                    Description="QuorumRAG Local-First P2P Retrieval-Augmented Generation Daemon and Web UI"
+                                    Type="ownProcess"
+                                    Start="auto"
+                                    ErrorControl="normal"
+                                    Account="LocalSystem"
+                                    Arguments="--service --host 0.0.0.0 --port 3031 --p2p-port 3032 --data-dir &quot;[CommonAppDataFolder]QuorumRAG\data&quot; --no-browser"
+                                    Vital="yes" />
+                    <!-- Started at install, stopped before upgrade/uninstall, and deleted from the
+                         Service Control Manager on uninstall (Remove="uninstall"). -->
+                    <ServiceControl Id="QuorumRagServiceControl"
+                                    Name="QuorumRAGDaemon"
+                                    Start="install"
+                                    Stop="both"
+                                    Remove="uninstall"
+                                    Wait="yes" />
+                </Component>
+
+                <Component Id="LauncherScript" Guid="b72e8d39-63e2-4c98-af47-9283c6e51af2" Bitness="always64">
+                    <File Id="QuorumLaunchCmd" Source="packaging\windows\quorumrag-launch.cmd" KeyPath="yes" />
+                </Component>
+
+                <Component Id="OpenUiScript" Guid="f1c6a273-07d8-4f1b-b3e2-5a6c9d7e8f01" Bitness="always64">
+                    <File Id="QuorumOpenUiCmd" Source="packaging\windows\quorumrag-open-ui.cmd" KeyPath="yes" />
+                </Component>
+
+                <Component Id="UninstallScript" Guid="0b7d4e92-3a5f-4c61-8e2d-6f9a1c3b5d72" Bitness="always64">
+                    <File Id="QuorumUninstallCmd" Source="packaging\windows\quorumrag-uninstall.cmd" KeyPath="yes" />
+                </Component>
+
+                <Component Id="InstallReadme" Guid="c83f9e40-74f3-4da9-b058-0394d7f62ba3" Bitness="always64">
+                    <File Id="ReadmeInstallTxt" Source="packaging\windows\README_INSTALL.txt" KeyPath="yes" />
+                </Component>
+            </Directory>
+        </StandardDirectory>
+
+        <StandardDirectory Id="ProgramMenuFolder">
+            <Directory Id="ApplicationProgramsFolder" Name="QuorumRAG">
+                <Component Id="StartMenuShortcuts" Guid="d94a0f51-85a4-4eba-9169-14a5e8073cb4" Bitness="always64">
+                    <Shortcut Id="StartMenuLaunchShortcut"
+                              Name="QuorumRAG Chat UI"
+                              Description="Launch QuorumRAG Local-First P2P Agentic RAG Web UI"
+                              Target="[INSTALLFOLDER]quorumrag-launch.cmd"
+                              WorkingDirectory="INSTALLFOLDER" />
+                    <!-- One-click complete removal: uninstalls the MSI, which stops and deletes
+                         the QuorumRAGDaemon service and its firewall rule. -->
+                    <Shortcut Id="StartMenuUninstallShortcut"
+                              Name="Uninstall QuorumRAG"
+                              Description="Stop and delete the QuorumRAG service and remove the application"
+                              Target="[System64Folder]msiexec.exe"
+                              Arguments="/x [ProductCode]" />
+                    <RemoveFolder Id="CleanUpShortCutDir" Directory="ApplicationProgramsFolder" On="uninstall" />
+                    <RegistryValue Root="HKLM"
+                                   Key="Software\OshoosiSecurity\QuorumRAG"
+                                   Name="StartMenuShortcutInstalled"
+                                   Type="integer"
+                                   Value="1"
+                                   KeyPath="yes" />
+                </Component>
+            </Directory>
+        </StandardDirectory>
+
+        <StandardDirectory Id="DesktopFolder">
+            <Component Id="DesktopShortcuts" Guid="ea5b1062-96b5-4fcb-a27a-25b6f9184dc5" Bitness="always64">
+                <Shortcut Id="DesktopLaunchShortcut"
+                          Name="QuorumRAG Chat UI"
+                          Description="Launch QuorumRAG Local-First P2P Agentic RAG Web UI"
+                          Target="[INSTALLFOLDER]quorumrag-launch.cmd"
+                          WorkingDirectory="INSTALLFOLDER" />
+                <RegistryValue Root="HKLM"
+                               Key="Software\OshoosiSecurity\QuorumRAG"
+                               Name="DesktopShortcutInstalled"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+            </Component>
+        </StandardDirectory>
+
+        <Feature Id="ProductFeature" Title="QuorumRAG Core Daemon &amp; Web UI" Level="1">
+            <ComponentRef Id="MainExecutable" />
+            <ComponentRef Id="LauncherScript" />
+            <ComponentRef Id="OpenUiScript" />
+            <ComponentRef Id="UninstallScript" />
+            <ComponentRef Id="InstallReadme" />
+            <ComponentRef Id="StartMenuShortcuts" />
+            <ComponentRef Id="DesktopShortcuts" />
+        </Feature>
+
+        <!-- Scoped Private-LAN Firewall Rule for QuorumRAG Web UI & libp2p mDNS/QUIC/TCP
+             Opt out during silent install via: msiexec /i QuorumRAG-0.1.0-x86_64.msi FIREWALLRULE=0 -->
+        <Property Id="FIREWALLRULE" Value="1" Secure="yes" />
+        <CustomAction Id="AddQuorumFirewallRule"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Mesh&quot; dir=in action=allow program=&quot;[INSTALLFOLDER]quorumrag.exe&quot; enable=yes profile=private" />
+        <CustomAction Id="RemoveQuorumFirewallRule"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG P2P Mesh&quot;" />
+
+        <!-- Open the Web UI in the installing user's browser when installation finishes.
+             The script waits for the service health endpoint first. Disable with LAUNCHBROWSER=0. -->
+        <Property Id="LAUNCHBROWSER" Value="1" Secure="yes" />
+        <CustomAction Id="LaunchQuorumWebUi"
+                      Directory="INSTALLFOLDER"
+                      Execute="immediate"
+                      Impersonate="yes"
+                      Return="asyncNoWait"
+                      ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c &quot;&quot;[INSTALLFOLDER]quorumrag-open-ui.cmd&quot;&quot;" />
+
+        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.1.0-x86_64.msi REMOVEDATA=1
+             deletes the index and logs in %ProgramData%\QuorumRAG (kept by default). -->
+        <Property Id="REMOVEDATA" Value="0" Secure="yes" />
+        <CustomAction Id="RemoveQuorumData"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c rmdir /s /q &quot;[CommonAppDataFolder]QuorumRAG&quot;" />
+
+        <InstallExecuteSequence>
+            <Custom Action="AddQuorumFirewallRule" After="InstallFiles" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="RemoveQuorumFirewallRule" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="RemoveQuorumData" After="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND REMOVEDATA=&quot;1&quot; AND NOT UPGRADINGPRODUCTCODE" />
+            <Custom Action="LaunchQuorumWebUi" After="InstallFinalize" Condition="LAUNCHBROWSER=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+        </InstallExecuteSequence>
+    </Package>
+</Wix>

@@ -1,0 +1,3 @@
+[build]
+# Cap concurrent rustc/linker jobs to prevent Windows commit charge exhaustion (0xc0000017 STATUS_NO_MEMORY)
+jobs = 2

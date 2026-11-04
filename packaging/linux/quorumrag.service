@@ -1,0 +1,28 @@
+[Unit]
+Description=QuorumRAG Local-First P2P Agentic RAG Daemon
+Documentation=https://github.com/oyesanyf/MusicFusion/tree/main/QuorumRAG
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/quorumrag --host 0.0.0.0 --port 3031 --p2p-port 3032 --data-dir /var/lib/quorumrag/data --watch-dir /var/lib/quorumrag/docs --no-browser
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+WorkingDirectory=/var/lib/quorumrag
+StateDirectory=quorumrag
+LogsDirectory=quorumrag
+
+# Hardening & Sandboxing Controls
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/quorumrag /var/log/quorumrag
+
+# Resource Limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

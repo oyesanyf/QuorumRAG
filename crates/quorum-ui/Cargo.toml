@@ -1,0 +1,22 @@
+[package]
+name = "quorum-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Axum 0.7 web server, embedded ChatGPT UI, SSE streaming, search toggle, LangExtract visualizer, and reindex/drift controls"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+rust-embed = { version = "8.4", features = ["mime-guess"] }
+mime_guess = "2.0"
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

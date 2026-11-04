@@ -1,0 +1,44 @@
+[package]
+name = "quorum-coordinator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Scatter-gather query coordinator, 400ms timeout guard, Ed25519 ACL, RRF fusion, volatile memory protection, LangGraph agentic state graph, hardware-aware GLM selection"
+
+[dependencies]
+quorum-types = { workspace = true }
+quorum-contract = { workspace = true }
+quorum-storage = { workspace = true }
+quorum-network = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+ed25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sysinfo = { workspace = true }
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+x509-parser = { version = "0.18", features = ["verify"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+quorum-classifier = { workspace = true }
+quorum-ingest = { workspace = true }
+quorum-ui = { workspace = true }
+axum = { version = "0.7", features = ["macros", "tokio"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }

@@ -1,0 +1,19 @@
+[package]
+name = "quorum-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pure Rust domain models, access tier specifications, and DTOs for QuorumRAG"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+blake3 = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,57 @@
+[package]
+name = "quorum-daemon"
+version = "0.1.0"
+edition = "2021"
+authors = ["QuorumRAG Team"]
+license = "MIT OR Apache-2.0"
+description = "Single executable launcher and Axum 0.7 daemon for QuorumRAG"
+
+[[bin]]
+name = "quorumrag"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates
+quorum-types = { workspace = true }
+quorum-classifier = { workspace = true }
+quorum-contract = { workspace = true }
+quorum-storage = { workspace = true }
+quorum-ingest = { workspace = true }
+quorum-network = { workspace = true }
+quorum-coordinator = { workspace = true }
+quorum-ui = { workspace = true }
+
+# Axum Web Server & Networking
+axum = { version = "0.7", features = ["macros", "tokio"] }
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+
+# CLI & Launcher
+clap = { version = "4.5", features = ["derive", "env"] }
+open = "5.3"
+mime_guess = "2.0"
+
+# Serialization & System
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sysinfo = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Services"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[test]]
+name = "benchmarks_r4"
+path = "../../tests/benchmarks_r4.rs"

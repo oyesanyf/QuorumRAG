@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/quorum-types",
+    "crates/quorum-classifier",
+    "crates/quorum-contract",
+    "crates/quorum-storage",
+    "crates/quorum-ingest",
+    "crates/quorum-network",
+    "crates/quorum-coordinator",
+    "crates/quorum-ui",
+    "crates/quorum-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["QuorumRAG Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/QuorumRAG/QuorumRAG"
+
+[workspace.dependencies]
+# Internal workspace crates
+quorum-types = { path = "crates/quorum-types" }
+quorum-classifier = { path = "crates/quorum-classifier" }
+quorum-contract = { path = "crates/quorum-contract" }
+quorum-storage = { path = "crates/quorum-storage" }
+quorum-ingest = { path = "crates/quorum-ingest" }
+quorum-network = { path = "crates/quorum-network" }
+quorum-coordinator = { path = "crates/quorum-coordinator" }
+quorum-ui = { path = "crates/quorum-ui" }
+quorum-daemon = { path = "crates/quorum-daemon" }
+
+# Ingestion & Traversal
+ignore = "0.4.22"
+notify = "6.1.1"
+notify-debouncer-full = "0.3.1"
+walkdir = "2.5"
+
+# Serialization & Core
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Cryptography & Security
+blake3 = "1.5"
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
+
+# Async & Networking
+tokio = { version = "1.40", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+sysinfo = "0.30"
+
+# Error Handling & Tracing
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ML / Embeddings / Deep Content
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+candle-transformers = "0.11.1"
+tokenizers = "0.19"
+magika = "1.1"
+
+# Utilities
+tempfile = "3.10"
+
+[profile.dev]
+# Disable heavy PDB symbol generation for massive dependencies (LanceDB/DataFusion/Arrow)
+# to prevent Windows pagefile/commit memory exhaustion (0xc0000017 STATUS_NO_MEMORY)
+debug = 0
+
+[profile.test]
+debug = 0
