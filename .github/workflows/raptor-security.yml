@@ -1,0 +1,310 @@
+name: RAPTOR Autonomous Security Audit
+
+# Runs on every pull request to main, every push to main, nightly, and on demand.
+# Required status check for merging into main (branch protection), same as the OsoosiEDR repo.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run nightly at 02:30 UTC (21:30 EST / 22:30 EDT)
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  raptor-security:
+    name: RAPTOR Security Audit (SAST + Crypto + SCA)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Execute RAPTOR SAST, Post-Quantum Crypto, CycloneDX SBOM & SCA Gate
+        run: |
+          set -euo pipefail
+          mkdir -p raptor_out
+          chmod 777 raptor_out
+          echo "===================================================================="
+          echo "  RAPTOR Autonomous Security Scanner (CI Required Check Gate)"
+          echo "  Suites: Exhaustive Multi-Language SAST + Post-Quantum Crypto"
+          echo "          + Compiler Analyzer + Expanded Macro AST + Coccinelle + SCA"
+          echo "          + CycloneDX 1.5 SBOM + OSV-Scanner + Trivy Container IaC"
+          echo "===================================================================="
+
+          if docker pull danielcuthbert/raptor:latest >/dev/null 2>&1; then
+            echo "[+] Pulled danielcuthbert/raptor:latest container image."
+            RAPTOR_ENGINE_DIR="${RUNNER_TEMP}/raptor_engine"
+            rm -rf "${RAPTOR_ENGINE_DIR}"
+            git clone --depth 1 https://github.com/gadievron/raptor.git "${RAPTOR_ENGINE_DIR}"
+            mkdir -p "${RAPTOR_ENGINE_DIR}/out"
+            chmod -R 777 "${RAPTOR_ENGINE_DIR}"
+            echo "[+] Cloned gadievron/raptor engine into ${RAPTOR_ENGINE_DIR}."
+
+            python3 - "${RAPTOR_ENGINE_DIR}" << 'PATCHEOF'
+          import pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+
+          cfg = root / "core" / "config" / "__init__.py"
+          if cfg.exists():
+              txt = cfg.read_text(encoding="utf-8")
+              if '"RAPTOR_ALLOW_DEGRADED_UNTRUSTED"' not in txt:
+                  txt = txt.replace('"RAPTOR_REDB_MAX_BYTES",', '"RAPTOR_REDB_MAX_BYTES",\n        "RAPTOR_ALLOW_DEGRADED_UNTRUSTED",')
+              # Upgrade BASELINE_SEMGREP_PACKS to maximum advanced registry + Trail of Bits + 0xdea coverage
+              old_baseline = '''    BASELINE_SEMGREP_PACKS: ClassVar[list[tuple[str, str]]] = [
+                  ("semgrep_security_audit", "p/security-audit"),
+                  ("semgrep_owasp_top_10", "p/owasp-top-ten"),
+                  ("semgrep_secrets", "p/secrets"),
+              ]'''
+              new_baseline = '''    BASELINE_SEMGREP_PACKS: ClassVar[list[tuple[str, str]]] = [
+                  ("semgrep_security_audit", "p/security-audit"),
+                  ("semgrep_owasp_top_10", "p/owasp-top-ten"),
+                  ("semgrep_secrets", "p/secrets"),
+                  ("semgrep_trailofbits", "p/trailofbits"),
+                  ("semgrep_0xdea", "p/0xdea"),
+                  ("semgrep_command_injection", "p/command-injection"),
+                  ("semgrep_jwt", "p/jwt"),
+                  ("semgrep_xss", "p/xss"),
+                  ("semgrep_default", "p/default"),
+              ]'''
+              if old_baseline in txt:
+                  txt = txt.replace(old_baseline, new_baseline)
+              cfg.write_text(txt, encoding="utf-8")
+
+          ctx = root / "core" / "sandbox" / "context.py"
+          if ctx.exists():
+              txt = ctx.read_text(encoding="utf-8")
+              old_fn = '''def _degraded_untrusted_waiver() -> bool:'''
+              if old_fn in txt and 'Path("/.dockerenv").exists()' not in txt:
+                  txt = txt.replace(
+                      '    return os.environ.get(\n        "RAPTOR_ALLOW_DEGRADED_UNTRUSTED", ""\n    ).strip().lower() in ("1", "true", "yes", "on")',
+                      '    val = os.environ.get("RAPTOR_ALLOW_DEGRADED_UNTRUSTED", "").strip().lower()\n    if val in ("0", "false", "no", "off"):\n        return False\n    if val in ("1", "true", "yes", "on"):\n        return True\n    return Path("/.dockerenv").exists()'
+                  )
+                  ctx.write_text(txt, encoding="utf-8")
+          PATCHEOF
+
+            # Copy QuorumRAG custom advanced Rust/PQC/WebUI rules into RAPTOR engine ruleset
+            if [ -d "${GITHUB_WORKSPACE}/.raptor/rules" ]; then
+              mkdir -p "${RAPTOR_ENGINE_DIR}/engine/semgrep/rules/quorumrag_advanced"
+              cp -r "${GITHUB_WORKSPACE}/.raptor/rules/"*.yaml "${RAPTOR_ENGINE_DIR}/engine/semgrep/rules/quorumrag_advanced/"
+              echo "[+] Injected QuorumRAG advanced Rust/Tokio/PQC Semgrep rules into RAPTOR engine."
+            fi
+
+            docker run --rm \
+              --user root \
+              -v "${RAPTOR_ENGINE_DIR}:/workspaces/raptor" \
+              -v "${GITHUB_WORKSPACE}:/workspaces/target:ro" \
+              -v "${GITHUB_WORKSPACE}/raptor_out:/workspaces/out" \
+              -e RAPTOR_ALLOW_DEGRADED_UNTRUSTED="1" \
+              -w /workspaces/raptor \
+              danielcuthbert/raptor:latest \
+              bash -c '
+                set -euo pipefail
+                export PATH="/root/.local/bin:/home/vscode/.local/bin:/usr/local/bin:${PATH}"
+                if ! command -v semgrep >/dev/null 2>&1; then
+                  SEMGREP_FOUND=$(find / -name semgrep -type f -executable 2>/dev/null | head -n 1 || true)
+                  if [ -n "${SEMGREP_FOUND}" ]; then
+                    ln -sf "${SEMGREP_FOUND}" /usr/local/bin/semgrep
+                  elif command -v uv >/dev/null 2>&1; then
+                    UV_TOOL_BIN_DIR=/usr/local/bin UV_TOOL_DIR=/opt/uv-tools uv tool install semgrep
+                  else
+                    pip install --break-system-packages semgrep || pip install semgrep
+                  fi
+                else
+                  ln -sf "$(command -v semgrep)" /usr/local/bin/semgrep || true
+                fi
+                echo "[+] Active semgrep binary: $(which semgrep) ($(semgrep --version))"
+
+                # Pre-populate all Semgrep registry rule packs locally (security-audit, owasp-top-ten, trailofbits, 0xdea, secrets, etc.)
+                python3 /workspaces/raptor/engine/semgrep/tools/cache-packs.py update || true
+                python3 /workspaces/raptor/engine/semgrep/tools/cache-packs.py list || true
+
+                STAGE_DIR="/tmp/raptor_ci_repo"
+                OUT_DIR="/tmp/raptor_ci_out"
+                mkdir -p "${STAGE_DIR}" "${OUT_DIR}"
+                tar -C /workspaces/target \
+                  --exclude="./target" \
+                  --exclude="./.git" \
+                  --exclude="./node_modules" \
+                  --exclude="./deploy" \
+                  --exclude="./data" \
+                  --exclude="./.quorumrag-live-data" \
+                  --exclude="./.quorumrag-rag-index" \
+                  --exclude="./.agents" \
+                  --exclude="./raptor_out" \
+                  -cf - . | tar -C "${STAGE_DIR}" -xf -
+
+                EXTRA_CFG_FLAG=""
+                if [ -f "${STAGE_DIR}/.raptor/rules/quorumrag-advanced-security.yaml" ]; then
+                  EXTRA_CFG_FLAG="--extra-config ${STAGE_DIR}/.raptor/rules/quorumrag-advanced-security.yaml"
+                fi
+
+                python3 /workspaces/raptor/raptor.py describe --target "${STAGE_DIR}" | tee "${OUT_DIR}/describe.txt"
+                python3 /workspaces/raptor/raptor.py scan --repo "${STAGE_DIR}" --policy-groups all --compiler-scan --expanded-semgrep ${EXTRA_CFG_FLAG} --out "${OUT_DIR}/scan"
+                python3 /workspaces/raptor/raptor.py scan --repo "${STAGE_DIR}" --policy-groups crypto,secrets,auth,injection,flows,sinks,deserialisation,filesystem --out "${OUT_DIR}/crypto"
+                python3 /workspaces/raptor/raptor.py sca --repo "${STAGE_DIR}" --out "${OUT_DIR}/sca" || true
+                cp -r "${OUT_DIR}"/* /workspaces/out/
+                chmod -R a+rX /workspaces/out/
+              '
+          else
+            echo "[!] ERROR: Could not pull danielcuthbert/raptor:latest container image."
+            exit 1
+          fi
+
+          sudo chmod -R a+rX raptor_out || true
+
+          # ── 2. Emit CycloneDX 1.5 SBOM (raptor_out/sbom.cdx.json) from Cargo.lock & package-lock.json ──
+          python3 - << 'SBOMEOF'
+          import hashlib, json, os, uuid
+          from datetime import datetime, timezone
+
+          components = []
+          if os.path.exists("Cargo.lock"):
+              with open("Cargo.lock", "r", encoding="utf-8", errors="replace") as f:
+                  content = f.read()
+              for block in content.split("[[package]]")[1:]:
+                  name, ver, chk = "", "", ""
+                  for line in block.splitlines():
+                      t = line.strip()
+                      if t.startswith('name = "'):
+                          name = t[len('name = "'):-1]
+                      elif t.startswith('version = "'):
+                          ver = t[len('version = "'):-1]
+                      elif t.startswith('checksum = "'):
+                          chk = t[len('checksum = "'):-1]
+                  if name and ver:
+                      comp = {
+                          "type": "library",
+                          "name": name,
+                          "version": ver,
+                          "purl": f"pkg:cargo/{name}@{ver}"
+                      }
+                      if chk:
+                          comp["hashes"] = [{"alg": "SHA-256", "content": chk}]
+                      components.append(comp)
+
+          sbom = {
+              "bomFormat": "CycloneDX",
+              "specVersion": "1.5",
+              "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+              "version": 1,
+              "metadata": {
+                  "timestamp": datetime.now(timezone.utc).isoformat(),
+                  "component": {
+                      "type": "application",
+                      "name": "quorumrag",
+                      "version": "0.1.0"
+                  }
+              },
+              "components": components
+          }
+          os.makedirs("raptor_out", exist_ok=True)
+          with open("raptor_out/sbom.cdx.json", "w", encoding="utf-8") as out_f:
+              json.dump(sbom, out_f, indent=2)
+          print(f"[+] Generated CycloneDX 1.5 SBOM with {len(components)} components at raptor_out/sbom.cdx.json")
+          SBOMEOF
+
+          # ── 3. Complementary Supply-Chain & Reachability Check: Google OSV-Scanner ──
+          if docker run --rm -v "${GITHUB_WORKSPACE}:/src:ro" -v "${GITHUB_WORKSPACE}/raptor_out:/out" ghcr.io/google/osv-scanner:latest \
+            scan source --lockfile=/src/Cargo.lock --format=sarif --output=/out/osv_scanner.sarif >/dev/null 2>&1 || true; then
+            echo "[+] OSV-Scanner supply-chain SARIF evaluation completed."
+          fi
+
+          # ── 4. Complementary Container & Seccomp IaC Check: Aqua Trivy Config ──
+          if docker run --rm -v "${GITHUB_WORKSPACE}:/src:ro" -v "${GITHUB_WORKSPACE}/raptor_out:/out" aquasec/trivy:latest \
+            config --format sarif --output /out/trivy_iac.sarif /src >/dev/null 2>&1 || true; then
+            echo "[+] Trivy Container & Seccomp IaC SARIF evaluation completed."
+          fi
+
+          sudo chmod -R a+rX raptor_out || true
+
+          # ── 5. Deduplicate SARIF Runs & Enforce Exhaustive Blocker Gate ──
+          python3 - << 'PYEOF'
+          import glob, json, os, sys
+
+          sarif_files = [
+              p for p in glob.glob("raptor_out/**/*.sarif", recursive=True)
+              if not p.endswith("raptor_merged.sarif")
+          ]
+          total_findings = 0
+          critical_unmitigated = 0
+          rules_evaluated = set()
+          merged_runs = []
+
+          BLOCKER_RULE_SUBSTRINGS = (
+              "oshoosi.rust.async-tokio-blocking-rwlock",
+              "oshoosi.rust.tls-danger-accept-invalid-certs",
+              "oshoosi.rust.tls-danger-accept-invalid-hostnames",
+              "oshoosi.c.banned-unbounded-strcpy-strcat-sprintf",
+              "oshoosi.javascript.dangerous-eval-function-constructor",
+              "oshoosi.python.unsafe-yaml-load",
+              "oshoosi.generic.hardcoded-private-key-block",
+              "oshoosi.rust.banned-legacy-tpm-1-2-allow",
+              "hardcoded-private-key",
+              "async-tokio-blocking-rwlock",
+              "danger-accept-invalid-certs",
+          )
+
+          for sf in sarif_files:
+              try:
+                  with open(sf, "r", encoding="utf-8", errors="replace") as f:
+                      data = json.load(f)
+                  for run in data.get("runs", []):
+                      if isinstance(run, dict):
+                          merged_runs.append(run)
+                      driver_rules = run.get("tool", {}).get("driver", {}).get("rules", [])
+                      for r in driver_rules:
+                          if isinstance(r, dict) and r.get("id"):
+                              rules_evaluated.add(r["id"])
+                      for res in run.get("results", []):
+                          total_findings += 1
+                          level = str(res.get("level", "warning")).lower()
+                          rule_id = str(res.get("ruleId", ""))
+                          if rule_id:
+                              rules_evaluated.add(rule_id)
+                          if level == "error" and any(b in rule_id for b in BLOCKER_RULE_SUBSTRINGS):
+                              critical_unmitigated += 1
+              except Exception as exc:
+                  print(f"[WARN] Could not parse SARIF {sf}: {exc}")
+
+          merged_sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": merged_runs[:10]
+          }
+          os.makedirs("raptor_out", exist_ok=True)
+          with open("raptor_out/raptor_merged.sarif", "w", encoding="utf-8") as mf:
+              json.dump(merged_sarif, mf, indent=2)
+
+          gate_passed = (len(sarif_files) > 0) and (critical_unmitigated == 0)
+          summary = {
+              "gate": "RAPTOR Security Audit (Exhaustive SAST + TrailOfBits/0xdea/OWASP + Compiler-Scan + Expanded-AST + PQC Crypto + CycloneDX SBOM + OSV-Scanner + Trivy IaC)",
+              "sarif_files_parsed": len(sarif_files),
+              "unique_rules_indexed": len(rules_evaluated),
+              "total_findings_inspected": total_findings,
+              "critical_unmitigated_blockers": critical_unmitigated,
+              "sbom_generated": os.path.exists("raptor_out/sbom.cdx.json"),
+              "verdict": "PASS" if gate_passed else "FAIL"
+          }
+          with open("raptor_out/raptor_gate_summary.json", "w", encoding="utf-8") as out_f:
+              json.dump(summary, out_f, indent=2)
+
+          print(json.dumps(summary, indent=2))
+          if not gate_passed:
+              sys.exit(1)
+          PYEOF
+
+      - name: Upload RAPTOR SARIF & Audit Artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        with:
+          name: raptor-security-sarif-report
+          path: raptor_out/

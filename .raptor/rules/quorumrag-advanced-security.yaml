@@ -1,0 +1,243 @@
+rules:
+  # ===========================================================================
+  # 1. RUST & ASYNC TOKIO RUNTIME INVARIANTS (CWE-833 / CWE-667 / CWE-78)
+  # ===========================================================================
+  - id: oshoosi.rust.async-tokio-blocking-rwlock
+    message: >-
+      Calling blocking_read() or blocking_write() on a tokio::sync::RwLock
+      inside an async context or multi-threaded runtime causes an immediate
+      thread panic ("Cannot block the current thread from within a runtime").
+      Use .read().await or .write().await, or use std::sync::RwLock / parking_lot
+      for synchronous short critical sections.
+    languages: [rust]
+    severity: ERROR
+    pattern-either:
+      - pattern: $LOCK.blocking_read()
+      - pattern: $LOCK.blocking_write()
+    metadata:
+      cwe: ["CWE-833", "CWE-667"]
+      category: security
+      confidence: HIGH
+      tags: ["rust", "tokio", "deadlock", "panic", "oshoosi-invariant"]
+
+  - id: oshoosi.rust.command-shell-injection-sh-c
+    message: >-
+      Spawning a shell interpreter (sh -c, bash -c, cmd /C, powershell -Command)
+      with dynamic arguments risks OS command injection (CWE-78). Pass arguments
+      directly as discrete Command::arg() elements without invoking a shell.
+    languages: [rust]
+    severity: WARNING
+    pattern-either:
+      - pattern: std::process::Command::new("sh").arg("-c").arg($CMD)
+      - pattern: std::process::Command::new("bash").arg("-c").arg($CMD)
+      - pattern: tokio::process::Command::new("sh").arg("-c").arg($CMD)
+      - pattern: tokio::process::Command::new("bash").arg("-c").arg($CMD)
+    metadata:
+      cwe: ["CWE-78"]
+      owasp_top_10: ["A03:2021-Injection"]
+      category: security
+      tags: ["rust", "command-injection"]
+
+  - id: oshoosi.rust.unsafe-transmute-raw-pointer
+    message: >-
+      std::mem::transmute bypasses Rust's type and lifetime safety checker
+      (CWE-843 / CWE-119). Prefer safe casts, TryFrom, or explicit pointer
+      casts with documented safety invariants.
+    languages: [rust]
+    severity: WARNING
+    pattern: std::mem::transmute(...)
+    metadata:
+      cwe: ["CWE-843", "CWE-119"]
+      category: security
+      tags: ["rust", "memory-safety", "unsafe"]
+
+  - id: oshoosi.rust.tls-danger-accept-invalid-certs
+    message: >-
+      danger_accept_invalid_certs(true) disables TLS certificate validation
+      (CWE-295), allowing active Man-in-the-Middle (MitM) interception.
+    languages: [rust]
+    severity: ERROR
+    pattern: $BUILDER.danger_accept_invalid_certs(true)
+    metadata:
+      cwe: ["CWE-295"]
+      owasp_top_10: ["A07:2021-Identification and Authentication Failures"]
+      category: security
+      tags: ["rust", "tls", "crypto"]
+
+  - id: oshoosi.rust.tls-danger-accept-invalid-hostnames
+    message: >-
+      danger_accept_invalid_hostnames(true) disables TLS hostname verification
+      (CWE-297), enabling certificate substitution attacks.
+    languages: [rust]
+    severity: ERROR
+    pattern: $BUILDER.danger_accept_invalid_hostnames(true)
+    metadata:
+      cwe: ["CWE-297"]
+      owasp_top_10: ["A07:2021-Identification and Authentication Failures"]
+      category: security
+      tags: ["rust", "tls", "crypto"]
+
+  # ===========================================================================
+  # 2. POST-QUANTUM CRYPTOGRAPHY & CLASSICAL PRIMITIVE AUDIT (CWE-327 / PQC)
+  # ===========================================================================
+  - id: oshoosi.rust.weak-md5-digest
+    message: >-
+      MD5 is cryptographically broken and collision-vulnerable (CWE-328).
+      Use SHA-256 (sha2::Sha256) or BLAKE3 (blake3::Hasher) for security
+      integrity and Merkle proofs.
+    languages: [rust]
+    severity: WARNING
+    pattern-either:
+      - pattern: md5::compute(...)
+      - pattern: md5::Md5::new()
+    metadata:
+      cwe: ["CWE-328", "CWE-327"]
+      category: crypto
+      tags: ["rust", "crypto", "pqc-readiness"]
+
+  - id: oshoosi.python.weak-hash-md5-sha1
+    message: >-
+      MD5 and SHA-1 are collision-vulnerable cryptographic hashes (CWE-328).
+      Use hashlib.sha256(), hashlib.sha384(), or hashlib.blake2b() unless
+      explicitly suppressed for legacy protocol compatibility.
+    languages: [python]
+    severity: WARNING
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)
+    metadata:
+      cwe: ["CWE-328"]
+      category: crypto
+      tags: ["python", "crypto", "weak-hash"]
+
+  # ===========================================================================
+  # 3. KERNEL C / C++ & WINDOWS DRIVER MEMORY SAFETY (CWE-120 / CWE-676)
+  # ===========================================================================
+  - id: oshoosi.c.banned-unbounded-strcpy-strcat-sprintf
+    message: >-
+      Unbounded string copy/format functions (strcpy, strcat, sprintf, gets)
+      cause stack or pool buffer overflows (CWE-120) in Ring-0 drivers and
+      native binaries. Use RtlStringCbCopyA/W, snprintf, or strncpy_s.
+    languages: [c, cpp]
+    severity: ERROR
+    pattern-either:
+      - pattern: strcpy($DST, $SRC)
+      - pattern: strcat($DST, $SRC)
+      - pattern: sprintf($DST, $FMT, ...)
+      - pattern: gets($DST)
+    metadata:
+      cwe: ["CWE-120", "CWE-676"]
+      category: security
+      tags: ["c", "cpp", "driver", "buffer-overflow"]
+
+  - id: oshoosi.c.system-popenshell-execution
+    message: >-
+      Direct invocation of system() or popen() in C/C++ passes strings through
+      the system shell (CWE-78).
+    languages: [c, cpp]
+    severity: WARNING
+    pattern-either:
+      - pattern: system($CMD)
+      - pattern: popen($CMD, $MODE)
+    metadata:
+      cwe: ["CWE-78"]
+      category: security
+      tags: ["c", "cpp", "command-injection"]
+
+  # ===========================================================================
+  # 4. WEBUI & BROWSER EXTENSION DOM XSS / CODE INJECTION (CWE-79 / CWE-95)
+  # ===========================================================================
+  - id: oshoosi.javascript.dangerous-eval-function-constructor
+    message: >-
+      Dynamic code evaluation via eval() or new Function() enables arbitrary
+      JavaScript execution (CWE-95 / DOM XSS) and violates Manifest V3 CSP.
+    languages: [javascript, typescript]
+    severity: ERROR
+    pattern-either:
+      - pattern: eval($CODE)
+      - pattern: new Function(...)
+    metadata:
+      cwe: ["CWE-95", "CWE-79"]
+      owasp_top_10: ["A03:2021-Injection"]
+      category: security
+      tags: ["javascript", "xss", "csp"]
+
+  - id: oshoosi.javascript.document-write-dom-xss
+    message: >-
+      document.write() and document.writeln() introduce DOM-based Cross-Site
+      Scripting (CWE-79) sinks. Use textContent or safe DOM node construction.
+    languages: [javascript, typescript]
+    severity: WARNING
+    pattern-either:
+      - pattern: document.write(...)
+      - pattern: document.writeln(...)
+    metadata:
+      cwe: ["CWE-79"]
+      owasp_top_10: ["A03:2021-Injection"]
+      category: security
+      tags: ["javascript", "xss"]
+
+  # ===========================================================================
+  # 5. PYTHON AUTOMATION & DESERIALIZATION SAFETY (CWE-502 / CWE-295)
+  # ===========================================================================
+  - id: oshoosi.python.unsafe-yaml-load
+    message: >-
+      yaml.load() without SafeLoader allows arbitrary Python object
+      instantiation and remote code execution (CWE-502). Use yaml.safe_load().
+    languages: [python]
+    severity: ERROR
+    patterns:
+      - pattern: yaml.load($DATA, ...)
+      - pattern-not: yaml.load($DATA, Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.load($DATA, Loader=yaml.CSafeLoader, ...)
+    metadata:
+      cwe: ["CWE-502"]
+      owasp_top_10: ["A08:2021-Software and Data Integrity Failures"]
+      category: security
+      tags: ["python", "deserialization"]
+
+  - id: oshoosi.python.unsafe-pickle-loads
+    message: >-
+      pickle.loads() / pickle.load() executes arbitrary bytecode on untrusted
+      streams (CWE-502). Use JSON or cryptographically signed envelopes.
+    languages: [python]
+    severity: WARNING
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+    metadata:
+      cwe: ["CWE-502"]
+      category: security
+      tags: ["python", "deserialization"]
+
+  # ===========================================================================
+  # 6. HARDCODED PRIVATE KEYS & CREDENTIAL LEAK GUARD (CWE-798)
+  # ===========================================================================
+  - id: oshoosi.generic.hardcoded-private-key-block
+    message: >-
+      Detected an embedded PEM private key block (CWE-798). Private keys must
+      never be committed to source control; load from DPAPI Vault or TPM 2.0.
+    languages: [python, javascript, typescript, rust, go, c, cpp]
+    severity: ERROR
+    pattern-regex: '-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----'
+    metadata:
+      cwe: ["CWE-798"]
+      owasp_top_10: ["A07:2021-Identification and Authentication Failures"]
+      category: security
+      tags: ["secrets", "private-key"]
+
+  # ===========================================================================
+  # 7. EXCLUSIVE TPM 2.0 HARDWARE ATTESTATION INVARIANT (TPM 1.2 BANNED)
+  # ===========================================================================
+  - id: oshoosi.rust.banned-legacy-tpm-1-2-allow
+    message: >-
+      Legacy TPM 1.2 is strictly banned in OshoosiClaw (SHA-1 collision risk,
+      CWE-328). Only TPM 2.0 (Hardware Attested or vTPM 2.0) is allowed for
+      hardware root-of-trust attestation. Never set tpm_1_2_banned = false.
+    languages: [rust]
+    severity: ERROR
+    pattern: $STATUS.tpm_1_2_banned = false
+    metadata:
+      cwe: ["CWE-328", "CWE-327"]
+      category: security
+      tags: ["rust", "tpm", "hardware-rot", "oshoosi-invariant"]
