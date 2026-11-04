@@ -58,6 +58,16 @@ pub struct IngestConfig {
     /// Whether to exclude source code files (`FileCategory::Code`), raw `.dat` blobs, and monolithic dumps during ingestion.
     #[serde(default)]
     pub exclude_source_code: bool,
+
+    /// Optional explicit path to persistent Level-1 deduplication catalog.
+    /// If None, falls back to <storage_path>/dedup_catalog.json.
+    #[serde(default)]
+    pub dedup_catalog_path: Option<PathBuf>,
+
+    /// Directories or paths strictly excluded from crawling and watching
+    /// (e.g. internal database storage directories, cache folders).
+    #[serde(default)]
+    pub excluded_paths: Vec<PathBuf>,
 }
 
 impl Default for IngestConfig {
@@ -80,6 +90,8 @@ impl Default for IngestConfig {
             access_tier_rules: Vec::new(),
             auto_drift_heal_interval_secs: None,
             exclude_source_code: false,
+            dedup_catalog_path: None,
+            excluded_paths: Vec::new(),
         }
     }
 }

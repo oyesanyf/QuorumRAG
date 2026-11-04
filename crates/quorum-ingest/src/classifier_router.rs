@@ -97,6 +97,11 @@ impl ClassifierRouter {
             }
         }
 
+        // 0. Check excluded paths
+        if self.config.excluded_paths.iter().any(|ex| path == ex || path.starts_with(ex)) {
+            return FilterDecision::SkipHidden;
+        }
+
         // 1. Check symlink policy
         if !self.config.follow_symlinks {
             if let Ok(meta) = std::fs::symlink_metadata(path) {
@@ -117,6 +122,23 @@ impl ClassifierRouter {
                 || lower_name.ends_with(".tmp")
                 || lower_name.ends_with(".bak")
                 || lower_name.ends_with(".wbk")
+                || lower_name == "dedup_catalog.json"
+                || lower_name.starts_with("dedup_catalog.")
+                || lower_name.starts_with(".dedup_catalog")
+                || lower_name.starts_with("document_catalog.")
+                || lower_name == "metadata.json"
+                || lower_name == ".metadata.json"
+                || lower_name == "embedding_contract.json"
+                || matches!(
+                    lower_name.as_str(),
+                    "cargo.lock"
+                        | "package-lock.json"
+                        | "pnpm-lock.yaml"
+                        | "yarn.lock"
+                        | "poetry.lock"
+                        | "composer.lock"
+                        | "gemfile.lock"
+                )
             {
                 return FilterDecision::SkipHidden;
             }

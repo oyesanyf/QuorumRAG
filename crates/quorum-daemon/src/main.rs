@@ -160,6 +160,10 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     let mut ingest_config = quorum_ingest::IngestConfig::default();
     ingest_config.exclude_source_code = true;
     ingest_config.max_file_size_bytes = 15 * 1024 * 1024; // 15MB cap skips monolithic raw dumps
+    ingest_config.dedup_catalog_path = Some(cli.data_dir.join("dedup_catalog.json"));
+    if !ingest_config.excluded_paths.iter().any(|p| p == &cli.data_dir) {
+        ingest_config.excluded_paths.push(cli.data_dir.clone());
+    }
     if let Some(ref watch_path) = cli.watch_dir {
         ingest_config.watch_paths.push(watch_path.clone());
     } else {
@@ -309,8 +313,6 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     let bg_worker = Arc::clone(&reindex_worker);
     let bg_default_paths = ingest_config.watch_paths.clone();
     let bg_shutdown = Arc::clone(&shutdown_notify);
-    let bg_dedup = Arc::clone(&dedup);
-    let bg_catalog_path = cli.data_dir.join("dedup_catalog.json");
 
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -350,8 +352,6 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 };
                 if let Err(e) = bg_worker.start_reindex(pass_options).await {
                     error!("Continuous background indexer pass warning: {}", e);
-                } else {
-                    let _ = bg_dedup.save_catalog_to_file(&bg_catalog_path);
                 }
             }
 
@@ -477,6 +477,12 @@ pub async fn run_standalone_reindex(
         quorum_contract::DeterministicOfflineEngine::new()
     );
     let dedup = Arc::new(quorum_ingest::TwoLevelDedupEngine::new());
+    let catalog_path = cli.data_dir.join("dedup_catalog.json");
+    if catalog_path.exists() {
+        if let Err(e) = dedup.load_catalog_from_file(&catalog_path) {
+            warn!("Standalone reindex: Failed to load dedup catalog from disk: {}", e);
+        }
+    }
     let _ = dedup.hydrate_from_storage(&storage).await;
 
     let target_paths = path.map(|p| vec![p]).unwrap_or_else(|| {
@@ -496,6 +502,10 @@ pub async fn run_standalone_reindex(
 
     let mut ingest_cfg = quorum_ingest::IngestConfig::default();
     ingest_cfg.exclude_source_code = true;
+    ingest_cfg.dedup_catalog_path = Some(catalog_path);
+    if !ingest_cfg.excluded_paths.iter().any(|p| p == &cli.data_dir) {
+        ingest_cfg.excluded_paths.push(cli.data_dir.clone());
+    }
 
     let worker = quorum_ingest::ReindexWorker::new(
         ingest_cfg,
