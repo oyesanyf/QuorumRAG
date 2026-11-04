@@ -9,3 +9,5 @@ data/
 /.agents/
 *.log
 .test_live_storage/
+__pycache__/
+*.py[cod]
