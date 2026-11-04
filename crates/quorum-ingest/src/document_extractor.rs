@@ -183,7 +183,7 @@ impl DocumentExtractor {
                 if metadata_header.is_empty() {
                     return Ok(ocr_text);
                 } else {
-                    return Ok(format!("{}\n\n{}", metadata_header, ocr_text));
+                    return Ok(format!("{}\n\n{}", ocr_text, metadata_header));
                 }
             }
         }
@@ -195,7 +195,7 @@ impl DocumentExtractor {
                 if metadata_header.is_empty() {
                     return Ok(jpeg_ocr);
                 } else {
-                    return Ok(format!("{}\n\n{}", metadata_header, jpeg_ocr));
+                    return Ok(format!("{}\n\n{}", jpeg_ocr, metadata_header));
                 }
             }
         }
