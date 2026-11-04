@@ -16,6 +16,7 @@
 
 pub(crate) mod arrow_interop;
 pub mod config;
+pub mod document_catalog;
 pub mod engine;
 pub mod error;
 pub mod query_framing;
@@ -23,5 +24,7 @@ pub(crate) mod tantivy_fts;
 pub(crate) mod vector_store;
 
 pub use config::StorageConfig;
+pub use document_catalog::{derive_work_cluster_id, DocumentCatalog, DocumentCatalogEntry};
 pub use engine::{CompactionStats, SearchMode, StorageEngine, StorageSearchQuery};
 pub use error::StorageError;
+pub use tantivy_fts::DistinctWorkHit;

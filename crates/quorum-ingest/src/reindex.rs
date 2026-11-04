@@ -533,18 +533,21 @@ impl ReindexWorker {
 
                         let raw_chunks = chunker.chunk_text(&content);
                         let path_str = path.to_string_lossy().to_string();
+                        let header = crate::chunker::build_contextual_header(path, &content);
 
                         for raw in raw_chunks {
                             if raw.chunk_index > 0 && raw.chunk_index % 8 == 0 {
                                 tokio::task::yield_now().await;
                             }
 
-                            let chunk_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-                            file_chunk_hashes.push(chunk_b3.clone());
+                            let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
+                            let chunk_content = crate::chunker::prepend_contextual_header(&header, raw.text_slice);
+                            let chunk_b3 = DocumentChunk::compute_blake3_hash(&chunk_content);
+                            file_chunk_hashes.push(raw_b3.clone());
 
                             // Level-2 Evaluation: reuse cached vector if available
                             let vector = if !options.force_reembed {
-                                if let Some(existing_vec) = dedup.cache().get(&chunk_b3) {
+                                if let Some(existing_vec) = dedup.cache().get(&raw_b3) {
                                     let mut lock = progress.write().await;
                                     if let Some(ref mut p) = *lock {
                                         p.chunks_reused_from_cache += 1;
@@ -554,7 +557,7 @@ impl ReindexWorker {
                                     let vec = embedder
                                         .embed_text(raw.text_slice)
                                         .unwrap_or_else(|_| vec![0.0; embedder.dimension()]);
-                                    dedup.cache().insert(chunk_b3.clone(), vec.clone());
+                                    dedup.cache().insert(raw_b3.clone(), vec.clone());
                                     let mut lock = progress.write().await;
                                     if let Some(ref mut p) = *lock {
                                         p.chunks_newly_embedded += 1;
@@ -563,7 +566,7 @@ impl ReindexWorker {
                                 }
                             } else {
                                 let vec = embedder
-                                    .embed_text(raw.text_slice)
+                                    .embed_text(&chunk_content)
                                     .unwrap_or_else(|_| vec![0.0; embedder.dimension()]);
                                 dedup.cache().insert(chunk_b3.clone(), vec.clone());
                                 let mut lock = progress.write().await;
@@ -590,7 +593,7 @@ impl ReindexWorker {
                                 raw.line_end,
                                 access_tier,
                                 vector,
-                                raw.text_slice,
+                                &chunk_content,
                                 Some(metadata_json),
                             ) {
                                 batch_chunks.push(doc_chunk);

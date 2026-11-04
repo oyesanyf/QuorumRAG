@@ -5,7 +5,7 @@
 //! Callers interact solely with pure domain types (`DocumentChunk`, `ScoredChunk`, `StorageError`).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -14,8 +14,9 @@ use quorum_types::{DocumentChunk, ScoredChunk};
 use serde::{Deserialize, Serialize};
 
 use crate::config::StorageConfig;
+use crate::document_catalog::{DocumentCatalog, DocumentCatalogEntry};
 use crate::error::StorageError;
-use crate::tantivy_fts::TantivyFtsIndex;
+use crate::tantivy_fts::{DistinctWorkHit, TantivyFtsIndex};
 use crate::vector_store::VectorStore;
 
 /// Search execution mode for storage queries.
@@ -133,16 +134,19 @@ pub struct StorageEngine {
     config: StorageConfig,
     vector_store: Arc<VectorStore>,
     fts_index: Arc<TantivyFtsIndex>,
+    catalog: Arc<DocumentCatalog>,
     index_epoch: Arc<AtomicU64>,
     metadata_lock: Arc<Mutex<StorageMetadata>>,
+    is_neural: Arc<AtomicBool>,
 }
 
 impl StorageEngine {
-    /// Opens or creates the embedded LanceDB vector table and co-located Tantivy FTS index.
+    /// Opens or creates the embedded LanceDB vector table, co-located Tantivy FTS index, and SQLite document catalog.
     pub async fn open(config: impl Into<StorageConfig>) -> Result<Self, StorageError> {
         let cfg = config.into();
         let vector_store = Arc::new(VectorStore::open(&cfg).await?);
         let fts_index = Arc::new(TantivyFtsIndex::open(&cfg.tantivy_path())?);
+        let catalog = Arc::new(DocumentCatalog::open(&cfg.document_catalog_path())?);
 
         // Load or initialize metadata
         let meta_path = cfg.metadata_path();
@@ -162,13 +166,16 @@ impl StorageEngine {
 
         let index_epoch = Arc::new(AtomicU64::new(metadata.index_epoch));
         let metadata_lock = Arc::new(Mutex::new(metadata));
+        let is_neural = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
             config: cfg,
             vector_store,
             fts_index,
+            catalog,
             index_epoch,
             metadata_lock,
+            is_neural,
         })
     }
 
@@ -251,23 +258,23 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Inserts document chunks with automatic Level-2 BLAKE3 deduplication.
+    /// Inserts document chunks with automatic per-document chunk_id deduplication.
     pub async fn insert_chunks(&self, chunks: &[DocumentChunk]) -> Result<usize, StorageError> {
         if chunks.is_empty() {
             return Ok(0);
         }
 
         let mut unique_chunks: Vec<DocumentChunk> = Vec::with_capacity(chunks.len());
-        let mut seen_hashes: HashSet<String> = HashSet::with_capacity(chunks.len());
+        let mut seen_chunk_ids: HashSet<String> = HashSet::with_capacity(chunks.len());
 
         for chunk in chunks {
-            if seen_hashes.contains(&chunk.blake3_hash) {
+            if seen_chunk_ids.contains(&chunk.chunk_id) {
                 continue;
             }
-            if self.fts_index.has_chunk_hash(&chunk.blake3_hash).unwrap_or(false) {
+            if self.fts_index.has_chunk_id(&chunk.chunk_id).unwrap_or(false) {
                 continue;
             }
-            seen_hashes.insert(chunk.blake3_hash.clone());
+            seen_chunk_ids.insert(chunk.chunk_id.clone());
             unique_chunks.push(chunk.clone());
         }
 
@@ -277,6 +284,9 @@ impl StorageEngine {
 
         let count = self.vector_store.insert_chunks(&unique_chunks).await?;
         let _ = self.fts_index.index_chunks(&unique_chunks)?;
+
+        // Automatically hydrate document catalog for ingested files
+        let _ = self.catalog.hydrate_from_chunks(&unique_chunks);
 
         Ok(count)
     }
@@ -341,12 +351,18 @@ impl StorageEngine {
             .filter(|s| s.score > 0.0 && !exclude_set.contains(s.chunk.chunk_id.as_str()))
             .collect();
 
+        let (text_weight, vector_weight) = if self.is_neural() {
+            (1.0f32, 1.0f32)
+        } else {
+            (1.0f32, 0.05f32)
+        };
+
         let mut current_rank = 1;
         for (i, scored) in relevant_vector_hits.iter().enumerate() {
             if i > 0 && (scored.score - relevant_vector_hits[i - 1].score).abs() > 1e-6 {
                 current_rank = i + 1;
             }
-            let rrf = 1.0 / (60.0 + current_rank as f32);
+            let rrf = vector_weight / (60.0 + current_rank as f32);
             let entry = rrf_map
                 .entry(scored.chunk.chunk_id.clone())
                 .or_insert((0.0, scored.chunk.clone()));
@@ -364,7 +380,7 @@ impl StorageEngine {
             if i > 0 && (scored.score - relevant_text_hits[i - 1].score).abs() > 1e-6 {
                 current_rank = i + 1;
             }
-            let rrf = 1.0 / (60.0 + current_rank as f32);
+            let rrf = text_weight / (60.0 + current_rank as f32);
             let entry = rrf_map
                 .entry(scored.chunk.chunk_id.clone())
                 .or_insert((0.0, scored.chunk.clone()));
@@ -457,6 +473,7 @@ impl StorageEngine {
     pub async fn delete_by_file_path(&self, file_path: &str) -> Result<usize, StorageError> {
         let lance_deleted = self.vector_store.delete_by_file_path(file_path).await?;
         let tantivy_deleted = self.fts_index.delete_by_file_path(file_path)?;
+        let _ = self.catalog.delete_by_file_path(file_path);
         Ok(lance_deleted.max(tantivy_deleted))
     }
 
@@ -468,7 +485,8 @@ impl StorageEngine {
         }
         self.vector_store.delete_by_file_paths(file_paths).await?;
         for p in file_paths {
-            self.fts_index.delete_by_file_path(p)?;
+            let _ = self.fts_index.delete_by_file_path(p);
+            let _ = self.catalog.delete_by_file_path(p);
         }
         Ok(())
     }
@@ -589,6 +607,62 @@ impl StorageEngine {
         let l = self.vector_store.delete_by_chunk_id(chunk_id).await?;
         let t = self.fts_index.delete_by_chunk_id(chunk_id)?;
         Ok(l.max(t))
+    }
+
+    /// Reference to the SQLite Document Catalog.
+    pub fn catalog(&self) -> &DocumentCatalog {
+        &self.catalog
+    }
+
+    /// Fast scan of all stored chunks without decoding vector_bytes.
+    pub fn scan_all_chunks_fast(&self) -> Result<Vec<DocumentChunk>, StorageError> {
+        self.fts_index.scan_all_chunks_fast()
+    }
+
+    /// Sets whether the active embedding engine is neural (vs deterministic offline).
+    pub fn set_neural_engine(&self, neural: bool) {
+        self.is_neural.store(neural, Ordering::Release);
+    }
+
+    /// Whether the active embedding engine is neural.
+    pub fn is_neural(&self) -> bool {
+        self.is_neural.load(Ordering::Acquire)
+    }
+
+    /// Enumerates distinct works from Tantivy BM25 collapsed by work_cluster_id.
+    pub fn enumerate_distinct_works(
+        &self,
+        query_text: &str,
+        max_tier: u8,
+        max_hits: usize,
+    ) -> Result<Vec<DistinctWorkHit>, StorageError> {
+        self.fts_index.enumerate_distinct_works(query_text, max_tier, max_hits)
+    }
+
+    /// Finds documents in the SQLite Document Catalog matching a query.
+    pub fn catalog_find_documents(&self, query: &str, limit: usize) -> Result<Vec<DocumentCatalogEntry>, StorageError> {
+        self.catalog.catalog_find_documents(query, limit)
+    }
+
+    /// Extended document search in the SQLite Document Catalog with kind filter.
+    pub fn catalog_find_documents_extended(
+        &self,
+        query: &str,
+        doc_kinds: Option<&[&str]>,
+        max_tier: u8,
+        limit: usize,
+    ) -> Result<Vec<DocumentCatalogEntry>, StorageError> {
+        self.catalog.catalog_find_documents_extended(query, doc_kinds, max_tier, limit)
+    }
+
+    /// Hydrates the SQLite Document Catalog from stored chunks if empty.
+    pub async fn hydrate_document_catalog_if_needed(&self) -> Result<usize, StorageError> {
+        self.catalog.hydrate_document_catalog_if_needed(self)
+    }
+
+    /// Optimizes LanceDB indices specifically.
+    pub async fn optimize_indices(&self) -> Result<(), StorageError> {
+        self.vector_store.optimize_indices().await
     }
 }
 

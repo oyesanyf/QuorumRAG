@@ -188,17 +188,31 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Creates an IVF_PQ index over the vector column using Cosine distance.
+    /// Creates scalar pre-filter indices and dynamic IVF_PQ vector index using Cosine distance.
     pub(crate) async fn create_ivf_pq_index(&self) -> Result<(), StorageError> {
         let table = self.table.read().await;
+
+        // 1. Create scalar pre-filter indices if supported
+        let _ = table
+            .create_index(&["access_tier"], Index::Bitmap(Default::default()))
+            .execute()
+            .await;
+        let _ = table
+            .create_index(&["file_path"], Index::BTree(Default::default()))
+            .execute()
+            .await;
+
         let num_rows = table.count_rows(None).await.unwrap_or(0);
         if num_rows < 256 {
             // IVF_PQ requires adequate training rows
             return Ok(());
         }
 
+        // Dynamic IVF_PQ partition sizing based on square root of row count
+        let num_partitions = ((num_rows as f64).sqrt().round() as u32).clamp(16, 1024);
         let builder = IvfPqIndexBuilder::default()
-            .distance_type(DistanceType::Cosine);
+            .distance_type(DistanceType::Cosine)
+            .num_partitions(num_partitions);
 
         table
             .create_index(&["vector"], Index::IvfPq(builder))
@@ -217,11 +231,29 @@ impl VectorStore {
             .await
             .map_err(|e| StorageError::Compaction(format!("Optimization failed: {}", e)))?;
 
+        // Prune versions older than 5 minutes
+        let prune_action = OptimizeAction::Prune {
+            older_than: chrono::TimeDelta::try_seconds(300),
+            delete_unverified: None,
+            error_if_tagged_old_versions: None,
+        };
+        let _ = table.optimize(prune_action).await;
+
         let fragments_removed = stats.compaction.as_ref().map_or(0, |c| c.fragments_removed);
         let fragments_added = stats.compaction.as_ref().map_or(0, |c| c.fragments_added);
         let old_versions_pruned = stats.prune.as_ref().map_or(0, |p| p.old_versions as usize);
 
         Ok((fragments_removed, fragments_added, old_versions_pruned))
+    }
+
+    /// Optimizes indices specifically.
+    pub(crate) async fn optimize_indices(&self) -> Result<(), StorageError> {
+        let table = self.table.read().await;
+        table
+            .optimize(OptimizeAction::Index(Default::default()))
+            .await
+            .map_err(|e| StorageError::Compaction(format!("Index optimization failed: {}", e)))?;
+        Ok(())
     }
 
     /// Returns the total number of rows in the table.

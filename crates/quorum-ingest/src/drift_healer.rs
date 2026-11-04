@@ -423,19 +423,22 @@ impl DriftHealer {
 
                         let mut file_chunk_hashes = Vec::new();
                         let mut chunks = Vec::new();
+                        let header = crate::chunker::build_contextual_header(path, &content);
 
                         for raw in raw_chunks {
-                            let chunk_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-                            file_chunk_hashes.push(chunk_b3.clone());
+                            let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
+                            let chunk_content = crate::chunker::prepend_contextual_header(&header, raw.text_slice);
+                            let _chunk_b3 = DocumentChunk::compute_blake3_hash(&chunk_content);
+                            file_chunk_hashes.push(raw_b3.clone());
 
-                            let vector = if let Some(cached) = self.dedup.cache().get(&chunk_b3) {
+                            let vector = if let Some(cached) = self.dedup.cache().get(&raw_b3) {
                                 cached
                             } else {
                                 let v = self
                                     .embedder
                                     .embed_text(raw.text_slice)
                                     .unwrap_or_else(|_| vec![0.0; self.embedder.dimension()]);
-                                self.dedup.cache().insert(chunk_b3.clone(), v.clone());
+                                self.dedup.cache().insert(raw_b3.clone(), v.clone());
                                 v
                             };
 
@@ -456,7 +459,7 @@ impl DriftHealer {
                                 raw.line_end,
                                 access_tier,
                                 vector,
-                                raw.text_slice,
+                                &chunk_content,
                                 Some(metadata_json),
                             )?;
                             chunks.push(doc_chunk);

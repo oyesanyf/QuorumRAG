@@ -19,7 +19,7 @@ use crate::error::IngestError;
 use crate::image_indexer::ImageIndexer;
 use quorum_classifier::{FileCategory, FileIdentity};
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use std::process::Command;
 
@@ -55,7 +55,6 @@ impl DocumentExtractor {
     /// Extracts all searchable UTF-8 text from any file discovered by Magika.
     pub fn extract_text(path: &Path, identity: &FileIdentity) -> io::Result<String> {
         let ext = path
-
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
@@ -63,12 +62,49 @@ impl DocumentExtractor {
         let label = identity.label.to_ascii_lowercase();
         let mime = identity.mime_type.to_ascii_lowercase();
 
+        // 0. Magic-byte sniffing before extension routing
+        let mut magic_header = [0u8; 16];
+        if let Ok(mut f) = std::fs::File::open(path) {
+            let _ = f.read_exact(&mut magic_header);
+        }
+
+        // Sniff OLE2 Compound Document: \xD0\xCF\x11\xE0 (e.g. legacy binary .doc misnamed as .pdf)
+        if magic_header.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
+            if let Ok(text) = Self::extract_ole2_doc_text(path) {
+                if !text.trim().is_empty() {
+                    return Ok(text);
+                }
+            }
+        }
+
+        // Sniff JPEG: \xFF\xD8\xFF misnamed as other formats (e.g. .pdf)
+        if magic_header.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            if let Some(ocr_text) = ImageIndexer::run_ocr_on_file(path) {
+                if !ocr_text.trim().is_empty() {
+                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
+                    return Ok(format!("[Image OCR — {}]\n{}", file_name, ocr_text));
+                }
+            }
+        }
+
         // 1. PDF Documents (multi-page text + metadata + OCR fallback + native stream fallback)
-        if label == "pdf" || mime == "application/pdf" || ext == "pdf" {
+        if label == "pdf" || mime == "application/pdf" || ext == "pdf" || magic_header.starts_with(b"%PDF-") {
             return Self::extract_pdf_text(path);
         }
 
-        // 2. Word OpenXML & Legacy Word / OpenDocument Text (.docx, .doc, .odt)
+        // 2. HTML Documents (.html, .htm, .xhtml, .mhtml)
+        if label == "html"
+            || mime == "text/html"
+            || matches!(ext.as_str(), "html" | "htm" | "xhtml" | "mhtml")
+            || magic_header.starts_with(b"<!DOCTYPE")
+            || magic_header.starts_with(b"<!doctype")
+            || magic_header.starts_with(b"<html")
+            || magic_header.starts_with(b"<HTML")
+        {
+            return Self::extract_html_prose(path);
+        }
+
+        // 3. Word OpenXML & Legacy Word / OpenDocument Text (.docx, .doc, .odt)
         if label == "docx"
             || mime.contains("wordprocessingml")
             || matches!(ext.as_str(), "docx" | "doc" | "odt")
@@ -421,6 +457,14 @@ impl DocumentExtractor {
 
     /// Extracts all paragraphs, tables, headers, and footers from `.docx`, `.doc`, or `.odt`.
     fn extract_word_or_odt_text(path: &Path, ext: &str) -> io::Result<String> {
+        if ext == "doc" {
+            if let Ok(text) = Self::extract_ole2_doc_text(path) {
+                if !text.trim().is_empty() {
+                    return Ok(text);
+                }
+            }
+        }
+
         let script = [
             "import sys, zipfile, xml.etree.ElementTree as ET",
             "sys.stdout.reconfigure(encoding='utf-8', errors='replace')",
@@ -470,6 +514,325 @@ impl DocumentExtractor {
             path,
             &format!("Word/Document ({})", ext),
         ))
+    }
+
+    /// Pure-Rust OLE2 parser using `cfb` for legacy binary `.doc` files (Word 97-2003).
+    /// Extracts text from the `WordDocument` stream without 256KB truncation.
+    pub fn extract_ole2_doc_text(path: &Path) -> io::Result<String> {
+        let file = std::fs::File::open(path)?;
+        let mut comp = cfb::CompoundFile::open(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        if !comp.is_stream("/WordDocument") {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "No WordDocument stream found in OLE2 container",
+            ));
+        }
+
+        let word_bytes = {
+            let mut word_doc_stream = comp
+                .open_stream("/WordDocument")
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut bytes = Vec::new();
+            word_doc_stream.read_to_end(&mut bytes)?;
+            bytes
+        };
+
+        // Try piece table extraction from 1Table or 0Table if present
+        let table_stream_name = if word_bytes.len() > 11 && (word_bytes[11] & 0x02) != 0 {
+            "/1Table"
+        } else {
+            "/0Table"
+        };
+
+        if comp.is_stream(table_stream_name) {
+            if let Ok(mut table_stream) = comp.open_stream(table_stream_name) {
+                let mut table_bytes = Vec::new();
+                if table_stream.read_to_end(&mut table_bytes).is_ok() {
+                    if let Some(text) = Self::parse_word_piece_table(&word_bytes, &table_bytes) {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            return Ok(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Lossless text run scan fallback across word_bytes without truncation
+        let extracted = Self::extract_word_bytes_lossless(&word_bytes, path);
+        if !extracted.trim().is_empty() {
+            return Ok(extracted);
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "No extractable text in WordDocument stream",
+        ))
+    }
+
+    /// Parses the Word 97-2003 FIB piece table (`Plcfpcd`) from the Table stream.
+    fn parse_word_piece_table(word_bytes: &[u8], table_bytes: &[u8]) -> Option<String> {
+        if word_bytes.len() < 426 {
+            return None;
+        }
+        let fc_clx = u32::from_le_bytes(word_bytes[418..422].try_into().ok()?) as usize;
+        let lcb_clx = u32::from_le_bytes(word_bytes[422..426].try_into().ok()?) as usize;
+
+        if fc_clx + lcb_clx > table_bytes.len() || lcb_clx == 0 {
+            return None;
+        }
+
+        let clx_data = &table_bytes[fc_clx..fc_clx + lcb_clx];
+        let mut pos = 0;
+
+        // Skip any Prc (0x01) records
+        while pos < clx_data.len() && clx_data[pos] == 0x01 {
+            pos += 1;
+            if pos + 2 > clx_data.len() {
+                return None;
+            }
+            let cb = u16::from_le_bytes(clx_data[pos..pos + 2].try_into().ok()?) as usize;
+            pos += 2 + cb;
+        }
+
+        // Pcdt record (0x02)
+        if pos >= clx_data.len() || clx_data[pos] != 0x02 {
+            return None;
+        }
+        pos += 1;
+        if pos + 4 > clx_data.len() {
+            return None;
+        }
+        let lcb_pcd = u32::from_le_bytes(clx_data[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+
+        if pos + lcb_pcd > clx_data.len() || lcb_pcd < 4 {
+            return None;
+        }
+
+        let n_pieces = (lcb_pcd - 4) / 12;
+        if n_pieces == 0 {
+            return None;
+        }
+
+        let pcd_data = &clx_data[pos..pos + lcb_pcd];
+        let cp_array_len = (n_pieces + 1) * 4;
+        let pcd_start = cp_array_len;
+
+        let mut extracted_text = String::new();
+
+        for i in 0..n_pieces {
+            let cp_curr = u32::from_le_bytes(pcd_data[i * 4..i * 4 + 4].try_into().ok()?) as usize;
+            let cp_next = u32::from_le_bytes(pcd_data[(i + 1) * 4..(i + 1) * 4 + 4].try_into().ok()?) as usize;
+            if cp_next <= cp_curr {
+                continue;
+            }
+            let char_count = cp_next - cp_curr;
+
+            let pcd_offset = pcd_start + i * 8;
+            if pcd_offset + 8 > pcd_data.len() {
+                break;
+            }
+            let fc = u32::from_le_bytes(pcd_data[pcd_offset + 2..pcd_offset + 6].try_into().ok()?);
+            let f_compressed = (fc & 0x4000_0000) != 0;
+
+            if f_compressed {
+                let actual_offset = ((fc & !0x4000_0000) / 2) as usize;
+                if actual_offset + char_count <= word_bytes.len() {
+                    let slice = &word_bytes[actual_offset..actual_offset + char_count];
+                    for &b in slice {
+                        if b == 0x0D || b == 0x07 || b == 0x0B {
+                            extracted_text.push('\n');
+                        } else if b == 0x09 {
+                            extracted_text.push('\t');
+                        } else if (0x20..=0x7E).contains(&b) || b >= 0xA0 {
+                            extracted_text.push(b as char);
+                        }
+                    }
+                }
+            } else {
+                let actual_offset = fc as usize;
+                let byte_count = char_count * 2;
+                if actual_offset + byte_count <= word_bytes.len() {
+                    let slice = &word_bytes[actual_offset..actual_offset + byte_count];
+                    let u16_chars: Vec<u16> = slice
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    for ch in char::decode_utf16(u16_chars) {
+                        if let Ok(c) = ch {
+                            if c == '\r' || c == '\x07' || c == '\x0b' {
+                                extracted_text.push('\n');
+                            } else if c == '\t' || !c.is_control() {
+                                extracted_text.push(c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if extracted_text.trim().is_empty() {
+            None
+        } else {
+            Some(extracted_text)
+        }
+    }
+
+    /// Scans the entire WordDocument stream for UTF-16LE and CP1252 text runs without any 256KB cap.
+    fn extract_word_bytes_lossless(bytes: &[u8], path: &Path) -> String {
+        let mut out = format!(
+            "[WordDocument — {}]\n",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("document.doc")
+        );
+        let mut run_16 = Vec::new();
+        let mut i = 0;
+        let mut u16_runs = Vec::new();
+
+        while i + 1 < bytes.len() {
+            let code = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+            if code == 0x0D || code == 0x0A || (code >= 0x20 && code <= 0x024F) {
+                run_16.push(code);
+                i += 2;
+            } else {
+                if run_16.len() >= 4 {
+                    let decoded: String = char::decode_utf16(run_16.iter().copied())
+                        .map(|r| r.unwrap_or(' '))
+                        .collect();
+                    if decoded.trim().len() >= 4 {
+                        u16_runs.push(decoded.trim().to_string());
+                    }
+                }
+                run_16.clear();
+                i += 1;
+            }
+        }
+        if run_16.len() >= 4 {
+            let decoded: String = char::decode_utf16(run_16.iter().copied())
+                .map(|r| r.unwrap_or(' '))
+                .collect();
+            if decoded.trim().len() >= 4 {
+                u16_runs.push(decoded.trim().to_string());
+            }
+        }
+
+        if !u16_runs.is_empty() {
+            out.push_str(&u16_runs.join("\n"));
+            return out;
+        }
+
+        let mut run = String::new();
+        for &b in bytes {
+            if (0x20..=0x7E).contains(&b) || b == 0x09 || b == 0x0A || b == 0x0D || b >= 0xA0 {
+                run.push(b as char);
+            } else {
+                if run.trim().len() >= 4 {
+                    out.push_str(run.trim());
+                    out.push('\n');
+                }
+                run.clear();
+            }
+        }
+        if run.trim().len() >= 4 {
+            out.push_str(run.trim());
+        }
+        out
+    }
+
+    /// Extracts clean prose from HTML files, stripping `<script>` and `<style>` blocks and decoding entities.
+    pub fn extract_html_prose(path: &Path) -> io::Result<String> {
+        let raw = Self::read_any_text_encoding(path)?;
+        Ok(Self::clean_html_prose(&raw))
+    }
+
+    /// Strips `<script>` and `<style>` blocks, removes HTML tags, and decodes HTML entities into clean prose.
+    pub fn clean_html_prose(html: &str) -> String {
+        let without_script = if let Ok(re) = regex::RegexBuilder::new(r"(?is)<script\b[^>]*>.*?</script>")
+            .build()
+        {
+            re.replace_all(html, " ").to_string()
+        } else {
+            html.to_string()
+        };
+
+        let without_style = if let Ok(re) = regex::RegexBuilder::new(r"(?is)<style\b[^>]*>.*?</style>")
+            .build()
+        {
+            re.replace_all(&without_script, " ").to_string()
+        } else {
+            without_script
+        };
+
+        let block_spaced = if let Ok(re) = regex::RegexBuilder::new(r"(?i)</(?:p|div|h[1-6]|li|tr|blockquote|section|article)>")
+            .build()
+        {
+            re.replace_all(&without_style, "\n").to_string()
+        } else {
+            without_style
+        };
+
+        let tag_regex = regex::Regex::new(r"<[^>]+>").unwrap();
+        let stripped = tag_regex.replace_all(&block_spaced, " ");
+
+        let decoded = Self::decode_html_entities(&stripped);
+
+        let mut lines = Vec::new();
+        for line in decoded.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed);
+            }
+        }
+        lines.join("\n\n")
+    }
+
+    /// Decodes common named, decimal, and hex HTML entities.
+    fn decode_html_entities(text: &str) -> String {
+        let mut s = text
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&#39;", "'")
+            .replace("&ndash;", "–")
+            .replace("&mdash;", "—")
+            .replace("&hellip;", "…")
+            .replace("&lsquo;", "‘")
+            .replace("&rsquo;", "’")
+            .replace("&ldquo;", "“")
+            .replace("&rdquo;", "”");
+
+        if let Ok(re_dec) = regex::Regex::new(r"&#(\d+);") {
+            s = re_dec
+                .replace_all(&s, |caps: &regex::Captures| {
+                    if let Ok(num) = caps[1].parse::<u32>() {
+                        if let Some(ch) = char::from_u32(num) {
+                            return ch.to_string();
+                        }
+                    }
+                    caps[0].to_string()
+                })
+                .to_string();
+        }
+
+        if let Ok(re_hex) = regex::Regex::new(r"(?i)&#x([0-9a-f]+);") {
+            s = re_hex
+                .replace_all(&s, |caps: &regex::Captures| {
+                    if let Ok(num) = u32::from_str_radix(&caps[1], 16) {
+                        if let Some(ch) = char::from_u32(num) {
+                            return ch.to_string();
+                        }
+                    }
+                    caps[0].to_string()
+                })
+                .to_string();
+        }
+
+        s
     }
 
     /// Extracts all worksheets, shared strings, and cell values from `.xlsx`, `.xls`, or `.ods`.
@@ -794,5 +1157,50 @@ mod tests {
             let text = DocumentExtractor::extract_text(docx_path, &identity).expect("extract docx");
             assert!(!text.is_empty(), "Expected non-empty DOCX extraction");
         }
+    }
+
+    #[test]
+    fn test_extract_html_prose_strips_scripts_and_decodes_entities() {
+        let html_content = r#"
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <style>body { color: red; } p { font-size: 14px; }</style>
+                <script type="text/javascript">
+                    console.log("alert('secret tracking code');");
+                </script>
+            </head>
+            <body>
+                <h1>Research &amp; Analysis on Quorum Systems</h1>
+                <p>QuorumRAG introduces a &ldquo;recursive language model&rdquo; architecture &mdash; arXiv:2512.24601.</p>
+                <p>Numeric entities: &#65;&#66;&#67; and hex: &#x44;&#x45;&#x46;.</p>
+            </body>
+            </html>
+        "#;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let html_file = temp_dir.path().join("paper.html");
+        std::fs::write(&html_file, html_content).unwrap();
+
+        let extracted = DocumentExtractor::extract_html_prose(&html_file).unwrap();
+
+        assert!(!extracted.contains("color: red"), "Styles should be stripped");
+        assert!(!extracted.contains("secret tracking code"), "Scripts should be stripped");
+        assert!(extracted.contains("Research & Analysis on Quorum Systems"), "Entities decoded");
+        assert!(extracted.contains("“recursive language model” architecture — arXiv:2512.24601"), "Quotes and dashes decoded");
+        assert!(extracted.contains("ABC and hex: DEF"), "Numeric entities decoded");
+    }
+
+    #[test]
+    fn test_magic_byte_sniffing_misnamed_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let fake_pdf = temp_dir.path().join("fake_scan.pdf");
+        let mut jpeg_bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        jpeg_bytes.extend(vec![0u8; 100]);
+        std::fs::write(&fake_pdf, &jpeg_bytes).unwrap();
+
+        let classifier = FileTypeClassifier::new();
+        let identity = classifier.classify_file(&fake_pdf).expect("classify");
+        let _ = DocumentExtractor::extract_text(&fake_pdf, &identity);
     }
 }

@@ -70,6 +70,11 @@ impl StorageConfig {
     pub fn metadata_path(&self) -> PathBuf {
         self.storage_path.join(".metadata.json")
     }
+
+    /// Path to SQLite document catalog database (`document_catalog.db`).
+    pub fn document_catalog_path(&self) -> PathBuf {
+        self.storage_path.join("document_catalog.db")
+    }
 }
 
 impl<P: AsRef<Path>> From<P> for StorageConfig {

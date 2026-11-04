@@ -310,7 +310,7 @@ impl FilesystemCrawler {
                         ".cc", ".cs", ".java", ".go", ".kt", ".rb", ".php", ".swift", ".scala",
                         ".sh", ".bash", ".ps1", ".bat", ".cmd", ".sql", ".css", ".scss", ".less",
                         ".vue", ".svelte", ".toml", ".yaml", ".yml", ".lock", ".dat", ".log",
-                        ".json", ".jsonl", ".xml", ".html", ".htm", ".tex", ".aux", ".bbl",
+                        ".json", ".jsonl", ".xml", ".aux", ".bbl",
                         ".blg", ".out", ".toc", ".synctex", ".crt", ".pem", ".key",
                     ];
                     if EXCLUDED_SOURCE_EXTS.iter().any(|ext| lower.ends_with(ext)) {

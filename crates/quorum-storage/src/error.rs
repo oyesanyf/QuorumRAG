@@ -43,6 +43,9 @@ pub enum StorageError {
     #[error("Compaction error: {0}")]
     Compaction(String),
 
+    #[error("SQLite error: {0}")]
+    Sqlite(String),
+
     #[error("Chunk not found: {0}")]
     NotFound(String),
 }
@@ -50,5 +53,11 @@ pub enum StorageError {
 impl From<serde_json::Error> for StorageError {
     fn from(err: serde_json::Error) -> Self {
         Self::Serialization(err.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Sqlite(err.to_string())
     }
 }

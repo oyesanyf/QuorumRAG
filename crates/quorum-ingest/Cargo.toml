@@ -36,6 +36,10 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# OLE2 Binary Document Parsing
+cfb = "0.7"
+regex = "1"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Media_Ocr",

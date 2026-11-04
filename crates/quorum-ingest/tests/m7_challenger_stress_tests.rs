@@ -210,12 +210,12 @@ async fn test_adversarial_dedup_hydration_duplicate_chunk_hashes_across_storage(
     let mut c1 = chunk1.clone();
     c1.blake3_hash = shared_hash.to_string();
 
-    // Insert chunks (storage will deduplicate c1 since hash matches c0)
-    storage.insert_chunks(&[c0, c1]).await.unwrap();
+    // Insert chunks (storage preserves both document chunks with distinct chunk_ids, avoiding silent drops)
+    storage.insert_chunks(&[c0.clone(), c1, c0]).await.unwrap();
 
     let dedup = TwoLevelDedupEngine::new();
     let count = dedup.hydrate_from_storage(&storage).await.unwrap();
-    assert_eq!(count, 1, "Only unique chunks stored in LanceDB must be hydrated");
+    assert_eq!(count, 2, "Both distinct document chunks stored in LanceDB are hydrated");
 
     // Level-2 cache must contain the shared chunk hash without duplicates
     assert!(dedup.cache().has_chunk(shared_hash));
