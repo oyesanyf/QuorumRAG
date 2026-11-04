@@ -73,12 +73,24 @@ pub struct ReindexWorker {
 
 impl ReindexWorker {
     pub fn new(
-        config: IngestConfig,
+        mut config: IngestConfig,
         storage: Arc<StorageEngine>,
         classifier: Arc<FileTypeClassifier>,
         embedder: Arc<dyn EmbeddingGenerator>,
         dedup: Arc<TwoLevelDedupEngine>,
     ) -> Self {
+        let storage_path = storage.config().storage_path.clone();
+        if !config.excluded_paths.iter().any(|p| p == &storage_path) {
+            config.excluded_paths.push(storage_path);
+        }
+        if let Some(ref cat_path) = config.dedup_catalog_path {
+            if let Some(parent) = cat_path.parent() {
+                let parent_buf = parent.to_path_buf();
+                if !parent_buf.as_os_str().is_empty() && !config.excluded_paths.iter().any(|p| p == &parent_buf) {
+                    config.excluded_paths.push(parent_buf);
+                }
+            }
+        }
         Self {
             config,
             storage,
@@ -359,7 +371,7 @@ impl ReindexWorker {
     /// Internal execution loop for reindexing.
     #[allow(clippy::too_many_arguments)]
     async fn execute_pipeline(
-        config: IngestConfig,
+        mut config: IngestConfig,
         options: ReindexOptions,
         _task_id: Uuid,
         storage: Arc<StorageEngine>,
@@ -369,6 +381,19 @@ impl ReindexWorker {
         progress: Arc<RwLock<Option<ReindexProgress>>>,
         cancel_flag: Arc<AtomicBool>,
     ) -> Result<(), IngestError> {
+        let storage_path = storage.config().storage_path.clone();
+        if !config.excluded_paths.iter().any(|p| p == &storage_path) {
+            config.excluded_paths.push(storage_path);
+        }
+        if let Some(ref cat_path) = config.dedup_catalog_path {
+            if let Some(parent) = cat_path.parent() {
+                let parent_buf = parent.to_path_buf();
+                if !parent_buf.as_os_str().is_empty() && !config.excluded_paths.iter().any(|p| p == &parent_buf) {
+                    config.excluded_paths.push(parent_buf);
+                }
+            }
+        }
+
         let raw_targets = if !options.target_paths.is_empty() {
             options.target_paths.clone()
         } else {
@@ -381,6 +406,10 @@ impl ReindexWorker {
         }
 
         let targets = Self::expand_drive_roots(&raw_targets);
+        let targets: Vec<std::path::PathBuf> = targets
+            .into_iter()
+            .filter(|t| !config.excluded_paths.iter().any(|ex| t == ex || t.starts_with(ex)))
+            .collect();
         let chunker = TextChunker::new(ChunkerConfig::default());
 
         // Phase 1: Decoupled Upfront Discovery across all target slices
@@ -700,7 +729,11 @@ impl ReindexWorker {
             };
             let _ = storage.bump_index_epoch(reason)?;
 
-            let catalog_path = storage.config().storage_path.join("dedup_catalog.json");
+            let catalog_path = config
+                .dedup_catalog_path
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| storage.config().storage_path.join("dedup_catalog.json"));
             if let Err(e) = dedup.save_catalog_to_file(&catalog_path) {
                 warn!("Failed to auto-save dedup catalog after reindex pass: {}", e);
             } else {
@@ -745,8 +778,13 @@ impl ReindexWorker {
             ".tmp.driveupload",
             ".pytest_cache",
             ".lance",
+            "lance",
             ".tantivy",
+            "tantivy",
             ".quorumrag-live-data",
+            "storage",
+            "quorumrag",
+            ".quorumrag",
         ];
 
         let mut expanded = Vec::new();

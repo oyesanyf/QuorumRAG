@@ -210,7 +210,12 @@ impl FilesystemCrawler {
             .max_filesize(Some(self.config.max_file_size_bytes));
 
         let exclude_source_code = self.config.exclude_source_code;
+        let excluded_paths = self.config.excluded_paths.clone();
         builder.filter_entry(move |entry| {
+            let entry_path = entry.path();
+            if excluded_paths.iter().any(|ex| entry_path == ex || entry_path.starts_with(ex)) {
+                return false;
+            }
             if entry.depth() == 0 {
                 return true;
             }
@@ -245,8 +250,13 @@ impl FilesystemCrawler {
                             | "venv"
                             | ".pytest_cache"
                             | ".lance"
+                            | "lance"
                             | ".tantivy"
+                            | "tantivy"
                             | ".quorumrag-live-data"
+                            | "storage"
+                            | "quorumrag"
+                            | ".quorumrag"
                     ) {
                         return false;
                     }
@@ -270,6 +280,13 @@ impl FilesystemCrawler {
                     || lower.ends_with(".tmp")
                     || lower.ends_with(".bak")
                     || lower.ends_with(".wbk")
+                    || lower == "dedup_catalog.json"
+                    || lower.starts_with("dedup_catalog.")
+                    || lower.starts_with(".dedup_catalog")
+                    || lower.starts_with("document_catalog.")
+                    || lower == "metadata.json"
+                    || lower == ".metadata.json"
+                    || lower == "embedding_contract.json"
                     || matches!(
                         lower.as_str(),
                         "cargo.lock"
