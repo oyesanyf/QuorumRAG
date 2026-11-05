@@ -5,7 +5,7 @@ set -euo pipefail
 # Generates Debian (.deb), RedHat (.rpm), and portable (.tar.gz) packages for Linux deployments.
 
 BINARY_PATH="${1:-target/release/quorumrag}"
-VERSION="${2:-0.1.0}"
+VERSION="${2:-0.6.0}"
 INPUT_ARCH="${3:-amd64}"
 DIST_DIR="${4:-deploy/linux}"
 PACKAGE_NAME="${5:-quorumrag}"
@@ -72,6 +72,10 @@ set -euo pipefail
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
+# Stop and clean up any existing version before replacing
+if [ -x /usr/lib/quorumrag/quorumrag-ctl ]; then
+    /usr/lib/quorumrag/quorumrag-ctl pre-remove >/dev/null 2>&1 || true
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p /usr/bin /lib/systemd/system /usr/lib/quorumrag /usr/share/applications \
          /var/lib/quorumrag/data /var/lib/quorumrag/docs /var/log/quorumrag
@@ -127,7 +131,10 @@ Section: utils
 Priority: optional
 Architecture: ${DEB_ARCH}
 Maintainer: Oshoosi Security Team <security@oshoosiclaw.dev>
-Homepage: https://github.com/oyesanyf/MusicFusion
+Homepage: https://github.com/oyesanyf/QuorumRAG
+Provides: ${PACKAGE_NAME}
+Replaces: ${PACKAGE_NAME}
+Conflicts: ${PACKAGE_NAME} (<< ${VERSION})
 Recommends: curl, xdg-utils
 Description: QuorumRAG Local-First P2P Agentic RAG Daemon and Web UI
  Self-contained local-first peer-to-peer Retrieval-Augmented Generation
@@ -251,7 +258,9 @@ Version:        ${VERSION}
 Release:        1
 Summary:        QuorumRAG Local-First P2P Agentic RAG Daemon and Web UI
 License:        MIT OR Apache-2.0
-URL:            https://github.com/oyesanyf/MusicFusion
+URL:            https://github.com/oyesanyf/QuorumRAG
+Provides:       %{PACKAGE_NAME} = %{version}-%{release}
+Obsoletes:      %{PACKAGE_NAME} < %{version}-%{release}
 AutoReqProv:    no
 %define __strip /bin/true
 %define _build_id_links none

@@ -5,7 +5,7 @@ set -euo pipefail
 # Generates macOS native installer (.pkg), disk image (.dmg), and portable (.tar.gz) packages.
 
 BINARY_PATH="${1:-target/release/quorumrag}"
-VERSION="${2:-0.1.0}"
+VERSION="${2:-0.6.0}"
 INPUT_ARCH="${3:-universal}"
 DIST_DIR="${4:-deploy/macos}"
 PACKAGE_NAME="${5:-quorumrag}"
@@ -149,8 +149,13 @@ if [ "$(uname -s)" = "Darwin" ] && command -v pkgbuild >/dev/null 2>&1; then
 
     cat <<'EOF' > "${PKG_SCRIPTS}/preinstall"
 #!/bin/sh
-# Stop a running daemon before the payload replaces the binary (upgrade).
-launchctl bootout system/dev.quorumrag.daemon 2>/dev/null || true
+# Stop any running daemon or processes and remove previous app bundle before replacement (clean upgrade).
+LABEL="dev.quorumrag.daemon"
+launchctl bootout system/${LABEL} 2>/dev/null || true
+launchctl unload "/Library/LaunchDaemons/${LABEL}.plist" 2>/dev/null || true
+pkill -9 -f "quorumrag" 2>/dev/null || true
+rm -rf "/Applications/QuorumRAG.app" 2>/dev/null || true
+rm -f "/usr/local/bin/quorumrag" 2>/dev/null || true
 exit 0
 EOF
     chmod 755 "${PKG_SCRIPTS}/preinstall"

@@ -31,7 +31,7 @@ if not defined QR_UNINSTALL_RELAUNCHED (
 echo [1/4] Uninstalling the QuorumRAG MSI package (if registered)...
 set "MSI_EXTRA="
 if "%PURGE%"=="1" set "MSI_EXTRA=REMOVEDATA=1"
-set "PS_FIND=$k='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'QuorumRAG P2P Agentic RAG' } | ForEach-Object { $_.PSChildName }"
+set "PS_FIND=$k='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*QuorumRAG*' } | ForEach-Object { $_.PSChildName }"
 for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "%PS_FIND%"`) do call :msi_remove %%G
 
 echo [2/4] Stopping and deleting the %SERVICE% service (if still present)...
