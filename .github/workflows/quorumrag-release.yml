@@ -189,7 +189,8 @@ jobs:
   # 4. macOS Universal (Apple Silicon arm64 + Intel x86_64) Native .pkg, .dmg & .tar.gz
   build-macos:
     name: macOS Universal (.pkg, .dmg, .tar.gz)
-    runs-on: macos-13
+    runs-on: macos-15
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
