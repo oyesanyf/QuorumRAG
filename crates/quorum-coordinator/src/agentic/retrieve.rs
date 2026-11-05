@@ -264,8 +264,12 @@ impl RetrieveMeshNode {
             });
 
         if (daemon_active || !state.extracted_entities.is_empty()) && !prelim_entities.is_empty() {
-            let mut seen_ids: std::collections::HashSet<String> =
-                chunks.iter().map(|c| c.chunk.chunk_id.clone()).collect();
+            // Key seen_ids by (source_peer, chunk_id) so identical files on both local and remote peers
+            // (which share the same BLAKE3-derived chunk_id) are both retained across the Mesh.
+            let mut seen_ids: std::collections::HashSet<(String, String)> = chunks
+                .iter()
+                .map(|c| (c.source_peer.clone(), c.chunk.chunk_id.clone()))
+                .collect();
 
             let entity_kw_query = prelim_entities.join(" ");
             let entity_hits = engine
@@ -274,7 +278,7 @@ impl RetrieveMeshNode {
             for (idx, mut hit) in entity_hits.into_iter().enumerate() {
                 // Normalize supplemental BM25 scores to [0.0, 1.0] RRF scale (1.0 / (60.0 + rank))
                 hit.score = 1.0 / (60.0 + idx as f32);
-                if seen_ids.insert(hit.chunk.chunk_id.clone()) {
+                if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                     chunks.push(hit);
                 }
             }
@@ -288,7 +292,7 @@ impl RetrieveMeshNode {
                     .await;
                 for (idx, mut hit) in prompt_hits.into_iter().enumerate() {
                     hit.score = 1.0 / (60.0 + idx as f32);
-                    if seen_ids.insert(hit.chunk.chunk_id.clone()) {
+                    if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                         chunks.push(hit);
                     }
                 }
@@ -302,7 +306,7 @@ impl RetrieveMeshNode {
                 let cue_hits = engine.search_federated_text(&cue_query, access_tier, 48).await;
                 for (idx, mut hit) in cue_hits.into_iter().enumerate() {
                     hit.score = 1.0 / (60.0 + idx as f32);
-                    if seen_ids.insert(hit.chunk.chunk_id.clone()) {
+                    if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                         chunks.push(hit);
                     }
                 }
@@ -349,9 +353,10 @@ impl RetrieveMeshNode {
                     return false;
                 }
                 // Repo trees are excluded as code, except indexed media (e.g. D:\harfile\music\*.mp3).
-                let is_media = text_l.starts_with("[audio document:")
-                    || text_l.starts_with("[image document:")
-                    || text_l.starts_with("[video document:");
+                let is_media = text_l.contains("[audio document:")
+                    || text_l.contains("[image document:")
+                    || text_l.contains("[video document:")
+                    || text_l.contains("[ocr text]");
                 if !is_media && (path_l.contains("\\harfile\\") || path_l.contains("/harfile/")) {
                     return false;
                 }
@@ -487,6 +492,13 @@ impl RetrieveMeshNode {
                     if doc_tokens.contains(term) {
                         return true;
                     }
+                    // OCR left-edge clipping tolerance: "cve" -> "ve" when a 4-digit year token is present
+                    if term == "cve"
+                        && doc_tokens.contains("ve")
+                        && doc_tokens.iter().any(|t| t.len() == 4 && t.chars().all(|ch| ch.is_ascii_digit()))
+                    {
+                        return true;
+                    }
                     // Allow simple plural/singular inflection ("letter" <-> "letters", "school" <-> "schools"),
                     // never arbitrary prefix matches like "cover" matching "coverage" or "discover".
                     if term.len() >= 4 {
@@ -579,8 +591,11 @@ impl RetrieveMeshNode {
                     intent_bonus -= 300;
                 }
 
+                let has_ocr_text = text_l.contains("[ocr text]");
                 if !asks_image
-                    && (text_l.starts_with("[image document:")
+                    && !has_ocr_text
+                    && content_matched_terms == 0
+                    && (text_l.contains("[image document:")
                         || file_name_l.ends_with(".gif")
                         || file_name_l.ends_with(".jpg")
                         || file_name_l.ends_with(".jpeg")
@@ -778,18 +793,31 @@ impl RetrieveMeshNode {
             chunks = paired.into_iter().map(|(c, _)| c).collect();
         }
 
-        // Cap chunks per normalized document stem (max 2 per stem) to prevent draft revisions from crowding out distinct works
-        let mut stem_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        // Cap chunks per (source_peer, normalized document stem) (max 2 per stem per peer)
+        // so remote peer copies of the same document are NEVER dropped when the document also exists locally!
+        let mut stem_counts: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
         let mut stem_deduped: Vec<quorum_types::ScoredChunk> = Vec::with_capacity(chunks.len());
         for c in chunks {
-            let stem = crate::offline_engine::DeterministicOfflineSynthesisEngine::normalize_file_stem(&c.chunk.file_path);
-            let count = stem_counts.entry(stem).or_insert(0);
+            let stem = crate::offline_engine::DeterministicOfflineSynthesisEngine::normalize_file_stem(
+                &c.chunk.file_path,
+            );
+            let count = stem_counts.entry((c.source_peer.clone(), stem)).or_insert(0);
             if *count < 2 {
                 *count += 1;
                 stem_deduped.push(c);
             }
         }
         chunks = stem_deduped;
+
+        // Snapshot top remote peer chunks (`source_peer != "local"`) before parent-stitching and MMR
+        // so federated results from connected computers are guaranteed to appear alongside local results.
+        let preserved_remote: Vec<ScoredChunk> = chunks
+            .iter()
+            .filter(|c| c.source_peer != "local")
+            .take(4)
+            .cloned()
+            .collect();
 
         let ui = crate::dlp_mesh::global_mesh_dlp_controller()
             .settings
@@ -816,6 +844,20 @@ impl RetrieveMeshNode {
         }
 
         chunks.truncate(top_k);
+        // Ensure preserved remote peer chunks are included so multi-computer evidence is always surfaced
+        for rem in preserved_remote {
+            let already_has_peer_chunk = chunks
+                .iter()
+                .any(|c| c.source_peer == rem.source_peer && c.chunk.chunk_id == rem.chunk.chunk_id);
+            if !already_has_peer_chunk {
+                if chunks.len() >= top_k && chunks.len() > 2 {
+                    if let Some(pos) = chunks.iter().rposition(|c| c.source_peer == "local") {
+                        chunks.remove(pos);
+                    }
+                }
+                chunks.push(rem);
+            }
+        }
         state.retrieved_chunks = chunks;
         state.volatile_chunks = volatile;
     }
