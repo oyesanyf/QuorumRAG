@@ -115,6 +115,100 @@ pub async fn pull_model_handler(Json(payload): Json<PullModelRequest>) -> impl I
     .into_response()
 }
 
+/// Triggers automated Ollama host installation: `POST /api/ollama/install`.
+pub async fn install_ollama_handler() -> impl IntoResponse {
+    let installed_binary = quorum_coordinator::DeterministicOfflineSynthesisEngine::detect_ollama_binary();
+    if let Some(path) = installed_binary {
+        return Json(serde_json::json!({
+            "status": "already_installed",
+            "message": format!("Ollama is already installed at {}", path.display()),
+            "installed": true,
+            "binary_path": path.to_string_lossy()
+        }))
+        .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
+        #[cfg(windows)]
+        {
+            // 1. Try winget first (standard Windows package manager)
+            let winget_res = std::process::Command::new("winget")
+                .args(["install", "Ollama.Ollama", "--accept-source-agreements", "--accept-package-agreements", "--silent"])
+                .output();
+
+            if let Ok(out) = winget_res {
+                if out.status.success() {
+                    return Ok("Ollama installed successfully via winget".to_string());
+                }
+            }
+
+            // 2. Direct download of official OllamaSetup.exe
+            let ps_script = r#"
+                $ErrorActionPreference = 'Stop'
+                $installer = Join-Path $env:TEMP 'OllamaSetup.exe'
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                Invoke-WebRequest -Uri 'https://ollama.com/download/OllamaSetup.exe' -OutFile $installer -UseBasicParsing
+                if (Test-Path $installer) {
+                    Start-Process -FilePath $installer -ArgumentList '/SILENT' -Wait
+                    Remove-Item $installer -Force -ErrorAction SilentlyContinue
+                }
+            "#;
+            let mut cmd = std::process::Command::new("powershell");
+            cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script]);
+            match cmd.output() {
+                Ok(out) if out.status.success() => Ok("Ollama installed successfully via official setup installer".to_string()),
+                Ok(out) => Err(format!("Installer exited with status {:?}: {}", out.status, String::from_utf8_lossy(&out.stderr))),
+                Err(e) => Err(format!("Failed to execute installer process: {}", e)),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "curl -fsSL https://ollama.com/install.sh | sh"]);
+            match cmd.output() {
+                Ok(out) if out.status.success() => Ok("Ollama installed successfully via official install script".to_string()),
+                Ok(out) => Err(format!("Install script failed: {}", String::from_utf8_lossy(&out.stderr))),
+                Err(e) => Err(format!("Failed to spawn install script: {}", e)),
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(msg)) => {
+            let newly_detected = quorum_coordinator::DeterministicOfflineSynthesisEngine::detect_ollama_binary();
+            Json(serde_json::json!({
+                "status": "success",
+                "message": msg,
+                "installed": newly_detected.is_some(),
+                "binary_path": newly_detected.map(|p| p.to_string_lossy().to_string())
+            }))
+            .into_response()
+        }
+        Ok(Err(err)) => {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": err,
+                    "terminal_fallback": "winget install Ollama.Ollama or visit https://ollama.com/download"
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!("Task panicked: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Model family and hardware telemetry recommendation endpoint: `GET /api/models`.
 pub async fn models_handler(
     State(state): State<Arc<DaemonState>>,
@@ -131,6 +225,9 @@ pub async fn models_handler(
     let gemma4_installed = installed
         .iter()
         .any(|m| m.eq_ignore_ascii_case("gemma4:26b") || m.to_ascii_lowercase().starts_with("gemma4:26b"));
+
+    let ollama_binary = quorum_coordinator::DeterministicOfflineSynthesisEngine::detect_ollama_binary();
+    let ollama_installed = ollama_binary.is_some() || !installed.is_empty();
 
     let calibrated_target = if gemma4_installed && gemma4_eligible {
         "gemma4:26b".to_string()
@@ -192,6 +289,8 @@ pub async fn models_handler(
     Json(serde_json::json!({
         "active_family": format!("{:?}", state.default_model_family),
         "ollama_online": !installed.is_empty(),
+        "ollama_installed": ollama_installed,
+        "ollama_binary": ollama_binary.map(|p| p.to_string_lossy().to_string()),
         "auto_model": format!("Auto ({})", calibrated_target),
         "calibrated_target": calibrated_target,
         "calibrated_pills": calibrated_pills,

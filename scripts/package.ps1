@@ -198,8 +198,15 @@ if (-not $WixCmd) {
     throw "WiX v5 (wix.exe) could not be found or installed."
 }
 
+$MinMsiProductVersion = [version]"0.6.0"
+$ParsedVer = $null
+$MsiProductVersion = if ([version]::TryParse($Version, [ref]$ParsedVer) -and $ParsedVer -lt $MinMsiProductVersion) {
+    "0.6.0"
+} else {
+    $Version
+}
 $MsiOut = Join-Path $WinDeployDir "QuorumRAG-$Version-x86_64.msi"
-& $WixCmd build $WixWxs -arch x64 -d "ProductVersion=$Version" -out $MsiOut
+& $WixCmd build $WixWxs -arch x64 -d "ProductVersion=$MsiProductVersion" -out $MsiOut
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $MsiOut)) {
     throw "WiX MSI compilation failed (exit code $LASTEXITCODE)"
 }

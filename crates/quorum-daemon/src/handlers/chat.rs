@@ -143,6 +143,8 @@ pub async fn chat_sse_handler(
     };
     let sessions_registry = state.sessions.clone();
     let session_id_task = session_id.clone();
+    let state_for_history = Arc::clone(&state);
+    let model_label = format!("{:?}", family);
 
     let join_handle = tokio::spawn(async move {
         let _guard = in_flight_guard;
@@ -172,6 +174,25 @@ pub async fn chat_sse_handler(
                     .map(|c| c.chunk.chunk_id.clone())
                     .collect();
                 sessions_registry.record_seen_chunks(&session_id_task, &newly_seen);
+
+                // Persist completed user + assistant turn & citations to `<data_dir>/chat_history.db`
+                if let Ok(hist_store) = state_for_history.history_store() {
+                    let responder_peer = if coordinator.engine.sender_peer_id.trim().is_empty() {
+                        "local"
+                    } else {
+                        coordinator.engine.sender_peer_id.as_str()
+                    };
+                    if let Err(e) = hist_store.record_turn(
+                        &session_id_task,
+                        &prompt,
+                        &_result.synthesis_prompt,
+                        &_result.sources_cited,
+                        responder_peer,
+                        &model_label,
+                    ) {
+                        error!("Failed to persist chat turn to SQLite history: {}", e);
+                    }
+                }
                 // TokenDelta events and trailing CitationEmitted + ExecutionFinished events
                 // have already been streamed in real time by AgenticStateGraphRunner.
             }
@@ -257,6 +278,21 @@ pub async fn query_handler(
                 .map(|c| c.chunk.chunk_id.clone())
                 .collect();
             state.sessions.record_seen_chunks(&session_id, &newly_seen);
+            if let Ok(hist_store) = state.history_store() {
+                let responder_peer = if state.coordinator.engine.sender_peer_id.trim().is_empty() {
+                    "local"
+                } else {
+                    state.coordinator.engine.sender_peer_id.as_str()
+                };
+                let _ = hist_store.record_turn(
+                    &session_id,
+                    prompt,
+                    &result.synthesis_prompt,
+                    &result.sources_cited,
+                    responder_peer,
+                    &format!("{:?}", family),
+                );
+            }
             Json(result).into_response()
         }
         Err(e) => (

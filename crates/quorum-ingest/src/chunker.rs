@@ -240,7 +240,11 @@ pub fn build_contextual_header(path: &Path, content: &str) -> String {
 
     // 2. Author derivation (strictly within first 2KB before Abstract/Introduction)
     let mut doc_authors = "Unknown".to_string();
-    let header_preview = &content[..content.len().min(2048)];
+    let mut preview_end = content.len().min(2048);
+    while !content.is_char_boundary(preview_end) && preview_end > 0 {
+        preview_end -= 1;
+    }
+    let header_preview = &content[..preview_end];
     for line in header_preview.lines() {
         let trimmed = line.trim();
         if let Some(a) = trimmed.strip_prefix("Author: ") {

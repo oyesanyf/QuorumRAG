@@ -121,16 +121,19 @@ pub struct ChatSessionData {
     pub last_active: Instant,
 }
 
-/// Thread-safe registry mapping session IDs to their active continuation state and seen chunk IDs.
+/// Thread-safe registry mapping session IDs to their active continuation state, seen chunk IDs,
+/// and lazily-initialized SQLite chat history store.
 #[derive(Clone, Default)]
 pub struct ChatSessionRegistry {
     sessions: Arc<RwLock<HashMap<String, ChatSessionData>>>,
+    history_db: Arc<RwLock<Option<Arc<crate::chat_history_db::ChatHistoryStore>>>>,
 }
 
 impl ChatSessionRegistry {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            history_db: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -155,6 +158,18 @@ impl ChatSessionRegistry {
             for id in chunk_ids {
                 entry.seen_chunk_ids.insert(id.clone());
             }
+        }
+    }
+
+    pub fn remove_session(&self, session_id: &str) {
+        if let Ok(mut map) = self.sessions.write() {
+            map.remove(session_id);
+        }
+    }
+
+    pub fn clear_all_sessions(&self) {
+        if let Ok(mut map) = self.sessions.write() {
+            map.clear();
         }
     }
 
@@ -184,4 +199,30 @@ pub struct DaemonState {
     pub shutdown_notify: Arc<tokio::sync::Notify>,
     pub in_flight_queries: Arc<InFlightQueryRegistry>,
     pub sessions: ChatSessionRegistry,
+}
+
+impl DaemonState {
+    /// Returns the persistent SQLite `ChatHistoryStore` backed by `<data_dir>/chat_history.db`.
+    pub fn history_store(&self) -> Result<Arc<crate::chat_history_db::ChatHistoryStore>, String> {
+        if let Ok(guard) = self.sessions.history_db.read() {
+            if let Some(ref existing) = *guard {
+                return Ok(Arc::clone(existing));
+            }
+        }
+        let mut wguard = self
+            .sessions
+            .history_db
+            .write()
+            .map_err(|e| format!("History DB lock poisoned: {e}"))?;
+        if let Some(ref existing) = *wguard {
+            return Ok(Arc::clone(existing));
+        }
+        let db_path = self.data_dir.join("chat_history.db");
+        let opened = Arc::new(
+            crate::chat_history_db::ChatHistoryStore::open(&db_path)
+                .map_err(|e| format!("Failed to open {}: {e}", db_path.display()))?,
+        );
+        *wguard = Some(Arc::clone(&opened));
+        Ok(opened)
+    }
 }

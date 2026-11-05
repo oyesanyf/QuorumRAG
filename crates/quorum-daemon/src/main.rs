@@ -4,6 +4,7 @@ use std::time::Instant;
 use tracing::{error, info, warn};
 
 pub mod browser;
+pub mod chat_history_db;
 pub mod cli;
 pub mod handlers;
 pub mod server;
@@ -473,6 +474,11 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
+    // Warm persistent SQLite chat history database (`<data_dir>/chat_history.db`) on startup
+    if let Err(e) = app_state.history_store() {
+        error!("Failed to initialize SQLite chat history database: {}", e);
+    }
+
     // Continuously run background crawl & incremental ingestion unconditionally
     let bg_worker = Arc::clone(&reindex_worker);
     let bg_default_paths = ingest_config.watch_paths.clone();
@@ -480,6 +486,17 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
 
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // Self-heal any previously degraded .docx / .pdf chunks (e.g., ZIP XML manifest or raw PDF fallback)
+        // and any legacy pre-OCR image chunks so existing indexes upgrade automatically on startup.
+        if let Ok(upgraded_docs) = bg_worker.upgrade_degraded_document_chunks().await {
+            if upgraded_docs > 0 {
+                info!(
+                    upgraded_docs,
+                    "Self-healed degraded document chunks via native Rust OOXML/FlateDecode extractors"
+                );
+            }
+        }
+        let _ = bg_worker.upgrade_legacy_image_chunks().await;
         // Pass 0: Priority fast pass over user document & screenshot folders (Pictures, Desktop, Downloads, Documents)
         // so newly saved screenshots and documents are OCR-indexed and queryable within seconds before full drive scans.
         let priority_user_roots = quorum_ingest::IngestConfig::discover_user_document_roots();

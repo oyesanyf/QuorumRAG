@@ -26,6 +26,8 @@ pub const QUERY_META_INTENT_TERMS: &[&str] = &[
     "done", "he", "him", "his", "she", "her", "they", "them",
     "tell", "show", "give", "list", "find", "describe", "explain",
     "all", "any", "other", "more", "another", "besides",
+    "according", "based", "within", "listed", "documented", "provided", "explicitly",
+    "formal", "official", "mentioned", "stated", "shown", "included",
 ];
 
 pub const GENERIC_ATTRIBUTE_TERMS: &[&str] = &[
@@ -35,6 +37,10 @@ pub const GENERIC_ATTRIBUTE_TERMS: &[&str] = &[
     "job", "jobs", "role", "roles", "skill", "skills", "profession", "professional",
     "experience", "experiences", "career", "background", "profile", "resume",
     "resumes", "summary", "summaries", "history", "company", "companies",
+    "held", "hold", "holds", "holding", "timeline", "chronology", "chronological",
+    "position", "positions", "title", "titles", "capacity", "capacities",
+    "responsibility", "responsibilities", "duty", "duties", "employer", "employers",
+    "employment", "organization", "organizations", "past", "previous", "current", "recent",
     "project", "projects", "certification", "certifications", "went", "attend",
     "attended", "graduated", "year", "years", "detail", "details", "information",
     "income", "tax", "taxes", "statement", "statements", "plan", "plans",
@@ -108,11 +114,19 @@ impl RetrieveMeshNode {
                 "{} education university college master bachelor degree certifications",
                 state.current_query
             )
-        } else if (q_low.contains("resume") || q_low.contains("cv") || q_low.contains("curriculum vitae"))
+        } else if (q_low.contains("resume")
+            || q_low.contains("cv")
+            || q_low.contains("curriculum vitae")
+            || q_low.contains("roles")
+            || q_low.contains("role ")
+            || q_low.contains("positions")
+            || q_low.contains("career")
+            || q_low.contains("timeline")
+            || q_low.contains("work history"))
             && !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_authorship_query(&q_low)
         {
             format!(
-                "{} professional summary experience competencies publications",
+                "{} professional summary experience work history engineer architect analyst lead consultant manager",
                 state.current_query
             )
         } else {
@@ -793,8 +807,87 @@ impl RetrieveMeshNode {
             chunks = paired.into_iter().map(|(c, _)| c).collect();
         }
 
-        // Cap chunks per (source_peer, normalized document stem) (max 2 per stem per peer)
-        // so remote peer copies of the same document are NEVER dropped when the document also exists locally!
+        // Expand adjacent/body chunks (`{doc_id}:0..=4`) for the top matched local multi-chunk documents
+        // BEFORE parent-document stitching so multi-page resumes and timelines merge their full career body
+        // even when Chunk 0 initially scored highest via its header/title banner.
+        {
+            let mut seen_local_ids: std::collections::HashSet<String> = chunks
+                .iter()
+                .filter(|c| c.source_peer == "local")
+                .map(|c| c.chunk.chunk_id.clone())
+                .collect();
+            let mut top_local_docs: Vec<(String, f32)> = Vec::new();
+            for item in chunks.iter().filter(|c| c.source_peer == "local") {
+                let doc_prefix = if !item.chunk.document_id.is_empty() {
+                    item.chunk.document_id.clone()
+                } else if let Some((prefix, _)) = item.chunk.chunk_id.rsplit_once(':') {
+                    prefix.to_string()
+                } else {
+                    continue;
+                };
+                if !top_local_docs.iter().any(|(d, _)| d == &doc_prefix) {
+                    top_local_docs.push((doc_prefix, item.score));
+                    if top_local_docs.len() >= 4 {
+                        break;
+                    }
+                }
+            }
+            if !top_local_docs.is_empty() {
+                let mut sibling_ids: Vec<String> = Vec::new();
+                let mut base_scores: std::collections::HashMap<String, f32> =
+                    std::collections::HashMap::new();
+                for (doc_id, base_score) in top_local_docs {
+                    base_scores.insert(doc_id.clone(), base_score);
+                    for idx in 0..=4 {
+                        let cid = format!("{}:{}", doc_id, idx);
+                        if !seen_local_ids.contains(&cid)
+                            && !state.seen_chunk_ids.contains(&cid)
+                        {
+                            sibling_ids.push(cid);
+                        }
+                    }
+                }
+                if !sibling_ids.is_empty() {
+                    let extras = engine
+                        .local_storage
+                        .get_chunks_by_ids(&sibling_ids, access_tier)
+                        .await;
+                    for extra in extras {
+                        if !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(
+                            &extra.text_content,
+                        ) && seen_local_ids.insert(extra.chunk_id.clone())
+                        {
+                            let base = base_scores
+                                .get(&extra.document_id)
+                                .copied()
+                                .unwrap_or(0.014);
+                            chunks.push(quorum_types::ScoredChunk::new(
+                                extra,
+                                (base * 0.94).max(0.012),
+                                "local",
+                                false,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let ui = crate::dlp_mesh::global_mesh_dlp_controller()
+            .settings
+            .read()
+            .map(|g| g.ui.clone())
+            .unwrap_or_default();
+
+        // Stitch adjacent chunks (`0..N`) of each matched file BEFORE per-stem capping so multi-chunk
+        // resumes and timelines merge their header + body sections into complete passages first!
+        if ui.parent_document_retrieval {
+            chunks = crate::offline_engine::DeterministicOfflineSynthesisEngine::stitch_parent_document_chunks(chunks);
+        }
+
+        // Cap stitched sections per (source_peer, normalized document stem) (max 3 per stem per peer)
+        // so remote peer copies of the same document are NEVER dropped when the document also exists locally,
+        // while keeping multi-section career timelines intact.
         let mut stem_counts: std::collections::HashMap<(String, String), usize> =
             std::collections::HashMap::new();
         let mut stem_deduped: Vec<quorum_types::ScoredChunk> = Vec::with_capacity(chunks.len());
@@ -803,31 +896,21 @@ impl RetrieveMeshNode {
                 &c.chunk.file_path,
             );
             let count = stem_counts.entry((c.source_peer.clone(), stem)).or_insert(0);
-            if *count < 2 {
+            if *count < 3 {
                 *count += 1;
                 stem_deduped.push(c);
             }
         }
         chunks = stem_deduped;
 
-        // Snapshot top remote peer chunks (`source_peer != "local"`) before parent-stitching and MMR
-        // so federated results from connected computers are guaranteed to appear alongside local results.
+        // Snapshot top remote peer chunks (`source_peer != "local"`) after parent-stitching and before MMR
+        // so federated stitched results from connected computers are guaranteed to appear alongside local results.
         let preserved_remote: Vec<ScoredChunk> = chunks
             .iter()
             .filter(|c| c.source_peer != "local")
             .take(4)
             .cloned()
             .collect();
-
-        let ui = crate::dlp_mesh::global_mesh_dlp_controller()
-            .settings
-            .read()
-            .map(|g| g.ui.clone())
-            .unwrap_or_default();
-
-        if ui.parent_document_retrieval {
-            chunks = crate::offline_engine::DeterministicOfflineSynthesisEngine::stitch_parent_document_chunks(chunks);
-        }
 
         // Apply Maximal Marginal Relevance (MMR) candidate diversity selection (default lambda = 0.70)
         chunks = apply_mmr_selection(chunks, effective_vector, top_k, 0.70);
@@ -956,4 +1039,218 @@ pub fn apply_mmr_selection(
     }
 
     selected_chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acl::PeerAclManager;
+    use crate::config::CoordinatorConfig;
+    use crate::mesh::{MockMeshDispatcher, MockRemotePeer};
+    use crate::offline_engine::DeterministicOfflineSynthesisEngine;
+    use crate::scatter_gather::StorageSearcher;
+    use crate::types::SynthesisModelFamily;
+    use quorum_types::{CandidateChunkDto, DocumentChunk};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+
+    struct InMemoryLocalResumeStorage {
+        chunks: Vec<DocumentChunk>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageSearcher for InMemoryLocalResumeStorage {
+        async fn search_hybrid(
+            &self,
+            _query_text: &str,
+            _query_vec: &[f32],
+            max_tier: u8,
+            _top_k: usize,
+        ) -> Vec<ScoredChunk> {
+            self.chunks
+                .iter()
+                .filter(|c| c.access_tier <= max_tier)
+                .map(|c| ScoredChunk::new(c.clone(), 0.89, "local", false))
+                .collect()
+        }
+
+        async fn get_chunks_by_ids(
+            &self,
+            chunk_ids: &[String],
+            max_tier: u8,
+        ) -> Vec<DocumentChunk> {
+            self.chunks
+                .iter()
+                .filter(|c| c.access_tier <= max_tier && chunk_ids.contains(&c.chunk_id))
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resume_timeline_roles_query_stitches_remote_timeline_and_preserves_local_resumes() {
+        let embedder = quorum_contract::DeterministicOfflineEngine::new();
+        let vec768 = embedder.embed_text("Femi Oyesanya AI Security Resume Timeline").unwrap();
+
+        let local_resume = DocumentChunk::new(
+            "local_cv_doc:0",
+            "local_cv_doc",
+            r"C:\Users\oyesanyf\Documents\Femi_Oyesanya_Enhanced_Resume_v3.docx",
+            1,
+            40,
+            0,
+            vec768.clone(),
+            "Femi Oyesanya, CISSP | Principal Application & AI Security Engineer (2020–2026) | Senior Cloud Security Architect (2015–2020).",
+            None,
+        )
+        .unwrap();
+
+        let local_paper = DocumentChunk::new(
+            "local_paper_doc:0",
+            "local_paper_doc",
+            r"C:\Users\oyesanyf\Documents\RedactX_v3_arXiv_Femi_Oyesanya.pdf",
+            1,
+            25,
+            0,
+            vec768.clone(),
+            "RedactX-v3: Clinical De-Identification System. Femi Oyesanya, Independent Researcher, October 2026.",
+            None,
+        )
+        .unwrap();
+
+        let local_storage = Arc::new(InMemoryLocalResumeStorage {
+            chunks: vec![local_resume, local_paper],
+        });
+
+        let remote_peer_id = "12D3KooWEcNhbaJtvJCF6QqvWwzxWTXBMfMqvxrRbxKbAZ2ZvKR5";
+        let remote_chunks = vec![
+            CandidateChunkDto {
+                chunk_id: "remote_pdf_doc:0".to_string(),
+                file_path: r"D:\Shared\Femi_Oyesanya_AI_Security_Resume_Timeline_Fixed.pdf".to_string(),
+                line_start: 1,
+                line_end: 18,
+                content: "Femi Oyesanya — AI Security Resume Timeline | LinkedIn: linkedin.com/in/femioyesanya | GitHub: github.com/oyesanyf".to_string(),
+                score: 0.96,
+                access_tier: 0,
+            },
+            CandidateChunkDto {
+                chunk_id: "remote_pdf_doc:1".to_string(),
+                file_path: r"D:\Shared\Femi_Oyesanya_AI_Security_Resume_Timeline_Fixed.pdf".to_string(),
+                line_start: 19,
+                line_end: 65,
+                content: "Career Timeline: 2022–Present: Principal AI Security Architect — Led LLM & Agentic RAG containment. 2018–2022: Lead Application Security Engineer — Directed SDLC threat modeling and cloud security.".to_string(),
+                score: 0.91,
+                access_tier: 0,
+            },
+            CandidateChunkDto {
+                chunk_id: "remote_docx_doc:0".to_string(),
+                file_path: r"D:\Shared\Femi_Oyesanya_AI_Security_Resume_Timeline_Fixed.docx".to_string(),
+                line_start: 1,
+                line_end: 18,
+                content: "Femi Oyesanya — AI Security Resume Timeline | LinkedIn: linkedin.com/in/femioyesanya | GitHub: github.com/oyesanyf".to_string(),
+                score: 0.93,
+                access_tier: 0,
+            },
+            CandidateChunkDto {
+                chunk_id: "remote_docx_doc:1".to_string(),
+                file_path: r"D:\Shared\Femi_Oyesanya_AI_Security_Resume_Timeline_Fixed.docx".to_string(),
+                line_start: 19,
+                line_end: 65,
+                content: "Career Timeline: 2022–Present: Principal AI Security Architect | 2014–2018: Senior Information Security Consultant.".to_string(),
+                score: 0.89,
+                access_tier: 0,
+            },
+        ];
+
+        let mesh = MockMeshDispatcher::new();
+        mesh.add_peer(MockRemotePeer {
+            peer_id: remote_peer_id.to_string(),
+            latency: Duration::from_millis(5),
+            max_access_tier: 0,
+            candidate_chunks: remote_chunks,
+        })
+        .await;
+
+        let engine = ScatterGatherEngine::new(
+            local_storage,
+            Arc::new(mesh),
+            Arc::new(RwLock::new(PeerAclManager::default())),
+            CoordinatorConfig::default(),
+            [7u8; 32],
+            "12D3KooWDRDLdpC9DeyiHMfpTMUVrDz73vgYXKjQPJKWgtiaqtrL".to_string(),
+        );
+
+        let prompt = "What roles has Femi Oyesanya held according to the resume timeline?";
+        let mut state = AgenticGraphState::new(prompt, SynthesisModelFamily::AutoFusion, 3);
+        let q_vec = embedder.embed_text(prompt).unwrap();
+
+        RetrieveMeshNode::execute(&mut state, &engine, &q_vec, 0, 12).await;
+
+        assert!(
+            !state.retrieved_chunks.is_empty(),
+            "Expected fused local + mesh resume chunks"
+        );
+
+        // 1. Remote timeline body chunk (`Principal AI Security Architect`) MUST be stitched and retained
+        //    even when both `.pdf` and `.docx` share the same stem and have Chunk 0 headers!
+        let has_remote_timeline_roles = state.retrieved_chunks.iter().any(|c| {
+            c.is_remote
+                && c.source_peer == remote_peer_id
+                && c.chunk.text_content.contains("Principal AI Security Architect")
+                && c.chunk.text_content.contains("Lead Application Security Engineer")
+        });
+        assert!(
+            has_remote_timeline_roles,
+            "Remote timeline body roles must be stitched into retrieved chunks without header starvation: {:?}",
+            state
+                .retrieved_chunks
+                .iter()
+                .map(|c| (&c.source_peer, &c.chunk.file_path, &c.chunk.text_content))
+                .collect::<Vec<_>>()
+        );
+
+        // 2. Local resume (`Femi_Oyesanya_Enhanced_Resume_v3.docx`) MUST NOT be filtered out by
+        //    query-framing words (`according`, `held`, `timeline`)
+        let has_local_resume = state.retrieved_chunks.iter().any(|c| {
+            !c.is_remote
+                && c.chunk
+                    .file_path
+                    .contains("Femi_Oyesanya_Enhanced_Resume_v3.docx")
+        });
+        assert!(
+            has_local_resume,
+            "Local resume must remain in retrieved chunks despite framing words 'according'/'held'/'timeline'"
+        );
+
+        // 3. Per-source citation attribution must preserve remote PeerId on mesh chunks and None/local on local chunks
+        let remote_cit = state
+            .retrieved_chunks
+            .iter()
+            .find(|c| c.is_remote)
+            .unwrap()
+            .to_citation();
+        assert!(remote_cit.is_external_node);
+        assert_eq!(remote_cit.node_id.as_deref(), Some(remote_peer_id));
+
+        let local_cit = state
+            .retrieved_chunks
+            .iter()
+            .find(|c| !c.is_remote)
+            .unwrap()
+            .to_citation();
+        assert!(!local_cit.is_external_node);
+        assert!(local_cit.node_id.is_none());
+
+        // 4. Deterministic synthesis produces concrete role titles
+        let (answer, _) = DeterministicOfflineSynthesisEngine::synthesize(
+            prompt,
+            &state.retrieved_chunks,
+            "AutoFusion",
+        );
+        assert!(
+            answer.contains("Principal AI Security Architect"),
+            "Synthesized answer should cite concrete roles from timeline: {answer}"
+        );
+    }
 }

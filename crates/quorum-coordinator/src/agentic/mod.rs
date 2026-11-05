@@ -279,11 +279,11 @@ impl AgenticStateGraphRunner {
                                 })
                                 .await;
 
-                            let responder_peer_id = graph_state
-                                .citations
-                                .iter()
-                                .find_map(|c| c.node_id.clone())
-                                .unwrap_or_else(|| "local".to_string());
+                            let responder_peer_id = if engine.sender_peer_id.trim().is_empty() {
+                                "local".to_string()
+                            } else {
+                                engine.sender_peer_id.clone()
+                            };
                             let _ = tx
                                 .send(AgenticTelemetryEvent::ExecutionFinished {
                                     total_hops: 0,
@@ -552,11 +552,11 @@ impl AgenticStateGraphRunner {
                                 .await;
                         }
 
-                        let responder_peer_id = graph_state
-                            .citations
-                            .iter()
-                            .find_map(|c| c.node_id.clone())
-                            .unwrap_or_else(|| "local".to_string());
+                        let responder_peer_id = if engine.sender_peer_id.trim().is_empty() {
+                            "local".to_string()
+                        } else {
+                            engine.sender_peer_id.clone()
+                        };
                         let _ = tx
                             .send(AgenticTelemetryEvent::ExecutionFinished {
                                 total_hops: graph_state.hop_count,

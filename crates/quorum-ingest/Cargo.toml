@@ -36,8 +36,10 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# OLE2 Binary Document Parsing
+# OLE2, ZIP/OOXML, PDF FlateDecode & SQLite Native Document Parsing
 cfb = "0.7"
+flate2 = "1.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 regex = "1"
 
 [target.'cfg(windows)'.dependencies]
@@ -54,4 +56,3 @@ windows = { version = "0.58", features = [
 
 [dev-dependencies]
 tempfile = { workspace = true }
-
