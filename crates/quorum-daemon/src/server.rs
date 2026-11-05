@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::handlers::{cache, chat, drift, export, health, langextract, media, mesh, reindex, settings};
+use crate::handlers::{cache, chat, drift, export, health, history, langextract, media, mesh, reindex, settings};
 use crate::state::DaemonState;
 
 /// Constructs the complete Axum 0.7 web server Router.
@@ -16,12 +16,23 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         .route("/assets/*path", get(serve_asset))
         .route("/favicon.ico", get(serve_favicon))
 
-        // Chat & Query Endpoints (SSE streaming & JSON)
+        // Chat & Query Endpoints (SSE streaming, JSON & SQLite History)
         .route("/api/chat", post(chat::chat_sse_handler))
         .route("/api/chat/stream", get(chat_stream_compat_handler))
         .route("/api/chat/cancel", post(chat::cancel_chat_handler))
         .route("/api/chat/spellcheck", post(chat::spellcheck_handler))
         .route("/api/query", post(chat::query_handler))
+        .route(
+            "/api/history",
+            get(history::list_history_handler)
+                .post(history::save_history_turn_handler)
+                .delete(history::delete_all_history_handler),
+        )
+        .route(
+            "/api/history/:session_id",
+            get(history::get_history_session_handler)
+                .delete(history::delete_history_session_handler),
+        )
 
         // Multimodal media streaming, system viewer launch, and PDF/DOCX export
         .route("/api/media", get(media::serve_media_handler))
@@ -84,6 +95,7 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         .route("/api/health", get(health::health_handler))
         .route("/api/models", get(health::models_handler))
         .route("/api/models/pull", post(health::pull_model_handler))
+        .route("/api/ollama/install", post(health::install_ollama_handler))
 
         // Graceful Shutdown Endpoint
         .route("/api/shutdown", post(shutdown_handler))

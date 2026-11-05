@@ -306,6 +306,135 @@ impl ReindexWorker {
         Ok(upgraded_count)
     }
 
+    /// Scans stored chunks at daemon startup for `.docx`, `.odt`, `.xlsx`, `.pptx`, or `.pdf` files
+    /// that were previously indexed via degraded fallbacks (e.g. raw PKZIP central directory XML
+    /// filenames `[Content_Types].xml` / `word/document.xml` or body-less PDF trailer metadata),
+    /// re-extracts them using the native Rust `DocumentExtractor`, and replaces them in storage.
+    pub async fn upgrade_degraded_document_chunks(&self) -> Result<usize, IngestError> {
+        let all_chunks = self.storage.scan_all_chunks().await?;
+        let mut degraded_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        for chunk in &all_chunks {
+            if DocumentExtractor::is_degraded_document_chunk(&chunk.file_path, &chunk.text_content) {
+                degraded_paths.insert(chunk.file_path.clone());
+            }
+        }
+
+        if degraded_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let chunker = TextChunker::new(ChunkerConfig::default());
+        let mut upgraded_files = 0usize;
+
+        for path_str in degraded_paths {
+            let file_path = std::path::Path::new(&path_str);
+            if !file_path.exists() {
+                continue;
+            }
+            let identity = match self.classifier.classify_file(file_path) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let content = match DocumentExtractor::extract_text(file_path, &identity) {
+                Ok(c) if !c.trim().is_empty() => c,
+                _ => continue,
+            };
+            if DocumentExtractor::is_degraded_document_chunk(&path_str, &content) {
+                continue;
+            }
+
+            let access_tier = self.config.resolve_access_tier(file_path);
+            let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
+            let raw_chunks = chunker.chunk_text(&content);
+            if raw_chunks.is_empty() {
+                continue;
+            }
+
+            let header = crate::chunker::build_contextual_header(file_path, &content);
+            let contract_hash = self.embedder.contract().derive_contract_hash_hex();
+            let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
+            let mut doc_chunks = Vec::with_capacity(raw_chunks.len());
+
+            for raw in raw_chunks {
+                let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
+                let chunk_content = crate::chunker::prepend_contextual_header(&header, raw.text_slice);
+                file_chunk_hashes.push(raw_b3.clone());
+
+                let vector = if let Some(cached) = self.dedup.cache().get(&raw_b3) {
+                    cached
+                } else {
+                    let vec = self
+                        .embedder
+                        .embed_text(raw.text_slice)
+                        .unwrap_or_else(|_| vec![0.0; self.embedder.dimension()]);
+                    self.dedup.cache().insert(raw_b3, vec.clone());
+                    vec
+                };
+
+                let chunk_id = format!("{}:{}", file_b3, raw.chunk_index);
+                let metadata_json = serde_json::json!({
+                    "char_start": raw.char_start,
+                    "char_end": raw.char_end,
+                    "chunk_index": raw.chunk_index,
+                    "contract_hash": contract_hash,
+                })
+                .to_string();
+
+                if let Ok(dc) = DocumentChunk::new(
+                    chunk_id,
+                    file_b3.clone(),
+                    &path_str,
+                    raw.line_start,
+                    raw.line_end,
+                    access_tier,
+                    vector,
+                    &chunk_content,
+                    Some(metadata_json),
+                ) {
+                    doc_chunks.push(dc);
+                }
+            }
+
+            if doc_chunks.is_empty() {
+                continue;
+            }
+
+            let _ = self.storage.delete_by_file_path(&path_str).await;
+            self.storage.insert_chunks(&doc_chunks).await?;
+
+            if let Ok(meta) = std::fs::metadata(file_path) {
+                let mtime_secs = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                self.dedup.register_entry(FileCatalogEntry {
+                    file_path: file_path.to_path_buf(),
+                    file_blake3: file_b3,
+                    mtime_secs,
+                    size_bytes: meta.len(),
+                    chunk_hashes: file_chunk_hashes,
+                });
+            }
+            upgraded_files += 1;
+        }
+
+        if upgraded_files > 0 {
+            if let Some(ref cat_path) = self.config.dedup_catalog_path {
+                let _ = self.dedup.save_catalog_to_file(cat_path);
+            }
+            let _ = self.storage.bump_index_epoch("degraded_doc_chunks_upgraded");
+            info!(
+                upgraded_files,
+                "Self-healed degraded DOCX/PDF chunks using native Rust extractor"
+            );
+        }
+
+        Ok(upgraded_files)
+    }
+
 
     /// Cooperative cancellation of an ongoing reindex task.
     pub fn cancel_reindex(&self) -> bool {

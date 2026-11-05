@@ -113,12 +113,41 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   async function verifySelectedModelAvailability(modelFamily) {
     const existingBanner = document.getElementById('missing-model-guidance-card');
     if (existingBanner) existingBanner.remove();
+    const existingOllamaBanner = document.getElementById('missing-ollama-install-card');
+    if (existingOllamaBanner) existingOllamaBanner.remove();
     try {
-      const res = await fetchWithTimeout('/api/models', {}, 400);
+      const res = await fetchWithTimeout('/api/models', {}, 600);
       if (!res || !res.ok) return;
       const info = await res.json();
+      window._modelsData = info;
       const installed = Array.isArray(info.installed_models) ? info.installed_models : [];
-      if (!installed.length) return;
+
+      // 1. Mandatory Ollama Host Installation Check
+      if (info.ollama_installed === false || (!info.ollama_online && installed.length === 0)) {
+        const card = document.createElement('div');
+        card.id = 'missing-ollama-install-card';
+        card.style.cssText = 'margin:10px 16px; padding:14px 18px; border-radius:10px; border:1px solid rgba(239,68,68,0.5); background:rgba(239,68,68,0.12); font-size:13px; line-height:1.55;';
+        card.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+            <div>
+              <strong style="color:#ef4444; font-size:13.5px;">⚠️ Ollama is Not Installed on this Computer</strong>
+              <div style="margin-top:3px; opacity:0.9;">QuorumRAG consensus deliberation and local neural synthesis require Ollama. Install it now with 1 click.</div>
+            </div>
+            <button type="button" id="btn-install-ollama-auto" class="pill-btn" style="background:#ef4444; color:#fff; border-color:#ef4444; font-weight:600; padding:7px 16px;">
+              ⚡ Install Ollama Automatically
+            </button>
+          </div>
+          <div id="ollama-install-progress-status" style="margin-top:8px; font-size:12px; font-family:monospace; display:none;"></div>
+        `;
+        if (chatStream && chatStream.parentElement) {
+          chatStream.parentElement.insertBefore(card, chatStream);
+        }
+        const btn = card.querySelector('#btn-install-ollama-auto');
+        if (btn) {
+          btn.addEventListener('click', () => window._installOllamaAuto(btn));
+        }
+        return;
+      }
       const expectedTagMap = {
         Gemma4_26b: 'gemma4:26b',
         Glm4Agentic: 'glm4:9b',
@@ -196,32 +225,39 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         window._discoveredOllamaTags = info.installed_models;
       }
 
-      // 1. Dynamic Header Model Selector Bar
-      const bar = document.querySelector('.model-selector-bar');
-      if (bar && Array.isArray(info.calibrated_pills) && info.calibrated_pills.length > 0) {
-        bar.innerHTML = info.calibrated_pills
-          .filter(p => p.category === 'auto' || (p.category === 'chat' && p.memory_eligible !== false))
-          .map(p => {
-            const isAct = currentModel === p.id || (p.category === 'auto' && (currentModel === 'AutoFusion' || !currentModel));
-            return `<button class="model-pill ${isAct ? 'active' : ''}" data-model="${escapeHtml(p.id)}" title="${escapeHtml(p.description || '')}">${escapeHtml(p.name)}</button>`;
-          })
-          .join('');
+      // 1. Populate Top Navigation Primary Model Selector (Clean Dropdown, Zero Pill Clutter)
+      const topModelSel = document.getElementById('top-model-select');
+      if (topModelSel) {
+        const autoLabel = info.calibrated_target ? `✨ Auto-Fusion (${info.calibrated_target})` : '✨ Auto-Fusion';
+        const coreOpts = [
+          { id: 'AutoFusion', name: autoLabel },
+          { id: 'Gemma4_26b', name: '💎 Gemma 4 26B' },
+          { id: 'Glm4Agentic', name: '🧠 GLM-4-9B' },
+          { id: 'Qwen25Code', name: '💻 Qwen 2.5' },
+          { id: 'GemmaProse', name: '📜 Gemma 2' },
+        ];
 
-        // Rebind click listeners to new dynamic buttons
-        bar.querySelectorAll('.model-pill').forEach(pill => {
-          pill.addEventListener('click', () => {
-            bar.querySelectorAll('.model-pill').forEach(p => p.classList.remove('active'));
-            pill.classList.add('active');
-            currentModel = pill.dataset.model;
-            if (typeof saveUiSettingsPatch === 'function') {
-              saveUiSettingsPatch({ default_model_family: currentModel }).catch(() => {});
-            }
-            if (telemetryModelInfo) {
-              telemetryModelInfo.textContent = pill.textContent.trim();
-            }
-            verifySelectedModelAvailability(currentModel);
-          });
+        let selectHtml = coreOpts.map(m => {
+          const isSel = (currentModel === m.id) || (m.id === 'AutoFusion' && (!currentModel || currentModel === 'AutoFusion'));
+          return `<option value="${escapeHtml(m.id)}" ${isSel ? 'selected' : ''}>${escapeHtml(m.name)}</option>`;
+        }).join('');
+
+        const otherModels = (info.installed_models || []).filter(m => {
+          const l = m.toLowerCase();
+          return !l.includes('embed') && !l.includes('bge') && !l.includes('minilm') && !l.includes('nomic');
         });
+
+        if (otherModels.length > 0) {
+          selectHtml += `<optgroup label="Other Installed Ollama Models">`;
+          otherModels.forEach(m => {
+            const isSel = currentModel === m;
+            selectHtml += `<option value="${escapeHtml(m)}" ${isSel ? 'selected' : ''}>${escapeHtml(m)}</option>`;
+          });
+          selectHtml += `</optgroup>`;
+        }
+
+        topModelSel.innerHTML = selectHtml;
+        if (currentModel) topModelSel.value = currentModel;
       }
 
       // 2. Update telemetry display if auto
@@ -229,6 +265,25 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         telemetryModelInfo.textContent = 'Auto (' + info.calibrated_target + ')';
       }
     } catch (_) {}
+  }
+
+  // Top Deliberation Bar Dropdown Listeners
+  const topConsensusSelectEl = document.getElementById('top-consensus-select');
+  if (topConsensusSelectEl) {
+    topConsensusSelectEl.addEventListener('change', () => {
+      if (typeof window._setConsensusFromSettings === 'function') {
+        window._setConsensusFromSettings(topConsensusSelectEl.value);
+      }
+    });
+  }
+
+  const topModelSelectEl = document.getElementById('top-model-select');
+  if (topModelSelectEl) {
+    topModelSelectEl.addEventListener('change', () => {
+      if (typeof window._setModelFromSettings === 'function') {
+        window._setModelFromSettings(topModelSelectEl.value);
+      }
+    });
   }
 
   // Trigger dynamic model hydration on load
@@ -258,7 +313,213 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   // Ensure any legacy quick-prompt chips are removed while keeping the top page logo (#welcome-banner) visible
   document.querySelectorAll('.quick-prompts, .prompt-chip, .prompt-chips, .sample-prompts').forEach(el => el.remove());
 
-  // 5. NEW CHAT
+  // 5. NEW CHAT & PERSISTENT SQLITE SIDEBAR HISTORY (`GET/POST/DELETE /api/history`)
+  const conversationHistoryList = document.getElementById('conversation-history');
+  const btnClearAllHistory = document.getElementById('btn-clear-all-history');
+  const dialogConfirmClearHistory = document.getElementById('dialog-confirm-clear-history');
+  let sidebarSessionsCache = [];
+
+  function renderSidebarHistoryList(sessions) {
+    const list = Array.isArray(sessions) ? sessions : [];
+    if (btnClearAllHistory) {
+      btnClearAllHistory.classList.toggle('hidden', list.length === 0);
+    }
+    if (!conversationHistoryList) return;
+
+    if (list.length === 0) {
+      conversationHistoryList.innerHTML = '<li class="history-empty-hint">No saved chats yet</li>';
+      return;
+    }
+
+    conversationHistoryList.innerHTML = list.map(item => {
+      const sid = String(item.session_id || '');
+      const title = String(item.title || 'Conversation').trim() || 'Conversation';
+      const isActive = sid === activeSessionId;
+      return `
+        <li class="conversation-item${isActive ? ' active' : ''}" data-session-id="${escapeHtml(sid)}">
+          <button type="button" class="conversation-open-btn" data-session-id="${escapeHtml(sid)}">
+            <span class="conversation-title-text">${escapeHtml(title)}</span>
+          </button>
+          <button type="button" class="btn-delete-conv" data-session-id="${escapeHtml(sid)}" aria-label="${escapeHtml('Delete conversation: ' + title)}">
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+              <path d="M10 11v6"></path>
+              <path d="M14 11v6"></path>
+              <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
+            </svg>
+          </button>
+        </li>
+      `;
+    }).join('');
+  }
+
+  async function loadSidebarChatHistory() {
+    try {
+      const res = await fetchWithTimeout('/api/history', {}, 2500);
+      if (!res || !res.ok) return;
+      const data = await res.json();
+      sidebarSessionsCache = Array.isArray(data.sessions) ? data.sessions : [];
+      renderSidebarHistoryList(sidebarSessionsCache);
+    } catch (_) {}
+  }
+
+  async function openHistorySession(sessionId) {
+    if (!sessionId || isGenerating) return;
+    try {
+      const res = await fetchWithTimeout('/api/history/' + encodeURIComponent(sessionId), {}, 2500);
+      if (!res || !res.ok) return;
+      const data = await res.json();
+      const messages = Array.isArray(data.messages) ? data.messages : [];
+
+      activeSessionId = sessionId;
+      activeSessionSeenChunkIds.clear();
+      conversationHistoryTurns = [];
+      chatStream.innerHTML = '';
+      if (welcomeBanner) {
+        welcomeBanner.style.display = '';
+        welcomeBanner.classList.remove('hidden');
+      }
+      if (telemetryBar) {
+        telemetryBar.classList.add('hidden');
+      }
+      resetTelemetryPills();
+
+      let lastUserPrompt = '';
+      let priorTurnsSnapshot = [];
+
+      for (const msg of messages) {
+        if (!msg) continue;
+        if (msg.role === 'user') {
+          lastUserPrompt = String(msg.content || '');
+          appendMessage('user', lastUserPrompt);
+        } else if (msg.role === 'assistant') {
+          const { bodyEl, citationsEl, headerEl, actionsEl } = createAssistantMessage();
+          const rawMd = String(msg.content || '');
+          bodyEl._rawMarkdown = rawMd;
+          bodyEl.style.whiteSpace = 'normal';
+          bodyEl.innerHTML = renderMarkdownHtml(rawMd);
+
+          const cits = Array.isArray(msg.citations) ? msg.citations : [];
+          citationsEl._pendingCitations = cits;
+          citationsEl._seenFiles = new Set();
+          citationsEl._hasSourcesHeading = false;
+          citationsEl._nextIndex = 0;
+          citationsEl._records = [];
+          citationsEl._gallery = null;
+          if (msg.responder_peer_id && msg.responder_peer_id !== 'local') {
+            citationsEl._responderPeerId = String(msg.responder_peer_id).trim();
+          }
+          citationsEl._suppressMedia = answerSaysNoMatch(rawMd || bodyEl.innerText || '');
+          for (const cit of cits) {
+            if (cit && cit.file_path && !String(cit.file_path).startsWith('Local Neural')) {
+              appendCitation(citationsEl, cit);
+            }
+          }
+          linkInlineCitations(bodyEl, citationsEl);
+          if (actionsEl) {
+            renderResponseActionsBar(actionsEl, bodyEl, citationsEl, headerEl, lastUserPrompt, priorTurnsSnapshot);
+          }
+
+          const cleanAsst = stripSourcesFooterMarkdown(rawMd);
+          if (lastUserPrompt) {
+            conversationHistoryTurns.push(
+              { role: 'user', content: lastUserPrompt },
+              { role: 'assistant', content: cleanAsst }
+            );
+            priorTurnsSnapshot = conversationHistoryTurns.slice(-14);
+          }
+        }
+      }
+
+      renderSidebarHistoryList(sidebarSessionsCache);
+      scrollToBottom();
+    } catch (_) {}
+  }
+
+  async function deleteSingleHistorySession(sessionId) {
+    if (!sessionId) return;
+    try {
+      await fetch('/api/history/' + encodeURIComponent(sessionId), { method: 'DELETE' });
+    } catch (_) {}
+    sidebarSessionsCache = sidebarSessionsCache.filter(s => s.session_id !== sessionId);
+    if (sessionId === activeSessionId) {
+      activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
+      activeSessionSeenChunkIds.clear();
+      conversationHistoryTurns = [];
+      if (chatStream) chatStream.innerHTML = '';
+      if (welcomeBanner) {
+        welcomeBanner.style.display = '';
+        welcomeBanner.classList.remove('hidden');
+      }
+      if (telemetryBar) telemetryBar.classList.add('hidden');
+      resetTelemetryPills();
+    }
+    renderSidebarHistoryList(sidebarSessionsCache);
+    loadSidebarChatHistory();
+  }
+
+  async function clearAllHistorySessions() {
+    try {
+      await fetch('/api/history', { method: 'DELETE' });
+    } catch (_) {}
+    sidebarSessionsCache = [];
+    activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
+    activeSessionSeenChunkIds.clear();
+    conversationHistoryTurns = [];
+    if (chatStream) chatStream.innerHTML = '';
+    if (welcomeBanner) {
+      welcomeBanner.style.display = '';
+      welcomeBanner.classList.remove('hidden');
+    }
+    if (telemetryBar) telemetryBar.classList.add('hidden');
+    resetTelemetryPills();
+    renderSidebarHistoryList([]);
+    if (typeof showSettingsToast === 'function') {
+      showSettingsToast('All chat history deleted from database');
+    }
+  }
+
+  function promptAndClearAllHistory() {
+    if (dialogConfirmClearHistory && typeof dialogConfirmClearHistory.showModal === 'function') {
+      dialogConfirmClearHistory.returnValue = 'cancel';
+      dialogConfirmClearHistory.showModal();
+      return;
+    }
+    clearAllHistorySessions();
+  }
+
+  if (dialogConfirmClearHistory) {
+    dialogConfirmClearHistory.addEventListener('close', () => {
+      if (dialogConfirmClearHistory.returnValue === 'confirm') {
+        clearAllHistorySessions();
+      }
+    });
+  }
+
+  if (btnClearAllHistory) {
+    btnClearAllHistory.addEventListener('click', () => {
+      promptAndClearAllHistory();
+    });
+  }
+
+  if (conversationHistoryList) {
+    conversationHistoryList.addEventListener('click', (e) => {
+      const delBtn = e.target.closest('.btn-delete-conv');
+      if (delBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        deleteSingleHistorySession(delBtn.dataset.sessionId);
+        return;
+      }
+      const openBtn = e.target.closest('.conversation-open-btn');
+      if (openBtn) {
+        e.preventDefault();
+        openHistorySession(openBtn.dataset.sessionId);
+      }
+    });
+  }
+
   btnNewChat.addEventListener('click', () => {
     activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     activeSessionSeenChunkIds.clear();
@@ -270,6 +531,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     }
     telemetryBar.classList.add('hidden');
     resetTelemetryPills();
+    renderSidebarHistoryList(sidebarSessionsCache);
   });
 
   // 7. INPUT AUTO-RESIZE, DYNAMIC REAL-TIME SPELLCHECK & KEYBOARD HANDLING
@@ -582,6 +844,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       if (btnStop) {
         btnStop.classList.add('hidden');
       }
+      loadSidebarChatHistory();
       scrollToBottom();
     }
   }
@@ -1277,11 +1540,12 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     const records = Array.isArray(citationsEl._records) ? citationsEl._records : [];
     const distinctPeers = new Set();
     for (const item of pendingList) {
+      const isExt = Boolean(item && item.is_external_node);
       const pid = String((item && (item.node_id || item.peer_id || item.source_peer)) || '').trim();
-      if (pid && pid.toLowerCase() !== 'local') {
+      if (isExt && pid && pid.toLowerCase() !== 'local') {
         distinctPeers.add(pid);
       } else {
-        distinctPeers.add(responderId);
+        distinctPeers.add(localNodeId);
       }
     }
     for (const rec of records) {
@@ -1359,9 +1623,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       : 'local';
     const rawPeer = String(cit.node_id || cit.peer_id || cit.source_peer || 'local').trim();
     const isLocal = !cit.is_external_node && (rawPeer === '' || rawPeer.toLowerCase() === 'local' || rawPeer === fallbackLocalPeerId);
-    const effectiveNodeId = (rawPeer === '' || rawPeer.toLowerCase() === 'local')
-      ? (citationsEl._responderPeerId && citationsEl._responderPeerId !== 'local' ? citationsEl._responderPeerId : fallbackLocalPeerId)
-      : rawPeer;
+    const effectiveNodeId = isLocal
+      ? fallbackLocalPeerId
+      : ((rawPeer === '' || rawPeer.toLowerCase() === 'local')
+          ? (citationsEl._responderPeerId && citationsEl._responderPeerId !== 'local' ? citationsEl._responderPeerId : fallbackLocalPeerId)
+          : rawPeer);
     const shortNodeId = effectiveNodeId.length > 12 ? effectiveNodeId.slice(0, 12) + '…' : effectiveNodeId;
     const dedupKey = effectiveNodeId.toLowerCase() + '::' + cleanFileName.toLowerCase();
     if (!cleanFileName || citationsEl._seenFiles.has(dedupKey)) {
@@ -2225,6 +2491,19 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         }
       }
       cachedSettingsData = data;
+      if (data && data.ui) {
+        const topConsensusSel = document.getElementById('top-consensus-select');
+        if (topConsensusSel && typeof data.ui.fusion_panel_size !== 'undefined') {
+          topConsensusSel.value = String(data.ui.fusion_panel_size);
+          window._currentConsensusPanelSize = Number(data.ui.fusion_panel_size);
+        }
+        const topModelSel = document.getElementById('top-model-select');
+        if (topModelSel && (data.ui.default_model_family || data.ui.primary_workhorse_model)) {
+          const mod = data.ui.default_model_family || data.ui.primary_workhorse_model;
+          currentModel = mod;
+          topModelSel.value = mod;
+        }
+      }
       updateSidebarMeshAndDlpPills(data);
       return data;
     } catch (_) {
@@ -2964,6 +3243,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           if (ep) await window._probeEndpoint(ep);
           break;
 
+        case 'install-ollama-auto':
+          e.preventDefault();
+          await window._installOllamaAuto(actionEl);
+          break;
+
         case 'refresh-ollama-tags':
           e.preventDefault();
           await window._refreshOllamaTags();
@@ -3224,22 +3508,15 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
 
         case 'clear-chat-history':
           e.preventDefault();
-          conversationHistoryTurns = [];
-          const histEl = document.getElementById('conversation-history');
-          if (histEl) histEl.innerHTML = '';
-          if (chatStream) chatStream.innerHTML = '';
-          if (welcomeBanner) {
-            welcomeBanner.style.display = '';
-            welcomeBanner.classList.remove('hidden');
-          }
-          showSettingsToast('Active chat history cleared');
+          await clearAllHistorySessions();
           break;
 
         case 'clear-archived-chats':
           e.preventDefault();
           await saveUiSettingsPatch({ archived_chats: [] });
+          await clearAllHistorySessions();
           renderSettingsTabContent('archived', '');
-          showSettingsToast('All archived chats cleared');
+          showSettingsToast('All saved and archived chats cleared');
           break;
       }
     });
@@ -3280,6 +3557,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             val = changeEl.value;
           }
           const toastMsg = changeEl.dataset.toastMessage || 'Setting updated';
+          if (key === 'fusion_panel_size') {
+            const topConsensusSel = document.getElementById('top-consensus-select');
+            if (topConsensusSel) topConsensusSel.value = String(val);
+            window._currentConsensusPanelSize = Number(val);
+          }
           await saveUiSettingsPatch({ [key]: val });
           showSettingsToast(toastMsg);
           if (changeEl.dataset.rerenderTab) {
@@ -3596,6 +3878,25 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             </div>
           </div>
 
+          <!-- Ollama Host Engine & One-Click Auto-Installer -->
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Ollama Host Engine</span>
+              <div class="settings-row-desc">Native Ollama inference engine for local LLM deliberation and GGUF execution.</div>
+              <div id="status-ollama-host" style="font-size:12px; margin-top:4px;">
+                ${window._modelsData && window._modelsData.ollama_installed
+                  ? `<span style="color:var(--success, #10a37f); font-weight:600;">🟢 Installed:</span> <code style="font-size:11px;">${escapeHtml(window._modelsData.ollama_binary || 'Active on host')}</code>`
+                  : `<span style="color:var(--danger, #ef4444); font-weight:600;">🔴 Not Installed:</span> Required for consensus deliberation and local neural synthesis`
+                }
+              </div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button type="button" class="pill-btn" data-action="install-ollama-auto" style="${window._modelsData && window._modelsData.ollama_installed ? '' : 'background:#ef4444; color:#fff; border-color:#ef4444; font-weight:600;'}">
+                ${window._modelsData && window._modelsData.ollama_installed ? '🔄 Reinstall / Update' : '⚡ Install Ollama Automatically'}
+              </button>
+            </div>
+          </div>
+
           <!-- Local Ollama REST API -->
           <div class="settings-row">
             <div class="settings-row-info">
@@ -3642,7 +3943,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Active model used for interactive directives, RAG synthesis, and multi-turn chat.</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center;">
-              <select id="setting-active-model" class="pill-select" style="min-width:250px;" data-change-action="ui-patch" data-patch-key="primary_workhorse_model" data-rerender-tab="true" data-toast-message="Primary model updated">
+              <select id="setting-active-model" class="pill-select" style="min-width:250px;" data-change-action="set-model">
                 ${discoveredTags.concat(customModels.map(m => m.tag)).filter((v, i, a) => v && a.indexOf(v) === i).map(tag => `
                   <option value="${escapeHtml(tag)}" ${workhorse === tag ? 'selected' : ''}>${escapeHtml(tag)}</option>
                 `).join('')}
@@ -5393,14 +5694,88 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     if (modalId === 'modal-reindex') checkReindexStatus();
   };
 
+  window._setConsensusFromSettings = async function(val) {
+    const num = Number(val) || 0;
+    window._currentConsensusPanelSize = num;
+    const topSel = document.getElementById('top-consensus-select');
+    if (topSel) topSel.value = String(num);
+    const settingSel = document.getElementById('setting-fusion-models');
+    if (settingSel) settingSel.value = String(num);
+    await saveUiSettingsPatch({ fusion_panel_size: num });
+    const label = num === 0 ? '0 (Auto: Dynamic RAM)' : (num + ' Models');
+    showSettingsToast('Consensus panel size set to ' + label);
+  };
+
   window._setModelFromSettings = async function(model) {
     currentModel = model;
+    const topModelSel = document.getElementById('top-model-select');
+    if (topModelSel) topModelSel.value = model;
+    const settingActiveModel = document.getElementById('setting-active-model');
+    if (settingActiveModel) settingActiveModel.value = model;
+    document.querySelectorAll('[data-change-action="set-model"]').forEach(sel => {
+      sel.value = model;
+    });
     document.querySelectorAll('.model-pill').forEach(b => {
       b.classList.toggle('active', b.dataset.model === model);
     });
-    await saveUiSettingsPatch({ default_model_family: model });
+    if (telemetryModelInfo) {
+      telemetryModelInfo.textContent = (model === 'AutoFusion' && window._modelsData && window._modelsData.calibrated_target)
+        ? `Auto (${window._modelsData.calibrated_target})`
+        : model;
+    }
+    await saveUiSettingsPatch({ default_model_family: model, primary_workhorse_model: model });
     verifySelectedModelAvailability(model);
-    showSettingsToast('Default model set to ' + model);
+    showSettingsToast('Primary model set to ' + model);
+  };
+
+  window._installOllamaAuto = async function(btnEl) {
+    const statusBox = document.getElementById('ollama-install-progress-status') || document.getElementById('result-test-ollama');
+    if (btnEl) {
+      btnEl.disabled = true;
+      btnEl.textContent = '⏳ Installing Ollama...';
+    }
+    if (statusBox) {
+      statusBox.style.display = 'block';
+      statusBox.style.color = '#818cf8';
+      statusBox.textContent = 'Triggering automated Ollama installation via host package manager / setup installer... Please wait.';
+    }
+    try {
+      const resp = await fetch('/api/ollama/install', { method: 'POST' });
+      const res = await resp.json();
+      if (resp.ok) {
+        if (statusBox) {
+          statusBox.style.color = 'var(--success, #10a37f)';
+          statusBox.textContent = '✓ ' + (res.message || 'Ollama installed successfully!') + ' Refreshing models...';
+        }
+        showSettingsToast('Ollama installed successfully!');
+        setTimeout(async () => {
+          await refreshDynamicModels();
+          const missingCard = document.getElementById('missing-ollama-install-card');
+          if (missingCard) missingCard.remove();
+          if (activeSettingsTab === 'models') {
+            renderSettingsTabContent('models', '');
+          }
+        }, 2000);
+      } else {
+        if (statusBox) {
+          statusBox.style.color = 'var(--danger, #ef4444)';
+          statusBox.textContent = '❌ Installation failed: ' + (res.error || 'Unknown error') + '. Fallback: ' + (res.terminal_fallback || 'winget install Ollama.Ollama');
+        }
+        if (btnEl) {
+          btnEl.disabled = false;
+          btnEl.textContent = '⚡ Retry Ollama Install';
+        }
+      }
+    } catch (e) {
+      if (statusBox) {
+        statusBox.style.color = 'var(--danger, #ef4444)';
+        statusBox.textContent = '❌ Request error: ' + e.message;
+      }
+      if (btnEl) {
+        btnEl.disabled = false;
+        btnEl.textContent = '⚡ Retry Ollama Install';
+      }
+    }
   };
 
   window._setSearchModeFromSettings = async function(mode) {
@@ -5949,8 +6324,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     showSettingsToast('All chats and settings exported to JSON');
   };
 
-  // Load initial settings on startup to sync theme & sidebar pills
-  loadFullSettings();
+  // Load initial settings and persistent SQLite conversation history on startup
+  loadFullSettings().then(() => loadSidebarChatHistory()).catch(() => loadSidebarChatHistory());
+  loadSidebarChatHistory();
   initSettingsEventDelegation();
 
 })();

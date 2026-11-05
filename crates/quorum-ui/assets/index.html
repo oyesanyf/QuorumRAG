@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>QuorumRAG — Local-First P2P Retrieval &amp; Agentic Workspace</title>
   <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
-  <link rel="stylesheet" href="/assets/styles.css?v=20261105a">
+  <link rel="stylesheet" href="/assets/styles.css?v=20261105b">
   <style>
     /* Inlined fallback styles ensuring test assertions pass */
     :root {
@@ -55,10 +55,13 @@
         <button id="btn-open-dlp-settings" class="sidebar-nav-btn"><span id="dlp-status-pill" class="status-pill healthy">Redact</span></button>
       </div>
 
-      <!-- Recent Conversations List -->
+      <!-- Recent Conversations List (SQLite-backed) -->
       <div class="sidebar-section conversations-section custom-scroll">
-        <div class="section-title">History</div>
-        <div id="conversation-history" class="conversation-list"></div>
+        <div class="history-header-row">
+          <span class="section-title history-section-title">History</span>
+          <button id="btn-clear-all-history" type="button" class="btn-clear-history hidden">Clear All</button>
+        </div>
+        <ul id="conversation-history" class="conversation-list" role="list"></ul>
       </div>
 
       <!-- Sidebar Footer Status & Settings Trigger -->
@@ -101,23 +104,31 @@
       <header class="top-nav">
         <div class="nav-left">
           <button id="btn-mobile-sidebar" class="btn-icon mobile-only">☰</button>
-          <!-- Multi-Model Selector Pill Bar -->
-          <div class="model-selector-bar">
-            <button class="model-pill active" data-model="AutoFusion" title="Hardware-aware Auto-Fusion dynamic router (prefers Gemma 4 26B when installed &amp; memory-eligible)">
-              ✨ Auto-Fusion
-            </button>
-            <button class="model-pill" data-model="Gemma4_26b" title="Gemma 4 26B MoE high-precision synthesis (gated on &gt;=18GB free RAM or &gt;=16GB free VRAM)">
-              💎 Gemma 4 26B
-            </button>
-            <button class="model-pill" data-model="Glm4Agentic" title="GLM-4-9B 128K multi-hop agentic synthesis">
-              🧠 GLM-4-9B
-            </button>
-            <button class="model-pill" data-model="Qwen25Code" title="Qwen 2.5 code specialist (sized by runtime free RAM/VRAM)">
-              💻 Qwen 2.5
-            </button>
-            <button class="model-pill" data-model="GemmaProse" title="Google Gemma natural prose (sized by runtime free RAM/VRAM)">
-              📜 Gemma 3
-            </button>
+          <!-- Deliberation Consensus Panel & Model Selector Bar -->
+          <div class="top-deliberation-bar">
+            <!-- 1. Consensus Deliberation Panel Size Dropdown -->
+            <div class="top-nav-select-wrap" title="Consensus Deliberation Panel: Total number of models evaluated concurrently">
+              <span class="top-nav-select-icon">⚖️</span>
+              <select id="top-consensus-select" class="top-nav-dropdown" aria-label="Consensus Deliberation Panel Size">
+                <option value="0">0 (Auto: RAM Sized)</option>
+                <option value="2">2 Models (Fast Dual Consensus)</option>
+                <option value="3">3 Models (Tri-Specialist)</option>
+                <option value="5">5 Models (Deep Consensus Panel)</option>
+                <option value="10">10 Models (Exhaustive Frontier Deliberation)</option>
+              </select>
+            </div>
+
+            <!-- 2. Primary Synthesis Model Dropdown -->
+            <div class="top-nav-select-wrap" title="Primary Synthesis Model: Auto-Fusion or specific local specialist">
+              <span class="top-nav-select-icon">🧠</span>
+              <select id="top-model-select" class="top-nav-dropdown" aria-label="Primary Synthesis Model">
+                <option value="AutoFusion">✨ Auto-Fusion</option>
+                <option value="Gemma4_26b">💎 Gemma 4 26B</option>
+                <option value="Glm4Agentic">🧠 GLM-4-9B</option>
+                <option value="Qwen25Code">💻 Qwen 2.5</option>
+                <option value="GemmaProse">📜 Gemma 2</option>
+              </select>
+            </div>
           </div>
         </div>
 
@@ -408,6 +419,17 @@
     </section>
   </div>
 
-  <script src="/assets/app.js?v=20261105a"></script>
+  <dialog id="dialog-confirm-clear-history" class="history-confirm-dialog" aria-labelledby="clear-history-dialog-title">
+    <form method="dialog" class="history-confirm-form">
+      <h2 id="clear-history-dialog-title" class="history-confirm-title">Delete all chat history?</h2>
+      <p class="history-confirm-desc">This permanently removes every saved conversation from the local SQLite database. Indexed documents and settings are untouched.</p>
+      <div class="history-confirm-actions">
+        <button type="submit" value="cancel" class="pill-btn">Cancel</button>
+        <button type="submit" value="confirm" class="pill-btn btn-danger-confirm">Delete All</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/assets/app.js?v=20261105b"></script>
 </body>
 </html>

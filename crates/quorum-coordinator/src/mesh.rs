@@ -372,6 +372,61 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             }
         }
 
+        // Expand adjacent/body chunks (`{doc_id}:0..=4`) for the top matched multi-chunk documents
+        // so when Chunk 0 matches primarily via its title/header banner (e.g. a resume timeline),
+        // the subsequent career/body chunks are included in the federated response as well.
+        let mut top_doc_ids: Vec<(String, f32)> = Vec::new();
+        for item in &scored {
+            let doc_prefix = if !item.chunk.document_id.is_empty() {
+                item.chunk.document_id.clone()
+            } else if let Some((prefix, _)) = item.chunk.chunk_id.rsplit_once(':') {
+                prefix.to_string()
+            } else {
+                continue;
+            };
+            if !top_doc_ids.iter().any(|(d, _)| d == &doc_prefix) {
+                top_doc_ids.push((doc_prefix, item.score));
+                if top_doc_ids.len() >= 4 {
+                    break;
+                }
+            }
+        }
+
+        if !top_doc_ids.is_empty() {
+            let mut sibling_ids: Vec<String> = Vec::new();
+            let mut doc_base_scores: std::collections::HashMap<String, f32> =
+                std::collections::HashMap::new();
+            for (doc_id, base_score) in top_doc_ids {
+                doc_base_scores.insert(doc_id.clone(), base_score);
+                for idx in 0..=4 {
+                    let cand_id = format!("{}:{}", doc_id, idx);
+                    if !seen_ids.contains(&cand_id) {
+                        sibling_ids.push(cand_id);
+                    }
+                }
+            }
+            if !sibling_ids.is_empty() {
+                let extra_chunks = self
+                    .local_storage
+                    .get_chunks_by_ids(&sibling_ids, effective_tier)
+                    .await;
+                for extra in extra_chunks {
+                    if seen_ids.insert(extra.chunk_id.clone()) {
+                        let base = doc_base_scores
+                            .get(&extra.document_id)
+                            .copied()
+                            .unwrap_or(0.015);
+                        scored.push(quorum_types::ScoredChunk::new(
+                            extra,
+                            (base * 0.92).max(0.012),
+                            "local",
+                            false,
+                        ));
+                    }
+                }
+            }
+        }
+
         let candidate_dtos: Vec<CandidateChunkDto> = scored
             .iter()
             .map(CandidateChunkDto::from_scored_chunk)

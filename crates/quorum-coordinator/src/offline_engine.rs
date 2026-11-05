@@ -129,9 +129,17 @@ impl DeterministicOfflineSynthesisEngine {
                 continue;
             }
             // Strip image indexer structural labels (`[Filename Keywords]: ...`, `[Directory Context]: ...`, `[OCR Text]:`)
+            // and any residual OpenXML ZIP manifest lines (`[Content_Types].xml`, `_rels/.rels`, `word/document.xml`)
+            let tl_manifest = trimmed.to_ascii_lowercase();
             if trimmed.starts_with("[Filename Keywords]:")
                 || trimmed.starts_with("[Directory Context]:")
                 || trimmed.eq_ignore_ascii_case("[OCR Text]:")
+                || tl_manifest == "[content_types].xml"
+                || tl_manifest == "_rels/.rels"
+                || tl_manifest == "word/document.xml"
+                || tl_manifest == "word/_rels/document.xml.rels"
+                || tl_manifest.starts_with("word/theme/")
+                || tl_manifest.starts_with("docprops/")
             {
                 continue;
             }
@@ -2773,6 +2781,18 @@ impl DeterministicOfflineSynthesisEngine {
         if qw.first() == Some(&"when") || ["date", "dated", "start", "started", "began", "begin"].iter().any(|w| has(w)) {
             out.extend(["dated", "date", "starting", "day", "entered"]);
         }
+        if [
+            "role", "roles", "position", "positions", "title", "titles", "held", "timeline",
+            "career", "employer", "employers", "employment",
+        ]
+        .iter()
+        .any(|w| has(w))
+        {
+            out.extend([
+                "experience", "architect", "engineer", "lead", "senior", "analyst", "consultant",
+                "manager", "director",
+            ]);
+        }
         out.dedup();
         out
     }
@@ -2839,6 +2859,38 @@ impl DeterministicOfflineSynthesisEngine {
             }
             if text_l.contains('@') || tok("email") {
                 score += 120;
+            }
+        }
+
+        let asks_roles_or_timeline = [
+            "role", "roles", "position", "positions", "title", "titles", "held", "timeline",
+            "career", "employer", "employers", "employment",
+        ]
+        .iter()
+        .any(|w| has(w));
+        if asks_roles_or_timeline {
+            let role_hits = [
+                "architect", "engineer", "analyst", "consultant", "specialist", "director",
+                "manager", "lead", "principal", "senior", "developer", "administrator", "officer",
+            ]
+            .iter()
+            .filter(|w| tok(w))
+            .count();
+            if role_hits > 0 {
+                score += (role_hits.min(3) as i32) * 50;
+            }
+            let has_year_or_present = tok("present")
+                || tok("experience")
+                || tokens.iter().any(|t| {
+                    t.len() == 4
+                        && (t.starts_with("19") || t.starts_with("20"))
+                        && t.chars().all(|c| c.is_ascii_digit())
+                });
+            if role_hits > 0 && has_year_or_present {
+                score += 65;
+            }
+            if text_l.contains("[content_types].xml") || text_l.contains("word/document.xml") {
+                score -= 220;
             }
         }
         score

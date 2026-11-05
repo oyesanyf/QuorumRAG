@@ -52,6 +52,14 @@ pub trait StorageSearcher: Send + Sync {
         Vec::new()
     }
 
+    async fn get_chunks_by_ids(
+        &self,
+        _chunk_ids: &[String],
+        _max_tier: u8,
+    ) -> Vec<quorum_types::DocumentChunk> {
+        Vec::new()
+    }
+
     fn index_epoch(&self) -> u64 {
         1
     }
@@ -106,6 +114,19 @@ impl StorageSearcher for quorum_storage::StorageEngine {
             .unwrap_or_default()
     }
 
+    async fn get_chunks_by_ids(
+        &self,
+        chunk_ids: &[String],
+        max_tier: u8,
+    ) -> Vec<quorum_types::DocumentChunk> {
+        self.get_chunks_by_ids(chunk_ids)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.access_tier <= max_tier)
+            .collect()
+    }
+
     fn index_epoch(&self) -> u64 {
         self.index_epoch()
     }
@@ -154,6 +175,14 @@ impl<T: StorageSearcher + ?Sized> StorageSearcher for Arc<T> {
         top_k: usize,
     ) -> Vec<ScoredChunk> {
         (**self).search_text(query, max_tier, top_k).await
+    }
+
+    async fn get_chunks_by_ids(
+        &self,
+        chunk_ids: &[String],
+        max_tier: u8,
+    ) -> Vec<quorum_types::DocumentChunk> {
+        (**self).get_chunks_by_ids(chunk_ids, max_tier).await
     }
 
     fn index_epoch(&self) -> u64 {
