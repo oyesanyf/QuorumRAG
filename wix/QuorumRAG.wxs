@@ -9,7 +9,7 @@
              UpgradeCode="6c84d2a1-9f3b-47e2-b815-3d9a7e4c102f"
              Scope="perMachine">
 
-        <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+        <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallInitialize" />
         <MediaTemplate EmbedCab="yes" />
 
         <!-- Universal Zero-Touch PATH Law:
