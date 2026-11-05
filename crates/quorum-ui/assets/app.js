@@ -789,6 +789,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         citationsEl._pendingCitations.push(cit);
       }
     } else if (type === 'ExecutionFinished' || type === 'execution_finished' || type === 'done') {
+      if (citationsEl && data && data.responder_peer_id) {
+        citationsEl._responderPeerId = String(data.responder_peer_id).trim();
+      }
       markTelemetryComplete();
     } else if (type === 'ExecutionError' || type === 'execution_error') {
       bodyEl.innerHTML += `<div style="color:var(--danger); margin-top:8px;">[Error: ${data.error_message || 'Execution error'}]</div>`;
@@ -1115,6 +1118,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     pathLink.title = rec.local ? 'Open this file' : 'Remote peer file (path only)';
     pathLink.addEventListener('click', (ev) => { ev.preventDefault(); openFilePreview(rec); });
     inspector.appendChild(pathLink);
+    const nodeMeta = document.createElement('div');
+    nodeMeta.className = 'qr-inspector-node-meta';
+    nodeMeta.style.cssText = 'font-size:11.5px; color:var(--text-muted); margin-top:4px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;';
+    nodeMeta.innerHTML = `<span><strong>Providing Node / Peer ID:</strong> <code>${escapeHtml(rec.nodeId || 'local')}</code></span> <span>•</span> <span><strong>Origin:</strong> ${escapeHtml(rec.originLabel || (rec.local ? 'Local Node' : 'Mesh Peer'))}</span>`;
+    inspector.appendChild(nodeMeta);
     if (rec.local && rec.kind === 'image') {
       const thumb = document.createElement('img');
       thumb.className = 'qr-inspector-thumb';
@@ -1211,15 +1219,60 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       citationsEl.style.borderTop = '1px solid var(--border-color, rgba(128,128,128,0.25))';
       const label = document.createElement('div');
       label.className = 'sources-heading';
-      label.style.cssText = 'width:100%;font-size:0.76rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;opacity:0.75;margin-bottom:6px;';
+      label.style.cssText = 'width:100%;font-size:0.76rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;opacity:0.75;margin-bottom:4px;';
       label.textContent = 'Sources';
       citationsEl.appendChild(label);
+
+      const localNodeId = (cachedSettingsData && cachedSettingsData.runtime && cachedSettingsData.runtime.local_peer_id)
+        ? String(cachedSettingsData.runtime.local_peer_id).trim()
+        : 'local-sovereign-node';
+      const responderId = (citationsEl._responderPeerId && citationsEl._responderPeerId !== 'local')
+        ? citationsEl._responderPeerId
+        : localNodeId;
+      const pendingList = Array.isArray(citationsEl._pendingCitations) ? citationsEl._pendingCitations : [];
+      const distinctPeers = new Set();
+      for (const item of pendingList) {
+        const pid = String((item && (item.node_id || item.peer_id || item.source_peer)) || '').trim();
+        if (pid && pid.toLowerCase() !== 'local') {
+          distinctPeers.add(pid);
+        } else {
+          distinctPeers.add(responderId);
+        }
+      }
+      if (distinctPeers.size === 0) distinctPeers.add(responderId);
+
+      const nodeRow = document.createElement('div');
+      nodeRow.className = 'sources-node-id-row';
+      nodeRow.style.cssText = 'width:100%; display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px; font-size:11.5px; color:var(--text-muted, #9ca3af);';
+      const peerBadge = document.createElement('button');
+      peerBadge.type = 'button';
+      peerBadge.className = 'sources-responder-peer-pill';
+      peerBadge.style.cssText = 'display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:6px; font-size:11px; font-family:monospace; background:rgba(16,163,127,0.14); color:#10a37f; border:1px solid rgba(16,163,127,0.35); cursor:pointer;';
+      peerBadge.title = 'Click to copy responding Peer / Node ID';
+      peerBadge.innerHTML = `<span>🌐 Peer ID:</span> <strong>${escapeHtml(responderId)}</strong>`;
+      peerBadge.addEventListener('click', () => copyText(responderId, peerBadge, '✓ Peer ID Copied: ' + responderId.slice(0, 16) + (responderId.length > 16 ? '...' : '')));
+      nodeRow.appendChild(peerBadge);
+      if (distinctPeers.size > 1) {
+        const meshSpan = document.createElement('span');
+        meshSpan.style.cssText = 'font-size:11px; opacity:0.85;';
+        meshSpan.textContent = `• Federated across ${distinctPeers.size} mesh nodes`;
+        nodeRow.appendChild(meshSpan);
+      }
+      citationsEl.appendChild(nodeRow);
     }
     const rawPath = String(cit.file_path || '').replace(LINE_REF_RE, '').trim();
     const fileName = rawPath.split(/[\\/]/).pop() || rawPath;
     const cleanFileName = fileName.replace(LINE_REF_RE, '').replace(COLON_RANGE_RE, '').trim();
-    const peerId = String(cit.peer_id || cit.source_peer || 'local').trim();
-    const dedupKey = peerId.toLowerCase() + '::' + cleanFileName.toLowerCase();
+    const fallbackLocalPeerId = (cachedSettingsData && cachedSettingsData.runtime && cachedSettingsData.runtime.local_peer_id)
+      ? String(cachedSettingsData.runtime.local_peer_id).trim()
+      : 'local';
+    const rawPeer = String(cit.node_id || cit.peer_id || cit.source_peer || 'local').trim();
+    const isLocal = !cit.is_external_node && (rawPeer === '' || rawPeer.toLowerCase() === 'local' || rawPeer === fallbackLocalPeerId);
+    const effectiveNodeId = (rawPeer === '' || rawPeer.toLowerCase() === 'local')
+      ? (citationsEl._responderPeerId && citationsEl._responderPeerId !== 'local' ? citationsEl._responderPeerId : fallbackLocalPeerId)
+      : rawPeer;
+    const shortNodeId = effectiveNodeId.length > 12 ? effectiveNodeId.slice(0, 12) + '…' : effectiveNodeId;
+    const dedupKey = effectiveNodeId.toLowerCase() + '::' + cleanFileName.toLowerCase();
     if (!cleanFileName || citationsEl._seenFiles.has(dedupKey)) {
       return;
     }
@@ -1230,10 +1283,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     let scorePct = rawScore > 1 ? Math.round(rawScore) : Math.round(rawScore * 100);
     scorePct = Math.max(0, Math.min(100, scorePct));
 
-    const isLocal = peerId === '' || peerId.toLowerCase() === 'local';
-    const peerLabel = !isLocal
-      ? ` [Peer: ${peerId.length > 8 ? peerId.slice(0, 8) + '...' : peerId}]`
-      : '';
+    const peerLabel = ` [Peer: ${shortNodeId}]`;
     const kind = mediaKind(rawPath);
     const rec = {
       citeNum,
@@ -1242,7 +1292,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       scorePct,
       snippet: cit.snippet || '',
       kind,
-      local: isLocal
+      local: isLocal,
+      nodeId: effectiveNodeId,
+      originLabel: cit.origin_label || (isLocal ? 'Local Node' : 'Mesh Peer')
     };
     citationsEl._records.push(rec);
 
@@ -1250,8 +1302,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     badge.type = 'button';
     badge.className = 'citation-badge';
     badge.dataset.citeNum = String(citeNum);
-    badge.title = `[${citeNum}] ${rec.filePath}${peerLabel}\nRelevance: ${scorePct}%\nClick to preview, open, or download`;
-    badge.innerHTML = `<span class="cite-index" style="font-weight:700;opacity:0.9;">[${citeNum}]</span> <span>${kindIcon(kind)} ${escapeHtml(cleanFileName + peerLabel)}</span> <span class="score-pill" style="opacity:0.85; font-size:11px; margin-left:3px; padding:1px 6px; border-radius:4px; background:rgba(66,133,244,0.2); font-weight:600;">\u00B7 ${scorePct}%</span>`;
+    badge.dataset.peerId = effectiveNodeId;
+    badge.title = `[${citeNum}] ${rec.filePath}\nProviding Peer ID: ${effectiveNodeId} (${rec.originLabel})\nRelevance: ${scorePct}%\nClick to preview, open, or download`;
+    badge.innerHTML = `<span class="cite-index" style="font-weight:700;opacity:0.9;">[${citeNum}]</span> <span>${kindIcon(kind)} ${escapeHtml(cleanFileName)}</span> <span class="cite-peer-tag" style="opacity:0.85; font-size:10.5px; font-family:monospace; padding:1px 5px; border-radius:4px; background:rgba(16,163,127,0.16); color:#10a37f;">Peer: ${escapeHtml(shortNodeId)}</span> <span class="score-pill" style="opacity:0.85; font-size:11px; margin-left:2px; padding:1px 6px; border-radius:4px; background:rgba(66,133,244,0.2); font-weight:600;">\u00B7 ${scorePct}%</span>`;
     badge.addEventListener('click', () => showSourceInspector(citationsEl, rec));
     citationsEl.appendChild(badge);
     appendMediaCard(citationsEl, rec);
@@ -2043,6 +2096,17 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       const resp = await fetch('/api/settings');
       if (!resp.ok) return null;
       const data = await resp.json();
+      if (data && data.ui && Array.isArray(data.ui.archived_chats)) {
+        const cleaned = stripMockArchivedChats(data.ui.archived_chats);
+        if (cleaned.length !== data.ui.archived_chats.length) {
+          data.ui.archived_chats = cleaned;
+          fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ui: data.ui })
+          }).catch(() => {});
+        }
+      }
       cachedSettingsData = data;
       updateSidebarMeshAndDlpPills(data);
       return data;
@@ -2192,23 +2256,28 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   window.quorumBrowseDir = async function(pathStr) {
     await fetchBrowseFolders(pathStr);
     renderSettingsTabContent('mesh', '');
+    showSettingsToast(pathStr ? ('Browsing ' + pathStr) : 'Showing physical drives');
   };
 
   window.quorumShareFolder = async function(pathStr) {
-    if (!pathStr || !pathStr.trim()) return;
+    if (!pathStr || !pathStr.trim()) {
+      showSettingsToast('Please enter or select a folder path to share');
+      return;
+    }
     const resp = await fetch('/api/mesh/shared-folders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: 'add', path: pathStr.trim(), enabled: true, access_tier: 0 })
     });
-    const res = await resp.json();
+    const res = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      alert(res.error || 'Failed to share folder');
+      showSettingsToast('⚠ ' + (res.error || 'Failed to share folder'));
       return;
     }
     await loadFullSettings();
     await fetchBrowseFolders(currentBrowsePath);
     renderSettingsTabContent('mesh', '');
+    showSettingsToast('✓ Shared folder with Mesh: ' + pathStr.trim());
   };
 
   window.quorumRemoveSharedFolder = async function(pathStr) {
@@ -2220,6 +2289,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     await loadFullSettings();
     await fetchBrowseFolders(currentBrowsePath);
     renderSettingsTabContent('mesh', '');
+    showSettingsToast('Removed folder from Mesh sharing: ' + pathStr);
   };
 
   window.quorumToggleSharedFolder = async function(pathStr, enabled) {
@@ -2231,6 +2301,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     await loadFullSettings();
     await fetchBrowseFolders(currentBrowsePath);
     renderSettingsTabContent('mesh', '');
+    showSettingsToast(enabled ? ('✓ Enabled Mesh sharing for ' + pathStr) : ('Paused Mesh sharing for ' + pathStr));
   };
 
   window.quorumUpdateFolderPolicy = async function(pathStr, accessTier, dlpModeOverride) {
@@ -2246,6 +2317,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     });
     await loadFullSettings();
     renderSettingsTabContent('mesh', '');
+    showSettingsToast('✓ Updated Mesh policy for ' + pathStr);
   };
 
   window.quorumUpdateMeshConfig = async function(payload) {
@@ -2332,16 +2404,29 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   let archivedSearchFilter = '';
   let archivedProjectFilter = 'all';
 
-  const DEFAULT_ARCHIVED_CHATS = [
-    { id: 'arch-1', title: 'Power of Prayer', archived_at: 'Sep 25, 2026, 9:17 PM', project: 'No project' },
-    { id: 'arch-2', title: 'Itumọ ati Itumọ ọrọ', archived_at: 'Sep 25, 2026, 9:16 PM', project: 'No project' },
-    { id: 'arch-3', title: 'Math as Cosmic Language', archived_at: 'Sep 25, 2026, 9:13 PM', project: 'No project' },
-    { id: 'arch-4', title: "Doctor's findings explanation", archived_at: 'Jul 7, 2026, 10:06 PM', project: 'No project' },
-    { id: 'arch-5', title: 'Self-Identity and Dissonance', archived_at: 'Jan 31, 2026, 4:59 PM', project: 'No project' },
-    { id: 'arch-6', title: 'College Prep for Engineering', archived_at: 'Jan 21, 2026, 9:57 AM', project: 'No project' },
-    { id: 'arch-7', title: 'Credo Reflection and Revision', archived_at: 'Jan 16, 2026, 11:16 AM', project: 'No project' },
-    { id: 'arch-8', title: 'Ways to be happy', archived_at: 'Jan 10, 2026, 8:42 PM', project: 'No project' }
-  ];
+  const LEGACY_MOCK_ARCHIVED_IDS = new Set([
+    'arch-1', 'arch-2', 'arch-3', 'arch-4', 'arch-5', 'arch-6', 'arch-7', 'arch-8'
+  ]);
+  const LEGACY_MOCK_ARCHIVED_TITLES = new Set([
+    'power of prayer',
+    'itumọ ati itumọ ọrọ',
+    'math as cosmic language',
+    "doctor's findings explanation",
+    'self-identity and dissonance',
+    'college prep for engineering',
+    'credo reflection and revision',
+    'ways to be happy'
+  ]);
+
+  function stripMockArchivedChats(list) {
+    if (!Array.isArray(list)) return [];
+    return list.filter(c => {
+      if (!c) return false;
+      const id = String(c.id || '').trim().toLowerCase();
+      const title = String(c.title || '').trim().toLowerCase();
+      return !LEGACY_MOCK_ARCHIVED_IDS.has(id) && !LEGACY_MOCK_ARCHIVED_TITLES.has(title);
+    });
+  }
 
   function showSettingsToast(msg) {
     let toast = document.getElementById('quorum-settings-toast');
@@ -3411,10 +3496,10 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       const foldersListHtml = sharedFolders.length === 0
         ? `<div style="padding:14px; text-align:center; color:var(--text-muted); font-size:13px;">No folders are currently shared with the Mesh. All local files are strictly private to this machine.</div>`
         : sharedFolders.map(f => `
-            <div class="folder-pill-item">
+            <div class="folder-pill-item" data-folder-path="${escapeHtml(f.path)}">
               <div style="flex:1; min-width:220px;">
-                <div style="font-weight:600; font-size:13.5px; display:flex; align-items:center; gap:8px;">
-                  <span>📁 ${escapeHtml(f.path)}</span>
+                <div style="font-weight:600; font-size:13.5px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                  <button type="button" data-folder-path="${escapeHtml(f.path)}" onclick="window.quorumBrowseDir(this.dataset.folderPath)" title="Click to browse inside ${escapeHtml(f.path)}" style="background:transparent; border:none; padding:0; color:var(--text-primary); font-weight:600; font-size:13.5px; cursor:pointer; text-align:left; text-decoration:underline;">📁 ${escapeHtml(f.path)}</button>
                   <span class="${f.enabled ? 'dlp-badge-allow' : 'dlp-badge-block'}">${f.enabled ? 'Shared with Mesh' : 'Paused (Local Only)'}</span>
                 </div>
                 <div style="font-size:11.5px; color:var(--text-muted); margin-top:3px;">
@@ -3422,31 +3507,31 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                 </div>
               </div>
               <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                <select class="settings-select" style="padding:4px 8px; font-size:12px;" onchange="window.quorumUpdateFolderPolicy(${JSON.stringify(f.path)}, this.value, ${JSON.stringify(f.dlp_mode_override || 'default')})">
+                <select class="settings-select" style="padding:4px 8px; font-size:12px;" data-folder-path="${escapeHtml(f.path)}" data-dlp-override="${escapeHtml(f.dlp_mode_override || 'default')}" onchange="window.quorumUpdateFolderPolicy(this.dataset.folderPath, this.value, this.dataset.dlpOverride)">
                   <option value="0" ${f.access_tier === 0 ? 'selected' : ''}>Tier 0: Public Mesh</option>
                   <option value="1" ${f.access_tier === 1 ? 'selected' : ''}>Tier 1: Internal Team</option>
                   <option value="2" ${f.access_tier === 2 ? 'selected' : ''}>Tier 2: Confidential</option>
                   <option value="3" ${f.access_tier === 3 ? 'selected' : ''}>Tier 3: Restricted</option>
                 </select>
-                <select class="settings-select" style="padding:4px 8px; font-size:12px;" onchange="window.quorumUpdateFolderPolicy(${JSON.stringify(f.path)}, ${f.access_tier || 0}, this.value)">
-                  <option value="default" ${!f.dlp_mode_override ? 'selected' : ''}>DLP: Global (${dlp.mode || 'Redact'})</option>
+                <select class="settings-select" style="padding:4px 8px; font-size:12px;" data-folder-path="${escapeHtml(f.path)}" data-access-tier="${Number(f.access_tier || 0)}" onchange="window.quorumUpdateFolderPolicy(this.dataset.folderPath, Number(this.dataset.accessTier || 0), this.value)">
+                  <option value="default" ${!f.dlp_mode_override ? 'selected' : ''}>DLP: Global (${escapeHtml(dlp.mode || 'Redact')})</option>
                   <option value="Redact" ${f.dlp_mode_override === 'Redact' ? 'selected' : ''}>DLP: Redact PHI</option>
                   <option value="Block" ${f.dlp_mode_override === 'Block' ? 'selected' : ''}>DLP: Block on PHI</option>
                 </select>
-                <input type="checkbox" class="quorum-switch" ${f.enabled ? 'checked' : ''} title="Enable or pause Mesh sharing for this folder" onchange="window.quorumToggleSharedFolder(${JSON.stringify(f.path)}, this.checked)">
-                <button class="btn-secondary" style="padding:4px 10px; font-size:12px; color:var(--danger);" onclick="window.quorumRemoveSharedFolder(${JSON.stringify(f.path)})">Remove</button>
+                <input type="checkbox" class="quorum-switch" ${f.enabled ? 'checked' : ''} title="Enable or pause Mesh sharing for this folder" data-folder-path="${escapeHtml(f.path)}" onchange="window.quorumToggleSharedFolder(this.dataset.folderPath, this.checked)">
+                <button type="button" class="btn-secondary" style="padding:4px 10px; font-size:12px; color:var(--danger); cursor:pointer;" data-folder-path="${escapeHtml(f.path)}" onclick="window.quorumRemoveSharedFolder(this.dataset.folderPath)">Remove</button>
               </div>
             </div>
           `).join('');
 
       const browserItemsHtml = (cachedBrowseDirs || []).map(d => `
-        <div class="folder-browser-item">
-          <button style="background:transparent; border:none; color:var(--text-primary); cursor:pointer; text-align:left; font-size:12.5px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" onclick="window.quorumBrowseDir(${JSON.stringify(d.path)})" title="Open ${escapeHtml(d.path)}">
+        <div class="folder-browser-item" data-folder-path="${escapeHtml(d.path)}">
+          <button type="button" style="background:transparent; border:none; color:var(--text-primary); cursor:pointer; text-align:left; font-size:12.5px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" data-folder-path="${escapeHtml(d.path)}" onclick="window.quorumBrowseDir(this.dataset.folderPath)" title="Open ${escapeHtml(d.path)}">
             ${d.is_drive ? '💽' : '📁'} ${escapeHtml(d.name)}
           </button>
           ${d.is_shared
-            ? `<button class="btn-secondary" style="padding:2px 8px; font-size:11px; color:var(--success);" onclick="window.quorumRemoveSharedFolder(${JSON.stringify(d.path)})">✓ Shared</button>`
-            : `<button class="btn-primary" style="padding:2px 8px; font-size:11px;" onclick="window.quorumShareFolder(${JSON.stringify(d.path)})">+ Share</button>`
+            ? `<button type="button" class="btn-secondary" style="padding:2px 8px; font-size:11px; color:var(--success); cursor:pointer;" data-folder-path="${escapeHtml(d.path)}" onclick="window.quorumRemoveSharedFolder(this.dataset.folderPath)">✓ Shared</button>`
+            : `<button type="button" class="btn-primary" style="padding:2px 8px; font-size:11px; cursor:pointer;" data-folder-path="${escapeHtml(d.path)}" onclick="window.quorumShareFolder(this.dataset.folderPath)">+ Share</button>`
           }
         </div>
       `).join('');
@@ -3482,8 +3567,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
 
           <!-- Add Folder by Path -->
           <div style="display:flex; gap:8px; margin-bottom:14px;">
-            <input type="text" id="new-shared-folder-input" class="settings-input" style="flex:1;" placeholder="Enter folder path to share with Mesh (e.g. D:\\harfile\\QuorumRAG\\docs)">
-            <button class="btn-primary" onclick="window.quorumShareFolder(document.getElementById('new-shared-folder-input').value)">+ Share Folder with Mesh</button>
+            <input type="text" id="new-shared-folder-input" class="settings-input" style="flex:1;" placeholder="Enter folder path to share with Mesh (e.g. D:\\harfile\\QuorumRAG\\docs)" onkeydown="if(event.key==='Enter'){event.preventDefault();window.quorumShareFolder(this.value);}">
+            <button type="button" class="btn-primary" style="cursor:pointer;" onclick="window.quorumShareFolder(document.getElementById('new-shared-folder-input').value)">+ Share Folder with Mesh</button>
           </div>
 
           <!-- Interactive Physical Drive & Folder Browser -->
@@ -3491,8 +3576,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
               <span style="font-size:12.5px; font-weight:600;">Browse Physical Drives to Select Folders: <code>${escapeHtml(currentBrowsePath || 'Physical Drives (D:\\, C:\\)')}</code></span>
               <div style="display:flex; gap:6px;">
-                <button class="btn-secondary" style="padding:4px 10px; font-size:12px;" onclick="window.quorumBrowseDir('')">💽 Drives Root</button>
-                ${currentBrowsePath ? `<button class="btn-primary" style="padding:4px 10px; font-size:12px;" onclick="window.quorumShareFolder(${JSON.stringify(currentBrowsePath)})">+ Share Current Folder</button>` : ''}
+                <button type="button" class="btn-secondary" style="padding:4px 10px; font-size:12px; cursor:pointer;" onclick="window.quorumBrowseDir('')">💽 Drives Root</button>
+                ${currentBrowsePath ? `<button type="button" class="btn-primary" style="padding:4px 10px; font-size:12px; cursor:pointer;" data-folder-path="${escapeHtml(currentBrowsePath)}" onclick="window.quorumShareFolder(this.dataset.folderPath)">+ Share Current Folder</button>` : ''}
               </div>
             </div>
             <div class="folder-browser-grid">${browserItemsHtml || '<div style="font-size:12px; color:var(--text-muted);">No subdirectories found.</div>'}</div>
@@ -3785,7 +3870,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Local libp2p Peer ID</span>
               <div class="settings-row-desc"><code>${escapeHtml(rt.local_peer_id || 'local')}</code></div>
             </div>
-            <button class="pill-btn" onclick="navigator.clipboard && navigator.clipboard.writeText(${JSON.stringify(rt.local_peer_id || 'local')}); window._toast('Peer ID copied to clipboard')">Copy Peer ID</button>
+            <button type="button" class="pill-btn" data-peer-id="${escapeHtml(rt.local_peer_id || 'local')}" onclick="window.quorumCopyText(this.dataset.peerId, 'Peer ID copied to clipboard')">Copy Peer ID</button>
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
@@ -3809,9 +3894,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         </div>
       `;
     } else if (tab === 'archived') {
-      const archived = (Array.isArray(ui.archived_chats) && ui.archived_chats.length > 0)
-        ? ui.archived_chats
-        : DEFAULT_ARCHIVED_CHATS;
+      const archived = stripMockArchivedChats(Array.isArray(ui.archived_chats) ? ui.archived_chats : []);
       const q = (archivedSearchFilter || '').trim().toLowerCase();
       const filtered = archived.filter(c => {
         const matchQ = !q || (c.title || '').toLowerCase().includes(q) || (c.archived_at || '').toLowerCase().includes(q);
@@ -3820,19 +3903,19 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       });
 
       const rowsHtml = filtered.length === 0
-        ? `<div style="padding:18px; text-align:center; color:var(--text-muted); font-size:13.5px;">No archived chats match your filter.</div>`
+        ? `<div style="padding:18px; text-align:center; color:var(--text-muted); font-size:13.5px;">No archived chats yet. Click <strong>+ Archive Current Chat</strong> above to archive a real conversation session.</div>`
         : filtered.map(c => `
-            <div class="archived-chat-row">
+            <div class="archived-chat-row" data-chat-id="${escapeHtml(c.id)}">
               <div style="display:flex; align-items:center; gap:12px; min-width:0;">
                 <span style="font-size:16px; opacity:0.75;">☁</span>
                 <div style="min-width:0;">
-                  <a href="#" class="archived-chat-title" onclick="event.preventDefault(); window._unarchiveChat(${JSON.stringify(c.id)})">${escapeHtml(c.title)}</a>
-                  <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">${escapeHtml(c.archived_at || 'Archived session')}</div>
+                  <a href="#" class="archived-chat-title" data-chat-id="${escapeHtml(c.id)}" onclick="event.preventDefault(); window._unarchiveChat(this.dataset.chatId)">${escapeHtml(c.title)}</a>
+                  <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">${escapeHtml(c.archived_at || 'Archived session')}${c.message_count ? ' • ' + Number(c.message_count) + ' msg(s)' : ''}</div>
                 </div>
               </div>
               <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
-                <button class="pill-btn" onclick="window._unarchiveChat(${JSON.stringify(c.id)})">Unarchive</button>
-                <button class="pill-btn-danger" onclick="window._deleteArchivedChat(${JSON.stringify(c.id)})">Delete</button>
+                <button type="button" class="pill-btn" data-chat-id="${escapeHtml(c.id)}" onclick="window._unarchiveChat(this.dataset.chatId)">Unarchive</button>
+                <button type="button" class="pill-btn-danger" data-chat-id="${escapeHtml(c.id)}" onclick="window._deleteArchivedChat(this.dataset.chatId)">Delete</button>
               </div>
             </div>
           `).join('');
@@ -3949,8 +4032,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                    <div class="settings-row-desc">${escapeHtml(c.email)} ${c.peer ? ' • Peer: <code>' + escapeHtml(c.peer) + '</code>' : ''}</div>
                  </div>
                  <div style="display:flex; gap:8px;">
-                   <button class="pill-btn" onclick="window._toast('Verified trusted contact: ' + ${JSON.stringify(c.name)})">Verify</button>
-                   <button class="pill-btn-danger" onclick="window._removeTrustedContact(${idx})">Remove</button>
+                   <button type="button" class="pill-btn" data-contact-name="${escapeHtml(c.name)}" onclick="window._toast('Verified trusted contact: ' + this.dataset.contactName)">Verify</button>
+                   <button type="button" class="pill-btn-danger" onclick="window._removeTrustedContact(${idx})">Remove</button>
                  </div>
                </div>
              `).join('')}
@@ -4051,11 +4134,15 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         </div>
       `;
     } else if (tab === 'storage') {
+      const liveChunks = Number(rt.total_chunks || 0);
+      const liveFiles = Number(rt.total_files || 0);
+      const estIndexGb = Math.max(0.01, (liveChunks * 4096) / (1024 * 1024 * 1024));
+      const pctUsed = Math.max(2, Math.min(98, Math.round((estIndexGb / 20) * 100)));
       settingsContent.innerHTML = `
         <h2 class="settings-page-title" style="margin-bottom:18px;">Storage</h2>
-        <div style="font-size:14px; font-weight:600; color:var(--text-primary);">4.59 GB of 20 GB used</div>
+        <div style="font-size:14px; font-weight:600; color:var(--text-primary);">${estIndexGb.toFixed(2)} GB of 20 GB local index quota used (${liveChunks.toLocaleString()} chunks • ${liveFiles.toLocaleString()} cataloged files)</div>
         <div class="storage-progress-track">
-          <div class="storage-progress-fill" style="width: 23%;"></div>
+          <div class="storage-progress-fill" style="width: ${pctUsed}%;"></div>
         </div>
 
         <div class="settings-section-heading" style="margin-bottom:2px;">Manage storage</div>
@@ -4065,7 +4152,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           <div class="settings-row clickable-row" onclick="window._toggleStorageSection('files')">
             <div class="settings-row-info">
               <span class="settings-row-label">Files</span>
-              <div class="settings-row-desc">2.49 GB • 1,064 files • 50,996 indexed chunks across ${(rt.physical_drives || ['D:\\', 'C:\\']).join(', ')}</div>
+              <div class="settings-row-desc">${liveFiles.toLocaleString()} cataloged files • ${liveChunks.toLocaleString()} indexed chunks across ${(rt.physical_drives || ['D:\\', 'C:\\']).join(', ')}</div>
             </div>
             <span style="font-size:16px; color:var(--text-muted);">${showStorageFilesDetail ? '⌄' : '›'}</span>
           </div>
@@ -4081,8 +4168,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
 
           <div class="settings-row clickable-row" onclick="window._toggleStorageSection('images')">
             <div class="settings-row-info">
-              <span class="settings-row-label">Images</span>
-              <div class="settings-row-desc">2.10 GB • 2,502 images • Local OCR &amp; multimodal metadata indexed</div>
+              <span class="settings-row-label">Images &amp; Scanned Media</span>
+              <div class="settings-row-desc">WinRT OCR &amp; multimodal vision embeddings active across indexed drives</div>
             </div>
             <span style="font-size:16px; color:var(--text-muted);">${showStorageImagesDetail ? '⌄' : '›'}</span>
           </div>
@@ -4096,10 +4183,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         </div>
       `;
     } else if (tab === 'personalization') {
-      const memories = Array.isArray(ui.saved_memories) ? ui.saved_memories : [
-        'Synthesize comprehensive multi-section Markdown answers from hybrid BM25 + LanceDB dense vector embeddings.',
-        'All answers must be grounded in local files or local Ollama models with citations grouped cleanly at the bottom.'
-      ];
+      const memories = Array.isArray(ui.saved_memories) ? ui.saved_memories : [];
       const baseTone = ui.base_style_tone || 'Default';
       const warmth = ui.tone_warmth || 'More';
       const enthusiasm = ui.tone_enthusiasm || 'More';
@@ -4514,43 +4598,57 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   window._archiveCurrentChat = async function() {
     if (!cachedSettingsData) await loadFullSettings();
     const ui = Object.assign({}, cachedSettingsData ? cachedSettingsData.ui : {});
-    const list = (Array.isArray(ui.archived_chats) && ui.archived_chats.length > 0)
-      ? ui.archived_chats.slice()
-      : DEFAULT_ARCHIVED_CHATS.slice();
+    const list = stripMockArchivedChats(Array.isArray(ui.archived_chats) ? ui.archived_chats.slice() : []);
+    const turns = Array.isArray(conversationHistoryTurns) ? conversationHistoryTurns.slice() : [];
+    const firstUserTurn = turns.find(t => t && t.role === 'user' && t.content && String(t.content).trim());
+    const derivedTitle = firstUserTurn
+      ? String(firstUserTurn.content).trim().slice(0, 72)
+      : ('QuorumRAG Session (' + new Date().toLocaleTimeString() + ')');
     list.unshift({
-      id: 'chat-' + Date.now(),
-      title: 'QuorumRAG Session (' + new Date().toLocaleTimeString() + ')',
+      id: 'chat-' + Date.now() + '-' + secureRandomToken(5),
+      title: derivedTitle,
       archived_at: new Date().toLocaleString(),
-      project: 'No project'
+      message_count: turns.length,
+      project: 'No project',
+      messages: turns
     });
     await saveUiSettingsPatch({ archived_chats: list });
     renderSettingsTabContent('archived', '');
-    showSettingsToast('Current chat archived');
+    showSettingsToast('Current chat archived (' + turns.length + ' message(s))');
   };
 
   window._unarchiveChat = async function(chatId) {
     if (!cachedSettingsData) await loadFullSettings();
     const ui = Object.assign({}, cachedSettingsData ? cachedSettingsData.ui : {});
-    const list = (Array.isArray(ui.archived_chats) && ui.archived_chats.length > 0)
-      ? ui.archived_chats.slice()
-      : DEFAULT_ARCHIVED_CHATS.slice();
+    const list = stripMockArchivedChats(Array.isArray(ui.archived_chats) ? ui.archived_chats.slice() : []);
     const target = list.find(c => c.id === chatId);
     const remaining = list.filter(c => c.id !== chatId);
     await saveUiSettingsPatch({ archived_chats: remaining });
 
-    if (target && conversationHistory) {
+    const historyEl = document.getElementById('conversation-history');
+    if (target && historyEl) {
       const item = document.createElement('div');
       item.className = 'conversation-item';
       item.innerHTML = `<span>${escapeHtml(target.title)}</span>`;
       item.addEventListener('click', () => {
         closeSettingsView();
-        if (welcomeBanner) {
-          welcomeBanner.style.display = '';
-          welcomeBanner.classList.remove('hidden');
+        if (chatStream) chatStream.innerHTML = '';
+        const savedMsgs = Array.isArray(target.messages) ? target.messages : [];
+        if (savedMsgs.length > 0) {
+          if (welcomeBanner) welcomeBanner.classList.add('hidden');
+          conversationHistoryTurns = savedMsgs.slice();
+          for (const m of savedMsgs) {
+            appendMessage(m.role || 'user', m.content || '');
+          }
+        } else {
+          if (welcomeBanner) {
+            welcomeBanner.style.display = '';
+            welcomeBanner.classList.remove('hidden');
+          }
+          appendMessage('user', target.title);
         }
-        appendMessage('user', target.title);
       });
-      conversationHistory.prepend(item);
+      historyEl.prepend(item);
     }
     renderSettingsTabContent('archived', '');
     showSettingsToast('Unarchived "' + (target ? target.title : 'chat') + '" to sidebar History');
@@ -4559,9 +4657,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   window._deleteArchivedChat = async function(chatId) {
     if (!cachedSettingsData) await loadFullSettings();
     const ui = Object.assign({}, cachedSettingsData ? cachedSettingsData.ui : {});
-    const list = (Array.isArray(ui.archived_chats) && ui.archived_chats.length > 0)
-      ? ui.archived_chats.slice()
-      : DEFAULT_ARCHIVED_CHATS.slice();
+    const list = stripMockArchivedChats(Array.isArray(ui.archived_chats) ? ui.archived_chats.slice() : []);
     const remaining = list.filter(c => c.id !== chatId);
     await saveUiSettingsPatch({ archived_chats: remaining });
     renderSettingsTabContent('archived', '');
@@ -4652,15 +4748,33 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   };
 
   window._recordVoiceSample = async function() {
-    const ui = (cachedSettingsData && cachedSettingsData.ui) || {};
-    const list = Array.isArray(ui.voice_recordings) ? ui.voice_recordings.slice() : [];
-    list.unshift({
-      transcript: 'Voice dictation note (' + (ui.preferred_voice || 'Juniper') + ')',
-      time: new Date().toLocaleTimeString()
-    });
-    await saveUiSettingsPatch({ voice_recordings: list.slice(0, 20) });
-    renderSettingsTabContent('voice', '');
-    showSettingsToast('Voice note saved to device');
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRec) {
+      showSettingsToast('🎙️ Listening for voice note...');
+      const rec = new SpeechRec();
+      rec.lang = 'en-US';
+      rec.interimResults = false;
+      rec.maxAlternatives = 1;
+      rec.onresult = async function(ev) {
+        const transcript = (ev.results && ev.results[0] && ev.results[0][0] && ev.results[0][0].transcript) || '';
+        if (!transcript.trim()) return;
+        const ui = (cachedSettingsData && cachedSettingsData.ui) || {};
+        const list = Array.isArray(ui.voice_recordings) ? ui.voice_recordings.slice() : [];
+        list.unshift({
+          transcript: transcript.trim(),
+          time: new Date().toLocaleTimeString()
+        });
+        await saveUiSettingsPatch({ voice_recordings: list.slice(0, 20) });
+        renderSettingsTabContent('voice', '');
+        showSettingsToast('Voice note transcribed & saved to device');
+      };
+      rec.onerror = function(err) {
+        showSettingsToast('Microphone dictation unavailable (' + (err.error || 'permission denied') + ')');
+      };
+      rec.start();
+      return;
+    }
+    showSettingsToast('Browser SpeechRecognition API is not available in this browser');
   };
 
   window._clearVoiceRecordings = async function() {
@@ -4684,10 +4798,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     const input = document.getElementById('new-memory-input');
     if (!input || !input.value.trim()) return;
     const ui = (cachedSettingsData && cachedSettingsData.ui) || {};
-    const memories = Array.isArray(ui.saved_memories) ? ui.saved_memories.slice() : [
-      'Synthesize comprehensive multi-section Markdown answers from hybrid BM25 + LanceDB dense vector embeddings.',
-      'All answers must be grounded in local files or local Ollama models with citations grouped cleanly at the bottom.'
-    ];
+    const memories = Array.isArray(ui.saved_memories) ? ui.saved_memories.slice() : [];
     memories.push(input.value.trim());
     await saveUiSettingsPatch({ saved_memories: memories });
     renderSettingsTabContent('personalization', '');
@@ -4696,10 +4807,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
 
   window._removeMemoryItem = async function(idx) {
     const ui = (cachedSettingsData && cachedSettingsData.ui) || {};
-    const memories = Array.isArray(ui.saved_memories) ? ui.saved_memories.slice() : [
-      'Synthesize comprehensive multi-section Markdown answers from hybrid BM25 + LanceDB dense vector embeddings.',
-      'All answers must be grounded in local files or local Ollama models with citations grouped cleanly at the bottom.'
-    ];
+    const memories = Array.isArray(ui.saved_memories) ? ui.saved_memories.slice() : [];
     memories.splice(idx, 1);
     await saveUiSettingsPatch({ saved_memories: memories });
     renderSettingsTabContent('personalization', '');

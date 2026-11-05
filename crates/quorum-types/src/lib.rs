@@ -269,6 +269,10 @@ impl ScoredChunk {
             self.chunk.text_content.clone()
         };
 
+        let is_ext = self.is_remote && !self.source_peer.is_empty() && !self.source_peer.eq_ignore_ascii_case("local");
+        let node_id = if is_ext { Some(self.source_peer.clone()) } else { None };
+        let origin_label = if is_ext { Some("mesh".to_string()) } else { Some("local".to_string()) };
+
         Citation {
             peer_id: self.source_peer.clone(),
             file_path: self.chunk.file_path.clone(),
@@ -276,6 +280,10 @@ impl ScoredChunk {
             line_end: self.chunk.line_end,
             score: self.score,
             snippet,
+            node_id,
+            is_external_node: is_ext,
+            origin_label,
+            node_alias: None,
         }
     }
 }
@@ -300,6 +308,18 @@ pub struct Citation {
 
     /// Brief plain text excerpt.
     pub snippet: String,
+
+    #[serde(default)]
+    pub node_id: Option<String>,
+
+    #[serde(default)]
+    pub is_external_node: bool,
+
+    #[serde(default)]
+    pub origin_label: Option<String>,
+
+    #[serde(default)]
+    pub node_alias: Option<String>,
 }
 
 /// Data transfer object for transmitting candidate chunks across the network or between layers.
@@ -604,6 +624,10 @@ impl VolatileRemoteChunk {
             self.content.clone()
         };
 
+        let is_ext = !self.peer_id.is_empty() && !self.peer_id.eq_ignore_ascii_case("local");
+        let node_id = if is_ext { Some(self.peer_id.clone()) } else { None };
+        let origin_label = if is_ext { Some("mesh".to_string()) } else { Some("local".to_string()) };
+
         Citation {
             peer_id: self.peer_id.clone(),
             file_path: self.file_path.clone(),
@@ -611,6 +635,10 @@ impl VolatileRemoteChunk {
             line_end: self.line_end,
             score: self.score,
             snippet,
+            node_id,
+            is_external_node: is_ext,
+            origin_label,
+            node_alias: None,
         }
     }
 }

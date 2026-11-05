@@ -35,13 +35,20 @@ impl ContinuationFacetExtractor {
         let low = prior_text.to_ascii_lowercase();
         let mut facets = HashSet::new();
 
-        // Lease / Rental Agreement Domain (detected strictly from corpus/assistant evidence, never hardcoded names)
-        if low.contains("landlord")
-            || low.contains("tenant")
-            || low.contains("lease")
-            || low.contains("rent")
-            || low.contains("premises")
-            || low.contains("eviction")
+        // Lease / Rental Agreement Domain (detected strictly via whole-token word matches to prevent "current" / "different" false triggers)
+        let tokens: std::collections::HashSet<&str> = low
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        if tokens.contains("landlord")
+            || tokens.contains("tenant")
+            || tokens.contains("lease")
+            || tokens.contains("leases")
+            || tokens.contains("rent")
+            || tokens.contains("rental")
+            || tokens.contains("premises")
+            || tokens.contains("eviction")
         {
             facets.insert("domain:lease".to_string());
             if low.contains("contact") || low.contains("phone") || low.contains("email") || low.contains("address") {
@@ -118,12 +125,18 @@ impl ContinuationFacetExtractor {
     ) -> (String, String) {
         let low_topic = base_topic.to_ascii_lowercase();
 
+        let topic_tokens: std::collections::HashSet<&str> = low_topic
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+
         // 1. Lease / Property Agreement Rewrite Tree (triggered by covered lease facets or lease topic)
         if covered_facets.contains("domain:lease")
-            || low_topic.contains("lease")
-            || low_topic.contains("rent")
-            || low_topic.contains("tenant")
-            || low_topic.contains("landlord")
+            || topic_tokens.contains("lease")
+            || topic_tokens.contains("rent")
+            || topic_tokens.contains("rental")
+            || topic_tokens.contains("tenant")
+            || topic_tokens.contains("landlord")
         {
             let mut target_terms = Vec::new();
             if !covered_facets.contains("monthly_rent_rates_and_dates") {

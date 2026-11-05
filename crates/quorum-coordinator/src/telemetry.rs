@@ -93,6 +93,8 @@ pub enum AgenticTelemetryEvent {
         total_tokens: usize,
         final_state: AgenticStateName,
         model_name: String,
+        #[serde(default)]
+        responder_peer_id: String,
     },
     /// Fail-closed error reporting
     #[serde(rename = "execution_error")]

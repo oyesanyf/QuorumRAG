@@ -202,6 +202,7 @@ impl AgenticGraphState {
                     && !STOPWORDS.contains(&low.as_str())
                     && !PRONOUNS_AND_FOLLOWUPS.contains(&low.as_str())
                     && !crate::agentic::retrieve::GENERIC_ATTRIBUTE_TERMS.contains(&low.as_str())
+                    && !crate::agentic::retrieve::QUERY_META_INTENT_TERMS.contains(&low.as_str())
                     && !words.contains(&low)
                     && !prior_terms.contains(&low)
                 {

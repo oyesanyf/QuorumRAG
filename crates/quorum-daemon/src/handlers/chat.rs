@@ -127,10 +127,20 @@ pub async fn chat_sse_handler(
         .session_id
         .clone()
         .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
-    let mut session_seen = state.sessions.get_seen_chunks(&session_id);
-    for id in payload.seen_chunk_ids {
-        session_seen.insert(id);
-    }
+    let prompt_lower = prompt.to_ascii_lowercase();
+    let is_continuation_or_exclusion =
+        quorum_coordinator::DeterministicOfflineSynthesisEngine::is_continuation_query(&prompt_lower)
+            || quorum_coordinator::DeterministicOfflineSynthesisEngine::is_exclusion_query(&prompt_lower);
+
+    let session_seen = if is_continuation_or_exclusion {
+        let mut seen = state.sessions.get_seen_chunks(&session_id);
+        for id in payload.seen_chunk_ids {
+            seen.insert(id);
+        }
+        seen
+    } else {
+        std::collections::HashSet::new()
+    };
     let sessions_registry = state.sessions.clone();
     let session_id_task = session_id.clone();
 
@@ -220,10 +230,20 @@ pub async fn query_handler(
         .session_id
         .clone()
         .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
-    let mut session_seen = state.sessions.get_seen_chunks(&session_id);
-    for id in payload.seen_chunk_ids {
-        session_seen.insert(id);
-    }
+    let prompt_lower = prompt.to_ascii_lowercase();
+    let is_continuation_or_exclusion =
+        quorum_coordinator::DeterministicOfflineSynthesisEngine::is_continuation_query(&prompt_lower)
+            || quorum_coordinator::DeterministicOfflineSynthesisEngine::is_exclusion_query(&prompt_lower);
+
+    let session_seen = if is_continuation_or_exclusion {
+        let mut seen = state.sessions.get_seen_chunks(&session_id);
+        for id in payload.seen_chunk_ids {
+            seen.insert(id);
+        }
+        seen
+    } else {
+        std::collections::HashSet::new()
+    };
 
     match state
         .coordinator

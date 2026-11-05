@@ -9,7 +9,7 @@
 # Ollama; otherwise set the Ollama URL in the Web UI Settings (e.g. http://host.docker.internal:11434).
 #
 # Build context layout expected:  bin/amd64/quorumrag  and/or  bin/arm64/quorumrag
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ARG TARGETARCH
 ARG VERSION=0.1.0

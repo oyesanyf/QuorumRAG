@@ -68,16 +68,16 @@ impl GradeRelevanceNode {
             self.relevance_threshold
         };
 
-        let daemon_active = crate::dlp_mesh::global_mesh_dlp_controller()
-            .settings_file_path
-            .read()
-            .map(|p| p.is_some())
-            .unwrap_or(false);
+        let distinct_docs = state
+            .retrieved_chunks
+            .iter()
+            .map(|c| c.chunk.file_path.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
 
-        let satisfactory = !is_empty && max_score >= effective_threshold;
-        // When running in the live daemon, if Hop 0 already searched vector + BM25 + keyword index,
-        // do not stall the UI looping through redundant disambiguation hops.
-        let will_rewrite = !satisfactory && state.hop_count < state.max_hops && !daemon_active;
+        let is_author_query = crate::offline_engine::DeterministicOfflineSynthesisEngine::is_authorship_query(&state.original_prompt);
+        let satisfactory = !is_empty && max_score >= effective_threshold && (!is_author_query || distinct_docs >= 2);
+        let will_rewrite = !satisfactory && state.hop_count < state.max_hops;
 
         let reasoning = if is_empty {
             "Empty chunks retrieved. Scheduling query rewrite or fallback.".to_string()

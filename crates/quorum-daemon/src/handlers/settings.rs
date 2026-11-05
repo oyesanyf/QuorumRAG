@@ -121,6 +121,9 @@ pub async fn get_settings_handler(State(state): State<Arc<DaemonState>>) -> impl
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
+    let total_chunks = state.storage.count().await.unwrap_or(0);
+    let total_files = state.storage.catalog().count_documents().unwrap_or(0);
+
     Json(serde_json::json!({
         "status": "ok",
         "ui": settings.ui,
@@ -138,6 +141,8 @@ pub async fn get_settings_handler(State(state): State<Arc<DaemonState>>) -> impl
             "physical_drives": physical_drives,
             "watched_paths": watched_paths,
             "index_epoch": state.storage.index_epoch(),
+            "total_chunks": total_chunks,
+            "total_files": total_files,
             "hmac_epoch_signature": epoch_sig_preview,
             "uptime_secs": state.start_time.elapsed().as_secs()
         }
@@ -155,7 +160,8 @@ pub async fn update_settings_handler(
             .settings
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(ui) = payload.ui {
+        if let Some(mut ui) = payload.ui {
+            ui.sanitize_mock_artifacts();
             guard.ui = ui;
         }
         if let Some(mesh) = payload.mesh {

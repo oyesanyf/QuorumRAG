@@ -274,6 +274,10 @@ fn test_web_boundary_sse_chunk_json_serialization() {
         line_end: 58,
         score: 0.965,
         snippet: "pub fn execute() {}".to_string(),
+        node_id: Some("peer_123".to_string()),
+        is_external_node: true,
+        origin_label: Some("mesh".to_string()),
+        node_alias: Some("peer_123".to_string()),
     };
 
     let chunk = SseChunk::Citation { citation };
