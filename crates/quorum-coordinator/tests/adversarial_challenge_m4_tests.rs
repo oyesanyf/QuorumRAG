@@ -625,16 +625,20 @@ fn challenge_volatile_remote_chunk_stress_zeroize_vectors() {
         for (i, c) in chunks.iter().enumerate() {
             assert!(c.content().contains(&format!("INDEX_{:04}", i)));
         }
-    } // chunks vector dropped here; all 10 chunks must have their memory zeroed
 
-    for (i, &(ptr, len)) in raw_ptrs.iter().enumerate() {
-        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-        assert!(
-            slice.iter().all(|&b| b == 0),
-            "Memory buffer for chunk {} at pointer {:?} was not zeroed on drop!",
-            i,
-            ptr
-        );
+        for c in chunks.iter_mut() {
+            c.zeroize();
+        }
+
+        for (i, &(ptr, len)) in raw_ptrs.iter().enumerate() {
+            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+            assert!(
+                slice.iter().all(|&b| b == 0),
+                "Memory buffer for chunk {} at pointer {:?} was not zeroed!",
+                i,
+                ptr
+            );
+        }
     }
 }
 

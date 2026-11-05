@@ -268,3 +268,41 @@ fn test_type_alias_equivalence() {
     assert!(b.parent_document_retrieval);
     assert!(b.map_reduce_fact_extraction);
 }
+
+#[test]
+fn test_sanitize_mock_archived_chats_and_memories() {
+    let mut ui = ChatGptUiSettings::default();
+    ui.archived_chats.push(quorum_coordinator::ArchivedChatEntry {
+        id: "arch-1".to_string(),
+        title: "Power of Prayer".to_string(),
+        ..Default::default()
+    });
+    ui.archived_chats.push(quorum_coordinator::ArchivedChatEntry {
+        id: "arch-8".to_string(),
+        title: "Ways to be happy".to_string(),
+        ..Default::default()
+    });
+    ui.archived_chats.push(quorum_coordinator::ArchivedChatEntry {
+        id: "chat-real-1".to_string(),
+        title: "Real Research on CVE-2026-9910".to_string(),
+        ..Default::default()
+    });
+    ui.extra.insert(
+        "saved_memories".to_string(),
+        json!([
+            "Synthesize comprehensive multi-section Markdown answers from hybrid BM25 + LanceDB dense vector embeddings.",
+            "All answers must be grounded in local files or local Ollama models with citations grouped cleanly at the bottom.",
+            "User prefers concise executive summaries."
+        ]),
+    );
+
+    let cleaned = ui.sanitize_mock_artifacts();
+    assert!(cleaned, "Sanitization must report cleaned true");
+    assert_eq!(ui.archived_chats.len(), 1, "Only genuine chat must remain");
+    assert_eq!(ui.archived_chats[0].id, "chat-real-1");
+
+    let mems = ui.extra.get("saved_memories").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(mems.len(), 1, "Only genuine memory must remain");
+    assert_eq!(mems[0], "User prefers concise executive summaries.");
+}
+

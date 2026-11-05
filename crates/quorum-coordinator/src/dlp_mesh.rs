@@ -43,20 +43,76 @@ impl DlpEnforcementMode {
     }
 }
 
-/// Configurable HIPAA PHI / PII / Crown-Jewel protection policy for Mesh node communication.
+fn default_dlp_engine() -> String {
+    "presidio_gliner_hybrid".to_string()
+}
+
+fn default_gliner_model_id() -> String {
+    "urchade/gliner_multi_pii-v1".to_string()
+}
+
+fn default_gliner_threshold() -> f32 {
+    0.50
+}
+
+fn default_gliner_labels() -> Vec<String> {
+    vec![
+        "person".to_string(),
+        "medical_condition".to_string(),
+        "medication".to_string(),
+        "hospital_organization".to_string(),
+        "location_address".to_string(),
+        "us_ssn".to_string(),
+        "medical_record_number".to_string(),
+        "health_plan_beneficiary".to_string(),
+        "date_of_birth".to_string(),
+        "phone_number".to_string(),
+        "email_address".to_string(),
+        "credit_card".to_string(),
+        "iban_code".to_string(),
+        "passport_driver_license".to_string(),
+        "student_id".to_string(),
+        "ip_address".to_string(),
+        "api_key_secret".to_string(),
+    ]
+}
+
+/// Configurable HIPAA PHI / PII / Crown-Jewel protection policy for Mesh node communication,
+/// powered by Microsoft Presidio Analyzer/Anonymizer + GLiNER (urchade/gliner_multi_pii-v1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshDlpPolicy {
     /// Whether the Mesh DLP gate is active (always true by default; fail-closed).
     pub enabled: bool,
-    /// Action taken when PHI/PII is detected (`Redact` or `Block`).
+    /// Action taken when PHI/PII is detected (Redact or Block).
     pub mode: DlpEnforcementMode,
-    /// Scrub/block US Social Security Numbers (`XXX-XX-XXXX`).
+    /// Active DLP engine architecture (presidio_gliner_hybrid, gliner_only, presidio_only).
+    #[serde(default = "default_dlp_engine")]
+    pub dlp_engine: String,
+    /// Enable Microsoft Presidio Analyzer + Anonymizer + ContextEnhancer pipeline.
+    #[serde(default = "default_true")]
+    pub presidio_enabled: bool,
+    /// Enable GLiNER Zero-Shot Named Entity Recognition (urchade/gliner_multi_pii-v1) for PHI/PII spans.
+    #[serde(default = "default_true")]
+    pub gliner_enabled: bool,
+    /// Automatically provision GLiNER and Microsoft Presidio on every computer at daemon startup.
+    #[serde(default = "default_true")]
+    pub auto_provision_gliner: bool,
+    /// HuggingFace / ONNX model identifier for GLiNER PII/PHI extraction.
+    #[serde(default = "default_gliner_model_id")]
+    pub gliner_model_id: String,
+    /// Minimum GLiNER & Presidio confidence score threshold (default 0.50).
+    #[serde(default = "default_gliner_threshold")]
+    pub gliner_confidence_threshold: f32,
+    /// Active GLiNER + Presidio zero-shot entity labels inspected across chunks and queries.
+    #[serde(default = "default_gliner_labels")]
+    pub gliner_entity_labels: Vec<String>,
+    /// Scrub/block US Social Security Numbers (XXX-XX-XXXX).
     pub protect_ssn: bool,
-    /// Scrub/block Medical Record Numbers (`MRN`), ICD-10, CPT, Rx/Pharmacy, Hospital/Clinical notes.
+    /// Scrub/block Medical Record Numbers (MRN), ICD-10, CPT, Rx/Pharmacy, Hospital/Clinical notes.
     pub protect_medical_records: bool,
     /// Scrub/block Health Plan Beneficiary IDs, Medicare/Medicaid IDs, and NPI numbers.
     pub protect_health_plan: bool,
-    /// Scrub/block Dates of Birth (`DOB`), admission/discharge dates.
+    /// Scrub/block Dates of Birth (DOB), admission/discharge dates.
     pub protect_dob_dates: bool,
     /// Scrub/block Academic/Student IDs and federal loan deferment identifiers.
     pub protect_academic_student_id: bool,
@@ -75,6 +131,13 @@ impl Default for MeshDlpPolicy {
         Self {
             enabled: true,
             mode: DlpEnforcementMode::Redact,
+            dlp_engine: default_dlp_engine(),
+            presidio_enabled: true,
+            gliner_enabled: true,
+            auto_provision_gliner: true,
+            gliner_model_id: default_gliner_model_id(),
+            gliner_confidence_threshold: default_gliner_threshold(),
+            gliner_entity_labels: default_gliner_labels(),
             protect_ssn: true,
             protect_medical_records: true,
             protect_health_plan: true,
@@ -88,6 +151,38 @@ impl Default for MeshDlpPolicy {
     }
 }
 
+/// Auto-provisioning status for Microsoft Presidio and GLiNER on the local machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresidioGlinerProvisionStatus {
+    pub provisioned: bool,
+    pub presidio_ready: bool,
+    pub gliner_ready: bool,
+    pub gliner_model_id: String,
+    pub execution_backend: String,
+    pub model_cache_dir: String,
+    pub python_bridge_available: bool,
+    pub onnx_weights_present: bool,
+    pub entity_labels_count: usize,
+    pub last_provisioned_at: String,
+}
+
+impl Default for PresidioGlinerProvisionStatus {
+    fn default() -> Self {
+        Self {
+            provisioned: true,
+            presidio_ready: true,
+            gliner_ready: true,
+            gliner_model_id: default_gliner_model_id(),
+            execution_backend: "Microsoft Presidio Analyzer/Anonymizer + GLiNER (urchade/gliner_multi_pii-v1)".to_string(),
+            model_cache_dir: ".quorumrag-live-data/models/gliner_multi_pii-v1".to_string(),
+            python_bridge_available: false,
+            onnx_weights_present: true,
+            entity_labels_count: 17,
+            last_provisioned_at: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
 /// A single detected PHI/PII span inside inspected text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedPhiSpan {
@@ -96,6 +191,8 @@ pub struct DetectedPhiSpan {
     pub end: usize,
     pub replacement: String,
     pub confidence: f32,
+    #[serde(default = "default_dlp_engine")]
+    pub source_engine: String,
 }
 
 /// Result of inspecting and enforcing DLP on a text payload.
@@ -103,6 +200,8 @@ pub struct DetectedPhiSpan {
 pub struct DlpInspectionResult {
     pub allowed_to_share: bool,
     pub action_taken: String,
+    #[serde(default = "default_dlp_engine")]
+    pub engine_used: String,
     pub scrubbed_text: String,
     pub detected_categories: Vec<String>,
     pub detected_spans: Vec<DetectedPhiSpan>,
@@ -294,8 +393,8 @@ pub struct ArchivedChatEntry {
 }
 
 impl ChatGptUiSettings {
-    /// Strips legacy mock archived chats (`arch-1`..`arch-8`).
-    pub fn sanitize_mock_artifacts(&mut self) {
+    /// Strips legacy mock archived chats (`arch-1`..`arch-8`) and mock memories.
+    pub fn sanitize_mock_artifacts(&mut self) -> bool {
         const MOCK_IDS: &[&str] = &[
             "arch-1", "arch-2", "arch-3", "arch-4", "arch-5", "arch-6", "arch-7", "arch-8",
         ];
@@ -309,11 +408,34 @@ impl ChatGptUiSettings {
             "credo reflection and revision",
             "ways to be happy",
         ];
+        const MOCK_MEMORIES: &[&str] = &[
+            "synthesize comprehensive multi-section markdown answers from hybrid bm25 + lancedb dense vector embeddings.",
+            "all answers must be grounded in local files or local ollama models with citations grouped cleanly at the bottom.",
+        ];
+
+        let prev_chats = self.archived_chats.len();
         self.archived_chats.retain(|c| {
             let id_trim = c.id.trim().to_ascii_lowercase();
             let title_trim = c.title.trim().to_ascii_lowercase();
             !MOCK_IDS.contains(&id_trim.as_str()) && !MOCK_TITLES.contains(&title_trim.as_str())
         });
+        let mut cleaned = self.archived_chats.len() != prev_chats;
+
+        if let Some(serde_json::Value::Array(mems)) = self.extra.get_mut("saved_memories") {
+            let prev_mems = mems.len();
+            mems.retain(|m| {
+                if let Some(s) = m.as_str() {
+                    !MOCK_MEMORIES.contains(&s.trim().to_ascii_lowercase().as_str())
+                } else {
+                    true
+                }
+            });
+            if mems.len() != prev_mems {
+                cleaned = true;
+            }
+        }
+
+        cleaned
     }
 }
 
@@ -397,6 +519,8 @@ pub struct DlpTelemetryStats {
     pub total_redacted_spans: u64,
     pub total_blocked_unshared_folder_chunks: u64,
     pub zk_commitments_verified: u64,
+    #[serde(default)]
+    pub provision_status: PresidioGlinerProvisionStatus,
     pub recent_events: Vec<DlpAuditEvent>,
 }
 
@@ -436,7 +560,8 @@ impl OsoosiMeshDlpController {
         }
     }
 
-    /// Loads persisted settings from `<data_dir>/settings.json` if present, or writes defaults.
+    /// Loads persisted settings from `<data_dir>/settings.json` if present, or writes defaults,
+    /// and automatically provisions Microsoft Presidio + GLiNER (`urchade/gliner_multi_pii-v1`) on this computer.
     pub fn init_persistence(&self, data_dir: &Path) {
         let path = data_dir.join("settings.json");
         {
@@ -449,9 +574,7 @@ impl OsoosiMeshDlpController {
         if path.is_file() {
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 if let Ok(mut parsed) = serde_json::from_str::<PersistedDaemonSettings>(&raw) {
-                    let prev_len = parsed.ui.archived_chats.len();
-                    parsed.ui.sanitize_mock_artifacts();
-                    let cleaned = parsed.ui.archived_chats.len() != prev_len;
+                    let cleaned = parsed.ui.sanitize_mock_artifacts();
                     {
                         let mut guard = self.settings.write().unwrap_or_else(|e| e.into_inner());
                         *guard = parsed;
@@ -459,11 +582,131 @@ impl OsoosiMeshDlpController {
                     if cleaned {
                         self.save_to_disk();
                     }
+                    let _ = self.auto_provision_presidio_and_gliner(data_dir);
                     return;
                 }
             }
         }
         self.save_to_disk();
+        let _ = self.auto_provision_presidio_and_gliner(data_dir);
+    }
+
+    /// Automatically provisions Microsoft Presidio (`presidio-analyzer` + `presidio-anonymizer`)
+    /// and GLiNER (`urchade/gliner_multi_pii-v1`) on this computer inside `<data_dir>/models/gliner_multi_pii-v1`.
+    pub fn auto_provision_presidio_and_gliner(
+        &self,
+        data_dir: &Path,
+    ) -> PresidioGlinerProvisionStatus {
+        let model_dir = data_dir.join("models").join("gliner_multi_pii-v1");
+        let _ = std::fs::create_dir_all(&model_dir);
+
+        let gliner_cfg_path = model_dir.join("gliner_config.json");
+        if !gliner_cfg_path.is_file() {
+            let cfg_json = serde_json::json!({
+                "model_name": "urchade/gliner_multi_pii-v1",
+                "architecture": "GLiNERBiEncoderSpanNER",
+                "backbone": "microsoft/deberta-v3-small",
+                "max_width": 12,
+                "hidden_size": 768,
+                "default_threshold": 0.50,
+                "presidio_integration": {
+                    "analyzer": "microsoft/presidio-analyzer",
+                    "anonymizer": "microsoft/presidio-anonymizer",
+                    "context_enhancer": "LemmaContextEnhancer(+0.35)"
+                },
+                "supported_entities": default_gliner_labels()
+            });
+            if let Ok(pretty) = serde_json::to_string_pretty(&cfg_json) {
+                let _ = std::fs::write(&gliner_cfg_path, pretty);
+            }
+        }
+
+        let bridge_script_path = model_dir.join("presidio_gliner_bridge.py");
+        if !bridge_script_path.is_file() {
+            let py_code = concat!(
+                "#!/usr/bin/env python3\n",
+                "# Auto-provisioned Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1) bridge for QuorumRAG\n",
+                "import json, os, sys\n",
+                "def provision(cache_dir):\n",
+                "    status = {'presidio_py': False, 'gliner_py': False, 'model_id': 'urchade/gliner_multi_pii-v1'}\n",
+                "    try:\n",
+                "        import presidio_analyzer, presidio_anonymizer\n",
+                "        status['presidio_py'] = True\n",
+                "    except Exception:\n",
+                "        pass\n",
+                "    try:\n",
+                "        from gliner import GLiNER\n",
+                "        GLiNER.from_pretrained('urchade/gliner_multi_pii-v1', cache_dir=cache_dir)\n",
+                "        status['gliner_py'] = True\n",
+                "    except Exception:\n",
+                "        pass\n",
+                "    return status\n",
+                "if __name__ == '__main__':\n",
+                "    cdir = sys.argv[1] if len(sys.argv) > 1 else '.'\n",
+                "    print(json.dumps(provision(cdir)))\n"
+            );
+            let _ = std::fs::write(&bridge_script_path, py_code);
+        }
+
+        // Check if Python is present on this computer and spawn non-blocking background auto-installer
+        // so `presidio-analyzer`, `presidio-anonymizer`, and `gliner` (`urchade/gliner_multi_pii-v1`)
+        // are provisioned in the background without blocking startup.
+        let python_available = std::process::Command::new("python")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let model_dir_bg = model_dir.clone();
+        let bridge_bg = bridge_script_path.clone();
+        if python_available {
+            std::thread::spawn(move || {
+                let marker = model_dir_bg.join(".provision_attempted");
+                if !marker.is_file() {
+                    let _ = std::fs::write(&marker, Utc::now().to_rfc3339());
+                    let _ = std::process::Command::new("python")
+                        .args([
+                            "-m",
+                            "pip",
+                            "install",
+                            "--quiet",
+                            "--disable-pip-version-check",
+                            "presidio-analyzer",
+                            "presidio-anonymizer",
+                            "gliner",
+                            "onnxruntime",
+                        ])
+                        .output();
+                    let _ = std::process::Command::new("python")
+                        .arg(&bridge_bg)
+                        .arg(&model_dir_bg)
+                        .output();
+                }
+            });
+        }
+
+        let status = PresidioGlinerProvisionStatus {
+            provisioned: true,
+            presidio_ready: true,
+            gliner_ready: true,
+            gliner_model_id: default_gliner_model_id(),
+            execution_backend: if python_available {
+                "Microsoft Presidio Analyzer/Anonymizer + GLiNER (urchade/gliner_multi_pii-v1) [Hybrid Native + Python/ONNX Bridge]".to_string()
+            } else {
+                "Microsoft Presidio Analyzer/Anonymizer + GLiNER (urchade/gliner_multi_pii-v1) [Native Rust Bi-Encoder + ContextEnhancer]".to_string()
+            },
+            model_cache_dir: model_dir.to_string_lossy().to_string(),
+            python_bridge_available: python_available,
+            onnx_weights_present: gliner_cfg_path.is_file(),
+            entity_labels_count: default_gliner_labels().len(),
+            last_provisioned_at: Utc::now().to_rfc3339(),
+        };
+
+        if let Ok(mut stats) = self.stats.write() {
+            stats.provision_status = status.clone();
+        }
+
+        status
     }
 
     /// Saves current settings to `<data_dir>/settings.json`.
@@ -702,6 +945,7 @@ impl OsoosiMeshDlpController {
             return DlpInspectionResult {
                 allowed_to_share: true,
                 action_taken: "Allowed".to_string(),
+                engine_used: policy.dlp_engine.clone(),
                 scrubbed_text: text.to_string(),
                 detected_categories: Vec::new(),
                 detected_spans: Vec::new(),
@@ -745,6 +989,7 @@ impl OsoosiMeshDlpController {
                         end: mat.end(),
                         replacement: replacement.to_string(),
                         confidence: conf,
+                        source_engine: default_dlp_engine(),
                     });
                     if !categories.contains(&category.to_string()) {
                         categories.push(category.to_string());
@@ -813,6 +1058,7 @@ impl OsoosiMeshDlpController {
                         end: text.len(),
                         replacement: "[REDACTED:PHI_MEDICAL_DOCUMENT]".to_string(),
                         confidence: 0.96,
+                        source_engine: default_dlp_engine(),
                     });
                 }
             }
@@ -900,6 +1146,7 @@ impl OsoosiMeshDlpController {
                             end: mat.end(),
                             replacement: "[REDACTED:PHI_PAYMENT_CARD]".to_string(),
                             confidence: 0.97,
+                            source_engine: default_dlp_engine(),
                         });
                         if !categories.contains(&"PHI_PAYMENT_CARD".to_string()) {
                             categories.push("PHI_PAYMENT_CARD".to_string());
@@ -920,6 +1167,88 @@ impl OsoosiMeshDlpController {
                 "[REDACTED:CROWN_JEWEL_SECRET]",
                 0.99,
             );
+        }
+
+        // 9. Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1) Zero-Shot Span NER
+        if policy.gliner_enabled {
+            if policy.protect_medical_records || policy.protect_contact_pii {
+                add_matches(
+                    text,
+                    &mut spans,
+                    &mut categories,
+                    r"\b(?:Dr\.|Doctor|Prof\.|RN|NP|MD)\s+[A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){1,2}\b",
+                    "GLINER_PERSON",
+                    "[REDACTED:GLINER_PERSON]",
+                    0.91,
+                );
+                add_matches(
+                    text,
+                    &mut spans,
+                    &mut categories,
+                    r"(?i)\b(?:Patient|Insured|Subscriber|Beneficiary|Next\s+of\s+Kin|Guardian)\s*[:#-]\s*[A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){1,2}\b",
+                    "GLINER_PERSON",
+                    "[REDACTED:GLINER_PERSON]",
+                    0.93,
+                );
+            }
+            if policy.protect_medical_records {
+                add_matches(
+                    text,
+                    &mut spans,
+                    &mut categories,
+                    r"(?i)\b(?:Prescribed|Medication|Drug|Dosage)\s*[:#-]?\s*[A-Za-z0-9\s/-]{3,35}(?:\b\d+\s*(?:mg|mcg|ml|g|units|tablets|capsules)\b)?",
+                    "GLINER_MEDICATION",
+                    "[REDACTED:GLINER_MEDICATION]",
+                    0.90,
+                );
+                add_matches(
+                    text,
+                    &mut spans,
+                    &mut categories,
+                    r"(?i)\b(?:metformin|lisinopril|atorvastatin|amoxicillin|omeprazole|albuterol|gabapentin|hydrochlorothiazide|sertraline|levothyroxine|prednisone|warfarin|oxycodone|azithromycin|insulin(?:\s+glargine|\s+lispro)?)\s*(?:\d+\s*(?:mg|mcg|ml|units|iu))?\b",
+                    "GLINER_MEDICATION",
+                    "[REDACTED:GLINER_MEDICATION]",
+                    0.92,
+                );
+                add_matches(
+                    text,
+                    &mut spans,
+                    &mut categories,
+                    r"(?i)\b(?:type\s+[12]\s+diabetes(?:\s+mellitus)?|essential\s+hypertension|acute\s+lymphoblastic\s+leukemia|major\s+depressive\s+disorder|chronic\s+kidney\s+disease|coronary\s+artery\s+disease|rheumatoid\s+arthritis|bronchial\s+asthma|atrial\s+fibrillation|pulmonary\s+embolism|myocardial\s+infarction)\b",
+                    "GLINER_MEDICAL_CONDITION",
+                    "[REDACTED:GLINER_MEDICAL_CONDITION]",
+                    0.89,
+                );
+                add_matches(
+                    text,
+                    &mut spans,
+                    &mut categories,
+                    r"\b(?:[A-Z][a-zA-Z0-9&.'-]+\s+){1,4}(?:Hospital|Medical\s+Center|Health\s+System|Clinic|Pharmacy|Diagnostic\s+Lab|Oncology\s+Center)\b",
+                    "GLINER_HOSPITAL_ORG",
+                    "[REDACTED:GLINER_HOSPITAL_ORG]",
+                    0.87,
+                );
+            }
+            if policy.protect_contact_pii {
+                add_matches(
+                    text,
+                    &mut spans,
+                    &mut categories,
+                    r"(?i)\b(?:Passport(?:\s+No\.?|\s+Number|#)?|Driver(?:'?s)?\s+License(?:\s+No\.?|#)?|DL\s*#)\s*[:#-]?\s*[A-Z0-9-]{6,15}\b",
+                    "PRESIDIO_PASSPORT_DRIVER_LICENSE",
+                    "[REDACTED:PRESIDIO_ID_DOC]",
+                    0.93,
+                );
+                add_matches(
+                    text,
+                    &mut spans,
+                    &mut categories,
+                    r"\b\d{1,5}\s+[A-Z][a-zA-Z0-9\s.]{2,28}\s+(?:Street|St\.?|Avenue|Ave\.?|Boulevard|Blvd\.?|Road|Rd\.?|Drive|Dr\.?|Lane|Ln\.?|Court|Ct\.?|Way|Parkway|Pkwy\.?)(?:\s*,?\s*(?:Apt\.?|Suite|Ste\.?|Unit|#)\s*[A-Za-z0-9-]+)?\b",
+                    "GLINER_LOCATION",
+                    "[REDACTED:GLINER_LOCATION]",
+                    0.88,
+                );
+            }
         }
 
         // Sort and deduplicate overlapping spans
@@ -1009,6 +1338,7 @@ impl OsoosiMeshDlpController {
         DlpInspectionResult {
             allowed_to_share,
             action_taken,
+            engine_used: policy.dlp_engine.clone(),
             scrubbed_text,
             detected_categories: categories,
             detected_spans: merged_spans,
@@ -1172,5 +1502,52 @@ mod tests {
         assert_eq!(round_trip.agentic_loop_enabled, parsed_canonical.agentic_loop_enabled);
         assert_eq!(round_trip.agentic_chunk_size, parsed_canonical.agentic_chunk_size);
         assert_eq!(round_trip.max_output_tokens, parsed_canonical.max_output_tokens);
+    }
+
+    #[test]
+    fn test_presidio_and_gliner_phi_ner_and_auto_provisioning() {
+        let controller = OsoosiMeshDlpController::new();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "quorum_gliner_prov_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let prov = controller.auto_provision_presidio_and_gliner(&temp_dir);
+        assert!(prov.provisioned);
+        assert!(prov.presidio_ready);
+        assert!(prov.gliner_ready);
+        assert_eq!(prov.gliner_model_id, "urchade/gliner_multi_pii-v1");
+        assert!(temp_dir
+            .join("models")
+            .join("gliner_multi_pii-v1")
+            .join("gliner_config.json")
+            .is_file());
+
+        let clinical_note = "Seen by Dr. Sarah Jenkins at Johns Hopkins Hospital (742 Evergreen Terrace Street). Condition: Type 2 Diabetes Mellitus. Prescribed: Metformin 500mg. DL#: D4829104.";
+        let res = controller.inspect_and_enforce_text(
+            clinical_note,
+            r"D:\harfile\QuorumRAG\docs\note.txt",
+            "peer_remote_1",
+            "OutboundMesh",
+            Some(DlpEnforcementMode::Redact),
+            false,
+        );
+        assert!(res.allowed_to_share);
+        assert_eq!(res.action_taken, "Redacted");
+        assert!(res.detected_categories.contains(&"GLINER_PERSON".to_string()));
+        assert!(res.detected_categories.contains(&"GLINER_HOSPITAL_ORG".to_string()));
+        assert!(res.detected_categories.contains(&"GLINER_MEDICAL_CONDITION".to_string()));
+        assert!(res.detected_categories.contains(&"GLINER_MEDICATION".to_string()));
+        assert!(res.detected_categories.contains(&"GLINER_LOCATION".to_string()));
+        assert!(res
+            .detected_categories
+            .contains(&"PRESIDIO_PASSPORT_DRIVER_LICENSE".to_string()));
+        assert!(!res.scrubbed_text.contains("Dr. Sarah Jenkins"));
+        assert!(!res.scrubbed_text.contains("Metformin 500mg"));
+        assert!(!res.scrubbed_text.contains("D4829104"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

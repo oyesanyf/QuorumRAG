@@ -292,4 +292,25 @@ fn test_rust_embed_asset_enumeration() {
     assert!(filenames.iter().any(|f| f.contains("app.js")));
     assert!(filenames.iter().any(|f| f.contains("langextract.html")));
     assert!(filenames.iter().any(|f| f.contains("favicon.svg")));
+
+    // Verify all 5 core assets are statically embedded in the binary's .rdata section (Cow::Borrowed),
+    // NOT dynamically read from disk (Cow::Owned), so MSI installs on any other machine work identically.
+    for required in ["index.html", "styles.css", "app.js", "langextract.html", "favicon.svg"] {
+        let embedded = WebAssets::get(required)
+            .unwrap_or_else(|| panic!("WebAssets::get('{}') must be embedded in binary", required));
+        assert!(
+            matches!(embedded.data, std::borrow::Cow::Borrowed(_)),
+            "Asset '{}' must be statically embedded in the binary (Cow::Borrowed) so other machines do not need the source folder",
+            required
+        );
+        assert!(
+            embedded.data.len() > 100,
+            "Embedded asset '{}' must be non-trivial (got {} bytes)",
+            required,
+            embedded.data.len()
+        );
+        let fallback = quorum_ui::assets::compile_time_embedded_asset(required)
+            .unwrap_or_else(|| panic!("compile_time_embedded_asset('{}') must exist", required));
+        assert_eq!(fallback.0.len(), embedded.data.len());
+    }
 }

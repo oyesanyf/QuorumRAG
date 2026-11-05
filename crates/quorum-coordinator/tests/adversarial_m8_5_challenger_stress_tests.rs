@@ -311,7 +311,10 @@ async fn test_adversarial_oracle_non_code_queries_100_percent_isolated() {
     let vector = vec![0.5f32; 768];
 
     for prompt in &test_prompts {
-        let (tx, _rx) = tokio::sync::mpsc::channel(50);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let _drainer = tokio::spawn(async move {
+            while let Some(_) = rx.recv().await {}
+        });
         let result = runner
             .run(
                 prompt,

@@ -208,7 +208,10 @@ async fn test_m8_5_rag_retrieval_isolation_never_returns_code_or_temp_chunks() {
 
     // 3. Full State Graph End-to-End Verification: Run AgenticStateGraphRunner
     let runner = AgenticStateGraphRunner::new(3, 0.75);
-    let (tx, _rx) = tokio::sync::mpsc::channel(50);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let _drainer = tokio::spawn(async move {
+        while let Some(_) = rx.recv().await {}
+    });
 
     let result = runner
         .run(

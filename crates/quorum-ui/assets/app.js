@@ -179,9 +179,60 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       if (typeof saveUiSettingsPatch === 'function') {
         saveUiSettingsPatch({ default_model_family: currentModel }).catch(() => {});
       }
+      if (telemetryModelInfo) {
+        telemetryModelInfo.textContent = pill.textContent.trim();
+      }
       verifySelectedModelAvailability(currentModel);
     });
   });
+
+  async function refreshDynamicModels() {
+    try {
+      const res = await fetchWithTimeout('/api/models', {}, 600);
+      if (!res || !res.ok) return;
+      const info = await res.json();
+      window._modelsData = info;
+      if (Array.isArray(info.installed_models)) {
+        window._discoveredOllamaTags = info.installed_models;
+      }
+
+      // 1. Dynamic Header Model Selector Bar
+      const bar = document.querySelector('.model-selector-bar');
+      if (bar && Array.isArray(info.calibrated_pills) && info.calibrated_pills.length > 0) {
+        bar.innerHTML = info.calibrated_pills
+          .filter(p => p.category === 'auto' || (p.category === 'chat' && p.memory_eligible !== false))
+          .map(p => {
+            const isAct = currentModel === p.id || (p.category === 'auto' && (currentModel === 'AutoFusion' || !currentModel));
+            return `<button class="model-pill ${isAct ? 'active' : ''}" data-model="${escapeHtml(p.id)}" title="${escapeHtml(p.description || '')}">${escapeHtml(p.name)}</button>`;
+          })
+          .join('');
+
+        // Rebind click listeners to new dynamic buttons
+        bar.querySelectorAll('.model-pill').forEach(pill => {
+          pill.addEventListener('click', () => {
+            bar.querySelectorAll('.model-pill').forEach(p => p.classList.remove('active'));
+            pill.classList.add('active');
+            currentModel = pill.dataset.model;
+            if (typeof saveUiSettingsPatch === 'function') {
+              saveUiSettingsPatch({ default_model_family: currentModel }).catch(() => {});
+            }
+            if (telemetryModelInfo) {
+              telemetryModelInfo.textContent = pill.textContent.trim();
+            }
+            verifySelectedModelAvailability(currentModel);
+          });
+        });
+      }
+
+      // 2. Update telemetry display if auto
+      if (currentModel === 'AutoFusion' && info.calibrated_target && telemetryModelInfo) {
+        telemetryModelInfo.textContent = 'Auto (' + info.calibrated_target + ')';
+      }
+    } catch (_) {}
+  }
+
+  // Trigger dynamic model hydration on load
+  refreshDynamicModels();
 
   // 3. SEARCH MODE TOGGLE
   searchPills.forEach(pill => {
@@ -791,6 +842,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     } else if (type === 'ExecutionFinished' || type === 'execution_finished' || type === 'done') {
       if (citationsEl && data && data.responder_peer_id) {
         citationsEl._responderPeerId = String(data.responder_peer_id).trim();
+        refreshSourcesNodeIdRow(citationsEl);
       }
       markTelemetryComplete();
     } else if (type === 'ExecutionError' || type === 'execution_error') {
@@ -1121,7 +1173,14 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     const nodeMeta = document.createElement('div');
     nodeMeta.className = 'qr-inspector-node-meta';
     nodeMeta.style.cssText = 'font-size:11.5px; color:var(--text-muted); margin-top:4px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;';
-    nodeMeta.innerHTML = `<span><strong>Providing Node / Peer ID:</strong> <code>${escapeHtml(rec.nodeId || 'local')}</code></span> <span>•</span> <span><strong>Origin:</strong> ${escapeHtml(rec.originLabel || (rec.local ? 'Local Node' : 'Mesh Peer'))}</span>`;
+    nodeMeta.innerHTML = `<span><strong>Providing Node / Peer ID:</strong> <button type="button" class="sources-responder-peer-pill" style="cursor:pointer;" title="Click to copy full Node ID"><span>🌐</span> <strong>${escapeHtml(rec.nodeId || 'local')}</strong></button></span> <span>•</span> <span><strong>Origin:</strong> ${escapeHtml(rec.originLabel || (rec.local ? 'Local Node' : 'Mesh Peer'))}</span>`;
+    const copyNodeBtn = nodeMeta.querySelector('.sources-responder-peer-pill');
+    if (copyNodeBtn) {
+      copyNodeBtn.addEventListener('click', () => {
+        const fullId = rec.nodeId || 'local';
+        copyText(fullId, copyNodeBtn, '✓ Copied: ' + fullId.slice(0, 16) + (fullId.length > 16 ? '...' : ''));
+      });
+    }
     inspector.appendChild(nodeMeta);
     if (rec.local && rec.kind === 'image') {
       const thumb = document.createElement('img');
@@ -1204,6 +1263,73 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     return /\b(no matching|did not find|could not find|couldn'?t find|were not found|was not found|do(?:es)? not contain|no (?:pictures?|photos?|images?|files?|documents?) (?:were |was )?(?:found|taken|matched))/i.test(String(text || ''));
   }
 
+  function refreshSourcesNodeIdRow(citationsEl) {
+    if (!citationsEl) return;
+    const localNodeId = (cachedSettingsData && cachedSettingsData.runtime && cachedSettingsData.runtime.local_peer_id)
+      ? String(cachedSettingsData.runtime.local_peer_id).trim()
+      : 'local-sovereign-node';
+
+    const responderId = (citationsEl._responderPeerId && citationsEl._responderPeerId !== 'local')
+      ? citationsEl._responderPeerId
+      : localNodeId;
+
+    const pendingList = Array.isArray(citationsEl._pendingCitations) ? citationsEl._pendingCitations : [];
+    const records = Array.isArray(citationsEl._records) ? citationsEl._records : [];
+    const distinctPeers = new Set();
+    for (const item of pendingList) {
+      const pid = String((item && (item.node_id || item.peer_id || item.source_peer)) || '').trim();
+      if (pid && pid.toLowerCase() !== 'local') {
+        distinctPeers.add(pid);
+      } else {
+        distinctPeers.add(responderId);
+      }
+    }
+    for (const rec of records) {
+      const pid = String(rec.nodeId || '').trim();
+      if (pid && pid.toLowerCase() !== 'local') {
+        distinctPeers.add(pid);
+      } else {
+        distinctPeers.add(responderId);
+      }
+    }
+    if (distinctPeers.size === 0) distinctPeers.add(responderId);
+
+    let nodeRow = citationsEl.querySelector('.sources-node-id-row');
+    if (!nodeRow) {
+      nodeRow = document.createElement('div');
+      nodeRow.className = 'sources-node-id-row';
+      const heading = citationsEl.querySelector('.sources-heading');
+      if (heading && heading.nextSibling) {
+        citationsEl.insertBefore(nodeRow, heading.nextSibling);
+      } else {
+        citationsEl.appendChild(nodeRow);
+      }
+    }
+
+    const isExternalResponder = responderId !== localNodeId && responderId !== 'local-sovereign-node';
+    const peerCount = distinctPeers.size;
+    const meshContributorsCount = isExternalResponder ? peerCount : (peerCount > 1 ? peerCount - 1 : 0);
+
+    nodeRow.innerHTML = `
+      <span style="font-weight:600; color:var(--text-secondary, #d1d5db);">Responding Node ID:</span>
+      <button type="button" class="sources-responder-peer-pill" title="Click to copy responding Node ID">
+        <span>🌐</span> <strong>${escapeHtml(responderId)}</strong>
+      </button>
+      ${meshContributorsCount > 0 ? `
+        <span class="sources-federated-tag" style="font-size:11px; opacity:0.85; color:var(--text-muted); background:rgba(255,255,255,0.06); padding:2px 6px; border-radius:4px;">
+          (+ ${meshContributorsCount} Mesh Peer${meshContributorsCount > 1 ? 's' : ''})
+        </span>
+      ` : ''}
+    `;
+
+    const btn = nodeRow.querySelector('.sources-responder-peer-pill');
+    if (btn) {
+      btn.addEventListener('click', () => {
+        copyText(responderId, btn, '✓ Node ID Copied: ' + responderId.slice(0, 16) + (responderId.length > 16 ? '...' : ''));
+      });
+    }
+  }
+
   function appendCitation(citationsEl, cit) {
     if (!citationsEl || !cit) return;
     if (!citationsEl._seenFiles) {
@@ -1222,44 +1348,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       label.style.cssText = 'width:100%;font-size:0.76rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;opacity:0.75;margin-bottom:4px;';
       label.textContent = 'Sources';
       citationsEl.appendChild(label);
-
-      const localNodeId = (cachedSettingsData && cachedSettingsData.runtime && cachedSettingsData.runtime.local_peer_id)
-        ? String(cachedSettingsData.runtime.local_peer_id).trim()
-        : 'local-sovereign-node';
-      const responderId = (citationsEl._responderPeerId && citationsEl._responderPeerId !== 'local')
-        ? citationsEl._responderPeerId
-        : localNodeId;
-      const pendingList = Array.isArray(citationsEl._pendingCitations) ? citationsEl._pendingCitations : [];
-      const distinctPeers = new Set();
-      for (const item of pendingList) {
-        const pid = String((item && (item.node_id || item.peer_id || item.source_peer)) || '').trim();
-        if (pid && pid.toLowerCase() !== 'local') {
-          distinctPeers.add(pid);
-        } else {
-          distinctPeers.add(responderId);
-        }
-      }
-      if (distinctPeers.size === 0) distinctPeers.add(responderId);
-
-      const nodeRow = document.createElement('div');
-      nodeRow.className = 'sources-node-id-row';
-      nodeRow.style.cssText = 'width:100%; display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px; font-size:11.5px; color:var(--text-muted, #9ca3af);';
-      const peerBadge = document.createElement('button');
-      peerBadge.type = 'button';
-      peerBadge.className = 'sources-responder-peer-pill';
-      peerBadge.style.cssText = 'display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:6px; font-size:11px; font-family:monospace; background:rgba(16,163,127,0.14); color:#10a37f; border:1px solid rgba(16,163,127,0.35); cursor:pointer;';
-      peerBadge.title = 'Click to copy responding Peer / Node ID';
-      peerBadge.innerHTML = `<span>🌐 Peer ID:</span> <strong>${escapeHtml(responderId)}</strong>`;
-      peerBadge.addEventListener('click', () => copyText(responderId, peerBadge, '✓ Peer ID Copied: ' + responderId.slice(0, 16) + (responderId.length > 16 ? '...' : '')));
-      nodeRow.appendChild(peerBadge);
-      if (distinctPeers.size > 1) {
-        const meshSpan = document.createElement('span');
-        meshSpan.style.cssText = 'font-size:11px; opacity:0.85;';
-        meshSpan.textContent = `• Federated across ${distinctPeers.size} mesh nodes`;
-        nodeRow.appendChild(meshSpan);
-      }
-      citationsEl.appendChild(nodeRow);
     }
+    refreshSourcesNodeIdRow(citationsEl);
+
     const rawPath = String(cit.file_path || '').replace(LINE_REF_RE, '').trim();
     const fileName = rawPath.split(/[\\/]/).pop() || rawPath;
     const cleanFileName = fileName.replace(LINE_REF_RE, '').replace(COLON_RANGE_RE, '').trim();
@@ -1283,7 +1374,6 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     let scorePct = rawScore > 1 ? Math.round(rawScore) : Math.round(rawScore * 100);
     scorePct = Math.max(0, Math.min(100, scorePct));
 
-    const peerLabel = ` [Peer: ${shortNodeId}]`;
     const kind = mediaKind(rawPath);
     const rec = {
       citeNum,
@@ -1304,10 +1394,23 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     badge.dataset.citeNum = String(citeNum);
     badge.dataset.peerId = effectiveNodeId;
     badge.title = `[${citeNum}] ${rec.filePath}\nProviding Peer ID: ${effectiveNodeId} (${rec.originLabel})\nRelevance: ${scorePct}%\nClick to preview, open, or download`;
-    badge.innerHTML = `<span class="cite-index" style="font-weight:700;opacity:0.9;">[${citeNum}]</span> <span>${kindIcon(kind)} ${escapeHtml(cleanFileName)}</span> <span class="cite-peer-tag" style="opacity:0.85; font-size:10.5px; font-family:monospace; padding:1px 5px; border-radius:4px; background:rgba(16,163,127,0.16); color:#10a37f;">Peer: ${escapeHtml(shortNodeId)}</span> <span class="score-pill" style="opacity:0.85; font-size:11px; margin-left:2px; padding:1px 6px; border-radius:4px; background:rgba(66,133,244,0.2); font-weight:600;">\u00B7 ${scorePct}%</span>`;
+    badge.innerHTML = `
+      <div style="display:flex; align-items:center; gap:6px;">
+        <span class="cite-index" style="font-weight:700; opacity:0.9;">[${citeNum}]</span>
+        <span>${kindIcon(kind)} ${escapeHtml(cleanFileName)}</span>
+        <span class="score-pill" style="opacity:0.85; font-size:11px; padding:1px 6px; border-radius:4px; background:rgba(66,133,244,0.2); font-weight:600;">\u00B7 ${scorePct}%</span>
+      </div>
+      <div class="citation-node-id-subline">
+        <span>Node ID:</span>
+        <span class="${isLocal ? 'cite-node-local' : 'cite-node-mesh'}">
+          ${escapeHtml(shortNodeId)} (${rec.originLabel})
+        </span>
+      </div>
+    `;
     badge.addEventListener('click', () => showSourceInspector(citationsEl, rec));
     citationsEl.appendChild(badge);
     appendMediaCard(citationsEl, rec);
+    refreshSourcesNodeIdRow(citationsEl);
   }
 
   function updateTelemetryStep(state) {
@@ -1738,7 +1841,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         <div style="background:var(--bg-surface); border:1px solid var(--border-color); border-radius:8px; padding:12px;">
           <h4>🔬 Google LangExtract Results (Consensus: ${data.consensus_passed ? 'PASSED' : 'REJECTED'})</h4>
           <p>Confidence: ${(data.fused_confidence_bp / 100).toFixed(1)}% | Verified Spans: ${data.verified_extractions.length}</p>
-          <pre style="margin-top:8px;">${JSON.stringify(data.verified_extractions, null, 2)}</pre>
+          <pre style="margin-top:8px;">${escapeHtml(JSON.stringify(data.verified_extractions, null, 2))}</pre>
           <div style="margin-top:10px;">
             <a href="/assets/langextract.html" target="_blank" class="btn-primary" style="display:inline-block; text-decoration:none; padding:4px 8px; font-size:12px;">Open Interactive Visualizer</a>
           </div>
@@ -2089,6 +2192,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   let activeSettingsTab = 'general';
   let cachedSettingsData = null;
   let currentBrowsePath = '';
+  let currentBrowseParentPath = '';
   let cachedBrowseDirs = [];
 
   async function loadFullSettings() {
@@ -2096,10 +2200,23 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       const resp = await fetch('/api/settings');
       if (!resp.ok) return null;
       const data = await resp.json();
-      if (data && data.ui && Array.isArray(data.ui.archived_chats)) {
-        const cleaned = stripMockArchivedChats(data.ui.archived_chats);
-        if (cleaned.length !== data.ui.archived_chats.length) {
-          data.ui.archived_chats = cleaned;
+      if (data && data.ui) {
+        let changed = false;
+        if (Array.isArray(data.ui.archived_chats)) {
+          const cleaned = stripMockArchivedChats(data.ui.archived_chats);
+          if (cleaned.length !== data.ui.archived_chats.length) {
+            data.ui.archived_chats = cleaned;
+            changed = true;
+          }
+        }
+        if (Array.isArray(data.ui.saved_memories)) {
+          const cleanedMem = stripMockMemories(data.ui.saved_memories);
+          if (cleanedMem.length !== data.ui.saved_memories.length) {
+            data.ui.saved_memories = cleanedMem;
+            changed = true;
+          }
+        }
+        if (changed) {
           fetch('/api/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2135,10 +2252,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
 
   async function openSettingsView(tab = 'general') {
     activeSettingsTab = tab;
+    if (typeof initSettingsEventDelegation === 'function') initSettingsEventDelegation();
     if (settingsView) settingsView.classList.remove('hidden');
     highlightSettingsNav(tab);
     await loadFullSettings();
-    if (tab === 'mesh') {
+    if (tab === 'mesh' || tab === 'storage') {
       await fetchMeshData();
       await fetchBrowseFolders(currentBrowsePath);
     }
@@ -2192,7 +2310,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       const tab = btn.dataset.tab || 'general';
       activeSettingsTab = tab;
       highlightSettingsNav(tab);
-      if (tab === 'mesh') {
+      if (tab === 'mesh' || tab === 'storage') {
         await fetchMeshData();
         await fetchBrowseFolders(currentBrowsePath);
       }
@@ -2249,13 +2367,14 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       if (!resp.ok) return;
       const data = await resp.json();
       currentBrowsePath = data.current_path || '';
+      currentBrowseParentPath = data.parent_path || '';
       cachedBrowseDirs = data.directories || [];
     } catch (_) {}
   }
 
   window.quorumBrowseDir = async function(pathStr) {
     await fetchBrowseFolders(pathStr);
-    renderSettingsTabContent('mesh', '');
+    renderSettingsTabContent(activeSettingsTab, '');
     showSettingsToast(pathStr ? ('Browsing ' + pathStr) : 'Showing physical drives');
   };
 
@@ -2373,6 +2492,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             <div><strong>Redacted Spans:</strong> ${insp.redacted_span_count || 0}</div>
           </div>
           <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">
+            <strong>Active DLP Model:</strong> <code>${escapeHtml(insp.engine_used || 'Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1)')}</code>
+          </div>
+          <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">
             <strong>Detected PHI/PII Categories:</strong> ${(insp.detected_categories || []).join(', ') || 'None'}
           </div>
           <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">
@@ -2425,6 +2547,20 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       const id = String(c.id || '').trim().toLowerCase();
       const title = String(c.title || '').trim().toLowerCase();
       return !LEGACY_MOCK_ARCHIVED_IDS.has(id) && !LEGACY_MOCK_ARCHIVED_TITLES.has(title);
+    });
+  }
+
+  const LEGACY_MOCK_MEMORIES = new Set([
+    'synthesize comprehensive multi-section markdown answers from hybrid bm25 + lancedb dense vector embeddings.',
+    'all answers must be grounded in local files or local ollama models with citations grouped cleanly at the bottom.'
+  ]);
+
+  function stripMockMemories(list) {
+    if (!Array.isArray(list)) return [];
+    return list.filter(m => {
+      if (!m) return false;
+      const s = String(m).trim().toLowerCase();
+      return !LEGACY_MOCK_MEMORIES.has(s);
     });
   }
 
@@ -2612,6 +2748,654 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     }
   };
 
+  function initSettingsEventDelegation() {
+    const container = document.getElementById('settings-content-container');
+    if (!container || container._hasDelegationListeners) return;
+    container._hasDelegationListeners = true;
+
+    container.addEventListener('click', async (e) => {
+      const actionEl = e.target.closest('[data-action]');
+      if (!actionEl) return;
+
+      const action = actionEl.dataset.action;
+      const folderPath = actionEl.dataset.folderPath || '';
+      const peerId = actionEl.dataset.peerId || '';
+      const chatId = actionEl.dataset.chatId || '';
+
+      switch (action) {
+        case 'browse-dir':
+          e.preventDefault();
+          if (folderPath) await window.quorumBrowseDir(folderPath);
+          break;
+
+        case 'browse-up':
+          e.preventDefault();
+          await window.quorumBrowseDir(folderPath || '');
+          break;
+
+        case 'browse-root':
+          e.preventDefault();
+          await window.quorumBrowseDir('');
+          break;
+
+        case 'share-folder':
+          e.preventDefault();
+          e.stopPropagation();
+          if (folderPath) await window.quorumShareFolder(folderPath);
+          break;
+
+        case 'remove-shared-folder':
+          e.preventDefault();
+          e.stopPropagation();
+          if (folderPath) await window.quorumRemoveSharedFolder(folderPath);
+          break;
+
+        case 'select-shared-pill':
+          e.preventDefault();
+          if (folderPath) {
+            const input = document.getElementById('new-shared-folder-input');
+            if (input) {
+              input.value = folderPath;
+              input.focus();
+            }
+            await window.quorumBrowseDir(folderPath);
+          }
+          break;
+
+        case 'share-input-folder':
+          e.preventDefault();
+          const inp = document.getElementById('new-shared-folder-input');
+          const val = inp ? inp.value.trim() : '';
+          if (val) {
+            await window.quorumShareFolder(val);
+          } else if (currentBrowsePath) {
+            await window.quorumShareFolder(currentBrowsePath);
+          } else {
+            showSettingsToast('Select a drive/folder below or enter a folder path first');
+            if (inp) inp.focus();
+          }
+          break;
+
+        case 'allow-pending-join':
+          e.preventDefault();
+          if (peerId) await window.quorumAllowPendingJoin(peerId);
+          break;
+
+        case 'deny-pending-join':
+          e.preventDefault();
+          if (peerId) await window.quorumDenyPendingJoin(peerId);
+          break;
+
+        case 'approve-all-pending':
+          e.preventDefault();
+          await window.quorumApproveAllPending();
+          break;
+
+        case 'clear-pending-joins':
+          e.preventDefault();
+          await window.quorumClearPendingJoins();
+          break;
+
+        case 'quarantine-peer':
+          e.preventDefault();
+          if (peerId) await window.quorumUpdateMeshConfig({ quarantine_peer: peerId });
+          break;
+
+        case 'release-quarantine-peer':
+          e.preventDefault();
+          if (peerId) await window.quorumReleaseQuarantinePeer(peerId);
+          break;
+
+        case 'copy-text':
+          e.preventDefault();
+          const textToCopy = actionEl.dataset.copyText || '';
+          const label = actionEl.dataset.copyLabel || 'Copied to clipboard';
+          if (textToCopy) window.quorumCopyText(textToCopy, label);
+          break;
+
+        case 'unarchive-chat':
+          e.preventDefault();
+          if (chatId) await window._unarchiveChat(chatId);
+          break;
+
+        case 'delete-archived-chat':
+          e.preventDefault();
+          if (chatId) await window._deleteArchivedChat(chatId);
+          break;
+
+        case 'archive-current-chat':
+          e.preventDefault();
+          await window._archiveCurrentChat();
+          break;
+
+        case 'set-workhorse-model':
+          e.preventDefault();
+          const modelTag = actionEl.dataset.modelTag;
+          if (modelTag) {
+            await window._saveUiPatch({ primary_workhorse_model: modelTag });
+            renderSettingsTabContent('models', '');
+            showSettingsToast('Activated ' + modelTag);
+          }
+          break;
+
+        case 'add-custom-model':
+          e.preventDefault();
+          await window._addCustomModel();
+          break;
+
+        case 'remove-custom-model':
+          e.preventDefault();
+          const cmIdx = Number(actionEl.dataset.index);
+          if (!isNaN(cmIdx)) await window._removeCustomModel(cmIdx);
+          break;
+
+        case 'create-custom-fusion':
+          e.preventDefault();
+          await window._createCustomFusion();
+          break;
+
+        case 'remove-custom-fusion':
+          e.preventDefault();
+          const cfIdx = Number(actionEl.dataset.index);
+          if (!isNaN(cfIdx)) await window._removeCustomFusion(cfIdx);
+          break;
+
+        case 'set-restrl-state':
+          e.preventDefault();
+          const isRun = actionEl.dataset.running === 'true';
+          const isRef = actionEl.dataset.refreshOnly === 'true';
+          await window._setRestRlState(isRun, isRef);
+          break;
+
+        case 'diag-health':
+          e.preventDefault();
+          try {
+            const resp = await fetch('/api/health');
+            const d = await resp.json();
+            const ramGb = d.free_ram_bytes ? (d.free_ram_bytes / (1024 * 1024 * 1024)).toFixed(1) : (d.free_ram_gb || 'N/A');
+            showSettingsToast(`✓ Health: ${d.status || 'ok'} • RAM Free: ${ramGb}GB • Chunks: ${d.total_chunks || 0} • GPU: ${d.gpu_count || 0}`);
+          } catch (err) {
+            showSettingsToast('Health check error: ' + err.message);
+          }
+          break;
+
+        case 'diag-reindex':
+          e.preventDefault();
+          try {
+            const resp = await fetch('/api/reindex', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: [] }) });
+            const d = await resp.json();
+            showSettingsToast(d.message || '✓ Physical drive reindex started');
+          } catch (err) {
+            showSettingsToast('Reindex error: ' + err.message);
+          }
+          break;
+
+        case 'diag-drift':
+          e.preventDefault();
+          try {
+            const resp = await fetch('/api/drift/fix', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dry_run: false }) });
+            const d = await resp.json();
+            showSettingsToast(`✓ 5-Drift scan completed: ${d.actions_taken || 0} issues repaired`);
+          } catch (err) {
+            showSettingsToast('Drift fix error: ' + err.message);
+          }
+          break;
+
+        case 'diag-recache':
+          e.preventDefault();
+          try {
+            const resp = await fetch('/api/cache/recache', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ clear: true, warm: true }) });
+            const d = await resp.json();
+            showSettingsToast(d.message || '✓ Query & embedding cache flushed and re-warmed');
+          } catch (err) {
+            showSettingsToast('Re-cache error: ' + err.message);
+          }
+          break;
+
+        case 'open-modal':
+          e.preventDefault();
+          const modalId = actionEl.dataset.modalId;
+          if (modalId) window._openModalFromSettings(modalId);
+          break;
+
+        case 'probe-endpoint':
+          e.preventDefault();
+          const ep = actionEl.dataset.endpoint;
+          if (ep) await window._probeEndpoint(ep);
+          break;
+
+        case 'refresh-ollama-tags':
+          e.preventDefault();
+          await window._refreshOllamaTags();
+          break;
+
+        case 'run-catalog-action':
+          e.preventDefault();
+          const catAct = actionEl.dataset.catalogAction;
+          if (catAct) await window._runCatalogAction(catAct);
+          break;
+
+        case 'toggle-appearance-advanced':
+          e.preventDefault();
+          window._toggleAppearanceAdvanced();
+          break;
+
+        case 'export-theme-config':
+          e.preventDefault();
+          window._exportThemeConfig();
+          break;
+
+        case 'copy-theme-config':
+          e.preventDefault();
+          window._copyThemeConfig();
+          break;
+
+        case 'apply-theme':
+          e.preventDefault();
+          const th = actionEl.dataset.theme;
+          if (th) await window._applyThemePreset(th);
+          break;
+
+        case 'apply-accent':
+          e.preventDefault();
+          const acc = actionEl.dataset.accent;
+          if (acc) await window._applyAccentColor(acc);
+          break;
+
+        case 'set-appearance-mode':
+          e.preventDefault();
+          const mode = actionEl.dataset.mode;
+          if (mode) await window._setAppearanceMode(mode);
+          break;
+
+        case 'save-profile':
+          e.preventDefault();
+          const profName = document.getElementById('prof-name') ? document.getElementById('prof-name').value : '';
+          const profRole = document.getElementById('prof-role') ? document.getElementById('prof-role').value : '';
+          const profOrg = document.getElementById('prof-org') ? document.getElementById('prof-org').value : '';
+          await saveUiSettingsPatch({ display_name: profName, profile_role: profRole, organization: profOrg });
+          showSettingsToast('Profile saved');
+          break;
+
+        case 'save-mesh-alias':
+          e.preventDefault();
+          const aliasInp = document.getElementById('mesh-alias-input');
+          if (aliasInp) await window.quorumUpdateMeshConfig({ node_alias: aliasInp.value.trim() });
+          break;
+
+        case 'save-mesh-bootstrap':
+          e.preventDefault();
+          const peersInp = document.getElementById('mesh-peers-input');
+          if (peersInp) {
+            const list = peersInp.value.split(',').map(s => s.trim()).filter(Boolean);
+            await window.quorumUpdateMeshConfig({ bootstrap_peers: list });
+          }
+          break;
+
+        case 'rotate-epoch':
+          e.preventDefault();
+          await window.quorumUpdateMeshConfig({ rotate_epoch: true });
+          showSettingsToast('Cryptographic epoch key rotated');
+          break;
+
+        case 'run-dlp-test':
+          e.preventDefault();
+          await window.quorumRunDlpTest();
+          break;
+
+        case 'reprovision-gliner':
+          e.preventDefault();
+          showSettingsToast('Provisioning & verifying Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1)...');
+          await window.quorumUpdateDlpPolicy({ reprovision_gliner: true });
+          showSettingsToast('✓ Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1) verified & provisioned');
+          break;
+
+        case 'refresh-tpm':
+          e.preventDefault();
+          await window.quorumRefreshTpmStatus();
+          break;
+
+        case 'enable-mesh':
+          e.preventDefault();
+          await window.quorumUpdateMeshConfig({ p2p_enabled: true });
+          break;
+
+        case 'disable-mesh':
+          e.preventDefault();
+          await window.quorumUpdateMeshConfig({ p2p_enabled: false });
+          break;
+
+        case 'test-notification':
+          e.preventDefault();
+          showSettingsToast('🔔 QuorumRAG Notification Channel Active & Verified');
+          break;
+
+        case 'toggle-add-family':
+          e.preventDefault();
+          window._toggleAddFamilyForm();
+          break;
+
+        case 'add-family-member':
+          e.preventDefault();
+          await window._addFamilyMember();
+          break;
+
+        case 'remove-family-member':
+          e.preventDefault();
+          const famIdx = Number(actionEl.dataset.index);
+          if (!isNaN(famIdx)) await window._removeFamilyMember(famIdx);
+          break;
+
+        case 'toggle-add-contact':
+          e.preventDefault();
+          window._toggleAddContactForm();
+          break;
+
+        case 'add-trusted-contact':
+          e.preventDefault();
+          await window._addTrustedContact();
+          break;
+
+        case 'remove-trusted-contact':
+          e.preventDefault();
+          const tcIdx = Number(actionEl.dataset.index);
+          if (!isNaN(tcIdx)) await window._removeTrustedContact(tcIdx);
+          break;
+
+        case 'verify-trusted-contact':
+          e.preventDefault();
+          const cname = actionEl.dataset.contactName || '';
+          showSettingsToast('Verified trusted contact: ' + cname);
+          break;
+
+        case 'preview-voice':
+          e.preventDefault();
+          const vnSel = document.getElementById('voice-name-select');
+          window._previewVoice(vnSel ? vnSel.value : 'Juniper');
+          break;
+
+        case 'record-voice':
+          e.preventDefault();
+          await window._recordVoiceSample();
+          break;
+
+        case 'clear-voice':
+          e.preventDefault();
+          await window._clearVoiceRecordings();
+          break;
+
+        case 'toggle-storage-section':
+          e.preventDefault();
+          const sec = actionEl.dataset.section;
+          if (sec) window._toggleStorageSection(sec);
+          break;
+
+        case 'toggle-memory-manager':
+          e.preventDefault();
+          window._toggleMemoryManager();
+          break;
+
+        case 'add-memory-item':
+          e.preventDefault();
+          await window._addMemoryItem();
+          break;
+
+        case 'remove-memory-item':
+          e.preventDefault();
+          const memIdx = Number(actionEl.dataset.index);
+          if (!isNaN(memIdx)) await window._removeMemoryItem(memIdx);
+          break;
+
+        case 'trigger-file-click':
+          e.preventDefault();
+          const tid = actionEl.dataset.targetId;
+          const targetInput = tid ? document.getElementById(tid) : null;
+          if (targetInput) targetInput.click();
+          break;
+
+        case 'toggle-custom-inst':
+          e.preventDefault();
+          window._toggleCustomInstEditor();
+          break;
+
+        case 'save-custom-inst':
+          e.preventDefault();
+          const instEl = document.getElementById('pers-inst');
+          if (instEl) {
+            await saveUiSettingsPatch({ custom_instructions: instEl.value });
+            showSettingsToast('QuorumRAG instructions saved');
+          }
+          break;
+
+        case 'toggle-codex-inst':
+          e.preventDefault();
+          window._toggleCodexInstEditor();
+          break;
+
+        case 'save-codex-inst':
+          e.preventDefault();
+          const codexEl = document.getElementById('codex-inst');
+          if (codexEl) {
+            await saveUiSettingsPatch({ codex_instructions: codexEl.value });
+            showSettingsToast('Codex instructions saved');
+          }
+          break;
+
+        case 'save-pet-name':
+          e.preventDefault();
+          const petInp = document.getElementById('pet-name-input');
+          if (petInp) {
+            await saveUiSettingsPatch({ mesh_pet_name: petInp.value.trim() });
+            showSettingsToast('Guardian name updated');
+            renderSettingsTabContent(activeSettingsTab, '');
+          }
+          break;
+
+        case 'jump-tab':
+          e.preventDefault();
+          const jt = actionEl.dataset.tab;
+          if (jt) await openSettingsView(jt);
+          break;
+
+        case 'export-all-data':
+          e.preventDefault();
+          window._exportAllData();
+          break;
+
+        case 'trigger-import-settings':
+          e.preventDefault();
+          const impInp = document.getElementById('import-settings-file-input');
+          if (impInp) impInp.click();
+          break;
+
+        case 'clear-query-cache':
+          e.preventDefault();
+          try {
+            await fetch('/api/cache/recache', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ clear: true, warm: false })
+            });
+            showSettingsToast('Query cache flushed');
+          } catch (err) {
+            showSettingsToast('Cache flush error: ' + err.message);
+          }
+          break;
+
+        case 'clear-chat-history':
+          e.preventDefault();
+          conversationHistoryTurns = [];
+          const histEl = document.getElementById('conversation-history');
+          if (histEl) histEl.innerHTML = '';
+          if (chatStream) chatStream.innerHTML = '';
+          if (welcomeBanner) {
+            welcomeBanner.style.display = '';
+            welcomeBanner.classList.remove('hidden');
+          }
+          showSettingsToast('Active chat history cleared');
+          break;
+
+        case 'clear-archived-chats':
+          e.preventDefault();
+          await saveUiSettingsPatch({ archived_chats: [] });
+          renderSettingsTabContent('archived', '');
+          showSettingsToast('All archived chats cleared');
+          break;
+      }
+    });
+
+    container.addEventListener('change', async (e) => {
+      const changeEl = e.target.closest('[data-change-action]');
+      if (!changeEl) return;
+
+      const action = changeEl.dataset.changeAction;
+      const folderPath = changeEl.dataset.folderPath || '';
+
+      switch (action) {
+        case 'apply-theme':
+          await window._applyThemePreset(changeEl.value);
+          break;
+
+        case 'apply-accent':
+          await window._applyAccentColor(changeEl.value);
+          break;
+
+        case 'apply-custom-bg':
+          await window._applyCustomBgFg(changeEl.value, null);
+          break;
+
+        case 'apply-custom-fg':
+          await window._applyCustomBgFg(null, changeEl.value);
+          break;
+
+        case 'ui-patch':
+          const key = changeEl.dataset.patchKey;
+          if (!key) return;
+          let val;
+          if (changeEl.type === 'checkbox') {
+            val = changeEl.checked;
+          } else if (changeEl.dataset.patchType === 'number') {
+            val = Number(changeEl.value);
+          } else {
+            val = changeEl.value;
+          }
+          const toastMsg = changeEl.dataset.toastMessage || 'Setting updated';
+          await saveUiSettingsPatch({ [key]: val });
+          showSettingsToast(toastMsg);
+          if (changeEl.dataset.rerenderTab) {
+            renderSettingsTabContent(activeSettingsTab, '');
+          }
+          break;
+
+        case 'set-model':
+          await window._setModelFromSettings(changeEl.value);
+          break;
+
+        case 'set-search-mode':
+          await window._setSearchModeFromSettings(changeEl.value);
+          break;
+
+        case 'mesh-config':
+          const cfgKey = changeEl.dataset.configKey;
+          if (cfgKey) {
+            const cfgVal = changeEl.type === 'checkbox'
+              ? changeEl.checked
+              : (changeEl.type === 'number' ? Number(changeEl.value) : changeEl.value);
+            await window.quorumUpdateMeshConfig({ [cfgKey]: cfgVal });
+          }
+          break;
+
+        case 'dlp-policy':
+          const polKey = changeEl.dataset.policyKey;
+          if (polKey) {
+            const polVal = changeEl.type === 'checkbox'
+              ? changeEl.checked
+              : (changeEl.dataset.policyType === 'number' ? Number(changeEl.value) : changeEl.value);
+            await window.quorumUpdateDlpPolicy({ [polKey]: polVal });
+          }
+          break;
+
+        case 'toggle-shared-folder':
+          if (folderPath) await window.quorumToggleSharedFolder(folderPath, changeEl.checked);
+          break;
+
+        case 'update-folder-tier':
+          if (folderPath) {
+            const tier = Number(changeEl.value || 0);
+            const dlpOverride = changeEl.dataset.dlpOverride || 'default';
+            await window.quorumUpdateFolderPolicy(folderPath, tier, dlpOverride);
+          }
+          break;
+
+        case 'update-folder-dlp':
+          if (folderPath) {
+            const accessTier = Number(changeEl.dataset.accessTier || 0);
+            await window.quorumUpdateFolderPolicy(folderPath, accessTier, changeEl.value);
+          }
+          break;
+
+        case 'filter-archived-project':
+          window._filterArchivedProject(changeEl.value);
+          break;
+
+        case 'handle-ref-photo':
+          window._handleRefPhotoSelected(e, changeEl.dataset.kind || 'headshot');
+          break;
+
+        case 'import-settings-file':
+          const file = changeEl.files && changeEl.files[0];
+          if (file) {
+            const reader = new FileReader();
+            reader.onload = async (ev) => {
+              try {
+                const parsed = JSON.parse(ev.target.result);
+                const payload = parsed.settings ? parsed.settings : parsed;
+                const resp = await fetch('/api/settings', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(payload)
+                });
+                if (resp.ok) {
+                  await loadFullSettings();
+                  renderSettingsTabContent(activeSettingsTab, '');
+                  showSettingsToast('✓ Settings imported successfully');
+                } else {
+                  showSettingsToast('Import failed: Server returned error');
+                }
+              } catch (err) {
+                showSettingsToast('Failed to parse settings JSON: ' + err.message);
+              }
+            };
+            reader.readAsText(file);
+          }
+          break;
+      }
+    });
+
+    container.addEventListener('input', (e) => {
+      const inputEl = e.target.closest('[data-input-action]');
+      if (!inputEl) return;
+      const action = inputEl.dataset.inputAction;
+      if (action === 'filter-archived-search') {
+        window._filterArchivedChats(inputEl.value);
+      } else if (action === 'update-temperature-label') {
+        const valEl = document.getElementById('val-temperature');
+        if (valEl) valEl.textContent = Number(inputEl.value).toFixed(2);
+      }
+    });
+
+    container.addEventListener('keydown', (e) => {
+      const keyEl = e.target.closest('[data-keydown-action]');
+      if (!keyEl) return;
+      const action = keyEl.dataset.keydownAction;
+      if (action === 'share-folder-enter' && e.key === 'Enter') {
+        e.preventDefault();
+        const path = (keyEl.value || '').trim();
+        if (path) window.quorumShareFolder(path);
+      }
+    });
+  }
+
   function renderSettingsTabContent(tab, searchQuery) {
     if (!settingsContent) return;
     const data = cachedSettingsData || { ui: {}, mesh: { shared_folders: [] }, dlp: {}, dlp_stats: { recent_events: [] }, runtime: {} };
@@ -2620,6 +3404,16 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     const dlp = data.dlp || {};
     const dlpStats = data.dlp_stats || { recent_events: [] };
     const rt = data.runtime || {};
+
+    const browserItemsHtml = (cachedBrowseDirs || []).map(d => `
+      <div class="folder-browser-item" data-action="browse-dir" data-folder-path="${escapeHtml(d.path)}" title="Open ${escapeHtml(d.path)}">
+        <span class="folder-item-label">${d.is_drive ? '💽' : '📁'} ${escapeHtml(d.name)}</span>
+        ${d.is_shared
+          ? `<button type="button" class="btn-secondary" style="padding:2px 8px; font-size:11px; color:var(--success); cursor:pointer;" data-action="remove-shared-folder" data-folder-path="${escapeHtml(d.path)}">✓ Shared</button>`
+          : `<button type="button" class="btn-primary" style="padding:2px 8px; font-size:11px; cursor:pointer;" data-action="share-folder" data-folder-path="${escapeHtml(d.path)}">+ Share</button>`
+        }
+      </div>
+    `).join('');
 
     if (tab === 'general') {
       const lang = ui.language || 'Auto';
@@ -2632,7 +3426,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Language</span>
               <div class="settings-row-desc">Language for the app UI</div>
             </div>
-            <select class="pill-select" onchange="window._saveUiPatch({language: this.value}); window._toast('Language updated')">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="language" data-toast-message="Language updated">
               <option value="Auto" ${lang === 'Auto' ? 'selected' : ''}>Auto detect</option>
               <option value="en-US" ${lang === 'en-US' ? 'selected' : ''}>English (US)</option>
               <option value="en-GB" ${lang === 'en-GB' ? 'selected' : ''}>English (UK)</option>
@@ -2646,7 +3440,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Available reasoning efforts</span>
               <div class="settings-row-desc">Choose which reasoning effort levels appear in model controls. Availability varies by model</div>
             </div>
-            <select class="pill-select" onchange="window._saveUiPatch({reasoning_efforts: this.value}); window._toast('Reasoning effort levels saved')">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="reasoning_efforts" data-toast-message="Reasoning effort levels saved">
               <option value="6 selected" ${efforts === '6 selected' ? 'selected' : ''}>6 selected</option>
               <option value="4 selected" ${efforts === '4 selected' ? 'selected' : ''}>4 selected</option>
               <option value="All 8 levels" ${efforts === 'All 8 levels' ? 'selected' : ''}>All 8 levels</option>
@@ -2662,7 +3456,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Default Model Family</span>
               <div class="settings-row-desc">Hardware-aware local synthesis router (evaluates runtime free RAM/VRAM).</div>
             </div>
-            <select class="pill-select" onchange="window._setModelFromSettings(this.value)">
+            <select class="pill-select" data-change-action="set-model">
               <option value="AutoFusion" ${ui.default_model_family === 'AutoFusion' ? 'selected' : ''}>✨ Auto-Fusion</option>
               <option value="Gemma4_26b" ${ui.default_model_family === 'Gemma4_26b' ? 'selected' : ''}>💎 Gemma 4 26B</option>
               <option value="Glm4Agentic" ${ui.default_model_family === 'Glm4Agentic' ? 'selected' : ''}>🧠 GLM-4-9B</option>
@@ -2675,7 +3469,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Retrieval Mode</span>
               <div class="settings-row-desc">Reciprocal Rank Fusion (RRF k=60) combining Tantivy BM25 and LanceDB vectors.</div>
             </div>
-            <select class="pill-select" onchange="window._setSearchModeFromSettings(this.value)">
+            <select class="pill-select" data-change-action="set-search-mode">
               <option value="Hybrid" ${ui.default_search_mode !== 'Keyword' && ui.default_search_mode !== 'Vector' ? 'selected' : ''}>★ Hybrid RRF</option>
               <option value="Keyword" ${ui.default_search_mode === 'Keyword' ? 'selected' : ''}>BM25 Keyword</option>
               <option value="Vector" ${ui.default_search_mode === 'Vector' ? 'selected' : ''}>Semantic Vector</option>
@@ -2686,7 +3480,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-auto-reindex" class="settings-row-label">Automatic Physical Drive Indexing</label>
               <div class="settings-row-desc">Automatically crawl fixed physical drives (${(rt.physical_drives || ['D:\\', 'C:\\']).join(', ')}) excluding virtual drives and CD-ROMs.</div>
             </div>
-            <input id="sw-auto-reindex" type="checkbox" class="quorum-switch" ${ui.auto_reindex_enabled !== false ? 'checked' : ''} onchange="window._saveUiPatch({auto_reindex_enabled: this.checked}); window._toast('Drive indexing preference saved')">
+            <input id="sw-auto-reindex" type="checkbox" class="quorum-switch" ${ui.auto_reindex_enabled !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="auto_reindex_enabled" data-toast-message="Drive indexing preference saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
@@ -2694,9 +3488,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Launch reindexing, 5-drift healing, BLAKE3 cache management, or AST grounding visualizer.</div>
             </div>
             <div style="display:flex; gap:8px; flex-wrap:wrap;">
-              <button class="pill-btn" onclick="window._openModalFromSettings('modal-reindex')">🔄 Reindex Engine</button>
-              <button class="pill-btn" onclick="window._openModalFromSettings('modal-drift')">🛡️ 5-Drift Remediation</button>
-              <button class="pill-btn" onclick="window._openModalFromSettings('modal-recache')">⚡ Re-Cache Engine</button>
+              <button type="button" class="pill-btn" data-action="open-modal" data-modal-id="modal-reindex">🔄 Reindex Engine</button>
+              <button type="button" class="pill-btn" data-action="open-modal" data-modal-id="modal-drift">🛡️ 5-Drift Remediation</button>
+              <button type="button" class="pill-btn" data-action="open-modal" data-modal-id="modal-recache">⚡ Re-Cache Engine</button>
               <a href="/assets/langextract.html" target="_blank" class="pill-btn" style="text-decoration:none;">🔬 LangExtract</a>
             </div>
           </div>
@@ -2710,7 +3504,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Stream token chunks with sub-50ms yields to the interactive terminal console.</div>
             </div>
             <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; color:var(--text-primary);">
-              <input id="setting-stream" type="checkbox" ${ui.enable_streaming !== false ? 'checked' : ''} style="width:16px; height:16px; accent-color:#6366f1; cursor:pointer;" onchange="window._saveUiPatch({enable_streaming: this.checked}); window._toast('Real-time token streaming ' + (this.checked ? 'enabled' : 'disabled'))">
+              <input id="setting-stream" type="checkbox" ${ui.enable_streaming !== false ? 'checked' : ''} style="width:16px; height:16px; accent-color:#6366f1; cursor:pointer;" data-change-action="ui-patch" data-patch-key="enable_streaming" data-toast-message="Real-time token streaming preference saved">
               <span>Enable Streaming</span>
             </label>
           </div>
@@ -2720,7 +3514,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Automatically scroll terminal screen to the newest message or streaming token.</div>
             </div>
             <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; color:var(--text-primary);">
-              <input id="setting-auto-scroll" type="checkbox" ${ui.auto_scroll !== false ? 'checked' : ''} style="width:16px; height:16px; accent-color:#6366f1; cursor:pointer;" onchange="window._saveUiPatch({auto_scroll: this.checked}); window._toast('Terminal auto-scroll ' + (this.checked ? 'enabled' : 'disabled'))">
+              <input id="setting-auto-scroll" type="checkbox" ${ui.auto_scroll !== false ? 'checked' : ''} style="width:16px; height:16px; accent-color:#6366f1; cursor:pointer;" data-change-action="ui-patch" data-patch-key="auto_scroll" data-toast-message="Terminal auto-scroll preference saved">
               <span>Auto-scroll Terminal</span>
             </label>
           </div>
@@ -2729,7 +3523,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-sizing-strategy" class="settings-row-label">Dynamic Hardware Sizing Rule</label>
               <div class="settings-row-desc">Rule to size local LLM tiers dynamically from runtime available / free memory.</div>
             </div>
-            <select id="setting-sizing-strategy" class="pill-select" style="min-width:290px;" onchange="window._saveUiPatch({sizing_strategy: this.value}); window._toast('Hardware sizing rule updated')">
+            <select id="setting-sizing-strategy" class="pill-select" style="min-width:290px;" data-change-action="ui-patch" data-patch-key="sizing_strategy" data-toast-message="Hardware sizing rule updated">
               <option value="runtime_ram" ${(ui.sizing_strategy || 'runtime_ram') === 'runtime_ram' ? 'selected' : ''}>Runtime Available RAM (Recommended / Dynamic)</option>
               <option value="pareto" ${ui.sizing_strategy === 'pareto' ? 'selected' : ''}>Pareto Multi-Objective Frontier</option>
               <option value="low_budget" ${ui.sizing_strategy === 'low_budget' ? 'selected' : ''}>Low-Budget / Low-Resource Mode</option>
@@ -2738,13 +3532,13 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           <div class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">System Architecture &amp; Diagnostics</span>
-              <div class="settings-row-desc">Platform execution engine verified across Master CLI parity targets.</div>
+              <div class="settings-row-desc">Execute real platform diagnostics against native daemon endpoints.</div>
             </div>
             <div style="display:grid; grid-template-columns:repeat(2, auto); gap:8px; justify-content:flex-end;">
-              <button type="button" class="pill-btn" onclick="window._toast('✓ Verified: Windows x64 Native Execution Engine')" style="font-family:monospace; font-size:11.5px; padding:5px 11px;">Windows x64 Native</button>
-              <button type="button" class="pill-btn" onclick="window._toast('✓ Verified: Dual-Stack IPv4/IPv6 Listener Ready')" style="font-family:monospace; font-size:11.5px; padding:5px 11px;">Dual-Stack IPv4/IPv6</button>
-              <button type="button" class="pill-btn" onclick="window._toast('✓ Verified: <8ms Windows Job Object Preemption')" style="font-family:monospace; font-size:11.5px; padding:5px 11px;">&lt;8ms Job Preemption</button>
-              <button type="button" class="pill-btn" onclick="window._toast('✓ Verified: 100% Zero-Cloud Offline Grounding')" style="font-family:monospace; font-size:11.5px; padding:5px 11px;">Zero-Cloud Offline</button>
+              <button type="button" class="pill-btn" data-action="diag-health" style="font-family:monospace; font-size:11.5px; padding:5px 11px;">🔍 Health Diagnostics</button>
+              <button type="button" class="pill-btn" data-action="diag-reindex" style="font-family:monospace; font-size:11.5px; padding:5px 11px;">🔄 Trigger Reindex</button>
+              <button type="button" class="pill-btn" data-action="diag-drift" style="font-family:monospace; font-size:11.5px; padding:5px 11px;">🛡️ Heal 5-Drift</button>
+              <button type="button" class="pill-btn" data-action="diag-recache" style="font-family:monospace; font-size:11.5px; padding:5px 11px;">⚡ Flush &amp; Re-cache</button>
             </div>
           </div>
         </div>
@@ -2771,9 +3565,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       const restRlProcessed = Number(ui.restrl_processed_tasks || 14);
       const customModels = Array.isArray(ui.custom_models) ? ui.custom_models : [];
       const customFusions = Array.isArray(ui.custom_fusions) ? ui.custom_fusions : [];
-      const discoveredTags = Array.isArray(window._discoveredOllamaTags) && window._discoveredOllamaTags.length > 0
-        ? window._discoveredOllamaTags
-        : ['gemma2:9b', 'gemma2:2b', 'qwen2.5:7b', 'qwen2.5:32b', 'qwen2.5:14b', 'qwen2.5:1.5b', 'glm4:9b', 'deepseek-r1:1.5b', 'deepseek-r1:32b'];
+      const discoveredTags = (window._modelsData && Array.isArray(window._modelsData.installed_models))
+        ? window._modelsData.installed_models.filter(m => !/embed|bge-|minilm/i.test(m))
+        : (Array.isArray(window._discoveredOllamaTags) && window._discoveredOllamaTags.length > 0
+            ? window._discoveredOllamaTags.filter(m => !/embed|bge-|minilm/i.test(m))
+            : [workhorse]);
 
       settingsContent.innerHTML = `
         <h2 class="settings-page-title">AI Models &amp; Endpoints</h2>
@@ -2792,9 +3588,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div style="font-size:12.5px; margin-bottom:4px;"><strong>Indexed Models:</strong> <span id="setting-models-count-banner">${(6438 + customModels.length).toLocaleString()} Models</span> (across 45 Tasks)</div>
               <div style="font-size:12.5px; margin-bottom:10px;"><strong>Hardware Model Fit:</strong> <span id="setting-models-hw-fit" style="color:#10a37f; font-weight:600;">${escapeHtml(workhorse)} (Auto-scaled)</span></div>
               <div style="display:flex; gap:6px; flex-wrap:wrap;">
-                <button type="button" class="pill-btn" onclick="window._runCatalogAction('panel')" style="font-size:11.5px; padding:5px 10px;">🧠 System Panel</button>
-                <button type="button" class="pill-btn" onclick="window._runCatalogAction('curated')" style="font-size:11.5px; padding:5px 10px;">⚡ Update Curated (~6.5k)</button>
-                <button type="button" class="pill-btn" onclick="window._runCatalogAction('full')" style="font-size:11.5px; padding:5px 10px;">🚀 Verify Registry</button>
+                <button type="button" class="pill-btn" data-action="run-catalog-action" data-catalog-action="panel" style="font-size:11.5px; padding:5px 10px;">🧠 System Panel</button>
+                <button type="button" class="pill-btn" data-action="run-catalog-action" data-catalog-action="curated" style="font-size:11.5px; padding:5px 10px;">⚡ Update Curated (~6.5k)</button>
+                <button type="button" class="pill-btn" data-action="run-catalog-action" data-catalog-action="full" style="font-size:11.5px; padding:5px 10px;">🚀 Verify Registry</button>
               </div>
               <div id="models-catalog-feedback" style="font-size:11.5px; color:#10a37f; margin-top:8px; display:none;"></div>
             </div>
@@ -2808,8 +3604,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div id="result-test-ollama" style="font-size:11.5px; margin-top:4px;"></div>
             </div>
             <div style="display:flex; gap:8px; align-items:center;">
-              <input type="text" id="setting-ollama-url" class="form-input" value="${escapeHtml(ollamaUrl)}" spellcheck="false" style="width:220px;" onchange="window._saveUiPatch({ollama_url: this.value.trim()})">
-              <button type="button" class="pill-btn" onclick="window._probeEndpoint('ollama')">Test Connection</button>
+              <input type="text" id="setting-ollama-url" class="form-input" value="${escapeHtml(ollamaUrl)}" spellcheck="false" style="width:220px;" data-change-action="ui-patch" data-patch-key="ollama_url">
+              <button type="button" class="pill-btn" data-action="probe-endpoint" data-endpoint="ollama">Test Connection</button>
             </div>
           </div>
 
@@ -2821,8 +3617,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div id="result-test-ipc" style="font-size:11.5px; margin-top:4px;"></div>
             </div>
             <div style="display:flex; gap:8px; align-items:center;">
-              <input type="text" id="setting-ipc-url" class="form-input" value="${escapeHtml(ipcUrl)}" spellcheck="false" style="width:220px;" onchange="window._saveUiPatch({ipc_url: this.value.trim()})">
-              <button type="button" class="pill-btn" onclick="window._probeEndpoint('ipc')">Test Connection</button>
+              <input type="text" id="setting-ipc-url" class="form-input" value="${escapeHtml(ipcUrl)}" spellcheck="false" style="width:220px;" data-change-action="ui-patch" data-patch-key="ipc_url">
+              <button type="button" class="pill-btn" data-action="probe-endpoint" data-endpoint="ipc">Test Connection</button>
             </div>
           </div>
 
@@ -2834,8 +3630,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div id="result-test-cdp" style="font-size:11.5px; margin-top:4px;"></div>
             </div>
             <div style="display:flex; gap:8px; align-items:center;">
-              <input type="number" id="setting-cdp-port" class="form-input" value="${cdpPort}" min="1" max="65535" style="width:110px;" onchange="window._saveUiPatch({cdp_port: Number(this.value) || 9222})">
-              <button type="button" class="pill-btn" onclick="window._probeEndpoint('cdp')">Test CDP</button>
+              <input type="number" id="setting-cdp-port" class="form-input" value="${cdpPort}" min="1" max="65535" style="width:110px;" data-change-action="ui-patch" data-patch-key="cdp_port" data-patch-type="number">
+              <button type="button" class="pill-btn" data-action="probe-endpoint" data-endpoint="cdp">Test CDP</button>
             </div>
           </div>
 
@@ -2846,12 +3642,12 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Active model used for interactive directives, RAG synthesis, and multi-turn chat.</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center;">
-              <select id="setting-active-model" class="pill-select" style="min-width:250px;" onchange="window._saveUiPatch({primary_workhorse_model: this.value}); window._toast('Primary model set to ' + this.value); renderSettingsTabContent('models', '')">
+              <select id="setting-active-model" class="pill-select" style="min-width:250px;" data-change-action="ui-patch" data-patch-key="primary_workhorse_model" data-rerender-tab="true" data-toast-message="Primary model updated">
                 ${discoveredTags.concat(customModels.map(m => m.tag)).filter((v, i, a) => v && a.indexOf(v) === i).map(tag => `
                   <option value="${escapeHtml(tag)}" ${workhorse === tag ? 'selected' : ''}>${escapeHtml(tag)}</option>
                 `).join('')}
               </select>
-              <button type="button" class="pill-btn" onclick="window._refreshOllamaTags()">Refresh Tags</button>
+              <button type="button" class="pill-btn" data-action="refresh-ollama-tags">Refresh Tags</button>
             </div>
           </div>
         </div>
@@ -2870,7 +3666,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                 <option value="hf_gguf">HuggingFace GGUF</option>
                 <option value="openai">OpenAI Endpoint</option>
               </select>
-              <button type="button" class="pill-btn" onclick="window._addCustomModel()" style="background:#6366f1; color:#fff; border-color:#6366f1;">➕ Add Custom Model</button>
+              <button type="button" class="pill-btn" data-action="add-custom-model" style="background:#6366f1; color:#fff; border-color:#6366f1;">➕ Add Custom Model</button>
             </div>
             ${customModels.length > 0 ? `
               <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">
@@ -2878,8 +3674,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                   <div style="display:flex; align-items:center; justify-content:space-between; padding:7px 12px; border-radius:8px; background:rgba(255,255,255,0.03); border:1px solid var(--border-subtle); font-size:12.5px;">
                     <div><strong>${escapeHtml(m.tag)}</strong> <span style="opacity:0.65;">(${escapeHtml(m.provider)})</span></div>
                     <div style="display:flex; gap:6px;">
-                      <button type="button" class="pill-btn" style="padding:3px 9px; font-size:11px;" onclick="window._saveUiPatch({primary_workhorse_model: '${escapeHtml(m.tag)}'}).then(() => { renderSettingsTabContent('models', ''); window._toast('Activated ${escapeHtml(m.tag)}'); })">Use Active</button>
-                      <button type="button" class="pill-btn" style="padding:3px 9px; font-size:11px; color:var(--danger);" onclick="window._removeCustomModel(${idx})">Remove</button>
+                      <button type="button" class="pill-btn" style="padding:3px 9px; font-size:11px;" data-action="set-workhorse-model" data-model-tag="${escapeHtml(m.tag)}">Use Active</button>
+                      <button type="button" class="pill-btn" style="padding:3px 9px; font-size:11px; color:var(--danger);" data-action="remove-custom-model" data-index="${idx}">Remove</button>
                     </div>
                   </div>
                 `).join('')}
@@ -2913,14 +3709,14 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               </select>
             </div>
             <div>
-              <button type="button" class="pill-btn" onclick="window._createCustomFusion()">⚡ Save &amp; Create Custom Fusion</button>
+              <button type="button" class="pill-btn" data-action="create-custom-fusion">⚡ Save &amp; Create Custom Fusion</button>
             </div>
             ${customFusions.length > 0 ? `
               <div style="display:flex; flex-direction:column; gap:6px;">
                 ${customFusions.map((f, idx) => `
                   <div style="display:flex; align-items:center; justify-content:space-between; padding:7px 12px; border-radius:8px; background:rgba(255,255,255,0.03); border:1px solid var(--border-subtle); font-size:12.5px;">
                     <div><strong>${escapeHtml(f.name)}</strong> — <code>${escapeHtml(f.primary)}</code> + <code>${escapeHtml(f.secondary)}</code> (${escapeHtml(f.arbiter)})</div>
-                    <button type="button" class="pill-btn" style="padding:3px 9px; font-size:11px; color:var(--danger);" onclick="window._removeCustomFusion(${idx})">Remove</button>
+                    <button type="button" class="pill-btn" style="padding:3px 9px; font-size:11px; color:var(--danger);" data-action="remove-custom-fusion" data-index="${idx}">Remove</button>
                   </div>
                 `).join('')}
               </div>
@@ -2939,9 +3735,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               </span>
             </div>
             <div style="display:flex; gap:8px; flex-wrap:wrap;">
-              <button type="button" class="pill-btn" onclick="window._setRestRlState(true)">▶ Start Daemon</button>
-              <button type="button" class="pill-btn" style="color:#ef4444; border-color:rgba(239,68,68,0.35);" onclick="window._setRestRlState(false)">⏹ Stop Daemon</button>
-              <button type="button" class="pill-btn" onclick="window._setRestRlState(restRlRunning, true)">🔄 Refresh Status</button>
+              <button type="button" class="pill-btn" data-action="set-restrl-state" data-running="true">▶ Start Daemon</button>
+              <button type="button" class="pill-btn" style="color:#ef4444; border-color:rgba(239,68,68,0.35);" data-action="set-restrl-state" data-running="false">⏹ Stop Daemon</button>
+              <button type="button" class="pill-btn" data-action="set-restrl-state" data-running="${restRlRunning}" data-refresh-only="true">🔄 Refresh Status</button>
             </div>
             <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:10px; padding:10px 12px; border-radius:8px; background:rgba(255,255,255,0.03); border:1px solid var(--border-subtle); font-size:12px;">
               <div><div style="color:var(--text-muted); font-size:11px;">Queue Length</div><div style="font-weight:600; font-family:monospace;">0 tasks</div></div>
@@ -2952,14 +3748,14 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           </div>
         </div>
 
-        <!-- Specialist Models, Sampling, Max Tokens & Agentic Loop (Matching Screenshot Exactly) -->
+        <!-- Specialist Models, Sampling, Max Tokens & Agentic Loop -->
         <div class="settings-card">
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="setting-fusion-models" class="settings-row-label">Consensus Panel Size (Number of Models to Fuse)</label>
               <div class="settings-row-desc">Total number of models evaluated concurrently in the multi-model consensus deliberation panel.</div>
             </div>
-            <select id="setting-fusion-models" class="pill-select" style="min-width:280px;" onchange="window._saveUiPatch({fusion_panel_size: Number(this.value)}); window._toast('Consensus panel size updated')">
+            <select id="setting-fusion-models" class="pill-select" style="min-width:280px;" data-change-action="ui-patch" data-patch-key="fusion_panel_size" data-patch-type="number" data-toast-message="Consensus panel size updated">
               <option value="0" ${panelSize === '0' ? 'selected' : ''}>0 (Auto: Dynamically sized from runtime available RAM)</option>
               <option value="2" ${panelSize === '2' ? 'selected' : ''}>2 Models (Fast Dual Consensus)</option>
               <option value="3" ${panelSize === '3' ? 'selected' : ''}>3 Models (Tri-Specialist: DOM + Vision + Reasoning)</option>
@@ -2973,10 +3769,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-vision-model" class="settings-row-label">Vision Specialist Model</label>
               <div class="settings-row-desc">Specialized visual grounding model for Set-of-Mark and image reasoning.</div>
             </div>
-            <select id="setting-vision-model" class="pill-select" style="min-width:280px;" onchange="window._saveUiPatch({vision_specialist_model: this.value}); window._toast('Vision model updated')">
+            <select id="setting-vision-model" class="pill-select" style="min-width:280px;" data-change-action="ui-patch" data-patch-key="vision_specialist_model" data-toast-message="Vision model updated">
               <option value="qwen2.5-vl" ${visionModel === 'qwen2.5-vl' ? 'selected' : ''}>qwen2.5-vl (Qwen 2.5 Vision-Language - Recommended)</option>
               <option value="llama3.2-vision" ${visionModel === 'llama3.2-vision' ? 'selected' : ''}>llama3.2-vision (Llama 3.2 Vision 11B)</option>
               <option value="llava" ${visionModel === 'llava' ? 'selected' : ''}>llava (LLaVA 1.6 7B/13B)</option>
+              <option value="moondream" ${visionModel === 'moondream' || visionModel === 'moondream:latest' ? 'selected' : ''}>moondream (Lightweight Vision Specialist)</option>
               <option value="bakllava" ${visionModel === 'bakllava' ? 'selected' : ''}>bakllava (BakLLaVA Multimodal)</option>
             </select>
           </div>
@@ -2986,7 +3783,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-audio-model" class="settings-row-label">Audio Specialist Model</label>
               <div class="settings-row-desc">Speech recognition and acoustic transcription model tag (e.g. Whisper).</div>
             </div>
-            <input type="text" id="setting-audio-model" class="form-input" value="${escapeHtml(audioModel)}" spellcheck="false" style="width:280px; font-family:monospace;" onchange="window._saveUiPatch({audio_specialist_model: this.value.trim()}); window._toast('Audio specialist model updated')">
+            <input type="text" id="setting-audio-model" class="form-input" value="${escapeHtml(audioModel)}" spellcheck="false" style="width:280px; font-family:monospace;" data-change-action="ui-patch" data-patch-key="audio_specialist_model" data-toast-message="Audio specialist model updated">
           </div>
 
           <div class="settings-row">
@@ -2995,7 +3792,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Automatically route prompts and attachments to specialized vision, audio, tabular, and reasoning panels.</div>
             </div>
             <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; color:var(--text-primary);">
-              <input id="setting-multimodal-auto" type="checkbox" ${mmAuto ? 'checked' : ''} style="width:16px; height:16px; accent-color:#6366f1; cursor:pointer;" onchange="window._saveUiPatch({multimodal_auto_routing: this.checked}); window._toast('Multimodal Auto-Routing ' + (this.checked ? 'enabled' : 'disabled'))">
+              <input id="setting-multimodal-auto" type="checkbox" ${mmAuto ? 'checked' : ''} style="width:16px; height:16px; accent-color:#6366f1; cursor:pointer;" data-change-action="ui-patch" data-patch-key="multimodal_auto_routing" data-toast-message="Multimodal Auto-Routing preference saved">
               <span>Multimodal Auto-Routing Enabled</span>
             </label>
           </div>
@@ -3006,7 +3803,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Injects dynamic burstiness, varied cadence, and bans robotic AI clichés for undetectable natural human prose.</div>
             </div>
             <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; color:var(--text-primary);">
-              <input id="setting-natural-voice" type="checkbox" ${naturalVoice ? 'checked' : ''} style="width:16px; height:16px; accent-color:#6366f1; cursor:pointer;" onchange="window._saveUiPatch({natural_human_voice: this.checked}); window._toast('Natural Human Voice ' + (this.checked ? 'active' : 'disabled'))">
+              <input id="setting-natural-voice" type="checkbox" ${naturalVoice ? 'checked' : ''} style="width:16px; height:16px; accent-color:#6366f1; cursor:pointer;" data-change-action="ui-patch" data-patch-key="natural_human_voice" data-toast-message="Natural Human Voice preference saved">
               <span>Natural Human Voice Active</span>
             </label>
           </div>
@@ -3017,7 +3814,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Natural human default (0.75) promotes burstiness &amp; flow; code tasks auto-scale to precision (0.20).</div>
             </div>
             <div style="display:flex; align-items:center; gap:12px; min-width:280px;">
-              <input type="range" id="setting-temperature" min="0.0" max="1.0" step="0.05" value="${tempVal}" style="flex:1; accent-color:#6366f1; cursor:pointer;" oninput="document.getElementById('val-temperature').textContent = Number(this.value).toFixed(2)" onchange="window._saveUiPatch({sampling_temperature: Number(this.value)}); window._toast('Sampling temperature set to ' + Number(this.value).toFixed(2))">
+              <input type="range" id="setting-temperature" min="0.0" max="1.0" step="0.05" value="${tempVal}" style="flex:1; accent-color:#6366f1; cursor:pointer;" data-change-action="ui-patch" data-patch-key="sampling_temperature" data-patch-type="number" data-toast-message="Sampling temperature updated" data-input-action="update-temperature-label">
               <span id="val-temperature" style="font-family:monospace; font-size:13px; font-weight:700; color:#818cf8; min-width:36px; text-align:right;">${tempVal}</span>
             </div>
           </div>
@@ -3027,7 +3824,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-max-tokens" class="settings-row-label">Max Output Tokens</label>
               <div class="settings-row-desc">Upper bound on generated response token count per directive.</div>
             </div>
-            <select id="setting-max-tokens" class="pill-select" style="min-width:295px;" onchange="window._saveUiPatch({max_output_tokens: Number(this.value)}); window._toast('Max output tokens set to ' + this.value)">
+            <select id="setting-max-tokens" class="pill-select" style="min-width:295px;" data-change-action="ui-patch" data-patch-key="max_output_tokens" data-patch-type="number" data-toast-message="Max output tokens updated">
               <option value="256" ${maxTok === '256' ? 'selected' : ''}>256 tokens (Ultra-Concise Micro-Budget)</option>
               <option value="512" ${maxTok === '512' ? 'selected' : ''}>512 tokens (Short Summary)</option>
               <option value="2048" ${maxTok === '2048' ? 'selected' : ''}>2048 tokens (Concise)</option>
@@ -3046,7 +3843,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-deep-research" class="settings-row-label">Deep Research &amp; Iterative Section RAG</label>
               <div class="settings-row-desc">Generate structured DocumentPlan and SectionPlan multi-hop research outline.</div>
             </div>
-            <input id="setting-deep-research" type="checkbox" ${deepResEn ? 'checked' : ''} style="width:16px; height:16px; accent-color:#3b82f6; cursor:pointer;" onchange="window._saveUiPatch({deep_research_iterative_rag: this.checked}); window._toast('Deep Research &amp; Iterative Section RAG ' + (this.checked ? 'enabled' : 'disabled'))">
+            <input id="setting-deep-research" type="checkbox" ${deepResEn ? 'checked' : ''} style="width:16px; height:16px; accent-color:#3b82f6; cursor:pointer;" data-change-action="ui-patch" data-patch-key="deep_research_iterative_rag" data-toast-message="Deep Research &amp; Iterative Section RAG setting saved">
           </div>
 
           <div class="settings-row">
@@ -3054,7 +3851,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-parent-doc-retrieval" class="settings-row-label">Parent Document Context Expansion</label>
               <div class="settings-row-desc">Stitch adjacent/surrounding chunks from the same document for broad context.</div>
             </div>
-            <input id="setting-parent-doc-retrieval" type="checkbox" ${parentDocEn ? 'checked' : ''} style="width:16px; height:16px; accent-color:#3b82f6; cursor:pointer;" onchange="window._saveUiPatch({parent_document_retrieval: this.checked}); window._toast('Parent Document Context Expansion ' + (this.checked ? 'enabled' : 'disabled'))">
+            <input id="setting-parent-doc-retrieval" type="checkbox" ${parentDocEn ? 'checked' : ''} style="width:16px; height:16px; accent-color:#3b82f6; cursor:pointer;" data-change-action="ui-patch" data-patch-key="parent_document_retrieval" data-toast-message="Parent Document Context Expansion setting saved">
           </div>
 
           <div class="settings-row">
@@ -3062,7 +3859,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-map-reduce-facts" class="settings-row-label">Map-Reduce Fact Sheet Extraction</label>
               <div class="settings-row-desc">Distill retrieved chunks into dense fact sheets before synthesis.</div>
             </div>
-            <input id="setting-map-reduce-facts" type="checkbox" ${mapReduceEn ? 'checked' : ''} style="width:16px; height:16px; accent-color:#3b82f6; cursor:pointer;" onchange="window._saveUiPatch({map_reduce_fact_extraction: this.checked}); window._toast('Map-Reduce Fact Sheet Extraction ' + (this.checked ? 'enabled' : 'disabled'))">
+            <input id="setting-map-reduce-facts" type="checkbox" ${mapReduceEn ? 'checked' : ''} style="width:16px; height:16px; accent-color:#3b82f6; cursor:pointer;" data-change-action="ui-patch" data-patch-key="map_reduce_fact_extraction" data-toast-message="Map-Reduce Fact Sheet Extraction setting saved">
           </div>
 
           <div class="settings-row">
@@ -3070,7 +3867,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-agentic-loop-enable" class="settings-row-label">Recursive Agentic Loop Chaining</label>
               <div class="settings-row-desc">Auto-chain LLM turns recursively up to 256k tokens.</div>
             </div>
-            <input id="setting-agentic-loop-enable" type="checkbox" ${loopEn ? 'checked' : ''} style="width:16px; height:16px; accent-color:#3b82f6; cursor:pointer;" onchange="window._saveUiPatch({agentic_loop_enabled: this.checked}); window._toast('Recursive Agentic Loop Chaining ' + (this.checked ? 'enabled' : 'disabled'))">
+            <input id="setting-agentic-loop-enable" type="checkbox" ${loopEn ? 'checked' : ''} style="width:16px; height:16px; accent-color:#3b82f6; cursor:pointer;" data-change-action="ui-patch" data-patch-key="agentic_loop_enabled" data-toast-message="Recursive Agentic Loop Chaining setting saved">
           </div>
 
           <div class="settings-row">
@@ -3078,7 +3875,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-agentic-chunk-size" class="settings-row-label">Agentic Loop Chunk Size</label>
               <div class="settings-row-desc">Token budget generated per sequential turn before triggering continuation.</div>
             </div>
-            <select id="setting-agentic-chunk-size" class="pill-select" style="min-width:260px;" onchange="window._saveUiPatch({agentic_chunk_size: Number(this.value)}); window._toast('Agentic loop chunk size set to ' + this.value)">
+            <select id="setting-agentic-chunk-size" class="pill-select" style="min-width:260px;" data-change-action="ui-patch" data-patch-key="agentic_chunk_size" data-patch-type="number" data-toast-message="Agentic loop chunk size set">
               <option value="4096" ${chunkSz === '4096' ? 'selected' : ''}>4096 tokens/turn (Recommended)</option>
               <option value="8192" ${chunkSz === '8192' ? 'selected' : ''}>8192 tokens/turn (Large Chunks)</option>
               <option value="2048" ${chunkSz === '2048' ? 'selected' : ''}>2048 tokens/turn (Fast Increments)</option>
@@ -3090,7 +3887,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="setting-agentic-strategy" class="settings-row-label">Agentic Loop Strategy</label>
               <div class="settings-row-desc">Sequencing approach for recursive context chaining and prompt triggers.</div>
             </div>
-            <select id="setting-agentic-strategy" class="pill-select" style="min-width:260px;" onchange="window._saveUiPatch({agentic_strategy: this.value}); window._toast('Agentic loop strategy updated')">
+            <select id="setting-agentic-strategy" class="pill-select" style="min-width:260px;" data-change-action="ui-patch" data-patch-key="agentic_strategy" data-toast-message="Agentic loop strategy updated">
               <option value="auto_continuation" ${loopStrat === 'auto_continuation' ? 'selected' : ''}>Auto-Continuation (Seamless Part-by-Part)</option>
               <option value="multi_part_assembly" ${loopStrat === 'multi_part_assembly' ? 'selected' : ''}>Multi-Part Assembly (Structured Modules)</option>
               <option value="target_budget" ${loopStrat === 'target_budget' ? 'selected' : ''}>Target Budget (Exact Token Target)</option>
@@ -3115,7 +3912,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             </div>
             <div class="mode-preview-group">
               <!-- System Split Thumbnail -->
-              <button class="mode-thumb-card ${mode === 'system' ? 'active' : ''}" title="System (Auto Light/Dark)" onclick="window._setAppearanceMode('system')">
+              <button class="mode-thumb-card ${mode === 'system' ? 'active' : ''}" title="System (Auto Light/Dark)" data-action="set-appearance-mode" data-mode="system">
                 <div style="display:flex; width:100%; height:100%;">
                   <div style="flex:1; background:#fcfcfc; padding:6px 4px; display:flex; flex-direction:column; gap:3px;">
                     <div style="width:80%; height:3px; background:#cbd5e1; border-radius:2px;"></div>
@@ -3128,7 +3925,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                 </div>
               </button>
               <!-- Light Thumbnail -->
-              <button class="mode-thumb-card ${mode === 'light' ? 'active' : ''}" title="Light Mode" onclick="window._setAppearanceMode('light')">
+              <button class="mode-thumb-card ${mode === 'light' ? 'active' : ''}" title="Light Mode" data-action="set-appearance-mode" data-mode="light">
                 <div style="width:100%; height:100%; background:#fcfcfc; padding:7px 8px; display:flex; flex-direction:column; justify-content:space-between;">
                   <div style="width:60%; height:3px; background:#cbd5e1; border-radius:2px;"></div>
                   <div style="width:85%; height:4px; background:#2563eb; border-radius:2px; align-self:flex-end;"></div>
@@ -3136,7 +3933,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                 </div>
               </button>
               <!-- Dark Thumbnail -->
-              <button class="mode-thumb-card ${mode === 'dark' ? 'active' : ''}" title="Dark Mode" onclick="window._setAppearanceMode('dark')">
+              <button class="mode-thumb-card ${mode === 'dark' ? 'active' : ''}" title="Dark Mode" data-action="set-appearance-mode" data-mode="dark">
                 <div style="width:100%; height:100%; background:#18181b; padding:7px 8px; display:flex; flex-direction:column; justify-content:space-between;">
                   <div style="width:60%; height:3px; background:#52525b; border-radius:2px;"></div>
                   <div style="width:85%; height:4px; background:#2563eb; border-radius:2px; align-self:flex-end;"></div>
@@ -3153,9 +3950,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Theme</span>
             </div>
             <div style="display:flex; align-items:center; gap:8px;">
-              <button class="btn-icon" title="Export theme JSON" onclick="window._exportThemeConfig()" style="font-size:14px;">⬇</button>
-              <button class="btn-icon" title="Copy theme CSS variables" onclick="window._copyThemeConfig()" style="font-size:14px;">❐</button>
-              <select class="pill-select" onchange="window._applyThemePreset(this.value)">
+              <button class="btn-icon" title="Export theme JSON" data-action="export-theme-config" style="font-size:14px;">⬇</button>
+              <button class="btn-icon" title="Copy theme CSS variables" data-action="copy-theme-config" style="font-size:14px;">❐</button>
+              <select class="pill-select" data-change-action="apply-theme">
                 <option value="theme-obsidian" ${ui.theme === 'theme-obsidian' ? 'selected' : ''}>Aa QuorumRAG Obsidian</option>
                 <option value="theme-dark" ${ui.theme === 'theme-dark' ? 'selected' : ''}>Aa QuorumRAG Slate</option>
                 <option value="theme-midnight" ${ui.theme === 'theme-midnight' ? 'selected' : ''}>Aa Midnight Navy</option>
@@ -3170,7 +3967,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             </div>
             <div style="display:flex; align-items:center; gap:8px;">
               <span style="width:10px; height:10px; border-radius:50%; background:${accentDotColor}; display:inline-block;"></span>
-              <select class="pill-select" onchange="window._applyAccentColor(this.value)">
+              <select class="pill-select" data-change-action="apply-accent">
                 <option value="Blue" ${accent === 'Blue' ? 'selected' : ''}>Blue</option>
                 <option value="Emerald" ${accent === 'Emerald' ? 'selected' : ''}>Emerald</option>
                 <option value="Violet" ${accent === 'Violet' ? 'selected' : ''}>Violet</option>
@@ -3183,7 +3980,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Background</span>
             </div>
             <label class="pill-btn" style="cursor:pointer;">
-              <input type="color" value="${escapeHtml(bgHex)}" style="width:14px; height:14px; border:none; padding:0; background:transparent; cursor:pointer;" onchange="window._applyCustomBgFg(this.value, null)">
+              <input type="color" value="${escapeHtml(bgHex)}" style="width:14px; height:14px; border:none; padding:0; background:transparent; cursor:pointer;" data-change-action="apply-custom-bg">
               <code>${escapeHtml(bgHex.toUpperCase())}</code>
             </label>
           </div>
@@ -3192,13 +3989,13 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Foreground</span>
             </div>
             <label class="pill-btn" style="cursor:pointer;">
-              <input type="color" value="${escapeHtml(fgHex)}" style="width:14px; height:14px; border:none; padding:0; background:transparent; cursor:pointer;" onchange="window._applyCustomBgFg(null, this.value)">
+              <input type="color" value="${escapeHtml(fgHex)}" style="width:14px; height:14px; border:none; padding:0; background:transparent; cursor:pointer;" data-change-action="apply-custom-fg">
               <code>${escapeHtml(fgHex.toUpperCase())}</code>
             </label>
           </div>
         </div>
 
-        <button class="pill-btn" style="border:none; background:transparent; color:var(--text-muted); padding-left:2px;" onclick="window._toggleAppearanceAdvanced()">
+        <button class="pill-btn" style="border:none; background:transparent; color:var(--text-muted); padding-left:2px;" data-action="toggle-appearance-advanced">
           <span>Advanced</span>
           <span>${showAppearanceAdvanced ? '⌄' : '›'}</span>
         </button>
@@ -3210,7 +4007,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Font Size</span>
               <div class="settings-row-desc">Adjust reading column typography scale.</div>
             </div>
-            <select class="pill-select" onchange="window._saveUiPatch({font_size: this.value}); window._toast('Font size updated')">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="font_size" data-toast-message="Font size updated">
               <option value="small" ${ui.font_size === 'small' ? 'selected' : ''}>Small (13px)</option>
               <option value="medium" ${ui.font_size !== 'small' && ui.font_size !== 'large' ? 'selected' : ''}>Medium (15px)</option>
               <option value="large" ${ui.font_size === 'large' ? 'selected' : ''}>Large (17px)</option>
@@ -3221,7 +4018,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-telemetry-bar" class="settings-row-label">Show Agentic State Graph Telemetry Bar</label>
               <div class="settings-row-desc">Display 4-stage pipeline progress above chat stream.</div>
             </div>
-            <input id="sw-telemetry-bar" type="checkbox" class="quorum-switch" ${ui.show_telemetry_bar !== false ? 'checked' : ''} onchange="window._saveUiPatch({show_telemetry_bar: this.checked}); window._toast('Telemetry bar setting saved')">
+            <input id="sw-telemetry-bar" type="checkbox" class="quorum-switch" ${ui.show_telemetry_bar !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="show_telemetry_bar" data-toast-message="Telemetry bar setting saved">
           </div>
         </div>` : ''}
       `;
@@ -3237,7 +4034,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                  <div style="font-weight:700; color:#f87171;">🔴 P2P MESH SWARM: DISABLED BY USER (STANDALONE LOCAL-ONLY MODE)</div>
                  <div style="font-size:12.5px; color:var(--text-muted); margin-top:4px;">Zero folders or queries are shared with remote nodes. Local RAG search remains 100% active.</div>
                </div>
-               <button class="btn-primary" onclick="window.quorumUpdateMeshConfig({p2p_enabled: true})">Enable P2P Mesh</button>
+               <button class="btn-primary" data-action="enable-mesh">Enable P2P Mesh</button>
              </div>
            </div>`
         : `<div class="settings-card" style="border-left:4px solid #10a37f; background:rgba(16,163,127,0.07);">
@@ -3248,7 +4045,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                    libp2p GossipSub v1.2 + mDNS + Kademlia + Noise Encryption | Port: <code>${mesh.mesh_port || 3032}</code> | HMAC Epoch: <code>#${mesh.hmac_epoch || 1}</code>
                  </div>
                </div>
-               <button class="btn-secondary" onclick="window.quorumUpdateMeshConfig({p2p_enabled: false})">Disable P2P</button>
+               <button class="btn-secondary" data-action="disable-mesh">Disable P2P</button>
              </div>
            </div>`;
 
@@ -3272,7 +4069,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span>🔐 Local Hardware Root-of-Trust (RoT) &amp; Attestation</span>
               <span class="${tpmBadgeClass}">${escapeHtml(tpmBadgeText)}</span>
             </span>
-            <button class="pill-btn" onclick="window.quorumRefreshTpmStatus()" title="Re-check TPM silicon and PCR banks" style="font-size:11.5px; padding:4px 10px;">🔄 Refresh PCRs</button>
+            <button class="pill-btn" data-action="refresh-tpm" title="Re-check TPM silicon and PCR banks" style="font-size:11.5px; padding:4px 10px;">🔄 Refresh PCRs</button>
           </div>
           <div style="font-size:12.5px; color:var(--text-muted); margin-bottom:12px;">
             ${isHw
@@ -3295,7 +4092,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           <div style="margin-top:8px; padding:10px 12px; background:var(--bg-canvas); border:1px solid var(--border-color); border-radius:8px;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
               <span style="font-size:12px; font-weight:600; color:var(--text-primary);">Composite PCR Digest (SHA-256 over PCR 0, 7, 16):</span>
-              <button class="pill-btn" style="padding:2px 8px; font-size:11px;" onclick="window.quorumCopyText('${escapeHtml(compDigest)}', 'Composite PCR Digest copied')">📋 Copy Digest</button>
+              <button class="pill-btn" style="padding:2px 8px; font-size:11px;" data-action="copy-text" data-copy-text="${escapeHtml(compDigest)}" data-copy-label="Composite PCR Digest copied">📋 Copy Digest</button>
             </div>
             <code style="font-size:11.5px; word-break:break-all; color:#38bdf8; display:block;">${escapeHtml(compDigest)}</code>
           </div>
@@ -3377,8 +4174,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                   </div>
                 </div>
                 <div style="display:flex; gap:6px; align-items:center;">
-                  <button class="pill-btn" style="padding:3px 8px; font-size:11px;" onclick="window.quorumCopyText('${escapeHtml(peer.peer_id || '')}', 'Peer ID copied')">Copy ID</button>
-                  <button class="pill-btn-danger" style="padding:3px 8px; font-size:11px;" onclick="window.quorumUpdateMeshConfig({quarantine_peer: '${escapeHtml(peer.peer_id || '')}'})">Quarantine</button>
+                  <button class="pill-btn" style="padding:3px 8px; font-size:11px;" data-action="copy-text" data-copy-text="${escapeHtml(peer.peer_id || '')}" data-copy-label="Peer ID copied">Copy ID</button>
+                  <button class="pill-btn-danger" style="padding:3px 8px; font-size:11px;" data-action="quarantine-peer" data-peer-id="${escapeHtml(peer.peer_id || '')}">Quarantine</button>
                 </div>
               </div>
             `;
@@ -3405,8 +4202,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             </span>
             ${pendingList.length > 0 ? `
               <span style="display:inline-flex; gap:6px;">
-                <button class="pill-btn" style="background:#10a37f; color:#fff; border-color:#10a37f; font-size:11.5px; padding:3px 9px;" onclick="window.quorumApproveAllPending()">✓ Approve All (${pendingList.length})</button>
-                <button class="pill-btn" style="color:var(--danger); border-color:rgba(239,68,68,0.3); font-size:11.5px; padding:3px 9px;" onclick="window.quorumClearPendingJoins()">✕ Deny All</button>
+                <button class="pill-btn" style="background:#10a37f; color:#fff; border-color:#10a37f; font-size:11.5px; padding:3px 9px;" data-action="approve-all-pending">✓ Approve All (${pendingList.length})</button>
+                <button class="pill-btn" style="color:var(--danger); border-color:rgba(239,68,68,0.3); font-size:11.5px; padding:3px 9px;" data-action="clear-pending-joins">✕ Deny All</button>
               </span>
             ` : ''}
           </div>
@@ -3423,7 +4220,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                 const repTier = repScore >= 0.85 ? 'Trusted' : (repScore >= 0.50 ? 'Neutral' : 'Low Rep');
                 const approveBtn = pjTpm.isBanned
                   ? `<button disabled class="pill-btn-danger" style="opacity:0.6; cursor:not-allowed; padding:4px 10px; font-size:11.5px;" title="TPM 1.2 is banned by policy. Only TPM 2.0 allowed.">🚫 Blocked (TPM 1.2 Banned)</button>`
-                  : `<button class="pill-btn" style="background:#10a37f; color:#fff; border-color:#10a37f; padding:4px 10px; font-size:11.5px;" onclick="window.quorumAllowPendingJoin('${escapeHtml(pj.peer_id)}')">✓ Approve / Allow</button>`;
+                  : `<button class="pill-btn" style="background:#10a37f; color:#fff; border-color:#10a37f; padding:4px 10px; font-size:11.5px;" data-action="allow-pending-join" data-peer-id="${escapeHtml(pj.peer_id)}">✓ Approve / Allow</button>`;
 
                 return `
                   <div class="folder-pill-item" style="border-left:4px solid #f59e0b; margin-bottom:8px;">
@@ -3446,7 +4243,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                     </div>
                     <div style="display:flex; gap:6px; align-items:center;">
                       ${approveBtn}
-                      <button class="pill-btn" style="color:var(--danger); border-color:rgba(239,68,68,0.3); padding:4px 10px; font-size:11.5px;" onclick="window.quorumDenyPendingJoin('${escapeHtml(pj.peer_id)}')">✕ Deny</button>
+                      <button class="pill-btn" style="color:var(--danger); border-color:rgba(239,68,68,0.3); padding:4px 10px; font-size:11.5px;" data-action="deny-pending-join" data-peer-id="${escapeHtml(pj.peer_id)}">✕ Deny</button>
                     </div>
                   </div>
                 `;
@@ -3485,7 +4282,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                     </div>
                   </div>
                   <div style="display:flex; gap:6px; align-items:center;">
-                    <button class="pill-btn" style="padding:4px 10px; font-size:11.5px;" onclick="window.quorumReleaseQuarantinePeer('${escapeHtml(qp.peer_id)}')">🔓 Release</button>
+                    <button class="pill-btn" style="padding:4px 10px; font-size:11.5px;" data-action="release-quarantine-peer" data-peer-id="${escapeHtml(qp.peer_id)}">🔓 Release</button>
                   </div>
                 </div>
               `).join('')
@@ -3499,7 +4296,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             <div class="folder-pill-item" data-folder-path="${escapeHtml(f.path)}">
               <div style="flex:1; min-width:220px;">
                 <div style="font-weight:600; font-size:13.5px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                  <button type="button" data-folder-path="${escapeHtml(f.path)}" onclick="window.quorumBrowseDir(this.dataset.folderPath)" title="Click to browse inside ${escapeHtml(f.path)}" style="background:transparent; border:none; padding:0; color:var(--text-primary); font-weight:600; font-size:13.5px; cursor:pointer; text-align:left; text-decoration:underline;">📁 ${escapeHtml(f.path)}</button>
+                  <button type="button" data-action="select-shared-pill" data-folder-path="${escapeHtml(f.path)}" title="Click to browse inside ${escapeHtml(f.path)}" style="background:transparent; border:none; padding:0; color:var(--text-primary); font-weight:600; font-size:13.5px; cursor:pointer; text-align:left; text-decoration:underline;">📁 ${escapeHtml(f.path)}</button>
                   <span class="${f.enabled ? 'dlp-badge-allow' : 'dlp-badge-block'}">${f.enabled ? 'Shared with Mesh' : 'Paused (Local Only)'}</span>
                 </div>
                 <div style="font-size:11.5px; color:var(--text-muted); margin-top:3px;">
@@ -3507,34 +4304,22 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                 </div>
               </div>
               <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                <select class="settings-select" style="padding:4px 8px; font-size:12px;" data-folder-path="${escapeHtml(f.path)}" data-dlp-override="${escapeHtml(f.dlp_mode_override || 'default')}" onchange="window.quorumUpdateFolderPolicy(this.dataset.folderPath, this.value, this.dataset.dlpOverride)">
+                <select class="settings-select" style="padding:4px 8px; font-size:12px;" data-change-action="update-folder-tier" data-folder-path="${escapeHtml(f.path)}" data-dlp-override="${escapeHtml(f.dlp_mode_override || 'default')}">
                   <option value="0" ${f.access_tier === 0 ? 'selected' : ''}>Tier 0: Public Mesh</option>
                   <option value="1" ${f.access_tier === 1 ? 'selected' : ''}>Tier 1: Internal Team</option>
                   <option value="2" ${f.access_tier === 2 ? 'selected' : ''}>Tier 2: Confidential</option>
                   <option value="3" ${f.access_tier === 3 ? 'selected' : ''}>Tier 3: Restricted</option>
                 </select>
-                <select class="settings-select" style="padding:4px 8px; font-size:12px;" data-folder-path="${escapeHtml(f.path)}" data-access-tier="${Number(f.access_tier || 0)}" onchange="window.quorumUpdateFolderPolicy(this.dataset.folderPath, Number(this.dataset.accessTier || 0), this.value)">
+                <select class="settings-select" style="padding:4px 8px; font-size:12px;" data-change-action="update-folder-dlp" data-folder-path="${escapeHtml(f.path)}" data-access-tier="${Number(f.access_tier || 0)}">
                   <option value="default" ${!f.dlp_mode_override ? 'selected' : ''}>DLP: Global (${escapeHtml(dlp.mode || 'Redact')})</option>
                   <option value="Redact" ${f.dlp_mode_override === 'Redact' ? 'selected' : ''}>DLP: Redact PHI</option>
                   <option value="Block" ${f.dlp_mode_override === 'Block' ? 'selected' : ''}>DLP: Block on PHI</option>
                 </select>
-                <input type="checkbox" class="quorum-switch" ${f.enabled ? 'checked' : ''} title="Enable or pause Mesh sharing for this folder" data-folder-path="${escapeHtml(f.path)}" onchange="window.quorumToggleSharedFolder(this.dataset.folderPath, this.checked)">
-                <button type="button" class="btn-secondary" style="padding:4px 10px; font-size:12px; color:var(--danger); cursor:pointer;" data-folder-path="${escapeHtml(f.path)}" onclick="window.quorumRemoveSharedFolder(this.dataset.folderPath)">Remove</button>
+                <input type="checkbox" class="quorum-switch" ${f.enabled ? 'checked' : ''} title="Enable or pause Mesh sharing for this folder" data-change-action="toggle-shared-folder" data-folder-path="${escapeHtml(f.path)}">
+                <button type="button" class="btn-secondary" style="padding:4px 10px; font-size:12px; color:var(--danger); cursor:pointer;" data-action="remove-shared-folder" data-folder-path="${escapeHtml(f.path)}">Remove</button>
               </div>
             </div>
           `).join('');
-
-      const browserItemsHtml = (cachedBrowseDirs || []).map(d => `
-        <div class="folder-browser-item" data-folder-path="${escapeHtml(d.path)}">
-          <button type="button" style="background:transparent; border:none; color:var(--text-primary); cursor:pointer; text-align:left; font-size:12.5px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" data-folder-path="${escapeHtml(d.path)}" onclick="window.quorumBrowseDir(this.dataset.folderPath)" title="Open ${escapeHtml(d.path)}">
-            ${d.is_drive ? '💽' : '📁'} ${escapeHtml(d.name)}
-          </button>
-          ${d.is_shared
-            ? `<button type="button" class="btn-secondary" style="padding:2px 8px; font-size:11px; color:var(--success); cursor:pointer;" data-folder-path="${escapeHtml(d.path)}" onclick="window.quorumRemoveSharedFolder(this.dataset.folderPath)">✓ Shared</button>`
-            : `<button type="button" class="btn-primary" style="padding:2px 8px; font-size:11px; cursor:pointer;" data-folder-path="${escapeHtml(d.path)}" onclick="window.quorumShareFolder(this.dataset.folderPath)">+ Share</button>`
-          }
-        </div>
-      `).join('');
 
       settingsContent.innerHTML = `
         <h2 class="settings-page-title">Mesh Network &amp; Shared Folders</h2>
@@ -3560,15 +4345,15 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-explicit-folders" class="settings-row-label">Require Explicit Folder Approval for Mesh Sharing (Fail-Closed)</label>
               <div class="settings-row-desc">Block remote peers from accessing any file outside the folders listed below (${dlpStats.total_blocked_unshared_folder_chunks || 0} unshared folder chunks blocked).</div>
             </div>
-            <input id="sw-explicit-folders" type="checkbox" class="quorum-switch" ${mesh.require_explicit_folder_share !== false ? 'checked' : ''} onchange="window.quorumUpdateMeshConfig({require_explicit_folder_share: this.checked})">
+            <input id="sw-explicit-folders" type="checkbox" class="quorum-switch" ${mesh.require_explicit_folder_share !== false ? 'checked' : ''} data-change-action="mesh-config" data-config-key="require_explicit_folder_share">
           </div>
 
           <div style="margin-bottom:14px;">${foldersListHtml}</div>
 
           <!-- Add Folder by Path -->
           <div style="display:flex; gap:8px; margin-bottom:14px;">
-            <input type="text" id="new-shared-folder-input" class="settings-input" style="flex:1;" placeholder="Enter folder path to share with Mesh (e.g. D:\\harfile\\QuorumRAG\\docs)" onkeydown="if(event.key==='Enter'){event.preventDefault();window.quorumShareFolder(this.value);}">
-            <button type="button" class="btn-primary" style="cursor:pointer;" onclick="window.quorumShareFolder(document.getElementById('new-shared-folder-input').value)">+ Share Folder with Mesh</button>
+            <input type="text" id="new-shared-folder-input" class="settings-input" style="flex:1;" placeholder="Enter folder path to share with Mesh (e.g. D:\\harfile\\QuorumRAG\\docs)" data-keydown-action="share-folder-enter">
+            <button type="button" class="btn-primary" style="cursor:pointer;" data-action="share-input-folder">+ Share Folder with Mesh</button>
           </div>
 
           <!-- Interactive Physical Drive & Folder Browser -->
@@ -3576,8 +4361,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
               <span style="font-size:12.5px; font-weight:600;">Browse Physical Drives to Select Folders: <code>${escapeHtml(currentBrowsePath || 'Physical Drives (D:\\, C:\\)')}</code></span>
               <div style="display:flex; gap:6px;">
-                <button type="button" class="btn-secondary" style="padding:4px 10px; font-size:12px; cursor:pointer;" onclick="window.quorumBrowseDir('')">💽 Drives Root</button>
-                ${currentBrowsePath ? `<button type="button" class="btn-primary" style="padding:4px 10px; font-size:12px; cursor:pointer;" data-folder-path="${escapeHtml(currentBrowsePath)}" onclick="window.quorumShareFolder(this.dataset.folderPath)">+ Share Current Folder</button>` : ''}
+                ${currentBrowsePath ? `<button type="button" class="btn-secondary" style="padding:4px 10px; font-size:12px; cursor:pointer;" data-action="browse-up" data-folder-path="${escapeHtml(currentBrowseParentPath || '')}">⬅ Up</button>` : ''}
+                <button type="button" class="btn-secondary" style="padding:4px 10px; font-size:12px; cursor:pointer;" data-action="browse-root">💽 Drives Root</button>
+                ${currentBrowsePath ? `<button type="button" class="btn-primary" style="padding:4px 10px; font-size:12px; cursor:pointer;" data-action="share-folder" data-folder-path="${escapeHtml(currentBrowsePath)}">+ Share Current Folder</button>` : ''}
               </div>
             </div>
             <div class="folder-browser-grid">${browserItemsHtml || '<div style="font-size:12px; color:var(--text-muted);">No subdirectories found.</div>'}</div>
@@ -3597,7 +4383,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             </div>
             <div style="display:flex; gap:8px;">
               <input type="text" id="mesh-alias-input" class="settings-input" style="width:170px;" value="${escapeHtml(mesh.node_alias || 'QuorumRAG-Master-Core')}">
-              <button class="btn-secondary" onclick="window.quorumUpdateMeshConfig({node_alias: document.getElementById('mesh-alias-input').value})">Save</button>
+              <button class="btn-secondary" data-action="save-mesh-alias">Save</button>
             </div>
           </div>
           <div class="settings-row">
@@ -3607,7 +4393,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             </div>
             <div style="display:flex; gap:8px; width:340px;">
               <input type="text" id="mesh-peers-input" class="settings-input" style="flex:1;" value="${escapeHtml((mesh.bootstrap_peers || []).join(', '))}" placeholder="/ip4/10.0.0.x/tcp/3032">
-              <button class="btn-primary" onclick="window.quorumUpdateMeshConfig({bootstrap_peers: document.getElementById('mesh-peers-input').value.split(',').map(s=>s.trim()).filter(Boolean)})">Dial &amp; Save</button>
+              <button class="btn-primary" data-action="save-mesh-bootstrap">Dial &amp; Save</button>
             </div>
           </div>
           <div class="settings-row">
@@ -3616,7 +4402,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Deterministic cap on remote peer candidate sets collected and fused per federated search.</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center;">
-              <input type="number" id="mesh-max-peer-responses" class="settings-input" style="width:90px;" min="1" max="64" value="${escapeHtml(String(mesh.max_peer_responses || 8))}" onchange="window.quorumUpdateMeshConfig({max_peer_responses: parseInt(this.value, 10) || 8})">
+              <input type="number" id="mesh-max-peer-responses" class="settings-input" style="width:90px;" min="1" max="64" value="${escapeHtml(String(mesh.max_peer_responses || 8))}" data-change-action="mesh-config" data-config-key="max_peer_responses">
               <span style="font-size:12px; color:var(--text-muted);">peers</span>
             </div>
           </div>
@@ -3625,12 +4411,15 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Monotonic HMAC Generation Epoch (#${mesh.hmac_epoch || 1})</span>
               <div class="settings-row-desc">Constant-time keyed BLAKE3/HMAC epoch verification across Mesh nodes. Rotating immediately invalidates stale peer handles.</div>
             </div>
-            <button class="btn-secondary" onclick="window.quorumUpdateMeshConfig({rotate_epoch: true})">🔄 Rotate Epoch Key (#${(mesh.hmac_epoch || 1) + 1})</button>
+            <button class="btn-secondary" data-action="rotate-epoch">🔄 Rotate Epoch Key (#${(mesh.hmac_epoch || 1) + 1})</button>
           </div>
         </div>
       `;
     } else if (tab === 'dlp') {
       const mode = dlp.mode || 'Redact';
+      const prov = dlpStats.provision_status || {};
+      const glinerModel = dlp.gliner_model_id || prov.gliner_model_id || 'urchade/gliner_multi_pii-v1';
+      const glinerThreshold = Number(dlp.gliner_confidence_threshold || 0.50).toFixed(2);
       const eventsHtml = (dlpStats.recent_events || []).slice(0, 10).map(ev => `
         <tr style="border-bottom:1px solid var(--border-color); font-size:12px;">
           <td style="padding:6px;"><code>${escapeHtml(ev.action_taken)}</code></td>
@@ -3642,8 +4431,61 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       `).join('');
 
       settingsContent.innerHTML = `
-        <h2 class="settings-page-title">DLP &amp; PHI Protection (Zero Inter-Node PHI Leakage)</h2>
-        <p class="settings-page-subtitle">OshoosiClaw Two-Tier Data Loss Prevention Gate ensuring Protected Health Information (PHI) and PII are never shared between Mesh nodes—always either <strong>Redacted</strong> or <strong>Blocked</strong>.</p>
+        <h2 class="settings-page-title">DLP &amp; PHI Protection (Microsoft Presidio + GLiNER)</h2>
+        <p class="settings-page-subtitle">OshoosiClaw Two-Tier Data Loss Prevention Gate powered by <strong>Microsoft Presidio</strong> (<code>presidio-analyzer</code> + <code>presidio-anonymizer</code> ContextEnhancer) and <strong>GLiNER</strong> (<code>${escapeHtml(glinerModel)}</code>) zero-shot Named Entity Recognition—auto-provisioned on every computer.</p>
+
+        <!-- MICROSOFT PRESIDIO + GLINER AUTO-PROVISIONING & ENGINE CARD -->
+        <div class="settings-card">
+          <div class="settings-card-title">
+            <span>🧠 Active PHI / PII NER Model: Microsoft Presidio + GLiNER</span>
+            <span class="dlp-badge-allow">✓ Auto-Provisioned (${escapeHtml(glinerModel)})</span>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">DLP Detection Architecture</span>
+              <div class="settings-row-desc">
+                <strong>Backend:</strong> <code>${escapeHtml(prov.execution_backend || 'Microsoft Presidio Analyzer/Anonymizer + GLiNER (urchade/gliner_multi_pii-v1)')}</code><br>
+                <strong>Local Model Cache:</strong> <code>${escapeHtml(prov.model_cache_dir || '.quorumrag-live-data/models/gliner_multi_pii-v1')}</code> • <strong>Active Labels:</strong> ${Number(prov.entity_labels_count || 17)} HIPAA/PII entities
+              </div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button type="button" class="pill-btn" data-action="reprovision-gliner">⚡ Verify &amp; Provision GLiNER</button>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <label for="sw-dlp-presidio" class="settings-row-label">Microsoft Presidio Analyzer &amp; Anonymizer + ContextEnhancer</label>
+              <div class="settings-row-desc">Enables Presidio checksum recognizers (SSN, Luhn Credit Card, NPI, IBAN, Passport, Driver License) and +0.18 clinical lemma context scoring.</div>
+            </div>
+            <input id="sw-dlp-presidio" type="checkbox" class="quorum-switch" ${dlp.presidio_enabled !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="presidio_enabled">
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <label for="sw-dlp-gliner" class="settings-row-label">GLiNER Zero-Shot Span NER (<code>${escapeHtml(glinerModel)}</code>)</label>
+              <div class="settings-row-desc">Detects unstructured zero-shot entities: <code>PERSON</code>, <code>MEDICAL_CONDITION</code>, <code>MEDICATION</code>, <code>HOSPITAL_ORG</code>, and <code>LOCATION</code>.</div>
+            </div>
+            <input id="sw-dlp-gliner" type="checkbox" class="quorum-switch" ${dlp.gliner_enabled !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="gliner_enabled">
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <label for="sw-dlp-autoprov" class="settings-row-label">Auto-Provision GLiNER &amp; Presidio on Every Computer at Startup</label>
+              <div class="settings-row-desc">Automatically provisions <code>urchade/gliner_multi_pii-v1</code> and Presidio recognizers in local node storage on startup.</div>
+            </div>
+            <input id="sw-dlp-autoprov" type="checkbox" class="quorum-switch" ${dlp.auto_provision_gliner !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="auto_provision_gliner">
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">GLiNER &amp; Presidio Confidence Threshold (${escapeHtml(glinerThreshold)})</span>
+              <div class="settings-row-desc">Minimum span confidence score required to trigger Redact or Block enforcement (default <code>0.50</code>).</div>
+            </div>
+            <select class="settings-select" data-change-action="dlp-policy" data-policy-key="gliner_confidence_threshold" data-policy-type="number">
+              <option value="0.35" ${Number(glinerThreshold) === 0.35 ? 'selected' : ''}>0.35 (High Recall / Strict)</option>
+              <option value="0.50" ${Number(glinerThreshold) === 0.50 ? 'selected' : ''}>0.50 (Recommended Balanced)</option>
+              <option value="0.65" ${Number(glinerThreshold) === 0.65 ? 'selected' : ''}>0.65 (High Precision)</option>
+              <option value="0.80" ${Number(glinerThreshold) === 0.80 ? 'selected' : ''}>0.80 (Exact Identifiers Only)</option>
+            </select>
+          </div>
+        </div>
 
         <div class="settings-card">
           <div class="settings-card-title">
@@ -3658,7 +4500,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                 <strong>Block (Strict Lockdown):</strong> Drops the entire chunk so 0 bytes are transmitted to the requesting peer.
               </div>
             </div>
-            <select class="settings-select" onchange="window.quorumUpdateDlpPolicy({mode: this.value})">
+            <select class="settings-select" data-change-action="dlp-policy" data-policy-key="mode">
               <option value="Redact" ${mode === 'Redact' ? 'selected' : ''}>✏️ Redact PHI &amp; PII Spans ([REDACTED:PHI_...])</option>
               <option value="Block" ${mode === 'Block' ? 'selected' : ''}>🚫 Block Entire Chunk on Any PHI/PII</option>
             </select>
@@ -3668,56 +4510,56 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-dlp-ssn" class="settings-row-label">US Social Security Numbers (HIPAA #7: SSN)</label>
               <div class="settings-row-desc">Detects and scrubs/blocks <code>XXX-XX-XXXX</code> and formatted SSN fields.</div>
             </div>
-            <input id="sw-dlp-ssn" type="checkbox" class="quorum-switch" ${dlp.protect_ssn !== false ? 'checked' : ''} onchange="window.quorumUpdateDlpPolicy({protect_ssn: this.checked})">
+            <input id="sw-dlp-ssn" type="checkbox" class="quorum-switch" ${dlp.protect_ssn !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="protect_ssn">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-dlp-mrn" class="settings-row-label">Medical Record Numbers (MRN), ICD-10, Pharmacy &amp; Clinical Notes (HIPAA #8)</label>
               <div class="settings-row-desc">Protects MRNs, Patient IDs, Pharmacy ID cards, ICD-10/CPT codes, prescriptions, and clinical records.</div>
             </div>
-            <input id="sw-dlp-mrn" type="checkbox" class="quorum-switch" ${dlp.protect_medical_records !== false ? 'checked' : ''} onchange="window.quorumUpdateDlpPolicy({protect_medical_records: this.checked})">
+            <input id="sw-dlp-mrn" type="checkbox" class="quorum-switch" ${dlp.protect_medical_records !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="protect_medical_records">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-dlp-hp" class="settings-row-label">Health Plan Beneficiary IDs, Medicare/Medicaid &amp; NPI (HIPAA #9)</label>
               <div class="settings-row-desc">Protects insurance member IDs, policy/group numbers, and National Provider Identifiers.</div>
             </div>
-            <input id="sw-dlp-hp" type="checkbox" class="quorum-switch" ${dlp.protect_health_plan !== false ? 'checked' : ''} onchange="window.quorumUpdateDlpPolicy({protect_health_plan: this.checked})">
+            <input id="sw-dlp-hp" type="checkbox" class="quorum-switch" ${dlp.protect_health_plan !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="protect_health_plan">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-dlp-dob" class="settings-row-label">Dates of Birth &amp; Admission/Discharge Dates (HIPAA #3)</label>
               <div class="settings-row-desc">Protects patient birthdates and clinical service dates.</div>
             </div>
-            <input id="sw-dlp-dob" type="checkbox" class="quorum-switch" ${dlp.protect_dob_dates !== false ? 'checked' : ''} onchange="window.quorumUpdateDlpPolicy({protect_dob_dates: this.checked})">
+            <input id="sw-dlp-dob" type="checkbox" class="quorum-switch" ${dlp.protect_dob_dates !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="protect_dob_dates">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-dlp-student" class="settings-row-label">Academic &amp; Student IDs (FERPA / Transcript Identifiers)</label>
               <div class="settings-row-desc">Scrubs/blocks student identification numbers on academic transcripts before Mesh sharing.</div>
             </div>
-            <input id="sw-dlp-student" type="checkbox" class="quorum-switch" ${dlp.protect_academic_student_id !== false ? 'checked' : ''} onchange="window.quorumUpdateDlpPolicy({protect_academic_student_id: this.checked})">
+            <input id="sw-dlp-student" type="checkbox" class="quorum-switch" ${dlp.protect_academic_student_id !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="protect_academic_student_id">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-dlp-contact" class="settings-row-label">Contact PII: Email Addresses, Phone &amp; Fax Numbers (HIPAA #4-#6)</label>
               <div class="settings-row-desc">Scrubs/blocks personal email addresses and telephone/fax numbers across nodes.</div>
             </div>
-            <input id="sw-dlp-contact" type="checkbox" class="quorum-switch" ${dlp.protect_contact_pii !== false ? 'checked' : ''} onchange="window.quorumUpdateDlpPolicy({protect_contact_pii: this.checked})">
+            <input id="sw-dlp-contact" type="checkbox" class="quorum-switch" ${dlp.protect_contact_pii !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="protect_contact_pii">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-dlp-fin" class="settings-row-label">Financial, Luhn Payment Cards &amp; IRS Tax Records (1040 / W-2 / EIN)</label>
               <div class="settings-row-desc">Protects Luhn-validated credit cards, bank routing/account numbers, and tax identifiers.</div>
             </div>
-            <input id="sw-dlp-fin" type="checkbox" class="quorum-switch" ${dlp.protect_financial_tax !== false ? 'checked' : ''} onchange="window.quorumUpdateDlpPolicy({protect_financial_tax: this.checked})">
+            <input id="sw-dlp-fin" type="checkbox" class="quorum-switch" ${dlp.protect_financial_tax !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="protect_financial_tax">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-dlp-secrets" class="settings-row-label">Cryptographic Crown Jewels &amp; API Secrets</label>
               <div class="settings-row-desc">Protects AWS/GitHub/OpenAI keys, PEM private keys, and <code>.env</code> credentials.</div>
             </div>
-            <input id="sw-dlp-secrets" type="checkbox" class="quorum-switch" ${dlp.protect_secrets_crown_jewels !== false ? 'checked' : ''} onchange="window.quorumUpdateDlpPolicy({protect_secrets_crown_jewels: this.checked})">
+            <input id="sw-dlp-secrets" type="checkbox" class="quorum-switch" ${dlp.protect_secrets_crown_jewels !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="protect_secrets_crown_jewels">
           </div>
         </div>
 
@@ -3725,7 +4567,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         <div class="settings-card">
           <div class="settings-card-title">
             <span>🔬 Live Inter-Node PHI / PII Redaction &amp; Block Simulator</span>
-            <button class="btn-primary" onclick="window.quorumRunDlpTest()">Run Live DLP Inspection</button>
+            <button class="btn-primary" data-action="run-dlp-test">Run Live DLP Inspection</button>
           </div>
           <div style="margin-bottom:8px;">
             <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:4px;">Simulated Source File Path:</label>
@@ -3770,28 +4612,28 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-notif-drift" class="settings-row-label">5-Drift Remediation Alerts</label>
               <div class="settings-row-desc">Notify when Merkle, LanceDB/Tantivy parity, or contract drift is automatically healed.</div>
             </div>
-            <input id="sw-notif-drift" type="checkbox" class="quorum-switch" ${ui.notify_drift_remediation !== false ? 'checked' : ''} onchange="window._saveUiPatch({notify_drift_remediation: this.checked}); window._toast('Drift notification setting saved')">
+            <input id="sw-notif-drift" type="checkbox" class="quorum-switch" ${ui.notify_drift_remediation !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="notify_drift_remediation" data-toast-message="Drift notification setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-notif-mesh" class="settings-row-label">Mesh Peer Join &amp; Handshake Alerts</label>
               <div class="settings-row-desc">Notify when a remote LAN/WAN peer connects or fails Gemma contract hash verification.</div>
             </div>
-            <input id="sw-notif-mesh" type="checkbox" class="quorum-switch" ${ui.notify_mesh_peer_events !== false ? 'checked' : ''} onchange="window._saveUiPatch({notify_mesh_peer_events: this.checked}); window._toast('Mesh notification setting saved')">
+            <input id="sw-notif-mesh" type="checkbox" class="quorum-switch" ${ui.notify_mesh_peer_events !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="notify_mesh_peer_events" data-toast-message="Mesh notification setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-notif-dlp" class="settings-row-label">HIPAA PHI / PII DLP Interception Alerts</label>
               <div class="settings-row-desc">Alert whenever PHI/PII is redacted or blocked from leaving this node.</div>
             </div>
-            <input id="sw-notif-dlp" type="checkbox" class="quorum-switch" ${ui.notify_dlp_interceptions !== false ? 'checked' : ''} onchange="window._saveUiPatch({notify_dlp_interceptions: this.checked}); window._toast('DLP notification setting saved')">
+            <input id="sw-notif-dlp" type="checkbox" class="quorum-switch" ${ui.notify_dlp_interceptions !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="notify_dlp_interceptions" data-toast-message="DLP notification setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">Verify Notification Channel</span>
               <div class="settings-row-desc">Trigger a live test notification banner.</div>
             </div>
-            <button class="pill-btn" onclick="window._toast('🔔 QuorumRAG Notification Channel Active & Verified')">Send Test Notification</button>
+            <button class="pill-btn" data-action="test-notification">Send Test Notification</button>
           </div>
         </div>
       `;
@@ -3813,7 +4655,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             <input type="text" id="prof-org" class="settings-input" style="width:280px;" value="${escapeHtml(ui.organization || 'QuorumRAG Local Sovereign Node')}">
           </div>
           <div style="margin-top:14px; text-align:right;">
-            <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" onclick="window._saveUiPatch({display_name: document.getElementById('prof-name').value, profile_role: document.getElementById('prof-role').value, organization: document.getElementById('prof-org').value}); window._toast('Profile saved')">Save Profile</button>
+            <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" data-action="save-profile">Save Profile</button>
           </div>
         </div>
       `;
@@ -3827,7 +4669,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Mesh Join Gate Mode</span>
               <div class="settings-row-desc">Requires mutual Gemma embedding contract hash verification and keyed BLAKE3/HMAC epoch validation.</div>
             </div>
-            <select class="pill-select" onchange="window.quorumUpdateMeshConfig({join_gate_mode: this.value}); window._toast('Mesh Join Gate updated')">
+            <select class="pill-select" data-change-action="mesh-config" data-config-key="join_gate_mode">
               <option value="MutualContractAndHmac" ${mesh.join_gate_mode === 'MutualContractAndHmac' ? 'selected' : ''}>Mutual Contract + HMAC Epoch</option>
               <option value="StrictOperatorApproval" ${mesh.join_gate_mode === 'StrictOperatorApproval' ? 'selected' : ''}>Strict Operator HITL Approval</option>
               <option value="OpenTrustedLan" ${mesh.join_gate_mode === 'OpenTrustedLan' ? 'selected' : ''}>Trusted LAN mDNS</option>
@@ -3838,14 +4680,14 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-wire-val" class="settings-row-label">Split-Plane Wire Frame Validator (Max 512 KiB)</label>
               <div class="settings-row-desc">Validates inbound libp2p frames before host-side deserialization (OshoosiClaw invariant).</div>
             </div>
-            <input id="sw-wire-val" type="checkbox" class="quorum-switch" ${ui.strict_wire_frame_validation !== false ? 'checked' : ''} onchange="window._saveUiPatch({strict_wire_frame_validation: this.checked}); window._toast('Wire frame validator setting saved')">
+            <input id="sw-wire-val" type="checkbox" class="quorum-switch" ${ui.strict_wire_frame_validation !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="strict_wire_frame_validation" data-toast-message="Wire frame validator setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">Default Inbound Peer Access Tier Cap</span>
               <div class="settings-row-desc">Maximum access tier remote peers may query within your shared folders.</div>
             </div>
-            <select class="pill-select" onchange="window._saveUiPatch({default_peer_access_tier: Number(this.value)}); window._toast('Inbound Peer Access Tier updated')">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="default_peer_access_tier" data-patch-type="number" data-toast-message="Inbound Peer Access Tier updated">
               <option value="0" ${ui.default_peer_access_tier === 0 ? 'selected' : ''}>Tier 0 (Public Only)</option>
               <option value="1" ${ui.default_peer_access_tier === 1 ? 'selected' : ''}>Tier 1 (Internal)</option>
               <option value="2" ${ui.default_peer_access_tier === 2 ? 'selected' : ''}>Tier 2 (Confidential)</option>
@@ -3856,7 +4698,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Rotate Cryptographic Session &amp; Epoch Keys</span>
               <div class="settings-row-desc">Advances the monotonic generation epoch across local and global containment registries.</div>
             </div>
-            <button class="pill-btn" onclick="window.quorumUpdateMeshConfig({rotate_epoch: true}); window._toast('Cryptographic epoch key rotated')">🔑 Rotate Epoch Key</button>
+            <button class="pill-btn" data-action="rotate-epoch">🔑 Rotate Epoch Key</button>
           </div>
         </div>
       `;
@@ -3870,14 +4712,14 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span class="settings-row-label">Local libp2p Peer ID</span>
               <div class="settings-row-desc"><code>${escapeHtml(rt.local_peer_id || 'local')}</code></div>
             </div>
-            <button type="button" class="pill-btn" data-peer-id="${escapeHtml(rt.local_peer_id || 'local')}" onclick="window.quorumCopyText(this.dataset.peerId, 'Peer ID copied to clipboard')">Copy Peer ID</button>
+            <button type="button" class="pill-btn" data-action="copy-text" data-copy-text="${escapeHtml(rt.local_peer_id || 'local')}" data-copy-label="Peer ID copied to clipboard">Copy Peer ID</button>
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">HTTP Web UI Bind</span>
               <div class="settings-row-desc"><code>http://${escapeHtml(rt.host || '0.0.0.0')}:${rt.http_port || 3031} (LAN: http://10.0.0.3:${rt.http_port || 3031})</code></div>
             </div>
-            <button class="pill-btn" onclick="navigator.clipboard && navigator.clipboard.writeText('http://10.0.0.3:' + (${rt.http_port || 3031})); window._toast('LAN URL copied to clipboard')">Copy LAN URL</button>
+            <button class="pill-btn" data-action="copy-text" data-copy-text="http://10.0.0.3:${rt.http_port || 3031}" data-copy-label="LAN URL copied to clipboard">Copy LAN URL</button>
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
@@ -3909,13 +4751,13 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div style="display:flex; align-items:center; gap:12px; min-width:0;">
                 <span style="font-size:16px; opacity:0.75;">☁</span>
                 <div style="min-width:0;">
-                  <a href="#" class="archived-chat-title" data-chat-id="${escapeHtml(c.id)}" onclick="event.preventDefault(); window._unarchiveChat(this.dataset.chatId)">${escapeHtml(c.title)}</a>
+                  <a href="#" class="archived-chat-title" data-action="unarchive-chat" data-chat-id="${escapeHtml(c.id)}">${escapeHtml(c.title)}</a>
                   <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">${escapeHtml(c.archived_at || 'Archived session')}${c.message_count ? ' • ' + Number(c.message_count) + ' msg(s)' : ''}</div>
                 </div>
               </div>
               <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
-                <button type="button" class="pill-btn" data-chat-id="${escapeHtml(c.id)}" onclick="window._unarchiveChat(this.dataset.chatId)">Unarchive</button>
-                <button type="button" class="pill-btn-danger" data-chat-id="${escapeHtml(c.id)}" onclick="window._deleteArchivedChat(this.dataset.chatId)">Delete</button>
+                <button type="button" class="pill-btn" data-action="unarchive-chat" data-chat-id="${escapeHtml(c.id)}">Unarchive</button>
+                <button type="button" class="pill-btn-danger" data-action="delete-archived-chat" data-chat-id="${escapeHtml(c.id)}">Delete</button>
               </div>
             </div>
           `).join('');
@@ -3923,19 +4765,19 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       settingsContent.innerHTML = `
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
           <h2 class="settings-page-title" style="margin:0;">Archived chats</h2>
-          <button class="pill-btn" onclick="window._archiveCurrentChat()">+ Archive Current Chat</button>
+          <button class="pill-btn" data-action="archive-current-chat">+ Archive Current Chat</button>
         </div>
 
         <div class="archived-filter-bar">
           <div class="archived-search-pill">
             <span style="opacity:0.65;">🔍</span>
-            <input type="text" placeholder="Search archived chats" value="${escapeHtml(archivedSearchFilter)}" oninput="window._filterArchivedChats(this.value)">
+            <input type="text" placeholder="Search archived chats" value="${escapeHtml(archivedSearchFilter)}" data-input-action="filter-archived-search">
           </div>
-          <select class="pill-select" onchange="window._toast('Showing ' + this.value)">
+          <select class="pill-select" data-change-action="ui-patch" data-patch-key="archived_view_mode" data-toast-message="Filter updated">
             <option value="All chats">All chats</option>
             <option value="Recent chats">Recent chats</option>
           </select>
-          <select class="pill-select" onchange="window._filterArchivedProject(this.value)">
+          <select class="pill-select" data-change-action="filter-archived-project">
             <option value="all" ${archivedProjectFilter === 'all' ? 'selected' : ''}>📁 All projects</option>
             <option value="No project" ${archivedProjectFilter === 'No project' ? 'selected' : ''}>📁 No project</option>
           </select>
@@ -3965,7 +4807,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                    <span class="settings-row-label">👤 ${escapeHtml(m.name)} (${escapeHtml(m.role || 'Teen')})</span>
                    <div class="settings-row-desc">${escapeHtml(m.email || 'Local Account')}</div>
                  </div>
-                 <button class="pill-btn-danger" onclick="window._removeFamilyMember(${idx})">Remove</button>
+                 <button class="pill-btn-danger" data-action="remove-family-member" data-index="${idx}">Remove</button>
                </div>
              `).join('')}
            </div>`;
@@ -3973,15 +4815,15 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       settingsContent.innerHTML = `
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
           <h2 class="settings-page-title" style="margin:0;">Parental controls</h2>
-          <button class="pill-btn" title="About Parental Controls" onclick="window._toast('Link family accounts to manage safe synthesis and folder access limits.')">?</button>
+          <button class="pill-btn" title="About Parental Controls" data-action="test-notification">?</button>
         </div>
         <p class="settings-page-subtitle" style="max-width:660px;">
           Parents and teens can link accounts, giving parents tools to adjust certain features, set limits, and add safeguards that work for their family.
-          <a href="#" style="color:var(--text-primary); text-decoration:underline;" onclick="event.preventDefault(); window._toggleAddFamilyForm()">Learn more</a>
+          <a href="#" style="color:var(--text-primary); text-decoration:underline;" data-action="toggle-add-family">Learn more</a>
         </p>
 
         <div style="margin-bottom:20px;">
-          <button class="pill-btn" onclick="window._toggleAddFamilyForm()">+ Add family member</button>
+          <button class="pill-btn" data-action="toggle-add-family">+ Add family member</button>
         </div>
 
         ${showAddFamilyForm ? `
@@ -3995,7 +4837,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <option value="Child">Child</option>
               <option value="Parent">Parent</option>
             </select>
-            <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" onclick="window._addFamilyMember()">Save Member</button>
+            <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" data-action="add-family-member">Save Member</button>
           </div>
         </div>` : ''}
 
@@ -4008,14 +4850,14 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-safe-syn" class="settings-row-label">Safe Synthesis Content Filter</label>
               <div class="settings-row-desc">Filter sensitive or age-restricted content during synthesis.</div>
             </div>
-            <input id="sw-safe-syn" type="checkbox" class="quorum-switch" ${ui.safe_synthesis_filter ? 'checked' : ''} onchange="window._saveUiPatch({safe_synthesis_filter: this.checked}); window._toast('Safe synthesis filter updated')">
+            <input id="sw-safe-syn" type="checkbox" class="quorum-switch" ${ui.safe_synthesis_filter ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="safe_synthesis_filter" data-toast-message="Safe synthesis filter updated">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-lock-tier3" class="settings-row-label">Lock Tier-3 Restricted Folders</label>
               <div class="settings-row-desc">Prevent Tier-3 restricted folders from being queried by guest or linked teen sessions.</div>
             </div>
-            <input id="sw-lock-tier3" type="checkbox" class="quorum-switch" ${ui.lock_tier3_restricted_folders !== false ? 'checked' : ''} onchange="window._saveUiPatch({lock_tier3_restricted_folders: this.checked}); window._toast('Tier-3 folder lock updated')">
+            <input id="sw-lock-tier3" type="checkbox" class="quorum-switch" ${ui.lock_tier3_restricted_folders !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="lock_tier3_restricted_folders" data-toast-message="Tier-3 folder lock updated">
           </div>
         </div>
       `;
@@ -4032,8 +4874,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
                    <div class="settings-row-desc">${escapeHtml(c.email)} ${c.peer ? ' • Peer: <code>' + escapeHtml(c.peer) + '</code>' : ''}</div>
                  </div>
                  <div style="display:flex; gap:8px;">
-                   <button type="button" class="pill-btn" data-contact-name="${escapeHtml(c.name)}" onclick="window._toast('Verified trusted contact: ' + this.dataset.contactName)">Verify</button>
-                   <button type="button" class="pill-btn-danger" onclick="window._removeTrustedContact(${idx})">Remove</button>
+                   <button type="button" class="pill-btn" data-action="verify-trusted-contact" data-contact-name="${escapeHtml(c.name)}">Verify</button>
+                   <button type="button" class="pill-btn-danger" data-action="remove-trusted-contact" data-index="${idx}">Remove</button>
                  </div>
                </div>
              `).join('')}
@@ -4046,11 +4888,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         </p>
         <p class="settings-page-subtitle" style="max-width:680px;">
           If a safety concern or critical node recovery event occurs in QuorumRAG, we can notify your trusted contact so they can check in with you. They must be 18+ to participate.
-          <a href="#" style="color:var(--text-primary); text-decoration:underline;" onclick="event.preventDefault(); window._toggleAddContactForm()">Learn more</a>
+          <a href="#" style="color:var(--text-primary); text-decoration:underline;" data-action="toggle-add-contact">Learn more</a>
         </p>
 
         <div style="margin-bottom:20px;">
-          <button class="pill-btn" onclick="window._toggleAddContactForm()">+ Add contact</button>
+          <button class="pill-btn" data-action="toggle-add-contact">+ Add contact</button>
         </div>
 
         ${showAddContactForm ? `
@@ -4060,7 +4902,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             <input type="text" id="tc-name-input" class="settings-input" placeholder="Contact Name (18+)">
             <input type="text" id="tc-email-input" class="settings-input" placeholder="Email or Phone">
             <input type="text" id="tc-peer-input" class="settings-input" value="${escapeHtml(ui.emergency_recovery_peer || '')}" placeholder="Optional Peer (/ip4/10.0.0.x/tcp/3032)">
-            <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" onclick="window._addTrustedContact()">Save Contact</button>
+            <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" data-action="add-trusted-contact">Save Contact</button>
           </div>
         </div>` : ''}
 
@@ -4080,8 +4922,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Choose the voice used for voice chat and read aloud</div>
             </div>
             <div style="display:flex; align-items:center; gap:8px;">
-              <button class="pill-btn" onclick="window._previewVoice(document.getElementById('voice-name-select').value)">🔊 Preview</button>
-              <select id="voice-name-select" class="pill-select" onchange="window._saveUiPatch({preferred_voice: this.value}); window._previewVoice(this.value)">
+              <button class="pill-btn" data-action="preview-voice">🔊 Preview</button>
+              <select id="voice-name-select" class="pill-select" data-change-action="ui-patch" data-patch-key="preferred_voice" data-toast-message="Voice updated">
                 <option value="Juniper" ${voiceName === 'Juniper' ? 'selected' : ''}>Juniper</option>
                 <option value="Cove" ${voiceName === 'Cove' ? 'selected' : ''}>Cove</option>
                 <option value="Ember" ${voiceName === 'Ember' ? 'selected' : ''}>Ember</option>
@@ -4095,7 +4937,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             <div class="settings-row-info">
               <span class="settings-row-label">Language</span>
             </div>
-            <select class="pill-select" onchange="window._saveUiPatch({voice_language: this.value}); window._toast('Voice language set to ' + this.value)">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="voice_language" data-toast-message="Voice language set">
               <option value="Auto-detect" ${voiceLang === 'Auto-detect' ? 'selected' : ''}>Auto-detect</option>
               <option value="English (US)" ${voiceLang === 'English (US)' ? 'selected' : ''}>English (US)</option>
               <option value="English (UK)" ${voiceLang === 'English (UK)' ? 'selected' : ''}>English (UK)</option>
@@ -4112,7 +4954,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-voice-in" class="settings-row-label">Enable Dictation</label>
               <div class="settings-row-desc">Use dictation in the chat composer.</div>
             </div>
-            <input id="sw-voice-in" type="checkbox" class="quorum-switch" ${ui.voice_input_enabled !== false ? 'checked' : ''} onchange="window._saveUiPatch({voice_input_enabled: this.checked}); window._toast(this.checked ? 'Dictation enabled' : 'Dictation disabled')">
+            <input id="sw-voice-in" type="checkbox" class="quorum-switch" ${ui.voice_input_enabled !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="voice_input_enabled" data-toast-message="Dictation setting updated">
           </div>
         </div>
 
@@ -4123,8 +4965,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Your last 20 recordings are saved on this device (${recordings.length} saved)</div>
             </div>
             <div style="display:flex; gap:8px;">
-              <button class="pill-btn" onclick="window._recordVoiceSample()">🎙️ Record Note</button>
-              ${recordings.length > 0 ? `<button class="pill-btn-danger" onclick="window._clearVoiceRecordings()">Clear</button>` : ''}
+              <button class="pill-btn" data-action="record-voice">🎙️ Record Note</button>
+              ${recordings.length > 0 ? `<button class="pill-btn-danger" data-action="clear-voice">Clear</button>` : ''}
             </div>
           </div>
           ${recordings.length > 0 ? `
@@ -4137,7 +4979,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       const liveChunks = Number(rt.total_chunks || 0);
       const liveFiles = Number(rt.total_files || 0);
       const estIndexGb = Math.max(0.01, (liveChunks * 4096) / (1024 * 1024 * 1024));
-      const pctUsed = Math.max(2, Math.min(98, Math.round((estIndexGb / 20) * 100)));
+      const pctUsed = Math.max(0, Math.min(98, Math.round((estIndexGb / 20) * 100)));
       settingsContent.innerHTML = `
         <h2 class="settings-page-title" style="margin-bottom:18px;">Storage</h2>
         <div style="font-size:14px; font-weight:600; color:var(--text-primary);">${estIndexGb.toFixed(2)} GB of 20 GB local index quota used (${liveChunks.toLocaleString()} chunks • ${liveFiles.toLocaleString()} cataloged files)</div>
@@ -4149,7 +4991,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         <div class="settings-section-sub">Manage your storage to free up space</div>
 
         <div class="settings-card">
-          <div class="settings-row clickable-row" onclick="window._toggleStorageSection('files')">
+          <div class="settings-row clickable-row" data-action="toggle-storage-section" data-section="files" style="cursor:pointer;">
             <div class="settings-row-info">
               <span class="settings-row-label">Files</span>
               <div class="settings-row-desc">${liveFiles.toLocaleString()} cataloged files • ${liveChunks.toLocaleString()} indexed chunks across ${(rt.physical_drives || ['D:\\', 'C:\\']).join(', ')}</div>
@@ -4161,12 +5003,22 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             <div><strong>Active Watched Paths:</strong> <code>${escapeHtml((rt.watched_paths || []).join(', '))}</code></div>
             <div style="margin-top:4px;"><strong>Local Index Directory:</strong> <code>${escapeHtml(rt.data_dir || '.quorumrag-live-data')}</code> (Epoch #${rt.index_epoch || 1})</div>
             <div style="margin-top:10px; display:flex; gap:8px;">
-              <button class="pill-btn" onclick="window._openModalFromSettings('modal-reindex')">🔄 Reindex Files</button>
-              <button class="pill-btn" onclick="window._openModalFromSettings('modal-drift')">🛡️ Run 5-Drift Remediation</button>
+              <button class="pill-btn" data-action="open-modal" data-modal-id="modal-reindex">🔄 Reindex Files</button>
+              <button class="pill-btn" data-action="open-modal" data-modal-id="modal-drift">🛡️ Run 5-Drift Remediation</button>
+            </div>
+            <div style="border-top:1px solid var(--border-color); padding-top:10px; margin-top:10px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+                <span style="font-size:12px; font-weight:600; color:var(--text-primary);">Browse Local Folders: <code>${escapeHtml(currentBrowsePath || 'Physical Drives (D:\\, C:\\)')}</code></span>
+                <div style="display:flex; gap:6px;">
+                  ${currentBrowsePath ? `<button type="button" class="btn-secondary" style="padding:3px 8px; font-size:11px; cursor:pointer;" data-action="browse-up" data-folder-path="${escapeHtml(currentBrowseParentPath || '')}">⬅ Up</button>` : ''}
+                  <button type="button" class="btn-secondary" style="padding:3px 8px; font-size:11px; cursor:pointer;" data-action="browse-root">💽 Drives Root</button>
+                </div>
+              </div>
+              <div class="folder-browser-grid">${browserItemsHtml || '<div style="font-size:12px; color:var(--text-muted);">No subdirectories found.</div>'}</div>
             </div>
           </div>` : ''}
 
-          <div class="settings-row clickable-row" onclick="window._toggleStorageSection('images')">
+          <div class="settings-row clickable-row" data-action="toggle-storage-section" data-section="images" style="cursor:pointer;">
             <div class="settings-row-info">
               <span class="settings-row-label">Images &amp; Scanned Media</span>
               <div class="settings-row-desc">WinRT OCR &amp; multimodal vision embeddings active across indexed drives</div>
@@ -4177,7 +5029,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           <div style="padding:10px 8px; font-size:12.5px; color:var(--text-muted);">
             <div>Scanned PDFs, ID cards, and diagrams are indexed locally with zero cloud uploads.</div>
             <div style="margin-top:10px;">
-              <button class="pill-btn" onclick="window._openModalFromSettings('modal-recache')">⚡ Compact &amp; Re-Cache Embeddings</button>
+              <button class="pill-btn" data-action="open-modal" data-modal-id="modal-recache">⚡ Compact &amp; Re-Cache Embeddings</button>
             </div>
           </div>` : ''}
         </div>
@@ -4195,7 +5047,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         <h2 class="settings-page-title">Personalization</h2>
 
         <div class="settings-section-heading" style="margin-bottom:2px;">QuorumRAG memory</div>
-        <div class="settings-section-sub">Configure how QuorumRAG manages memory. <a href="#" style="color:#3b82f6; text-decoration:none;" onclick="event.preventDefault(); window._toggleMemoryManager()">Learn more</a></div>
+        <div class="settings-section-sub">Configure how QuorumRAG manages memory. <a href="#" style="color:#3b82f6; text-decoration:none;" data-action="toggle-memory-manager">Learn more</a></div>
 
         <div class="settings-card">
           <div class="settings-row">
@@ -4203,16 +5055,16 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-mem-enable" class="settings-row-label">Enable memory</label>
               <div class="settings-row-desc">Let QuorumRAG personalize your experience based on your chats, files, and connected apps.</div>
             </div>
-            <input id="sw-mem-enable" type="checkbox" class="quorum-switch" ${ui.enable_memory !== false ? 'checked' : ''} onchange="window._saveUiPatch({enable_memory: this.checked}); window._toast(this.checked ? 'Memory enabled' : 'Memory paused')">
+            <input id="sw-mem-enable" type="checkbox" class="quorum-switch" ${ui.enable_memory !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="enable_memory" data-toast-message="Memory setting updated">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">Memory summary</span>
               <div class="settings-row-desc">
-                View an overview of what QuorumRAG has learned about you. Use <a href="#" style="color:#3b82f6; text-decoration:none;" onclick="event.preventDefault(); window._toggleCustomInstEditor()">custom instructions</a> for information you'd like it to always keep in mind. You can still manage your old <a href="#" style="color:#3b82f6; text-decoration:none;" onclick="event.preventDefault(); window._toggleMemoryManager()">saved memories</a>.
+                View an overview of what QuorumRAG has learned about you. Use <a href="#" style="color:#3b82f6; text-decoration:none;" data-action="toggle-custom-inst">custom instructions</a> for information you'd like it to always keep in mind. You can still manage your old <a href="#" style="color:#3b82f6; text-decoration:none;" data-action="toggle-memory-manager">saved memories</a>.
               </div>
             </div>
-            <button class="pill-btn" onclick="window._toggleMemoryManager()">Manage</button>
+            <button class="pill-btn" data-action="toggle-memory-manager">Manage</button>
           </div>
           ${showMemoryManager ? `
           <div style="padding:12px 0; border-bottom:1px solid var(--border-color);">
@@ -4220,12 +5072,12 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
             ${memories.map((m, idx) => `
               <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 10px; border-radius:8px; background:var(--bg-canvas); border:1px solid var(--border-color); margin-bottom:6px; font-size:12.5px;">
                 <span>🧠 ${escapeHtml(m)}</span>
-                <button class="pill-btn-danger" style="padding:2px 10px; font-size:11.5px;" onclick="window._removeMemoryItem(${idx})">Delete</button>
+                <button class="pill-btn-danger" style="padding:2px 10px; font-size:11.5px;" data-action="remove-memory-item" data-index="${idx}">Delete</button>
               </div>
             `).join('')}
             <div style="display:flex; gap:8px; margin-top:8px;">
               <input type="text" id="new-memory-input" class="settings-input" style="flex:1;" placeholder="Add a new memory fact for QuorumRAG...">
-              <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" onclick="window._addMemoryItem()">+ Add Memory</button>
+              <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" data-action="add-memory-item">+ Add Memory</button>
             </div>
           </div>` : ''}
           <div style="padding-top:10px; font-size:12px; color:var(--text-muted);">
@@ -4240,15 +5092,15 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-writing-style" class="settings-row-label">Reference my writing style</label>
               <div class="settings-row-desc">Let QuorumRAG use your chats, Library files, and connected apps to write in your style</div>
             </div>
-            <input id="sw-writing-style" type="checkbox" class="quorum-switch" ${ui.reference_writing_style ? 'checked' : ''} onchange="window._saveUiPatch({reference_writing_style: this.checked}); window._toast('Writing style preference saved')">
+            <input id="sw-writing-style" type="checkbox" class="quorum-switch" ${ui.reference_writing_style ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="reference_writing_style" data-toast-message="Writing style preference saved">
           </div>
         </div>
 
         <div class="settings-section-heading">Reference photos</div>
-        <input type="file" id="ref-photo-file-input" accept="image/*" class="hidden" onchange="window._handleRefPhotoSelected(event, 'headshot')">
-        <input type="file" id="ref-fullbody-file-input" accept="image/*" class="hidden" onchange="window._handleRefPhotoSelected(event, 'fullbody')">
+        <input type="file" id="ref-photo-file-input" accept="image/*" class="hidden" data-change-action="handle-ref-photo" data-kind="headshot">
+        <input type="file" id="ref-fullbody-file-input" accept="image/*" class="hidden" data-change-action="handle-ref-photo" data-kind="fullbody">
         <div class="settings-card">
-          <div class="settings-row clickable-row" onclick="document.getElementById('ref-photo-file-input').click()">
+          <div class="settings-row clickable-row" data-action="trigger-file-click" data-target-id="ref-photo-file-input" style="cursor:pointer;">
             <div class="settings-row-info">
               <span class="settings-row-label">Reference photo</span>
               <div class="settings-row-desc">This is the photo that QuorumRAG refers to when you create an image of yourself ${ui.ref_photo_name ? ' • <strong>Selected: ' + escapeHtml(ui.ref_photo_name) + '</strong>' : ''}</div>
@@ -4258,7 +5110,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <span>${ui.ref_photo_name ? 'Change ›' : 'Add ›'}</span>
             </span>
           </div>
-          <div class="settings-row clickable-row" onclick="document.getElementById('ref-fullbody-file-input').click()">
+          <div class="settings-row clickable-row" data-action="trigger-file-click" data-target-id="ref-fullbody-file-input" style="cursor:pointer;">
             <div class="settings-row-info">
               <span class="settings-row-label">Full-body reference photo</span>
               <div class="settings-row-desc">Used to show how clothing and accessories look on you ${ui.ref_fullbody_name ? ' • <strong>Selected: ' + escapeHtml(ui.ref_fullbody_name) + '</strong>' : ''}</div>
@@ -4274,7 +5126,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         <div class="settings-card">
           <div class="settings-row">
             <div class="settings-row-info"><span class="settings-row-label">Base style and tone</span></div>
-            <select class="pill-select" onchange="window._saveUiPatch({base_style_tone: this.value}); window._toast('Base style set to ' + this.value)">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="base_style_tone" data-toast-message="Base style updated">
               <option value="Default" ${baseTone === 'Default' ? 'selected' : ''}>Default</option>
               <option value="Concise" ${baseTone === 'Concise' ? 'selected' : ''}>Concise</option>
               <option value="Technical" ${baseTone === 'Technical' ? 'selected' : ''}>Technical</option>
@@ -4284,7 +5136,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           </div>
           <div class="settings-row">
             <div class="settings-row-info"><span class="settings-row-label">Warmth</span></div>
-            <select class="pill-select" onchange="window._saveUiPatch({tone_warmth: this.value}); window._toast('Warmth set to ' + this.value)">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="tone_warmth" data-toast-message="Warmth updated">
               <option value="More" ${warmth === 'More' ? 'selected' : ''}>More</option>
               <option value="Default" ${warmth === 'Default' ? 'selected' : ''}>Default</option>
               <option value="Less" ${warmth === 'Less' ? 'selected' : ''}>Less</option>
@@ -4292,7 +5144,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           </div>
           <div class="settings-row">
             <div class="settings-row-info"><span class="settings-row-label">Enthusiasm</span></div>
-            <select class="pill-select" onchange="window._saveUiPatch({tone_enthusiasm: this.value}); window._toast('Enthusiasm set to ' + this.value)">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="tone_enthusiasm" data-toast-message="Enthusiasm updated">
               <option value="More" ${enthusiasm === 'More' ? 'selected' : ''}>More</option>
               <option value="Default" ${enthusiasm === 'Default' ? 'selected' : ''}>Default</option>
               <option value="Less" ${enthusiasm === 'Less' ? 'selected' : ''}>Less</option>
@@ -4300,7 +5152,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           </div>
           <div class="settings-row">
             <div class="settings-row-info"><span class="settings-row-label">Emoji</span></div>
-            <select class="pill-select" onchange="window._saveUiPatch({tone_emoji: this.value}); window._toast('Emoji preference set to ' + this.value)">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="tone_emoji" data-toast-message="Emoji preference updated">
               <option value="Less" ${emojiLevel === 'Less' ? 'selected' : ''}>Less</option>
               <option value="Default" ${emojiLevel === 'Default' ? 'selected' : ''}>Default</option>
               <option value="More" ${emojiLevel === 'More' ? 'selected' : ''}>More</option>
@@ -4308,7 +5160,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           </div>
           <div class="settings-row">
             <div class="settings-row-info"><span class="settings-row-label">Visual answers</span></div>
-            <select class="pill-select" onchange="window._saveUiPatch({visual_answers: this.value}); window._toast('Visual answers set to ' + this.value)">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="visual_answers" data-toast-message="Visual answers updated">
               <option value="Default" ${visualAnswers === 'Default' ? 'selected' : ''}>Default</option>
               <option value="More" ${visualAnswers === 'More' ? 'selected' : ''}>More</option>
               <option value="Less" ${visualAnswers === 'Less' ? 'selected' : ''}>Less</option>
@@ -4316,7 +5168,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           </div>
           <div class="settings-row">
             <div class="settings-row-info"><span class="settings-row-label">Headers and lists</span></div>
-            <select class="pill-select" onchange="window._saveUiPatch({headers_and_lists: this.value}); window._toast('Headers and lists set to ' + this.value)">
+            <select class="pill-select" data-change-action="ui-patch" data-patch-key="headers_and_lists" data-toast-message="Headers and lists updated">
               <option value="Less" ${headersLists === 'Less' ? 'selected' : ''}>Less</option>
               <option value="Default" ${headersLists === 'Default' ? 'selected' : ''}>Default</option>
               <option value="More" ${headersLists === 'More' ? 'selected' : ''}>More</option>
@@ -4326,7 +5178,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
 
         <!-- Custom Instructions & Codex Rows -->
         <div class="settings-card">
-          <div class="settings-row clickable-row" onclick="window._toggleCustomInstEditor()">
+          <div class="settings-row clickable-row" data-action="toggle-custom-inst" style="cursor:pointer;">
             <div class="settings-row-info">
               <span class="settings-row-label">QuorumRAG</span>
               <div class="settings-row-desc">Give QuorumRAG extra instructions and context for all chats.</div>
@@ -4337,11 +5189,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           <div style="padding:10px 0; border-bottom:1px solid var(--border-color);">
             <textarea id="pers-inst" class="settings-textarea" style="width:100%; height:80px;">${escapeHtml(ui.custom_instructions || '')}</textarea>
             <div style="margin-top:8px; text-align:right;">
-              <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" onclick="window._saveUiPatch({custom_instructions: document.getElementById('pers-inst').value}); window._toast('QuorumRAG instructions saved')">Save Instructions</button>
+              <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" data-action="save-custom-inst">Save Instructions</button>
             </div>
           </div>` : ''}
 
-          <div class="settings-row clickable-row" onclick="window._toggleCodexInstEditor()">
+          <div class="settings-row clickable-row" data-action="toggle-codex-inst" style="cursor:pointer;">
             <div class="settings-row-info">
               <span class="settings-row-label">Codex</span>
               <div class="settings-row-desc">Instructions for Codex synced across desktop and web</div>
@@ -4352,7 +5204,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           <div style="padding:10px 0;">
             <textarea id="codex-inst" class="settings-textarea" style="width:100%; height:80px;">${escapeHtml(ui.codex_instructions || 'Prefer clean, zero-mock production Rust and TypeScript with deterministic tests.')}</textarea>
             <div style="margin-top:8px; text-align:right;">
-              <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" onclick="window._saveUiPatch({codex_instructions: document.getElementById('codex-inst').value}); window._toast('Codex instructions saved')">Save Codex Instructions</button>
+              <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" data-action="save-codex-inst">Save Codex Instructions</button>
             </div>
           </div>` : ''}
         </div>
@@ -4365,49 +5217,49 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-fast-ans" class="settings-row-label">Fast answers</label>
               <div class="settings-row-desc">QuorumRAG can sometimes use its general knowledge to give fast, in-depth answers. These aren't personalized and don't use your memory.</div>
             </div>
-            <input id="sw-fast-ans" type="checkbox" class="quorum-switch" ${ui.fast_answers !== false ? 'checked' : ''} onchange="window._saveUiPatch({fast_answers: this.checked}); window._toast('Fast answers setting saved')">
+            <input id="sw-fast-ans" type="checkbox" class="quorum-switch" ${ui.fast_answers !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="fast_answers" data-toast-message="Fast answers setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-sug-prompts" class="settings-row-label">Suggested prompts</label>
               <div class="settings-row-desc">QuorumRAG can generate suggestions based on searching connected plugins</div>
             </div>
-            <input id="sw-sug-prompts" type="checkbox" class="quorum-switch" ${ui.suggested_prompts !== false ? 'checked' : ''} onchange="window._saveUiPatch({suggested_prompts: this.checked}); window._toast('Suggested prompts setting saved')">
+            <input id="sw-sug-prompts" type="checkbox" class="quorum-switch" ${ui.suggested_prompts !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="suggested_prompts" data-toast-message="Suggested prompts setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-ref-rec" class="settings-row-label">Reference record history</label>
               <div class="settings-row-desc">Let QuorumRAG reference all previous recording transcripts and notes when responding.</div>
             </div>
-            <input id="sw-ref-rec" type="checkbox" class="quorum-switch" ${ui.reference_record_history !== false ? 'checked' : ''} onchange="window._saveUiPatch({reference_record_history: this.checked}); window._toast('Record history setting saved')">
+            <input id="sw-ref-rec" type="checkbox" class="quorum-switch" ${ui.reference_record_history !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="reference_record_history" data-toast-message="Record history setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-web-search" class="settings-row-label">Web search</label>
               <div class="settings-row-desc">Let QuorumRAG automatically search the web for answers</div>
             </div>
-            <input id="sw-web-search" type="checkbox" class="quorum-switch" ${ui.web_search_enabled !== false ? 'checked' : ''} onchange="window._saveUiPatch({web_search_enabled: this.checked}); window._toast('Web search setting saved')">
+            <input id="sw-web-search" type="checkbox" class="quorum-switch" ${ui.web_search_enabled !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="web_search_enabled" data-toast-message="Web search setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-q-voice" class="settings-row-label">QuorumRAG Voice</label>
               <div class="settings-row-desc">Enable Voice in QuorumRAG</div>
             </div>
-            <input id="sw-q-voice" type="checkbox" class="quorum-switch" ${ui.quorum_voice_enabled !== false ? 'checked' : ''} onchange="window._saveUiPatch({quorum_voice_enabled: this.checked}); window._toast('QuorumRAG Voice setting saved')">
+            <input id="sw-q-voice" type="checkbox" class="quorum-switch" ${ui.quorum_voice_enabled !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="quorum_voice_enabled" data-toast-message="QuorumRAG Voice setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-lib-search" class="settings-row-label">Library search</label>
               <div class="settings-row-desc">Allow QuorumRAG to automatically search Library files for answers</div>
             </div>
-            <input id="sw-lib-search" type="checkbox" class="quorum-switch" ${ui.library_search_enabled !== false ? 'checked' : ''} onchange="window._saveUiPatch({library_search_enabled: this.checked}); window._toast('Library search setting saved')">
+            <input id="sw-lib-search" type="checkbox" class="quorum-switch" ${ui.library_search_enabled !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="library_search_enabled" data-toast-message="Library search setting saved">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-conn-search" class="settings-row-label">Connector search</label>
               <div class="settings-row-desc">Let QuorumRAG automatically search connected sources for answers</div>
             </div>
-            <input id="sw-conn-search" type="checkbox" class="quorum-switch" ${ui.connector_search_enabled !== false ? 'checked' : ''} onchange="window._saveUiPatch({connector_search_enabled: this.checked}); window._toast('Connector search setting saved')">
+            <input id="sw-conn-search" type="checkbox" class="quorum-switch" ${ui.connector_search_enabled !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="connector_search_enabled" data-toast-message="Connector search setting saved">
           </div>
         </div>
       `;
@@ -4423,7 +5275,7 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           </p>
           <div style="display:flex; justify-content:center; gap:8px; max-width:360px; margin:0 auto;">
             <input type="text" id="pet-name-input" class="settings-input" value="${escapeHtml(ui.mesh_pet_name || 'Oshoosi Sentinel')}" placeholder="Guardian Name">
-            <button class="pill-btn" onclick="window._saveUiPatch({mesh_pet_name: document.getElementById('pet-name-input').value}); window._toast('Guardian name updated'); window._rerenderSettings()">Rename Guardian</button>
+            <button class="pill-btn" data-action="save-pet-name">Rename Guardian</button>
           </div>
         </div>
       `;
@@ -4461,14 +5313,14 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <label for="sw-dc-explicit" class="settings-row-label">Only Share Explicitly Approved Folders with Mesh</label>
               <div class="settings-row-desc">Prevent any folder not in your Shared Folders allowlist from being accessed over P2P.</div>
             </div>
-            <input id="sw-dc-explicit" type="checkbox" class="quorum-switch" ${mesh.require_explicit_folder_share !== false ? 'checked' : ''} onchange="window.quorumUpdateMeshConfig({require_explicit_folder_share: this.checked}); window._toast('Folder sharing policy updated')">
+            <input id="sw-dc-explicit" type="checkbox" class="quorum-switch" ${mesh.require_explicit_folder_share !== false ? 'checked' : ''} data-change-action="mesh-config" data-config-key="require_explicit_folder_share">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
               <label for="sw-dc-query-dlp" class="settings-row-label">Scrub/Block PHI in Outbound Mesh Queries</label>
               <div class="settings-row-desc">Automatically apply the HIPAA PHI/PII DLP gate to outbound search queries before broadcasting to peers.</div>
             </div>
-            <input id="sw-dc-query-dlp" type="checkbox" class="quorum-switch" ${dlp.scrub_outbound_queries !== false ? 'checked' : ''} onchange="window.quorumUpdateDlpPolicy({scrub_outbound_queries: this.checked}); window._toast('Outbound query DLP updated')">
+            <input id="sw-dc-query-dlp" type="checkbox" class="quorum-switch" ${dlp.scrub_outbound_queries !== false ? 'checked' : ''} data-change-action="dlp-policy" data-policy-key="scrub_outbound_queries">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">
@@ -4476,9 +5328,51 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
               <div class="settings-row-desc">Jump directly to folder-level sharing or HIPAA PHI/PII controls.</div>
             </div>
             <div style="display:flex; gap:8px;">
-              <button class="pill-btn" onclick="window._jumpSettingsTab('mesh')">🌐 Shared Folders</button>
-              <button class="pill-btn" onclick="window._jumpSettingsTab('dlp')">🛡️ PHI DLP Gate</button>
+              <button class="pill-btn" data-action="jump-tab" data-tab="mesh">🌐 Shared Folders</button>
+              <button class="pill-btn" data-action="jump-tab" data-tab="dlp">🛡️ PHI DLP Gate</button>
             </div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Export All Data</span>
+              <div class="settings-row-desc">Export current conversation sessions, preferences, and mesh settings to a standalone JSON file.</div>
+            </div>
+            <button class="pill-btn" data-action="export-all-data">Export All</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Import Settings</span>
+              <div class="settings-row-desc">Restore settings and configuration from a previously exported QuorumRAG JSON backup.</div>
+            </div>
+            <input type="file" id="import-settings-file-input" accept="application/json" class="hidden" data-change-action="import-settings-file">
+            <button class="pill-btn" data-action="trigger-import-settings">Import Settings</button>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Clear Query &amp; Embedding Cache</span>
+              <div class="settings-row-desc">Flush all in-memory and on-disk cached query responses and intermediate vector embeddings.</div>
+            </div>
+            <button class="pill-btn-danger" data-action="clear-query-cache">Clear Cache</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Clear Active Chat History</span>
+              <div class="settings-row-desc">Wipe all turns in the current active chat session.</div>
+            </div>
+            <button class="pill-btn-danger" data-action="clear-chat-history">Clear History</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Clear Archived Chats</span>
+              <div class="settings-row-desc">Permanently delete all stored archived chat sessions from local disk.</div>
+            </div>
+            <button class="pill-btn-danger" data-action="clear-archived-chats">Clear Archived</button>
           </div>
         </div>
       `;
@@ -4596,14 +5490,20 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   };
 
   window._archiveCurrentChat = async function() {
+    const turns = Array.isArray(conversationHistoryTurns)
+      ? conversationHistoryTurns.filter(t => t && t.content && String(t.content).trim())
+      : [];
+    if (turns.length === 0) {
+      showSettingsToast('No active chat messages to archive');
+      return;
+    }
     if (!cachedSettingsData) await loadFullSettings();
     const ui = Object.assign({}, cachedSettingsData ? cachedSettingsData.ui : {});
     const list = stripMockArchivedChats(Array.isArray(ui.archived_chats) ? ui.archived_chats.slice() : []);
-    const turns = Array.isArray(conversationHistoryTurns) ? conversationHistoryTurns.slice() : [];
-    const firstUserTurn = turns.find(t => t && t.role === 'user' && t.content && String(t.content).trim());
+    const firstUserTurn = turns.find(t => t.role === 'user');
     const derivedTitle = firstUserTurn
       ? String(firstUserTurn.content).trim().slice(0, 72)
-      : ('QuorumRAG Session (' + new Date().toLocaleTimeString() + ')');
+      : ('Conversation (' + new Date().toLocaleDateString() + ')');
     list.unshift({
       id: 'chat-' + Date.now() + '-' + secureRandomToken(5),
       title: derivedTitle,
@@ -5035,7 +5935,22 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     }
   };
 
+  window._exportAllData = function() {
+    const payload = {
+      settings: cachedSettingsData,
+      active_conversation: conversationHistoryTurns,
+      exported_at: new Date().toISOString()
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `quorumrag-export-${Date.now()}.json`;
+    a.click();
+    showSettingsToast('All chats and settings exported to JSON');
+  };
+
   // Load initial settings on startup to sync theme & sidebar pills
   loadFullSettings();
+  initSettingsEventDelegation();
 
 })();

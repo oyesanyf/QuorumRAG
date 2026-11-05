@@ -404,6 +404,40 @@ impl ScatterGatherEngine {
             self.config.rrf_k,
             top_k,
         );
+        // Promote chunks (including remote peer chunks) that contain exact rare query tokens (e.g. "16017" in "CVE-2020-16017")
+        // when partial matches lack the specific identifier token.
+        let q_tokens: Vec<String> = query_text
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| t.len() >= 4)
+            .map(|s| s.to_string())
+            .collect();
+        if !q_tokens.is_empty() && fused.len() > 1 {
+            let count_hits = |sc: &ScoredChunk| -> usize {
+                let hay = format!(
+                    "{} {}",
+                    sc.chunk.text_content.to_ascii_lowercase(),
+                    sc.chunk.file_path.to_ascii_lowercase()
+                );
+                q_tokens.iter().filter(|tok| hay.contains(tok.as_str())).count()
+            };
+            let max_hits = fused.iter().map(count_hits).max().unwrap_or(0);
+            let min_hits = fused.iter().map(count_hits).min().unwrap_or(0);
+            if max_hits > min_hits && max_hits == q_tokens.len() {
+                fused.sort_by(|a, b| {
+                    let ha = count_hits(a);
+                    let hb = count_hits(b);
+                    (hb == q_tokens.len())
+                        .cmp(&(ha == q_tokens.len()))
+                        .then_with(|| {
+                            b.score
+                                .partial_cmp(&a.score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
+                });
+            }
+        }
         if !exclude_set.is_empty() {
             fused.retain(|c| !exclude_set.contains(c.chunk.chunk_id.as_str()));
         }
@@ -468,7 +502,7 @@ impl ScatterGatherEngine {
             let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
             sign_request(&self.secret_seed, &mut req, tier);
 
-            let timeout_dur = Duration::from_millis(self.config.timeout_ms.min(300));
+            let timeout_dur = Duration::from_millis(self.config.timeout_ms.max(1500));
             if let Ok(responses) = self.mesh_dispatcher.query_peers(&req, timeout_dur).await {
                 let mut peer_count = 0;
                 for resp in responses {

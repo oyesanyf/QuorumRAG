@@ -118,7 +118,7 @@
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
-                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Mesh&quot; dir=in action=allow program=&quot;[INSTALLFOLDER]quorumrag.exe&quot; enable=yes profile=private" />
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Mesh&quot; dir=in action=allow program=&quot;[INSTALLFOLDER]quorumrag.exe&quot; enable=yes profile=any" />
         <CustomAction Id="RemoveQuorumFirewallRule"
                       Directory="INSTALLFOLDER"
                       Execute="deferred"

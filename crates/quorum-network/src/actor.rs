@@ -159,6 +159,11 @@ impl NetworkSwarmActor {
                             .behaviour_mut()
                             .kademlia
                             .add_address(&peer_id, addr.clone());
+                        if !self.swarm.is_connected(&peer_id)
+                            && crate::transport::is_allowed_dial_address(&addr)
+                        {
+                            let _ = self.swarm.dial(addr.clone());
+                        }
                         let _ = self
                             .event_tx
                             .send(NetworkEvent::PeerDiscovered { peer_id, address: addr });
