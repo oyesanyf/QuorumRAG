@@ -32,6 +32,18 @@ pub struct RlmOrchestrator {
     pub installed_models: Vec<String>,
 }
 
+/// Truncates a string to at most `max_bytes` without splitting multi-byte UTF-8 codepoints.
+fn safe_truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 impl RlmOrchestrator {
     /// Creates a new RLM orchestrator with the specified sandbox configuration and hardware context.
     pub fn new(config: RlmConfig, hw: HardwareTelemetry, installed_models: Vec<String>) -> Self {
@@ -292,11 +304,34 @@ impl RlmOrchestrator {
             summary
         });
 
-        // 10. append_section(heading, text)
+        // 10. append_section(heading, text) - clamped to 1 MB cumulative across all sections
+        const MAX_CUMULATIVE_SECTION_SIZE: usize = 1_048_576; // 1 MB
         let ws = Arc::clone(&workspace);
         engine.register_fn("append_section", move |heading: &str, text: &str| {
             let mut guard = ws.lock().unwrap();
-            guard.report_sections.push((heading.to_string(), text.to_string()));
+            let current_total: usize = guard
+                .report_sections
+                .iter()
+                .map(|(h, t)| h.len() + t.len())
+                .sum();
+            if current_total >= MAX_CUMULATIVE_SECTION_SIZE {
+                return;
+            }
+            let remaining = MAX_CUMULATIVE_SECTION_SIZE - current_total;
+            if heading.len() >= remaining {
+                let clamped_heading = safe_truncate_str(heading, remaining);
+                if !clamped_heading.is_empty() {
+                    guard.report_sections.push((clamped_heading.to_string(), String::new()));
+                }
+            } else {
+                let rem_text = remaining - heading.len();
+                let clamped_text = if text.len() > rem_text {
+                    safe_truncate_str(text, rem_text).to_string()
+                } else {
+                    text.to_string()
+                };
+                guard.report_sections.push((heading.to_string(), clamped_text));
+            }
         });
 
         // 11. get_report() -> String
@@ -636,4 +671,28 @@ mod tests {
         assert!(!resp.traces.is_empty());
         assert!(!resp.citations.is_empty());
     }
+
+    #[test]
+    fn test_append_section_cumulative_size_clamping_at_1mb() {
+        let config = RlmConfig::default();
+        let ws = Arc::new(Mutex::new(RlmWorkspaceState::default()));
+        let engine = RlmOrchestrator::create_sandboxed_engine(&config, Arc::clone(&ws), "qwen2.5:1.5b".to_string());
+        let mut scope = Scope::new();
+
+        // 1. Append 600 KB section
+        let chunk_600k = "A".repeat(600_000);
+        scope.push("chunk_600k", chunk_600k);
+        let _ = engine.eval_with_scope::<Dynamic>(&mut scope, r#"append_section("Section1", chunk_600k);"#).expect("append section 1");
+
+        // 2. Append another 600 KB section - should be clamped so cumulative size <= 1,048,576
+        let chunk_600k_2 = "B".repeat(600_000);
+        scope.push("chunk_600k_2", chunk_600k_2);
+        let _ = engine.eval_with_scope::<Dynamic>(&mut scope, r#"append_section("Section2", chunk_600k_2);"#).expect("append section 2");
+
+        let guard = ws.lock().unwrap();
+        let total_size: usize = guard.report_sections.iter().map(|(h, t)| h.len() + t.len()).sum();
+        assert!(total_size <= 1_048_576, "Cumulative sections must not exceed 1 MB, got: {}", total_size);
+        assert_eq!(total_size, 1_048_576, "Should clamp exactly to 1 MB boundary");
+    }
 }
+

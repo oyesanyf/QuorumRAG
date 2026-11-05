@@ -280,6 +280,11 @@ impl DeterministicOfflineSynthesisEngine {
         model_tag: &str,
         telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
     ) -> (String, Vec<Citation>) {
+        if telemetry_tx.map(|tx| tx.is_closed()).unwrap_or(false) {
+            let citations: Vec<Citation> = chunks.iter().map(|c| c.to_citation()).collect();
+            return ("Request cancelled by client.".to_string(), citations);
+        }
+
         const STOPWORDS: &[&str] = &[
             "what", "does", "do", "did", "where", "when", "who", "how", "why",
             "is", "are", "was", "were", "the", "and", "for", "with", "from",
@@ -919,32 +924,34 @@ impl DeterministicOfflineSynthesisEngine {
                 prompt_eff.to_string()
             };
             let client_disconnected = telemetry_tx.map(|tx| tx.is_closed()).unwrap_or(false);
-            if !client_disconnected {
-                if let Some((llm_orchestrated, llm_citations)) = Self::query_local_ollama_chat(
-                    &effective_question,
-                    history,
-                    &matched_chunk_refs,
-                    model_tag,
-                    telemetry_tx,
-                ) {
-                    return (llm_orchestrated, llm_citations);
-                }
+            if client_disconnected {
+                let citations: Vec<Citation> = chunks.iter().map(|c| c.to_citation()).collect();
+                return ("Request cancelled by client.".to_string(), citations);
+            }
+            if let Some((llm_orchestrated, llm_citations)) = Self::query_local_ollama_chat(
+                &effective_question,
+                history,
+                &matched_chunk_refs,
+                model_tag,
+                telemetry_tx,
+            ) {
+                return (llm_orchestrated, llm_citations);
+            }
 
-                // 1b. Fast-model retry: the primary model (often 26B+ on CPU) timed out or failed, so retry with up
-                // to two smaller installed models over the strongest excerpts before giving up on LLM synthesis.
-                if matched_chunk_refs.len() > 0 {
-                    let installed = Self::probe_installed_ollama_models_default();
-                    if !installed.is_empty() {
-                        let hw = crate::hardware::HardwareTelemetry::probe();
-                        let failed_model = Self::resolve_ollama_model_tag(model_tag, &hw, &installed);
-                        let top_refs = &matched_chunk_refs[..matched_chunk_refs.len().min(5)];
-                        for fast in crate::answer_orchestrator::fast_fallback_models(&installed, &failed_model).iter().take(2) {
-                            tracing::warn!(failed = %failed_model, retry = %fast, "Primary synthesis failed; retrying with faster local model");
-                            if let Some((text, cits)) =
-                                Self::query_local_ollama_chat(&effective_question, history, top_refs, fast, telemetry_tx)
-                            {
-                                return (text, cits);
-                            }
+            // 1b. Fast-model retry: the primary model (often 26B+ on CPU) timed out or failed, so retry with up
+            // to two smaller installed models over the strongest excerpts before giving up on LLM synthesis.
+            if matched_chunk_refs.len() > 0 {
+                let installed = Self::probe_installed_ollama_models_default();
+                if !installed.is_empty() {
+                    let hw = crate::hardware::HardwareTelemetry::probe();
+                    let failed_model = Self::resolve_ollama_model_tag(model_tag, &hw, &installed);
+                    let top_refs = &matched_chunk_refs[..matched_chunk_refs.len().min(5)];
+                    for fast in crate::answer_orchestrator::fast_fallback_models(&installed, &failed_model).iter().take(2) {
+                        tracing::warn!(failed = %failed_model, retry = %fast, "Primary synthesis failed; retrying with faster local model");
+                        if let Some((text, cits)) =
+                            Self::query_local_ollama_chat(&effective_question, history, top_refs, fast, telemetry_tx)
+                        {
+                            return (text, cits);
                         }
                     }
                 }
