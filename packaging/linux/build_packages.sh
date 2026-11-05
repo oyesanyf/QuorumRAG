@@ -259,8 +259,8 @@ Release:        1
 Summary:        QuorumRAG Local-First P2P Agentic RAG Daemon and Web UI
 License:        MIT OR Apache-2.0
 URL:            https://github.com/oyesanyf/QuorumRAG
-Provides:       %{PACKAGE_NAME} = %{version}-%{release}
-Obsoletes:      %{PACKAGE_NAME} < %{version}-%{release}
+Provides:       ${PACKAGE_NAME} = ${VERSION}-1
+Obsoletes:      ${PACKAGE_NAME} < ${VERSION}-1
 AutoReqProv:    no
 %define __strip /bin/true
 %define _build_id_links none
