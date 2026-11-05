@@ -69,7 +69,7 @@ impl DeterministicOfflineSynthesisEngine {
             .filter(|&c| {
                 matches!(
                     c,
-                    '~' | '`' | '^' | '|' | '\\' | '{' | '}' | '<' | '>' | '@' | '#' | '%' | '*' | '='
+                    '~' | '`' | '^' | '\\' | '{' | '}' | '<' | '>' | '@' | '#' | '%' | '*' | '='
                 )
             })
             .count();
@@ -108,11 +108,36 @@ impl DeterministicOfflineSynthesisEngine {
             if trimmed.is_empty() {
                 continue;
             }
-            // Strip leading `[Word/Document (...) — ...]` extractor banner if inline on the first line
-            if trimmed.starts_with("[Word/Document") || trimmed.starts_with("[PDF Document") {
+            // Strip leading `[Document: "..." | Author: ... | Kind: ... | File: ...]`, `[File: ...]`,
+            // `[Image Document: ...]`, `[Word/Document ...]`, or `[PDF Document ...]` extractor/chunker banners
+            while trimmed.starts_with("[Document:")
+                || trimmed.starts_with("[File:")
+                || trimmed.starts_with("[Word/Document")
+                || trimmed.starts_with("[PDF Document")
+                || trimmed.starts_with("[Image Document:")
+                || trimmed.starts_with("[Audio Document:")
+                || trimmed.starts_with("[Video Document:")
+            {
                 if let Some(close_bracket) = trimmed.find(']') {
                     trimmed = trimmed[close_bracket + 1..].trim();
                 } else {
+                    trimmed = "";
+                    break;
+                }
+            }
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Strip image indexer structural labels (`[Filename Keywords]: ...`, `[Directory Context]: ...`, `[OCR Text]:`)
+            if trimmed.starts_with("[Filename Keywords]:")
+                || trimmed.starts_with("[Directory Context]:")
+                || trimmed.eq_ignore_ascii_case("[OCR Text]:")
+            {
+                continue;
+            }
+            if let Some(after_ocr) = trimmed.strip_prefix("[OCR Text]:") {
+                trimmed = after_ocr.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
             }
@@ -586,9 +611,10 @@ impl DeterministicOfflineSynthesisEngine {
                 continue;
             }
             let raw_head = scored.chunk.text_content.trim_start();
-            let is_media_chunk = raw_head.starts_with("[Audio Document:")
-                || raw_head.starts_with("[Image Document:")
-                || raw_head.starts_with("[Video Document:");
+            let is_media_chunk = raw_head.contains("[Audio Document:")
+                || raw_head.contains("[Image Document:")
+                || raw_head.contains("[Video Document:")
+                || raw_head.contains("[OCR Text]");
             if !requests_code
                 && (SOURCE_CODE_EXTENSIONS
                     .iter()
@@ -608,7 +634,10 @@ impl DeterministicOfflineSynthesisEngine {
                 continue;
             }
 
+            let has_ocr_content = raw_head.contains("[OCR Text]")
+                || query_terms.iter().any(|qt| text_l.contains(qt.as_str()));
             if !asks_image
+                && !has_ocr_content
                 && (text_l.starts_with("[image document:")
                     || path_l.ends_with(".gif")
                     || path_l.ends_with(".jpg")
@@ -631,6 +660,12 @@ impl DeterministicOfflineSynthesisEngine {
 
             let matches_whole_word = |term: &str| -> bool {
                 if doc_tokens.contains(term) {
+                    return true;
+                }
+                if term == "cve"
+                    && doc_tokens.contains("ve")
+                    && doc_tokens.iter().any(|t| t.len() == 4 && t.chars().all(|ch| ch.is_ascii_digit()))
+                {
                     return true;
                 }
                 if (term == "maths" || term == "math")
@@ -708,20 +743,22 @@ impl DeterministicOfflineSynthesisEngine {
             };
 
             if is_relevant {
-                // Deduplicate chunks with identical normalized content prefix so duplicate PDF/DOCX copies don't bloat context
+                // Deduplicate chunks with identical normalized content prefix WITHIN the same peer
+                // so duplicate local PDF/DOCX copies don't bloat context, while NEVER dropping remote peer copies!
                 let norm_key: String = text_l
                     .chars()
                     .filter(|c| c.is_alphanumeric())
                     .take(120)
                     .collect();
-                if norm_key.len() >= 20 && seen_snippets.contains(&norm_key) {
+                let peer_snippet_key = format!("{}::{}", scored.source_peer, norm_key);
+                if norm_key.len() >= 20 && seen_snippets.contains(&peer_snippet_key) {
                     continue;
                 }
                 if is_continuation && previous_snippets.iter().any(|snip| text_l.contains(&snip.to_ascii_lowercase()) || norm_key.contains(snip)) {
                     continue;
                 }
                 if norm_key.len() >= 20 {
-                    seen_snippets.push(norm_key);
+                    seen_snippets.push(peer_snippet_key);
                 }
 
                 let file_tokens: std::collections::HashSet<&str> = file_l
@@ -890,12 +927,27 @@ impl DeterministicOfflineSynthesisEngine {
             12
         };
 
-        // Keep top N deduplicated RAG chunks for comprehensive multi-paragraph synthesis
+        // Keep top N deduplicated RAG chunks for comprehensive multi-paragraph synthesis,
+        // while ensuring matched remote peer chunks (`source_peer != "local"`) are always preserved!
+        let matched_remote_chunks: Vec<ScoredChunk> = scored_matches
+            .iter()
+            .filter(|(c, _, _, _)| c.source_peer != "local")
+            .take(4)
+            .map(|(c, _, _, _)| (*c).clone())
+            .collect();
         let mut candidate_chunks: Vec<ScoredChunk> = scored_matches
             .into_iter()
             .take(chunk_limit)
             .map(|(c, _, _, _)| c.clone())
             .collect();
+        for rem in matched_remote_chunks {
+            if !candidate_chunks
+                .iter()
+                .any(|c| c.source_peer == rem.source_peer && c.chunk.chunk_id == rem.chunk.chunk_id)
+            {
+                candidate_chunks.push(rem);
+            }
+        }
 
         if ui.parent_document_retrieval {
             candidate_chunks = Self::stitch_parent_document_chunks(candidate_chunks);
@@ -1814,7 +1866,11 @@ impl DeterministicOfflineSynthesisEngine {
             std::collections::HashMap::new();
 
         for (orig_rank, chunk) in chunks.into_iter().enumerate() {
-            let key = chunk.chunk.file_path.to_ascii_lowercase();
+            let key = format!(
+                "{}::{}",
+                chunk.source_peer,
+                chunk.chunk.file_path.to_ascii_lowercase()
+            );
             if !file_buckets.contains_key(&key) {
                 file_order.push(key.clone());
             }
@@ -3549,7 +3605,8 @@ impl DeterministicOfflineSynthesisEngine {
     }
 
     /// Deduplicates excerpts from multiple copies/exports of the same document on disk (e.g. `RedactX-v3.pdf` and
-    /// `RedactX-v3 (1).pdf`) by collapsing chunks that share an identical 160-character alphanumeric opening signature.
+    /// `RedactX-v3 (1).pdf`) WITHIN the same peer by collapsing chunks that share an identical 160-character alphanumeric
+    /// opening signature, while preserving distinct peer copies (`source_peer != "local"`).
     pub fn dedup_near_identical_excerpts<'a>(chunks: Vec<&'a ScoredChunk>) -> Vec<&'a ScoredChunk> {
         use std::collections::HashSet;
         let mut seen_sigs: HashSet<String> = HashSet::new();
@@ -3562,7 +3619,8 @@ impl DeterministicOfflineSynthesisEngine {
                 .flat_map(|ch| ch.to_lowercase())
                 .take(160)
                 .collect();
-            if sig.len() < 40 || seen_sigs.insert(sig) {
+            let peer_sig = format!("{}::{}", c.source_peer, sig);
+            if sig.len() < 40 || seen_sigs.insert(peer_sig) {
                 out.push(c);
             }
         }
@@ -4254,9 +4312,9 @@ impl DeterministicOfflineSynthesisEngine {
         }
 
         let mut discovered = Vec::new();
-        if let Ok(mut stream) = TcpStream::connect_timeout(addr, Duration::from_millis(400)) {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+        if let Ok(mut stream) = TcpStream::connect_timeout(addr, Duration::from_millis(600)) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(600)));
             let req = format!(
                 "GET /api/tags HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
                 host_port
@@ -4519,6 +4577,9 @@ impl DeterministicOfflineSynthesisEngine {
             return None;
         }
         let addr: SocketAddr = parsed_addr;
+
+        // Ensure local Ollama daemon is running before probing /api/tags or sending /api/chat
+        let _ = Self::ensure_ollama_daemon_running();
 
         let hw = crate::hardware::HardwareTelemetry::probe();
         let mut installed_models = Self::probe_installed_ollama_models(&addr, host_port, false);
@@ -5150,8 +5211,18 @@ impl DeterministicOfflineSynthesisEngine {
                 let consolidated_prose = Self::consolidate_duplicate_entity_statements(&prose_with_prefix);
                 // Compact & renumber inline [k] citations so every [1]..[M] in prose maps 1-to-1 to the M emitted sources
                 // (eliminating dangling [8] when 7 unique files exist, and omitting uncited Turn-1 files on `continue`).
-                let (compacted_prose, compacted_chunks) =
+                let (compacted_prose, mut compacted_chunks) =
                     Self::remap_and_compact_citations(&consolidated_prose, &unique_file_chunks, true);
+                // Preserve remote peer sources (`source_peer != "local"`) even if the LLM only cited [1]..[4]
+                // so multi-computer evidence is always surfaced in the Sources panel and citation cards!
+                for &rc in matched_chunks.iter().filter(|c| c.source_peer != "local").take(4) {
+                    if !compacted_chunks
+                        .iter()
+                        .any(|c| c.source_peer == rc.source_peer && c.chunk.file_path == rc.chunk.file_path)
+                    {
+                        compacted_chunks.push(rc);
+                    }
+                }
                 let sources_block = Self::format_sources_block(&compacted_chunks);
                 let final_with_sources = format!("{}{}", compacted_prose.trim(), sources_block);
                 let turn_citations = Self::build_deduplicated_citations(&compacted_chunks);
@@ -6766,5 +6837,99 @@ mod tests {
         );
         assert!(remapped.contains("[1]") && remapped.contains("[2]") && remapped.contains("[3]"));
         assert!(!remapped.contains("[7]") && !remapped.contains("[8]"), "No out-of-bounds citation index may remain: {}", remapped);
+    }
+
+    #[test]
+    fn test_document_header_stripping_ocr_screenshot_and_multi_peer_sources() {
+        // 1. Verify [Document: "..." | Author: ... | Kind: ... | File: ...] never leaks into synthesis
+        let raw_resume_chunk = "[Document: \"Femi Oyesanya AI Security Resume Timeline Fixed\" | Author: Unknown | Kind: resume_cv | File: Femi_Oyesanya_AI_Security_Resume_Timeline_Fixed.pdf]\nFemi Oyesanya is a Principal AI Security Architect and CISSP-certified cybersecurity leader specializing in agentic AI defense and zero-trust cryptography.";
+        let cleaned = DeterministicOfflineSynthesisEngine::clean_chunk_text(raw_resume_chunk);
+        assert!(
+            !cleaned.contains("[Document:"),
+            "[Document: ...] header must be completely stripped from cleaned chunk text, got: {}",
+            cleaned
+        );
+        assert!(cleaned.contains("Principal AI Security Architect"));
+
+        // 2. Verify multi-peer preservation when the exact same file exists on both `local` and a remote peer (`12D3KooW...`)
+        let local_ch = quorum_types::DocumentChunk::new(
+            "blake3_resume:0",
+            "doc_resume",
+            r"C:\Users\femi\Documents\Femi_Oyesanya_AI_Security_Resume_Timeline_Fixed.pdf",
+            1,
+            25,
+            0,
+            vec![0.1; 768],
+            raw_resume_chunk,
+            None,
+        )
+        .unwrap();
+        let remote_ch = local_ch.clone();
+        let peer_id = "12D3KooWEcNhbaJtvJCF6QqvWwzxWTXBMfMqvxrRbxKbAZ2ZvKR5";
+        let chunks = vec![
+            ScoredChunk::new(local_ch, 0.96, "local", false),
+            ScoredChunk::new(remote_ch, 0.94, peer_id, true),
+        ];
+
+        let (answer, citations) = DeterministicOfflineSynthesisEngine::synthesize_with_history(
+            "who is Femi Oyesanya",
+            "who is Femi Oyesanya",
+            &[],
+            &chunks,
+            "auto",
+            None,
+        );
+        assert!(
+            !answer.contains("[Document:"),
+            "Synthesized answer must never contain [Document: ...] header: {}",
+            answer
+        );
+        assert!(
+            citations.iter().any(|c| c.peer_id == "local"),
+            "Citations must include local copy"
+        );
+        assert!(
+            citations.iter().any(|c| c.peer_id == peer_id),
+            "Citations must ALSO include the remote peer copy ({}) when present on both computers, got: {:?}",
+            peer_id,
+            citations
+        );
+
+        // 3. Verify short OCR screenshot chunk (e.g. CVE-2020-16017.png with 7 pipes in headers and clipped `VE-2020-16017`) is synthesized
+        let ocr_raw = "[Document: \"CVE 2020 16017\" | Author: Unknown | Kind: document | File: CVE-2020-16017.png]\n[Image Document: CVE-2020-16017.png | Path: C:\\Users\\oyesanyf\\Pictures\\Screenshots\\CVE-2020-16017.png | Format: PNG | Dimensions: 917x182 px | Size: 33997 bytes]\n[Filename Keywords]: cve 2020 16017\n[Directory Context]: Users oyesanyf Pictures Screenshots\n[OCR Text]:\nVE-2020-16017 The Linux kernel through 5.5.7 allows remote attackers to trigger memory corruption in net/ tipc.";
+        assert!(
+            !DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(ocr_raw),
+            "Short OCR screenshot chunk with header pipes must not be flagged as binary garbage"
+        );
+        let ocr_chunk = quorum_types::DocumentChunk::new(
+            "ocr_cve:0",
+            "doc_ocr",
+            r"C:\Users\oyesanyf\Pictures\Screenshots\CVE-2020-16017.png",
+            1,
+            10,
+            0,
+            vec![0.1; 768],
+            ocr_raw,
+            None,
+        )
+        .unwrap();
+        let (ocr_ans, ocr_cits) = DeterministicOfflineSynthesisEngine::synthesize_with_history(
+            "CVE-2020-16017",
+            "CVE-2020-16017",
+            &[],
+            &[ScoredChunk::new(ocr_chunk, 0.95, "local", false)],
+            "auto",
+            None,
+        );
+        assert!(
+            !ocr_cits.is_empty(),
+            "CVE-2020-16017 screenshot chunk must match and produce citations, got answer: {}",
+            ocr_ans
+        );
+        assert!(
+            ocr_ans.contains("Linux kernel") || ocr_ans.contains("16017"),
+            "Synthesized OCR answer must describe the vulnerability: {}",
+            ocr_ans
+        );
     }
 }

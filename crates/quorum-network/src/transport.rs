@@ -93,7 +93,7 @@ pub fn build_swarm(
         })
         .map_err(|e| NetworkError::SwarmBuildError(e.to_string()))?
         .with_swarm_config(|cfg| {
-            cfg.with_idle_connection_timeout(Duration::from_secs(60))
+            cfg.with_idle_connection_timeout(Duration::from_secs(86_400))
         })
         .build();
 

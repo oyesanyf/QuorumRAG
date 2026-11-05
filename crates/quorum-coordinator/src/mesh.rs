@@ -133,11 +133,37 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
         request: &FederatedQueryRequest,
         timeout: Duration,
     ) -> Result<Vec<FederatedQueryResponse>, CoordinatorError> {
-        let peers = self
+        let mut peers = self
             .handle
             .connected_peers()
             .await
             .map_err(|e| CoordinatorError::Network(e.to_string()))?;
+
+        // If no peers are currently connected (e.g., idle TCP drop or remote node restarted),
+        // proactively dial configured bootstrap_peers from OshoosiClaw Mesh settings and wait briefly.
+        if peers.is_empty() {
+            let bootstrap_addrs = {
+                let controller = crate::dlp_mesh::global_mesh_dlp_controller();
+                let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
+                s.mesh.bootstrap_peers.clone()
+            };
+            if !bootstrap_addrs.is_empty() {
+                for addr_str in &bootstrap_addrs {
+                    if let Ok(addr) = addr_str.trim().parse::<quorum_network::Multiaddr>() {
+                        let _ = self.handle.dial(addr).await;
+                    }
+                }
+                for _ in 0..9 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if let Ok(rechecked) = self.handle.connected_peers().await {
+                        if !rechecked.is_empty() {
+                            peers = rechecked;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         if peers.is_empty() {
             return Ok(Vec::new());
@@ -296,11 +322,11 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             };
         }
 
-        // 3. Cryptographic handshake & anti-replay timestamp verification (drift <= 60s)
+        // 3. Cryptographic handshake & anti-replay timestamp verification (drift <= 300s across LAN clocks)
         let mut verified_tier = None;
         for t in 0..=max_tier.min(3) {
             if let Ok(candidate_tier) = quorum_types::AccessTier::from_u8(t) {
-                if crate::crypto::verify_request(&req, candidate_tier, 60).is_ok() {
+                if crate::crypto::verify_request(&req, candidate_tier, 300).is_ok() {
                     verified_tier = Some(candidate_tier);
                     break;
                 }
@@ -311,7 +337,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             Some(tier) => tier.as_u8().min(max_tier),
             None => {
                 tracing::warn!(
-                    "Rejecting unverified or stale query signature (>60s drift) from peer: {}",
+                    "Rejecting unverified or stale query signature (>300s drift) from peer: {}",
                     req.sender_peer_id
                 );
                 return FederatedQueryResponse {
@@ -322,10 +348,29 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             }
         };
 
-        let scored = self
+        let mut scored = self
             .local_storage
-            .search_hybrid(&req.query_text, &req.embedding, effective_tier, req.top_k.min(16))
+            .search_hybrid(
+                &req.query_text,
+                &req.embedding,
+                effective_tier,
+                req.top_k.clamp(16, 32),
+            )
             .await;
+
+        // Also include direct text matches on the remote peer so exact entity/CVE/name queries
+        // never miss chunks when embedding vectors differ or are zeroed.
+        let text_scored = self
+            .local_storage
+            .search_text(&req.query_text, effective_tier, 24)
+            .await;
+        let mut seen_ids: std::collections::HashSet<String> =
+            scored.iter().map(|c| c.chunk.chunk_id.clone()).collect();
+        for hit in text_scored {
+            if seen_ids.insert(hit.chunk.chunk_id.clone()) {
+                scored.push(hit);
+            }
+        }
 
         let candidate_dtos: Vec<CandidateChunkDto> = scored
             .iter()
