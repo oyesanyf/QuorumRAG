@@ -282,12 +282,39 @@ pub struct ChatGptUiSettings {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ArchivedChatEntry {
     pub id: String,
     pub title: String,
     pub archived_at: String,
     pub message_count: usize,
+    pub project: String,
+    pub messages: Vec<serde_json::Value>,
+}
+
+impl ChatGptUiSettings {
+    /// Strips legacy mock archived chats (`arch-1`..`arch-8`).
+    pub fn sanitize_mock_artifacts(&mut self) {
+        const MOCK_IDS: &[&str] = &[
+            "arch-1", "arch-2", "arch-3", "arch-4", "arch-5", "arch-6", "arch-7", "arch-8",
+        ];
+        const MOCK_TITLES: &[&str] = &[
+            "power of prayer",
+            "itumọ ati itumọ ọrọ",
+            "math as cosmic language",
+            "doctor's findings explanation",
+            "self-identity and dissonance",
+            "college prep for engineering",
+            "credo reflection and revision",
+            "ways to be happy",
+        ];
+        self.archived_chats.retain(|c| {
+            let id_trim = c.id.trim().to_ascii_lowercase();
+            let title_trim = c.title.trim().to_ascii_lowercase();
+            !MOCK_IDS.contains(&id_trim.as_str()) && !MOCK_TITLES.contains(&title_trim.as_str())
+        });
+    }
 }
 
 impl Default for ChatGptUiSettings {
@@ -421,9 +448,17 @@ impl OsoosiMeshDlpController {
         }
         if path.is_file() {
             if let Ok(raw) = std::fs::read_to_string(&path) {
-                if let Ok(parsed) = serde_json::from_str::<PersistedDaemonSettings>(&raw) {
-                    let mut guard = self.settings.write().unwrap_or_else(|e| e.into_inner());
-                    *guard = parsed;
+                if let Ok(mut parsed) = serde_json::from_str::<PersistedDaemonSettings>(&raw) {
+                    let prev_len = parsed.ui.archived_chats.len();
+                    parsed.ui.sanitize_mock_artifacts();
+                    let cleaned = parsed.ui.archived_chats.len() != prev_len;
+                    {
+                        let mut guard = self.settings.write().unwrap_or_else(|e| e.into_inner());
+                        *guard = parsed;
+                    }
+                    if cleaned {
+                        self.save_to_disk();
+                    }
                     return;
                 }
             }

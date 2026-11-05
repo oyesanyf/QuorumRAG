@@ -13,6 +13,7 @@ pub mod langextract;
 pub mod mesh;
 pub mod model_router;
 pub mod offline_engine;
+pub mod rlm_orchestrator;
 pub mod scatter_gather;
 pub mod telemetry;
 pub mod tpm;
@@ -49,6 +50,7 @@ pub use mesh::{
 };
 pub use model_router::AutoFusionRouter;
 pub use offline_engine::DeterministicOfflineSynthesisEngine;
+pub use rlm_orchestrator::{RlmOrchestrator, RlmWorkspaceState};
 pub use scatter_gather::{FederatedQueryCoordinator, ScatterGatherEngine, StorageSearcher};
 pub use telemetry::AgenticTelemetryEvent;
 pub use types::{

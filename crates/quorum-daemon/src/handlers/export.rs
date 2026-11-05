@@ -15,12 +15,12 @@ use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::state::DaemonState;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExportSource {
     #[serde(default)]
     pub cite_num: Option<usize>,
@@ -30,6 +30,14 @@ pub struct ExportSource {
     pub file_path: String,
     #[serde(default)]
     pub score_pct: Option<f32>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub source_peer: Option<String>,
+    #[serde(default)]
+    pub is_external_node: bool,
+    #[serde(default)]
+    pub origin_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -354,8 +362,9 @@ pub fn generate_docx(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
         for (i, s) in req.sources.iter().enumerate() {
             let n = s.cite_num.unwrap_or(i + 1);
             let score = s.score_pct.map(|p| format!(" ({p:.0}%)")).unwrap_or_default();
+            let peer_badge = s.node_id.as_deref().or(s.source_peer.as_deref()).map(|p| format!(" [Node: {p}]")).unwrap_or_default();
             body.push_str(&docx_para(None, true, &format!(
-                "<w:r><w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">[{n}] {}{score}</w:t></w:r><w:r><w:br/><w:t xml:space=\"preserve\">{}</w:t></w:r>",
+                "<w:r><w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">[{n}] {}{score}{peer_badge}</w:t></w:r><w:r><w:br/><w:t xml:space=\"preserve\">{}</w:t></w:r>",
                 xml_escape(&s.file_name),
                 xml_escape(&s.file_path)
             )));
@@ -630,7 +639,8 @@ pub fn generate_pdf(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
         for (i, s) in req.sources.iter().enumerate() {
             let n = s.cite_num.unwrap_or(i + 1);
             let score = s.score_pct.map(|p| format!(" ({p:.0}%)")).unwrap_or_default();
-            lay.para(&format!("[{n}] {}{score}", s.file_name), 10.0, true, 0.0, None);
+            let peer_badge = s.node_id.as_deref().or(s.source_peer.as_deref()).map(|p| format!(" [Node: {p}]")).unwrap_or_default();
+            lay.para(&format!("[{n}] {}{score}{peer_badge}", s.file_name), 10.0, true, 0.0, None);
             lay.para(&s.file_path, 9.0, false, 12.0, None);
         }
     }
@@ -776,6 +786,10 @@ mod tests {
                 file_name: "dog.119.jpg".into(),
                 file_path: r"D:\dataset\images\data\dogs\dog.119.jpg".into(),
                 score_pct: Some(96.0),
+                node_id: Some("local-node".into()),
+                source_peer: Some("local-node".into()),
+                is_external_node: false,
+                origin_label: Some("local".into()),
             }],
             attached_media: vec![],
             format: "pdf".into(),

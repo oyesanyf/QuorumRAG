@@ -18,6 +18,16 @@ pub struct ChunkScoreCriteria {
     pub proper_ok: bool,
 }
 
+pub const QUERY_META_INTENT_TERMS: &[&str] = &[
+    "article", "articles", "paper", "papers", "research",
+    "written", "writing", "writings", "write", "writes", "wrote",
+    "authored", "author", "authors",
+    "publication", "publications", "published", "publish",
+    "done", "he", "him", "his", "she", "her", "they", "them",
+    "tell", "show", "give", "list", "find", "describe", "explain",
+    "all", "any", "other", "more", "another", "besides",
+];
+
 pub const GENERIC_ATTRIBUTE_TERMS: &[&str] = &[
     "school", "schools", "university", "universities", "college", "colleges",
     "degree", "degrees", "education", "academic", "transcript", "transcripts",
@@ -98,14 +108,8 @@ impl RetrieveMeshNode {
                 "{} education university college master bachelor degree certifications",
                 state.current_query
             )
-        } else if q_low.contains("who is")
-            || q_low.contains("resume")
-            || q_low.contains("cv")
-            || q_low.contains("femi")
-            || q_low.contains("oyesanya")
-            || q_low.contains("work")
-            || q_low.contains("experience")
-            || q_low.contains("career")
+        } else if (q_low.contains("resume") || q_low.contains("cv") || q_low.contains("curriculum vitae"))
+            && !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_authorship_query(&q_low)
         {
             format!(
                 "{} professional summary experience competencies publications",
@@ -210,6 +214,7 @@ impl RetrieveMeshNode {
                     w.len() >= 3
                         && !STOPWORDS.contains(w)
                         && !GENERIC_ATTRIBUTE_TERMS.contains(w)
+                        && !QUERY_META_INTENT_TERMS.contains(w)
                 })
                 .fold(Vec::new(), |mut acc, w| {
                     let s = w.to_string();
@@ -266,7 +271,9 @@ impl RetrieveMeshNode {
             let entity_hits = engine
                 .search_federated_text(&entity_kw_query, access_tier, 96)
                 .await;
-            for hit in entity_hits {
+            for (idx, mut hit) in entity_hits.into_iter().enumerate() {
+                // Normalize supplemental BM25 scores to [0.0, 1.0] RRF scale (1.0 / (60.0 + rank))
+                hit.score = 1.0 / (60.0 + idx as f32);
                 if seen_ids.insert(hit.chunk.chunk_id.clone()) {
                     chunks.push(hit);
                 }
@@ -279,7 +286,8 @@ impl RetrieveMeshNode {
                 let prompt_hits = engine
                     .search_federated_text(&prompt_kw_query, access_tier, 64)
                     .await;
-                for hit in prompt_hits {
+                for (idx, mut hit) in prompt_hits.into_iter().enumerate() {
+                    hit.score = 1.0 / (60.0 + idx as f32);
                     if seen_ids.insert(hit.chunk.chunk_id.clone()) {
                         chunks.push(hit);
                     }
@@ -292,23 +300,8 @@ impl RetrieveMeshNode {
             if !cue_terms.is_empty() && !prompt_only_entities.is_empty() {
                 let cue_query = format!("{} {}", prompt_only_entities.join(" "), cue_terms.join(" "));
                 let cue_hits = engine.search_federated_text(&cue_query, access_tier, 48).await;
-                for hit in cue_hits {
-                    if seen_ids.insert(hit.chunk.chunk_id.clone()) {
-                        chunks.push(hit);
-                    }
-                }
-            }
-
-            // When querying about Femi Oyesanya, also pull resume/CV summary chunks across all resume documents
-            if q_low.contains("femi") || q_low.contains("oyesanya") {
-                let resume_hits = engine
-                    .search_federated_text(
-                        "Femi Oyesanya CISSP PROFESSIONAL SUMMARY Resume CV",
-                        access_tier,
-                        64,
-                    )
-                    .await;
-                for hit in resume_hits {
+                for (idx, mut hit) in cue_hits.into_iter().enumerate() {
+                    hit.score = 1.0 / (60.0 + idx as f32);
                     if seen_ids.insert(hit.chunk.chunk_id.clone()) {
                         chunks.push(hit);
                     }
@@ -383,6 +376,13 @@ impl RetrieveMeshNode {
                 }
                 !EXCLUDED_EXTS.iter().any(|ext| file_l.ends_with(ext))
             });
+        }
+
+        // Uniformly filter blacklisted session chunks BEFORE entity-coverage and scoring criteria
+        if is_continuation_turn || crate::offline_engine::DeterministicOfflineSynthesisEngine::is_exclusion_query(&orig_low) {
+            if !state.seen_chunk_ids.is_empty() {
+                chunks.retain(|c| !state.seen_chunk_ids.contains(&c.chunk.chunk_id));
+            }
         }
         let query_terms: Vec<String> = query_lower
             .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -612,16 +612,13 @@ impl RetrieveMeshNode {
                     }
                 }
 
-                if asks_profile_or_role
-                    || entity_terms
-                        .iter()
-                        .any(|e| e == "femi" || e == "oyesanya")
-                {
+                let asks_author_works = crate::offline_engine::DeterministicOfflineSynthesisEngine::is_authorship_query(&state.original_prompt);
+                if asks_profile_or_role && !asks_author_works {
                     if file_name_l.contains("resume")
                         || path_l.contains("resume")
                         || file_name_l.contains("cv")
                     {
-                        intent_bonus += 260;
+                        intent_bonus += 180;
                     }
                     if text_l.contains("professional summary")
                         || text_l.contains("cissp-certified")
@@ -633,6 +630,16 @@ impl RetrieveMeshNode {
                         || text_l.contains("education")
                     {
                         intent_bonus += 90;
+                    }
+                }
+
+                // Authorship / Publication Intent: boost research articles and heavily penalize government legal forms
+                if asks_author_works {
+                    if file_name_l.contains("g-28") || file_name_l.contains("g28") || file_name_l.contains("i-130") || file_name_l.contains("i130") || path_l.contains("dhs") || text_l.contains("notice of entry of appearance as attorney") {
+                        intent_bonus -= 200;
+                    }
+                    if file_name_l.contains("paper") || file_name_l.contains("article") || file_name_l.contains("manuscript") || text_l.contains("abstract") || text_l.contains("introduction") || text_l.contains("methodology") || text_l.contains("references") {
+                        intent_bonus += 120;
                     }
                 }
 
@@ -771,9 +778,18 @@ impl RetrieveMeshNode {
             chunks = paired.into_iter().map(|(c, _)| c).collect();
         }
 
-        if !state.seen_chunk_ids.is_empty() {
-            chunks.retain(|c| !state.seen_chunk_ids.contains(&c.chunk.chunk_id));
+        // Cap chunks per normalized document stem (max 2 per stem) to prevent draft revisions from crowding out distinct works
+        let mut stem_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut stem_deduped: Vec<quorum_types::ScoredChunk> = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            let stem = crate::offline_engine::DeterministicOfflineSynthesisEngine::normalize_file_stem(&c.chunk.file_path);
+            let count = stem_counts.entry(stem).or_insert(0);
+            if *count < 2 {
+                *count += 1;
+                stem_deduped.push(c);
+            }
         }
+        chunks = stem_deduped;
 
         let ui = crate::dlp_mesh::global_mesh_dlp_controller()
             .settings

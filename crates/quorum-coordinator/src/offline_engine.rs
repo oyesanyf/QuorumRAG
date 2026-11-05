@@ -772,10 +772,9 @@ impl DeterministicOfflineSynthesisEngine {
                     || expanded_lower.contains("work")
                     || expanded_lower.contains("experience")
                     || expanded_lower.contains("career")
-                    || expanded_lower.contains("background")
-                    || ((expanded_lower.contains("femi") || expanded_lower.contains("oyesanya"))
-                        && !asks_education);
-                if asks_profile
+                    || expanded_lower.contains("background");
+                let asks_author_works = Self::is_authorship_query(&expanded_lower);
+                if asks_profile && !asks_author_works
                     && (file_l.contains("cv")
                         || file_l.contains("resume")
                         || text_l.contains("professional summary")
@@ -783,7 +782,7 @@ impl DeterministicOfflineSynthesisEngine {
                         || text_l.contains("core competencies")
                         || text_l.contains("cissp-certified"))
                 {
-                    doc_bonus += 260;
+                    doc_bonus += 180;
                 }
                 // Strongly boost opening/overview/abstract chunks so "What is X?" or "What does it do?"
                 // gets the high-level definition and abstract rather than middle-of-paper chart axes
@@ -919,30 +918,33 @@ impl DeterministicOfflineSynthesisEngine {
             } else {
                 prompt_eff.to_string()
             };
-            if let Some((llm_orchestrated, llm_citations)) = Self::query_local_ollama_chat(
-                &effective_question,
-                history,
-                &matched_chunk_refs,
-                model_tag,
-                telemetry_tx,
-            ) {
-                return (llm_orchestrated, llm_citations);
-            }
+            let client_disconnected = telemetry_tx.map(|tx| tx.is_closed()).unwrap_or(false);
+            if !client_disconnected {
+                if let Some((llm_orchestrated, llm_citations)) = Self::query_local_ollama_chat(
+                    &effective_question,
+                    history,
+                    &matched_chunk_refs,
+                    model_tag,
+                    telemetry_tx,
+                ) {
+                    return (llm_orchestrated, llm_citations);
+                }
 
-            // 1b. Fast-model retry: the primary model (often 26B+ on CPU) timed out or failed, so retry with up
-            // to two smaller installed models over the strongest excerpts before giving up on LLM synthesis.
-            if matched_chunk_refs.len() > 0 {
-                let installed = Self::probe_installed_ollama_models_default();
-                if !installed.is_empty() {
-                    let hw = crate::hardware::HardwareTelemetry::probe();
-                    let failed_model = Self::resolve_ollama_model_tag(model_tag, &hw, &installed);
-                    let top_refs = &matched_chunk_refs[..matched_chunk_refs.len().min(5)];
-                    for fast in crate::answer_orchestrator::fast_fallback_models(&installed, &failed_model).iter().take(2) {
-                        tracing::warn!(failed = %failed_model, retry = %fast, "Primary synthesis failed; retrying with faster local model");
-                        if let Some((text, cits)) =
-                            Self::query_local_ollama_chat(&effective_question, history, top_refs, fast, telemetry_tx)
-                        {
-                            return (text, cits);
+                // 1b. Fast-model retry: the primary model (often 26B+ on CPU) timed out or failed, so retry with up
+                // to two smaller installed models over the strongest excerpts before giving up on LLM synthesis.
+                if matched_chunk_refs.len() > 0 {
+                    let installed = Self::probe_installed_ollama_models_default();
+                    if !installed.is_empty() {
+                        let hw = crate::hardware::HardwareTelemetry::probe();
+                        let failed_model = Self::resolve_ollama_model_tag(model_tag, &hw, &installed);
+                        let top_refs = &matched_chunk_refs[..matched_chunk_refs.len().min(5)];
+                        for fast in crate::answer_orchestrator::fast_fallback_models(&installed, &failed_model).iter().take(2) {
+                            tracing::warn!(failed = %failed_model, retry = %fast, "Primary synthesis failed; retrying with faster local model");
+                            if let Some((text, cits)) =
+                                Self::query_local_ollama_chat(&effective_question, history, top_refs, fast, telemetry_tx)
+                            {
+                                return (text, cits);
+                            }
                         }
                     }
                 }
@@ -1092,16 +1094,18 @@ impl DeterministicOfflineSynthesisEngine {
                 answer_parts.push(opening);
             }
 
-            // LangExtract-style grounded composition: structured, span-grounded facts and key passages
-            // replace raw excerpt dumps whenever anything can be grounded.
-            let fallback_subject = prefix.trim_end().strip_suffix(" is").map(|s| s.trim().to_string());
-            match crate::answer_orchestrator::render_grounded_sections(
-                prompt_eff,
-                fallback_subject.as_deref(),
-                &matched_chunk_refs,
-            ) {
-                Some(sections) => answer_parts.push(sections),
-                None => answer_parts.extend(body_paragraphs),
+            if !client_disconnected {
+                let fallback_subject = prefix.trim_end().strip_suffix(" is").map(|s| s.trim().to_string());
+                match crate::answer_orchestrator::render_grounded_sections(
+                    prompt_eff,
+                    fallback_subject.as_deref(),
+                    &matched_chunk_refs,
+                ) {
+                    Some(sections) => answer_parts.push(sections),
+                    None => answer_parts.extend(body_paragraphs),
+                }
+            } else {
+                answer_parts.extend(body_paragraphs);
             }
 
             // Add end-of-response sources block with accuracy scores (zero line numbers!)
@@ -1648,6 +1652,135 @@ impl DeterministicOfflineSynthesisEngine {
             || t.contains("keep going")
             || t.contains("expand")
             || t == "more"
+    }
+
+    /// Detects whether a query string requests exclusion of previously discussed works, authors, or documents.
+    pub fn is_exclusion_query(lower: &str) -> bool {
+        let t = lower.trim();
+        t.contains("other than")
+            || t.contains("other research")
+            || t.contains("other article")
+            || t.contains("other work")
+            || t.contains("other paper")
+            || t.contains("other document")
+            || t.contains("any other")
+            || t.contains("anything else")
+            || t.contains("what else")
+            || t.contains("besides")
+            || t.contains("excluding")
+            || t.contains("aside from")
+            || t.contains("apart from")
+            || t.contains("not those")
+            || t.contains("not that")
+            || t.contains("different work")
+            || t.contains("different paper")
+            || t.contains("different research")
+            || t.contains("different article")
+    }
+
+    /// Detects whether a query string specifically asks for publications, research papers, or articles authored by a subject.
+    pub fn is_authorship_query(lower: &str) -> bool {
+        let t = lower.trim();
+        t.contains("written by")
+            || t.contains("authored by")
+            || t.contains("has written")
+            || t.contains("has he written")
+            || t.contains("has she written")
+            || t.contains("did he write")
+            || t.contains("did she write")
+            || t.contains("he wrote")
+            || t.contains("she wrote")
+            || t.contains("author of")
+            || t.contains("article he has")
+            || t.contains("articles he has")
+            || t.contains("article she has")
+            || t.contains("articles she has")
+            || t.contains("paper he has")
+            || t.contains("papers he has")
+            || t.contains("other research")
+            || t.contains("done any other research")
+            || t.contains("dont any other research")
+            || t.contains("any other research")
+            || t.contains("publications by")
+            || t.contains("research by")
+            || ((t.contains("article") || t.contains("paper") || t.contains("research") || t.contains("book") || t.contains("publication"))
+                && (t.contains("written") || t.contains("authored") || t.contains("wrote") || t.contains("by ") || t.contains("femi") || t.contains("oyesanya")))
+    }
+
+    /// Normalizes a document file path down to its canonical document stem, stripping draft versioning,
+    /// revisions, and parenthesized copy indicators (e.g. `_v\d+`, `_final`, `_draft`, `(1)`).
+    pub fn normalize_file_stem(file_path: &str) -> String {
+        let path = std::path::Path::new(file_path);
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file_path);
+        let mut s = stem.to_ascii_lowercase();
+
+        // Strip revision patterns: _final, -final, _draft, -draft, _corrected, -corrected, etc.
+        let patterns = [
+            "_final", "-final", "_draft", "-draft", "_corrected", "-corrected",
+            "_rewritten", "-rewritten", "_typesetting", "-typesetting", "_arxiv", "-arxiv",
+        ];
+        for pat in patterns {
+            if let Some(pos) = s.rfind(pat) {
+                s.truncate(pos);
+            }
+        }
+        // Strip trailing version suffixes e.g. _v1, _v2, _v3, -v3
+        if let Some(pos) = s.rfind("_v") {
+            if s[pos + 2..].chars().all(|c| c.is_ascii_digit()) {
+                s.truncate(pos);
+            }
+        }
+        if let Some(pos) = s.rfind("-v") {
+            if s[pos + 2..].chars().all(|c| c.is_ascii_digit()) {
+                s.truncate(pos);
+            }
+        }
+        // Strip trailing parenthesized numbers e.g. (1), (2)
+        if let Some(open) = s.rfind('(') {
+            if let Some(close) = s.rfind(')') {
+                if open < close && s[open + 1..close].chars().all(|c| c.is_ascii_digit()) {
+                    s.truncate(open);
+                }
+            }
+        }
+        s.trim_end_matches(|c: char| c == '_' || c == '-' || c.is_whitespace()).to_string()
+    }
+
+    /// Fast synchronous sub-LLM query helper against local Ollama for Rhai REPL Map batches.
+    pub fn fast_sub_llm_query(model_tag: &str, prompt: &str) -> Option<String> {
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+        use std::time::Duration;
+
+        let addr = SocketAddr::from(([127, 0, 0, 1], 11434));
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
+
+        let payload = serde_json::json!({
+            "model": model_tag,
+            "prompt": prompt,
+            "stream": false,
+            "options": {
+                "temperature": 0.2,
+                "num_predict": 512
+            }
+        });
+        let body = serde_json::to_vec(&payload).ok()?;
+        let req = format!(
+            "POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1:11434\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).ok()?;
+        stream.write_all(&body).ok()?;
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).ok()?;
+        let json_part = resp.split("\r\n\r\n").nth(1)?;
+        let val: serde_json::Value = serde_json::from_str(json_part).ok()?;
+        val.get("response").and_then(|v| v.as_str()).map(|s| s.trim().to_string())
     }
 
     /// Stitches adjacent or contiguous document chunks from the same source file into unbroken parent document sections,
@@ -3344,8 +3477,9 @@ impl DeterministicOfflineSynthesisEngine {
             "work", "works", "worked", "working", "born", "say", "says", "said", "talk", "talks",
             "mention", "mentions", "mean", "means", "call", "called",
         ];
+        let clean_prompt = prompt.split(" (Subject context:").next().unwrap_or(prompt);
         let mut out: Vec<String> = Vec::new();
-        for w in prompt
+        for w in clean_prompt
             .to_ascii_lowercase()
             .split(|c: char| !c.is_alphanumeric())
             .filter(|w| w.len() >= 3 && !FILLER.contains(w))
@@ -3390,7 +3524,8 @@ impl DeterministicOfflineSynthesisEngine {
         };
         let scored: Vec<(usize, &'a ScoredChunk)> = chunks.iter().map(|c| (coverage(c), *c)).collect();
         let best = scored.iter().map(|(n, _)| *n).max().unwrap_or(0);
-        if best == 0 {
+        if best == 0 || Self::is_authorship_query(prompt) {
+            // Never prune candidate chunks on exhaustive authorship enumeration queries
             return chunks.to_vec();
         }
         let threshold = ((best * 3 + 3) / 4).max(1);
@@ -4327,6 +4462,12 @@ impl DeterministicOfflineSynthesisEngine {
             return None;
         }
 
+        if let Some(tx) = telemetry_tx {
+            if tx.is_closed() {
+                return None;
+            }
+        }
+
         let controller = crate::dlp_mesh::global_mesh_dlp_controller();
         // Only invoke external local Ollama TCP socket when running inside the initialized daemon runtime
         let daemon_active = controller
@@ -4399,10 +4540,14 @@ impl DeterministicOfflineSynthesisEngine {
         let max_output_tokens = ui.max_output_tokens.clamp(256, 262144);
         let _agentic_loop_enabled = ui.agentic_loop_enabled;
 
-        let (per_hop_predict, num_ctx) = if hw.free_ram_gb >= 18.0 || hw.free_vram_mb >= 12_000 {
-            (max_output_tokens.min(900), 6144usize)
+        let (per_hop_predict, num_ctx) = if hw.free_ram_gb >= 32.0 || hw.free_vram_mb >= 16_000 {
+            (max_output_tokens.clamp(1024, 16384), 32768usize)
+        } else if hw.free_ram_gb >= 18.0 || hw.free_vram_mb >= 12_000 {
+            (max_output_tokens.clamp(1024, 8192), 16384usize)
+        } else if hw.free_ram_gb >= 12.0 || hw.free_vram_mb >= 6_000 {
+            (max_output_tokens.clamp(512, 4096), 8192usize)
         } else {
-            (max_output_tokens.min(600), 4096usize)
+            (max_output_tokens.clamp(256, 2048), 4096usize)
         };
 
         let voice_directive = if ui.natural_human_voice {
@@ -4520,8 +4665,12 @@ impl DeterministicOfflineSynthesisEngine {
                 }
             }
         }
-        let matched_chunks: &[&ScoredChunk] = &pruned_chunks;
-        let active_excerpts: &[&ScoredChunk] = &matched_chunks[..matched_chunks.len().min(8)];
+        let max_excerpts = if ui.deep_research_iterative_rag || ui.map_reduce_fact_extraction {
+            64usize
+        } else {
+            24usize
+        };
+        let active_excerpts: &[&ScoredChunk] = &pruned_chunks[..pruned_chunks.len().min(max_excerpts)];
 
         // Assign 1-based citation numbers strictly by DISTINCT source filename across `active_excerpts`,
         // so multiple chunks from the same file share one `[doc_num]` and `[8]` can NEVER be emitted when 7 files exist.
@@ -4589,10 +4738,16 @@ impl DeterministicOfflineSynthesisEngine {
             }
         }
 
-        // ~6000 characters of evidence in total: a single stitched parent document gets a long window instead of
-        // its first 750 characters only.
-        let excerpt_count = active_excerpts.len().clamp(1, 8);
-        let per_excerpt_chars = (6000 / excerpt_count).clamp(750, 3000);
+        // Expand evidence window proportionally with num_ctx
+        let total_evidence_chars = if num_ctx >= 32768 {
+            64_000usize
+        } else if num_ctx >= 16384 {
+            32_000usize
+        } else {
+            12_000usize
+        };
+        let excerpt_count = active_excerpts.len().max(1);
+        let per_excerpt_chars = (total_evidence_chars / excerpt_count).clamp(1000, 8000);
         let context_blocks = active_excerpts
             .iter()
             .map(|c| {
@@ -4709,7 +4864,7 @@ impl DeterministicOfflineSynthesisEngine {
         }));
 
         let send_chat_request = |target_model: &str| -> Option<(String, Vec<Citation>)> {
-            let max_hops = 1usize;
+            let max_hops = if ui.agentic_loop_enabled { 3usize } else { 1usize };
 
             let mut current_messages = messages.clone();
             let mut full_text = String::new();
@@ -5064,6 +5219,15 @@ impl DeterministicOfflineSynthesisEngine {
         }
 
         const EXACT_TYPO_MAP: &[(&str, &str)] = &[
+            ("dont", "done"),
+            ("artiles", "articles"),
+            ("artcle", "article"),
+            ("artcles", "articles"),
+            ("writen", "written"),
+            ("reserch", "research"),
+            ("reasearch", "research"),
+            ("athored", "authored"),
+            ("anythng", "anything"),
             ("waht", "what"),
             ("whta", "what"),
             ("wat", "what"),
@@ -5457,7 +5621,7 @@ impl DeterministicOfflineSynthesisEngine {
                 .ok()?;
             let mut ps_resp = String::new();
             ps_stream.read_to_string(&mut ps_resp).ok()?;
-            if !ps_resp.contains("qwen2.5:1.5b") {
+            if !ps_resp.contains("qwen") && !ps_resp.contains("gemma") && !ps_resp.contains("deepseek") && !ps_resp.contains("glm") {
                 return None;
             }
         }
