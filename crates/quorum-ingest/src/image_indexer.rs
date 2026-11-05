@@ -729,6 +729,24 @@ impl ImageIndexer {
         let mut text = text.replace("PAGE-I", "PAGE-1");
         text = text.replace("PAGE-l", "PAGE-1");
 
+        // Normalize partially occluded "VE-YYYY-NNNN" (where leading 'C' was clipped/smudged) to "CVE-YYYY-NNNN"
+        let mut ve_from = 0;
+        while let Some(rel_idx) = text[ve_from..].find("VE-") {
+            let idx = ve_from + rel_idx;
+            let preceded_by_c = idx > 0 && matches!(text.as_bytes()[idx - 1], b'C' | b'c');
+            let rest = &text[idx + 3..];
+            if !preceded_by_c
+                && rest.len() >= 5
+                && rest[..4].chars().all(|c| c.is_ascii_digit())
+                && rest.as_bytes()[4] == b'-'
+            {
+                text.replace_range(idx..idx + 2, "CVE");
+                ve_from = idx + 3;
+            } else {
+                ve_from = idx + 3;
+            }
+        }
+
         text
     }
 

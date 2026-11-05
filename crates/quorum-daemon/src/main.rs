@@ -215,7 +215,33 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         if cli.max_peer_responses > 0 {
             guard.mesh.max_peer_responses = cli.max_peer_responses;
         }
+        // Ensure all discovered watch_paths (Documents, Desktop, Downloads, Pictures, physical drives)
+        // are shared with the LAN Mesh out-of-the-box (protected by the Microsoft Presidio + GLiNER DLP Redaction Gate).
+        for wp in &ingest_config.watch_paths {
+            let wp_str = wp.to_string_lossy().to_string();
+            if !guard
+                .mesh
+                .shared_folders
+                .iter()
+                .any(|f| f.path.eq_ignore_ascii_case(&wp_str))
+            {
+                let label = wp
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| wp_str.clone());
+                guard.mesh.shared_folders.push(quorum_coordinator::SharedFolderEntry {
+                    path: wp_str,
+                    label,
+                    enabled: true,
+                    access_tier: 0,
+                    dlp_mode_override: None,
+                    shared_at: chrono::Utc::now().to_rfc3339(),
+                });
+            }
+        }
     }
+    mesh_dlp_controller.save_to_disk();
 
     // Load or generate persistent 32-byte Ed25519 node seed
     let node_seed = quorum_network::load_or_generate_node_seed(&cli.data_dir)?;
@@ -259,6 +285,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
 
     let mut coord_cfg = quorum_coordinator::CoordinatorConfig::default();
     coord_cfg.max_peer_responses = cli.max_peer_responses;
+    coord_cfg.timeout_ms = 2500;
 
     let coordinator_engine = Arc::new(quorum_coordinator::ScatterGatherEngine::new(
         Arc::clone(&storage) as Arc<dyn quorum_coordinator::StorageSearcher>,
@@ -309,13 +336,165 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     let bind_addr = format!("{}:{}", cli.host, bound_http_port);
     info!("QuorumRAG Web UI listening on http://{}", bind_addr);
 
+    // Ensure Windows Firewall allows LAN P2P Mesh & Web UI across all network profiles (Private, Public, Domain)
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(exe_path) = std::env::current_exe() {
+            let exe_str = exe_path.to_string_lossy().to_string();
+            let _ = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    "name=QuorumRAG P2P Mesh (All Profiles)",
+                    "dir=in",
+                    "action=allow",
+                    &format!("program={}", exe_str),
+                    "enable=yes",
+                    "profile=any",
+                ])
+                .output();
+            let _ = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    "name=QuorumRAG LAN Ports (TCP 3031-3032)",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=TCP",
+                    &format!("localport={},{}", bound_http_port, chosen_p2p_port),
+                    "enable=yes",
+                    "profile=any",
+                ])
+                .output();
+            let _ = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    "name=QuorumRAG LAN Ports (UDP 3032,5353)",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=UDP",
+                    &format!("localport={},5353", chosen_p2p_port),
+                    "enable=yes",
+                    "profile=any",
+                ])
+                .output();
+        }
+    }
+
+    // Spawn automatic LAN /24 subnet peer scanner & bootstrap dialer so nodes connect even if Wi-Fi AP blocks UDP 5353 multicast
+    if let Some(ref handle) = app_state.swarm_handle {
+        let dial_handle = handle.clone();
+        let p2p_port = chosen_p2p_port;
+        let dial_shutdown = Arc::clone(&shutdown_notify);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            loop {
+                // 1. Dial any configured bootstrap peers
+                let bootstrap_list = quorum_coordinator::global_mesh_dlp_controller()
+                    .settings
+                    .read()
+                    .map(|g| g.mesh.bootstrap_peers.clone())
+                    .unwrap_or_default();
+                for addr_str in bootstrap_list {
+                    if let Ok(ma) = addr_str.parse::<quorum_network::Multiaddr>() {
+                        let _ = dial_handle.dial(ma).await;
+                    }
+                }
+
+                // 2. Discover local IPv4 /24 prefixes from listen_addresses and probe active LAN neighbors on p2p_port
+                if let Ok(listen_addrs) = dial_handle.listen_addresses().await {
+                    let mut prefixes = Vec::new();
+                    let mut self_ips = Vec::new();
+                    for ma in listen_addrs {
+                        let s = ma.to_string();
+                        if let Some(rest) = s.strip_prefix("/ip4/") {
+                            if let Some(ip_str) = rest.split('/').next() {
+                                if let Ok(ipv4) = ip_str.parse::<std::net::Ipv4Addr>() {
+                                    let oct = ipv4.octets();
+                                    // Scan private LAN subnets (10.x.x.x, 192.168.x.x, 172.16-31.x.x), skip WSL/Docker 172.17-31 if virtual
+                                    if (oct[0] == 10 || (oct[0] == 192 && oct[1] == 168)) && !ipv4.is_loopback() {
+                                        self_ips.push(ipv4);
+                                        let prefix = (oct[0], oct[1], oct[2]);
+                                        if !prefixes.contains(&prefix) {
+                                            prefixes.push(prefix);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    for (a, b, c) in prefixes {
+                        let mut join_set = tokio::task::JoinSet::new();
+                        for host in 1u8..=254u8 {
+                            let cand_ip = std::net::Ipv4Addr::new(a, b, c, host);
+                            if self_ips.contains(&cand_ip) {
+                                continue;
+                            }
+                            join_set.spawn(async move {
+                                let sock = std::net::SocketAddr::from((cand_ip, p2p_port));
+                                if tokio::time::timeout(
+                                    std::time::Duration::from_millis(120),
+                                    tokio::net::TcpStream::connect(sock),
+                                )
+                                .await
+                                .map(|r| r.is_ok())
+                                .unwrap_or(false)
+                                {
+                                    Some(cand_ip)
+                                } else {
+                                    None
+                                }
+                            });
+                        }
+                        while let Some(res) = join_set.join_next().await {
+                            if let Ok(Some(found_ip)) = res {
+                                let ma_str = format!("/ip4/{}/tcp/{}", found_ip, p2p_port);
+                                if let Ok(ma) = ma_str.parse::<quorum_network::Multiaddr>() {
+                                    let _ = dial_handle.dial(ma).await;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    _ = dial_shutdown.notified() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {}
+                }
+            }
+        });
+    }
+
     // Continuously run background crawl & incremental ingestion unconditionally
     let bg_worker = Arc::clone(&reindex_worker);
     let bg_default_paths = ingest_config.watch_paths.clone();
     let bg_shutdown = Arc::clone(&shutdown_notify);
 
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // Pass 0: Priority fast pass over user document & screenshot folders (Pictures, Desktop, Downloads, Documents)
+        // so newly saved screenshots and documents are OCR-indexed and queryable within seconds before full drive scans.
+        let priority_user_roots = quorum_ingest::IngestConfig::discover_user_document_roots();
+        if !priority_user_roots.is_empty() {
+            let fast_opts = quorum_ingest::ReindexOptions {
+                target_paths: priority_user_roots,
+                full_rebuild: false,
+                force_reembed: false,
+                batch_size: 64,
+                num_threads: 0,
+                dry_run: false,
+            };
+            let _ = bg_worker.start_reindex(fast_opts).await;
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        }
         loop {
             // Collect target watch path(s) + any user-configured shared folders
             let mut target_paths = bg_default_paths.clone();

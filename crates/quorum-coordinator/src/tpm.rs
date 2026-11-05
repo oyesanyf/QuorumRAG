@@ -342,6 +342,13 @@ pub fn inspect_tpm_windows_registry() -> Option<TpmHardwareInspection> {
 
         let _ = RegCloseKey(hkey);
 
+        // If the physical chip is legacy TPM 1.2 (which lacks SHA-256 PCR banks),
+        // return None so `inspect_tpm_hardware()` automatically bridges the node to the
+        // Pure-Rust Software SHA-256 Enclave (Tier 1) rather than failing or emitting a "1.2" version tag.
+        if fw_str.starts_with("1.2") || fw_str.contains("1.2.") || fw_str == "1.2" {
+            return None;
+        }
+
         let mfg_bytes = mfg_id.to_be_bytes();
         let mfg_txt = String::from_utf8_lossy(&mfg_bytes).trim_matches('\0').trim().to_string();
         let vendor = TpmOemVendor::from_manufacturer_id_or_str(mfg_id, &mfg_txt);

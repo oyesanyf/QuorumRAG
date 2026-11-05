@@ -52,6 +52,13 @@ pub struct SharedFolderActionPayload {
 pub struct UpdateDlpPolicyPayload {
     pub enabled: Option<bool>,
     pub mode: Option<String>,
+    pub dlp_engine: Option<String>,
+    pub presidio_enabled: Option<bool>,
+    pub gliner_enabled: Option<bool>,
+    pub auto_provision_gliner: Option<bool>,
+    pub gliner_model_id: Option<String>,
+    pub gliner_confidence_threshold: Option<f32>,
+    pub reprovision_gliner: Option<bool>,
     pub protect_ssn: Option<bool>,
     pub protect_medical_records: Option<bool>,
     pub protect_health_plan: Option<bool>,
@@ -659,6 +666,35 @@ pub async fn update_dlp_policy_handler(
         if let Some(v) = payload.scrub_outbound_queries {
             guard.dlp.scrub_outbound_queries = v;
         }
+        if let Some(ref eng) = payload.dlp_engine {
+            guard.dlp.dlp_engine = eng.trim().to_string();
+        }
+        if let Some(v) = payload.presidio_enabled {
+            guard.dlp.presidio_enabled = v;
+        }
+        if let Some(v) = payload.gliner_enabled {
+            guard.dlp.gliner_enabled = v;
+        }
+        if let Some(v) = payload.auto_provision_gliner {
+            guard.dlp.auto_provision_gliner = v;
+        }
+        if let Some(ref mid) = payload.gliner_model_id {
+            if !mid.trim().is_empty() {
+                guard.dlp.gliner_model_id = mid.trim().to_string();
+            }
+        }
+        if let Some(th) = payload.gliner_confidence_threshold {
+            guard.dlp.gliner_confidence_threshold = th.clamp(0.10, 0.99);
+        }
+    }
+    if payload.reprovision_gliner.unwrap_or(false) {
+        let data_dir = controller
+            .settings_file_path
+            .read()
+            .ok()
+            .and_then(|p| p.as_ref().and_then(|f| f.parent().map(|d| d.to_path_buf())))
+            .unwrap_or_else(|| std::path::PathBuf::from(".quorumrag-live-data"));
+        let _ = controller.auto_provision_presidio_and_gliner(&data_dir);
     }
     controller.save_to_disk();
 

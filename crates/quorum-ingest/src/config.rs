@@ -441,7 +441,7 @@ impl IngestConfig {
 
                     // Extract key document subfolders
                     let mut user_roots = Vec::new();
-                    for sub in ["Documents", "Desktop", "Downloads"] {
+                    for sub in ["Documents", "Desktop", "Downloads", "Pictures"] {
                         let sub_path = path.join(sub);
                         if sub_path.is_dir() && std::fs::read_dir(&sub_path).is_ok() {
                             if let Ok(meta) = std::fs::symlink_metadata(&sub_path) {
@@ -457,7 +457,7 @@ impl IngestConfig {
                     // Also check OneDrive sync directories if present
                     let onedrive = path.join("OneDrive");
                     if onedrive.is_dir() && std::fs::read_dir(&onedrive).is_ok() {
-                        for sub in ["Documents", "Desktop"] {
+                        for sub in ["Documents", "Desktop", "Pictures"] {
                             let one_sub = onedrive.join(sub);
                             if one_sub.is_dir() && std::fs::read_dir(&one_sub).is_ok() && !user_roots.contains(&one_sub) {
                                 if let Ok(meta) = std::fs::symlink_metadata(&one_sub) {
@@ -500,7 +500,7 @@ impl IngestConfig {
                         }
                         if path.is_dir() {
                             let mut found_sub = false;
-                            for sub in &["Documents", "Desktop", "Downloads"] {
+                            for sub in &["Documents", "Desktop", "Downloads", "Pictures"] {
                                 let sub_path = path.join(sub);
                                 if sub_path.is_dir() {
                                     roots.push(sub_path);

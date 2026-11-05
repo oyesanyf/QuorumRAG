@@ -1194,6 +1194,19 @@ body {
   margin-right: auto;
 }
 
+.settings-dialog-footer {
+  flex-shrink: 0;
+  position: relative;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 28px;
+  background-color: var(--bg-surface, #111318);
+  border-top: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
+  box-sizing: border-box;
+}
+
 .settings-page-title {
   font-size: 22px;
   font-weight: 600;
@@ -1355,12 +1368,90 @@ input[type="checkbox"][switch]:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
-  padding: 6px 10px;
-  border-radius: 6px;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
   border: 1px solid var(--border-color);
   background-color: var(--bg-surface);
   font-size: 12.5px;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.08s ease;
+}
+
+.folder-browser-item:hover {
+  background-color: var(--bg-canvas, rgba(255, 255, 255, 0.04));
+  border-color: var(--accent, #6366f1);
+}
+
+.folder-browser-item:active {
+  transform: translateY(1px);
+}
+
+.folder-browser-item .folder-item-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sources-node-id-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 11.5px;
+  color: var(--text-muted, #9ca3af);
+}
+
+.sources-responder-peer-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-family: monospace;
+  background: rgba(16, 163, 127, 0.14);
+  color: #10a37f;
+  border: 1px solid rgba(16, 163, 127, 0.35);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.sources-responder-peer-pill:hover {
+  background: rgba(16, 163, 127, 0.25);
+  border-color: rgba(16, 163, 127, 0.6);
+}
+
+.citation-node-id-subline {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-family: monospace;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.cite-node-local {
+  padding: 0 5px;
+  border-radius: 3px;
+  background: rgba(99, 102, 241, 0.12);
+  color: #818cf8;
+}
+
+.cite-node-mesh {
+  padding: 0 5px;
+  border-radius: 3px;
+  background: rgba(16, 163, 127, 0.14);
+  color: #10a37f;
 }
 
 .dlp-badge-redact {
