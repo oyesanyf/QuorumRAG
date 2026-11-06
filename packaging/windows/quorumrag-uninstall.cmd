@@ -7,7 +7,7 @@ rem   quorumrag-uninstall.cmd           remove MSI, service, firewall rule
 rem   quorumrag-uninstall.cmd /purge    ...and delete all index data + logs
 rem
 rem Normal uninstall is Settings ^> Apps ^> "QuorumRAG P2P Agentic RAG" or
-rem   msiexec /x QuorumRAG-0.1.0-x86_64.msi [REMOVEDATA=1]
+rem   msiexec /x QuorumRAG-0.6.0-x86_64.msi [REMOVEDATA=1]
 rem This script also cleans up when the MSI entry is already gone.
 rem Never touches PATH or any environment variable.
 rem ------------------------------------------------------------------

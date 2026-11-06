@@ -26,9 +26,9 @@ None of the installers modify `PATH` or any persistent environment variable.
 ## Windows (MSI)
 
 ```powershell
-msiexec /i QuorumRAG-0.1.0-x86_64.msi                       # interactive
-msiexec /i QuorumRAG-0.1.0-x86_64.msi /qn LAUNCHBROWSER=0   # silent, no browser
-msiexec /i QuorumRAG-0.1.0-x86_64.msi /qn FIREWALLRULE=0    # no private-LAN firewall rule
+msiexec /i QuorumRAG-0.6.0-x86_64.msi                       # interactive
+msiexec /i QuorumRAG-0.6.0-x86_64.msi /qn LAUNCHBROWSER=0   # silent, no browser
+msiexec /i QuorumRAG-0.6.0-x86_64.msi /qn FIREWALLRULE=0    # no private-LAN firewall rule
 ```
 
 - `quorumrag.exe --service` runs under the Service Control Manager. It reports `START_PENDING` and then `RUNNING`, and handles `STOP`/`SHUTDOWN` with a graceful daemon shutdown. The code is in [win_service.rs](../crates/quorum-daemon/src/win_service.rs).

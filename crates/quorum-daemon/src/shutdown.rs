@@ -1,6 +1,16 @@
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tracing::{error, info, warn};
 use crate::state::DaemonState;
+
+/// Bounded shutdown phases. The Windows SCM gives the service roughly the
+/// duration of the reported `dwWaitHint` (~30s) to report STOPPED; the MSI's
+/// `ServiceControl` stops the service before files are updated, and an
+/// unbounded cleanup here previously wedged installs with MSI Error 1921
+/// ("Service ... could not be stopped"). Every slow phase below therefore has
+/// a hard deadline; a missed deadline is logged and skipped, never fatal.
+const SWARM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const STORAGE_FLUSH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Process-wide stop request used by the Windows service control handler.
 fn external_stop() -> &'static tokio::sync::Notify {
@@ -63,23 +73,31 @@ pub async fn execute_graceful_shutdown(state: Arc<DaemonState>) {
 
     // 2. Shut down libp2p swarm actor
     if let Some(ref swarm) = state.swarm_handle {
-        match swarm.shutdown().await {
-            Ok(_) => info!("Libp2p network swarm actor shut down cleanly."),
-            Err(e) => warn!("Libp2p network swarm shutdown error: {}", e),
+        match tokio::time::timeout(SWARM_SHUTDOWN_TIMEOUT, swarm.shutdown()).await {
+            Ok(Ok(_)) => info!("Libp2p network swarm actor shut down cleanly."),
+            Ok(Err(e)) => warn!("Libp2p network swarm shutdown error: {}", e),
+            Err(_) => warn!(
+                "Libp2p network swarm shutdown exceeded {SWARM_SHUTDOWN_TIMEOUT:?}; continuing shutdown without it."
+            ),
         }
     }
 
     // 3. Compact and commit LanceDB and Tantivy indexes
     info!("Flushing and compacting LanceDB & Tantivy storage indexes...");
-    match state.storage.compact().await {
-        Ok(stats) => {
+    match tokio::time::timeout(STORAGE_FLUSH_TIMEOUT, state.storage.compact()).await {
+        Ok(Ok(stats)) => {
             info!(
                 "Storage indexes cleanly committed: {} fragments removed, {} added, Tantivy segments merged: {}",
                 stats.fragments_removed, stats.fragments_added, stats.tantivy_segments_merged
             );
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("Error flushing storage during shutdown: {}", e);
+        }
+        Err(_) => {
+            warn!(
+                "Storage compaction exceeded {STORAGE_FLUSH_TIMEOUT:?}; skipping remaining compaction so the service stop completes promptly."
+            );
         }
     }
 

@@ -118,7 +118,7 @@
         </Feature>
 
         <!-- Scoped Private-LAN Firewall Rule for QuorumRAG Web UI & libp2p mDNS/QUIC/TCP
-             Opt out during silent install via: msiexec /i QuorumRAG-0.1.0-x86_64.msi FIREWALLRULE=0 -->
+             Opt out during silent install via: msiexec /i QuorumRAG-0.6.0-x86_64.msi FIREWALLRULE=0 -->
         <Property Id="FIREWALLRULE" Value="1" Secure="yes" />
         <CustomAction Id="AddQuorumFirewallRule"
                       Directory="INSTALLFOLDER"
@@ -143,7 +143,7 @@
                       Return="asyncNoWait"
                       ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c &quot;&quot;[INSTALLFOLDER]quorumrag-open-ui.cmd&quot;&quot;" />
 
-        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.1.0-x86_64.msi REMOVEDATA=1
+        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.6.0-x86_64.msi REMOVEDATA=1
              deletes the index and logs in %ProgramData%\QuorumRAG (kept by default). -->
         <Property Id="REMOVEDATA" Value="0" Secure="yes" />
         <CustomAction Id="RemoveQuorumData"
