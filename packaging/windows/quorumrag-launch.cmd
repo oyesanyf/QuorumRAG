@@ -13,6 +13,20 @@ if %errorlevel%==0 (
     goto :eof
 )
 
+REM Portable path reuse guard: if a QuorumRAG daemon already answers on the default
+REM port, open the Web UI and exit instead of forking a second instance. The daemon
+REM otherwise auto-advances to the next free port, silently multiplying instances
+REM (observed as hung duplicate quorumrag.exe processes that wedged MSI service stops).
+set "HEALTH_URL=http://127.0.0.1:3031/api/health"
+set "LAUNCH_CURL=%SystemRoot%\System32\curl.exe"
+if exist "%LAUNCH_CURL%" (
+    "%LAUNCH_CURL%" -s -f -o NUL --max-time 2 "%HEALTH_URL%" && (
+        echo QuorumRAG is already running; opening the Web UI.
+        call "%APP_DIR%quorumrag-open-ui.cmd"
+        goto :eof
+    )
+)
+
 set "DATA_DIR=%LOCALAPPDATA%\QuorumRAG\data"
 if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 echo Starting QuorumRAG Local-First P2P Agentic RAG on http://127.0.0.1:3031 ...
