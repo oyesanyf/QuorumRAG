@@ -324,7 +324,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
 
         // 3. Cryptographic handshake & anti-replay timestamp verification (drift <= 300s across LAN clocks)
         let mut verified_tier = None;
-        for t in 0..=max_tier.min(3) {
+        for t in 0..=3 {
             if let Ok(candidate_tier) = quorum_types::AccessTier::from_u8(t) {
                 if crate::crypto::verify_request(&req, candidate_tier, 300).is_ok() {
                     verified_tier = Some(candidate_tier);

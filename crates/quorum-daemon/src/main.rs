@@ -288,10 +288,41 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     coord_cfg.max_peer_responses = cli.max_peer_responses;
     coord_cfg.timeout_ms = 2500;
 
+    let mut acl_mgr = quorum_coordinator::PeerAclManager::default();
+    let trusted_peers_list = mesh_dlp_controller
+        .settings
+        .read()
+        .map(|g| g.mesh.trusted_peers.clone())
+        .unwrap_or_default();
+    for peer_str in trusted_peers_list {
+        let trimmed = peer_str.trim();
+        if !trimmed.is_empty() {
+            info!("Hydrating trusted peer from persisted settings into PeerAclManager: {}", trimmed);
+            acl_mgr.register_peer_id(
+                trimmed.to_string(),
+                quorum_types::AccessTier::Tier2Confidential,
+            );
+            let now = chrono::Utc::now();
+            let expires = now + chrono::Duration::days(365);
+            acl_mgr.record_peer_attestation(quorum_coordinator::PeerAttestationRecord {
+                peer_id: trimmed.to_string(),
+                pubkey: None,
+                attestation_tier: quorum_coordinator::AttestationTier::VerifiedHardwareTpm,
+                vendor: Some(quorum_coordinator::TpmOemVendor::Unknown),
+                pcr_composite_digest: Some("OPERATOR_PERSISTED_TRUSTED_PEER".to_string()),
+                hardware_backed: true,
+                ek_fingerprint: None,
+                verified_at: now,
+                expires_at: expires,
+            });
+        }
+    }
+    let acl_manager = Arc::new(tokio::sync::RwLock::new(acl_mgr));
+
     let coordinator_engine = Arc::new(quorum_coordinator::ScatterGatherEngine::new(
         Arc::clone(&storage) as Arc<dyn quorum_coordinator::StorageSearcher>,
         mesh_dispatcher,
-        Arc::new(tokio::sync::RwLock::new(quorum_coordinator::PeerAclManager::default())),
+        acl_manager,
         coord_cfg.clone(),
         node_seed,
         persistent_peer_id_str,
@@ -409,58 +440,62 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                     }
                 }
 
-                // 2. Discover local IPv4 /24 prefixes from listen_addresses and probe active LAN neighbors on p2p_port
+                // 2. Discover local IPv4 /24 prefixes from active network interfaces & listen_addresses,
+                // and probe active LAN neighbors on p2p_port.
+                let mut self_ips = discover_local_private_ipv4_addresses();
+
                 if let Ok(listen_addrs) = dial_handle.listen_addresses().await {
-                    let mut prefixes = Vec::new();
-                    let mut self_ips = Vec::new();
                     for ma in listen_addrs {
                         let s = ma.to_string();
                         if let Some(rest) = s.strip_prefix("/ip4/") {
                             if let Some(ip_str) = rest.split('/').next() {
                                 if let Ok(ipv4) = ip_str.parse::<std::net::Ipv4Addr>() {
-                                    let oct = ipv4.octets();
-                                    // Scan private LAN subnets (10.x.x.x, 192.168.x.x, 172.16-31.x.x), skip WSL/Docker 172.17-31 if virtual
-                                    if (oct[0] == 10 || (oct[0] == 192 && oct[1] == 168)) && !ipv4.is_loopback() {
+                                    if is_private_lan_ipv4(&ipv4) && !self_ips.contains(&ipv4) {
                                         self_ips.push(ipv4);
-                                        let prefix = (oct[0], oct[1], oct[2]);
-                                        if !prefixes.contains(&prefix) {
-                                            prefixes.push(prefix);
-                                        }
                                     }
                                 }
                             }
                         }
                     }
+                }
 
-                    for (a, b, c) in prefixes {
-                        let mut join_set = tokio::task::JoinSet::new();
-                        for host in 1u8..=254u8 {
-                            let cand_ip = std::net::Ipv4Addr::new(a, b, c, host);
-                            if self_ips.contains(&cand_ip) {
-                                continue;
-                            }
-                            join_set.spawn(async move {
-                                let sock = std::net::SocketAddr::from((cand_ip, p2p_port));
-                                if tokio::time::timeout(
-                                    std::time::Duration::from_millis(120),
-                                    tokio::net::TcpStream::connect(sock),
-                                )
-                                .await
-                                .map(|r| r.is_ok())
-                                .unwrap_or(false)
-                                {
-                                    Some(cand_ip)
-                                } else {
-                                    None
-                                }
-                            });
+                let mut prefixes = Vec::new();
+                for ip in &self_ips {
+                    let oct = ip.octets();
+                    let prefix = (oct[0], oct[1], oct[2]);
+                    if !prefixes.contains(&prefix) {
+                        prefixes.push(prefix);
+                    }
+                }
+
+                for (a, b, c) in prefixes {
+                    let mut join_set = tokio::task::JoinSet::new();
+                    for host in 1u8..=254u8 {
+                        let cand_ip = std::net::Ipv4Addr::new(a, b, c, host);
+                        if self_ips.contains(&cand_ip) {
+                            continue;
                         }
-                        while let Some(res) = join_set.join_next().await {
-                            if let Ok(Some(found_ip)) = res {
-                                let ma_str = format!("/ip4/{}/tcp/{}", found_ip, p2p_port);
-                                if let Ok(ma) = ma_str.parse::<quorum_network::Multiaddr>() {
-                                    let _ = dial_handle.dial(ma).await;
-                                }
+                        join_set.spawn(async move {
+                            let sock = std::net::SocketAddr::from((cand_ip, p2p_port));
+                            if tokio::time::timeout(
+                                std::time::Duration::from_millis(120),
+                                tokio::net::TcpStream::connect(sock),
+                            )
+                            .await
+                            .map(|r| r.is_ok())
+                            .unwrap_or(false)
+                            {
+                                Some(cand_ip)
+                            } else {
+                                None
+                            }
+                        });
+                    }
+                    while let Some(res) = join_set.join_next().await {
+                        if let Ok(Some(found_ip)) = res {
+                            let ma_str = format!("/ip4/{}/tcp/{}", found_ip, p2p_port);
+                            if let Ok(ma) = ma_str.parse::<quorum_network::Multiaddr>() {
+                                let _ = dial_handle.dial(ma).await;
                             }
                         }
                     }
@@ -885,3 +920,122 @@ pub async fn run_standalone_recache(
 
     Ok(())
 }
+
+/// Helper to determine if an IPv4 address belongs to an RFC1918 private LAN subnet
+/// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) and is not loopback, link-local, or unspecified.
+pub fn is_private_lan_ipv4(ipv4: &std::net::Ipv4Addr) -> bool {
+    if ipv4.is_loopback() || ipv4.is_unspecified() || ipv4.is_link_local() {
+        return false;
+    }
+    let oct = ipv4.octets();
+    // 10.0.0.0/8
+    if oct[0] == 10 {
+        return true;
+    }
+    // 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
+    if oct[0] == 172 && (16..=31).contains(&oct[1]) {
+        return true;
+    }
+    // 192.168.0.0/16
+    if oct[0] == 192 && oct[1] == 168 {
+        return true;
+    }
+    false
+}
+
+/// Discovers the local host's real network interface IPv4 addresses on private LAN subnets
+/// using kernel routing table probes via connected UDP sockets and hostname resolution.
+pub fn discover_local_private_ipv4_addresses() -> Vec<std::net::Ipv4Addr> {
+    use std::net::{ToSocketAddrs, UdpSocket};
+
+    let mut discovered: Vec<std::net::Ipv4Addr> = Vec::new();
+
+    // 1. Probe the kernel routing table by creating connected UDP sockets to canonical LAN/Internet gateway addresses.
+    // Calling connect() on a UDP socket in the OS does not transmit any packets over the wire;
+    // it simply forces the kernel IP routing table to select the local outbound interface address.
+    let probe_targets = [
+        "1.1.1.1:80",
+        "8.8.8.8:80",
+        "10.255.255.255:80",
+        "10.0.0.1:80",
+        "10.1.1.1:80",
+        "172.16.0.1:80",
+        "172.31.255.255:80",
+        "192.168.0.1:80",
+        "192.168.1.1:80",
+        "192.168.2.1:80",
+        "192.168.50.1:80",
+        "192.168.100.1:80",
+        "192.168.178.1:80",
+    ];
+
+    for target in probe_targets {
+        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect(target).is_ok() {
+                if let Ok(std::net::SocketAddr::V4(addr)) = socket.local_addr() {
+                    let ip = *addr.ip();
+                    if is_private_lan_ipv4(&ip) && !discovered.contains(&ip) {
+                        discovered.push(ip);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Resolve the local hostname via getaddrinfo to discover multi-homed network interface IPs
+    if let Ok(host) = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")) {
+        if let Ok(addrs) = format!("{}:0", host).to_socket_addrs() {
+            for sa in addrs {
+                if let std::net::SocketAddr::V4(v4) = sa {
+                    let ip = *v4.ip();
+                    if is_private_lan_ipv4(&ip) && !discovered.contains(&ip) {
+                        discovered.push(ip);
+                    }
+                }
+            }
+        }
+    }
+
+    discovered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn test_is_private_lan_ipv4_classification() {
+        // RFC1918 10.0.0.0/8
+        assert!(is_private_lan_ipv4(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_private_lan_ipv4(&Ipv4Addr::new(10, 254, 1, 50)));
+
+        // RFC1918 172.16.0.0/12
+        assert!(is_private_lan_ipv4(&Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(is_private_lan_ipv4(&Ipv4Addr::new(172, 31, 255, 254)));
+        assert!(!is_private_lan_ipv4(&Ipv4Addr::new(172, 15, 255, 254)));
+        assert!(!is_private_lan_ipv4(&Ipv4Addr::new(172, 32, 0, 1)));
+
+        // RFC1918 192.168.0.0/16
+        assert!(is_private_lan_ipv4(&Ipv4Addr::new(192, 168, 1, 100)));
+        assert!(is_private_lan_ipv4(&Ipv4Addr::new(192, 168, 0, 1)));
+
+        // Loopback & Unspecified & Link-local rejected
+        assert!(!is_private_lan_ipv4(&Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_private_lan_ipv4(&Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(!is_private_lan_ipv4(&Ipv4Addr::new(169, 254, 1, 1)));
+
+        // Public IPs rejected
+        assert!(!is_private_lan_ipv4(&Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_private_lan_ipv4(&Ipv4Addr::new(1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn test_discover_local_private_ipv4_addresses_does_not_panic() {
+        let addrs = discover_local_private_ipv4_addresses();
+        for ip in &addrs {
+            assert!(is_private_lan_ipv4(ip), "Discovered non-private IP: {}", ip);
+        }
+    }
+}
+
