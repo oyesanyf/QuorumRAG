@@ -12,6 +12,13 @@
         <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallInitialize" />
         <MediaTemplate EmbedCab="yes" />
 
+        <!-- Fail fast when the installer session is not elevated. Unprivileged runs of this
+             package previously failed deep inside the MajorUpgrade sequence with status 1603
+             and Error 1730 ("You must be an Administrator to remove this application") when
+             RemoveExistingProducts had to uninstall an older QuorumRAG product. -->
+        <Launch Condition="Privileged OR Installed"
+                Message="QuorumRAG must be installed, repaired, or upgraded from an elevated (administrator) session. Right-click the MSI and choose 'Run as administrator', or run msiexec /i from an elevated terminal." />
+
         <!-- Universal Zero-Touch PATH Law:
              Strictly ZERO WiX Environment XML elements anywhere in this manifest.
              Launching relies exclusively on [INSTALLFOLDER] shortcuts and process-scoped launcher scripts. -->
