@@ -153,7 +153,45 @@
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c rmdir /s /q &quot;[CommonAppDataFolder]QuorumRAG&quot;" />
 
+        <!-- Clean-replace law: an existing QuorumRAGDaemon registration or an orphaned
+             quorumrag.exe process previously wedged installs with MSI Error 1921
+             ("Service ... could not be stopped"). Before the old product is removed
+             (upgrade) or files are removed (uninstall), the installer now stops the
+             service, waits past the bounded stop path, force-kills any remaining
+             quorumrag.exe processes (orphans included), and deletes the service
+             registration, so every install proceeds from a clean slate and the new
+             ServiceInstall registers the service fresh. -->
+        <CustomAction Id="StopDeleteQuorumServiceUpgrade"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]sc.exe stop QuorumRAGDaemon &amp; ping -n 16 127.0.0.1 &gt;nul &amp; [System64Folder]taskkill.exe /f /im quorumrag.exe &amp; [System64Folder]sc.exe delete QuorumRAGDaemon" />
+        <CustomAction Id="StopDeleteQuorumServiceUninstall"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]sc.exe stop QuorumRAGDaemon &amp; ping -n 16 127.0.0.1 &gt;nul &amp; [System64Folder]taskkill.exe /f /im quorumrag.exe &amp; [System64Folder]sc.exe delete QuorumRAGDaemon" />
+        <!-- Fresh-install lock guarantee: a leftover portable/consle quorumrag.exe would
+             hold target\release\quorumrag.exe open and break file replacement. Only runs
+             when this product is not yet Installed, so upgrades keep their graceful
+             stop handled by the deferred clean-replace action above. -->
+        <CustomAction Id="KillQuorumOrphans"
+                      Directory="INSTALLFOLDER"
+                      Execute="immediate"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]taskkill.exe&quot; /f /im quorumrag.exe" />
+
         <InstallExecuteSequence>
+            <!-- Upgrade path: clean the slate before RemoveExistingProducts uninstalls the
+                 detected related product (WiX MajorUpgrade Schedule=afterInstallInitialize)
+                 and before the new service is installed. Skipped on repair and fresh installs. -->
+            <Custom Action="StopDeleteQuorumServiceUpgrade" Before="RemoveExistingProducts" Condition="WIX_UPGRADE_DETECTED AND NOT REINSTALL" />
+            <!-- Uninstall path: RemoveExistingProducts is never scheduled, so anchor to the
+                 file-removal phase instead. Idempotent no-ops when nothing is left over. -->
+            <Custom Action="StopDeleteQuorumServiceUninstall" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT REINSTALL" />
+            <Custom Action="KillQuorumOrphans" Before="InstallInitialize" Condition="NOT Installed AND NOT REINSTALL" />
             <Custom Action="AddQuorumFirewallRule" After="InstallFiles" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
             <Custom Action="RemoveQuorumFirewallRule" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
             <Custom Action="RemoveQuorumData" After="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND REMOVEDATA=&quot;1&quot; AND NOT UPGRADINGPRODUCTCODE" />
