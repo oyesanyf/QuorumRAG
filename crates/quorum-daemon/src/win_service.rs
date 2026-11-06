@@ -8,7 +8,7 @@
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -32,6 +32,17 @@ const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: i32 = 1063;
 
 static CLI_SLOT: OnceLock<Mutex<Option<Cli>>> = OnceLock::new();
 static STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+/// Set when SCM stop control arrives; the watchdog thread polls STOP_COMPLETED.
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Set once the service has reported STOPPED and no further work is pending.
+static STOP_COMPLETED: AtomicBool = AtomicBool::new(false);
+
+/// Hard deadline for the entire graceful shutdown path. The SCM kill-window is
+/// roughly the first `dwWaitHint` (30s) after the STOP control arrives; the
+/// MSI's `ServiceControl` (Wait=yes) fails the whole install with Error 1921
+/// if the service cannot stop in that window. Orphaned/hung shutdown paths are
+/// therefore force-exited at the deadline so installs can never wedge again.
+const STOP_DEADLINE: Duration = Duration::from_secs(25);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -57,6 +68,36 @@ fn report(state: u32, accepted: u32, checkpoint: u32, wait_hint_ms: u32, exit_co
     }
 }
 
+/// Final STOPPED report: marks the stop path complete so the exit watchdog
+/// disarms, then reports STOPPED to the SCM.
+fn report_stopped(exit_code: u32) {
+    STOP_COMPLETED.store(true, Ordering::SeqCst);
+    report(SERVICE_STOPPED, 0, 0, 0, exit_code);
+}
+
+/// Arms the graceful-shutdown deadline: on the FIRST SCM stop control, a
+/// watchdog thread waits `STOP_DEADLINE` and force-exits the process if the
+/// shutdown path has not reported STOPPED, so a hung daemon can never wedge
+/// an SCM stop (MSI Error 1921) again. Subsequent stop re-entries are no-ops.
+fn arm_stop_watchdog() {
+    if STOP_REQUESTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("service-stop-watchdog".into())
+        .spawn(|| {
+            std::thread::sleep(STOP_DEADLINE);
+            if !STOP_COMPLETED.load(Ordering::SeqCst) {
+                tracing::error!(
+                    "Graceful shutdown did not complete within {STOP_DEADLINE:?} of the SCM stop request; \
+                     force-exiting so service stop cannot wedge an installation."
+                );
+                std::process::exit(0);
+            }
+        })
+        .ok();
+}
+
 unsafe extern "system" fn control_handler(
     control: u32,
     _event_type: u32,
@@ -68,6 +109,7 @@ unsafe extern "system" fn control_handler(
             tracing::info!("SCM requested stop; starting graceful shutdown");
             report(SERVICE_STOP_PENDING, 0, 1, 30_000, NO_ERROR);
             crate::shutdown::request_external_stop();
+            arm_stop_watchdog();
             NO_ERROR
         }
         SERVICE_CONTROL_INTERROGATE => NO_ERROR,
@@ -88,7 +130,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
 
     let cli = CLI_SLOT.get().and_then(|slot| slot.lock().ok().and_then(|mut g| g.take()));
     let Some(cli) = cli else {
-        report(SERVICE_STOPPED, 0, 0, 0, ERROR_EXCEPTION_IN_SERVICE);
+        report_stopped(ERROR_EXCEPTION_IN_SERVICE);
         return;
     };
 
@@ -96,7 +138,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!("Failed to start Tokio runtime for service: {e}");
-            report(SERVICE_STOPPED, 0, 0, 0, ERROR_EXCEPTION_IN_SERVICE);
+            report_stopped(ERROR_EXCEPTION_IN_SERVICE);
             return;
         }
     };
@@ -114,7 +156,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     };
     report(SERVICE_STOP_PENDING, 0, 2, 15_000, exit_code);
     runtime.shutdown_timeout(Duration::from_secs(10));
-    report(SERVICE_STOPPED, 0, 0, 0, exit_code);
+    report_stopped(exit_code);
 }
 
 /// Hand control to the Service Control Manager. Blocks until the service stops.
