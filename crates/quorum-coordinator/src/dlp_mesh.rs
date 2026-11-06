@@ -273,15 +273,8 @@ impl Default for OsoosiMeshSettings {
             auto_bootstrap_duckdns: true,
             hmac_epoch: 1,
             join_gate_mode: "MutualContractAndHmac".to_string(),
-            require_explicit_folder_share: true,
-            shared_folders: vec![SharedFolderEntry {
-                path: r"D:\harfile\QuorumRAG\docs".to_string(),
-                label: "QuorumRAG Documentation".to_string(),
-                enabled: true,
-                access_tier: 0,
-                dlp_mode_override: None,
-                shared_at: Utc::now().to_rfc3339(),
-            }],
+            require_explicit_folder_share: false,
+            shared_folders: Vec::new(),
             quarantined_peers: Vec::new(),
             trusted_peers: Vec::new(),
             max_peer_responses: 8,
@@ -1419,7 +1412,24 @@ mod tests {
     #[test]
     fn test_mesh_shared_folder_enforcement() {
         let controller = OsoosiMeshDlpController::new();
-        // Default shared folder is D:\harfile\QuorumRAG\docs
+        // Out-of-the-box fresh install: require_explicit_folder_share is false, so indexed document roots match
+        assert!(controller
+            .check_file_shared_with_mesh(r"C:\Users\someone\Documents\architecture.md")
+            .is_some());
+
+        // When require_explicit_folder_share is enabled, only explicitly configured folders are permitted
+        {
+            let mut guard = controller.settings.write().unwrap();
+            guard.mesh.require_explicit_folder_share = true;
+            guard.mesh.shared_folders = vec![SharedFolderEntry {
+                path: r"D:\harfile\QuorumRAG\docs".to_string(),
+                label: "QuorumRAG Documentation".to_string(),
+                enabled: true,
+                access_tier: 0,
+                dlp_mode_override: None,
+                shared_at: Utc::now().to_rfc3339(),
+            }];
+        }
         assert!(controller
             .check_file_shared_with_mesh(r"D:\harfile\QuorumRAG\docs\architecture.md")
             .is_some());

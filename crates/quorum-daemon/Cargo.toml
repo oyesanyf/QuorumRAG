@@ -56,3 +56,7 @@ tempfile = { workspace = true }
 [[test]]
 name = "benchmarks_r4"
 path = "../../tests/benchmarks_r4.rs"
+
+[[test]]
+name = "multi_node_p2p_search_tests"
+path = "../../tests/multi_node_p2p_search_tests.rs"
