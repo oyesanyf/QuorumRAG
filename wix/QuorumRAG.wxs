@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?ifndef ProductVersion ?>
-<?define ProductVersion = "0.6.1" ?>
+<?define ProductVersion = "0.6.2" ?>
 <?endif ?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
     <Package Name="QuorumRAG P2P Agentic RAG"
@@ -9,7 +9,7 @@
              UpgradeCode="6c84d2a1-9f3b-47e2-b815-3d9a7e4c102f"
              Scope="perMachine">
 
-        <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallInitialize" />
+        <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallExecute" />
         <MediaTemplate EmbedCab="yes" />
 
         <!-- Fail fast when the installer session is not elevated. Unprivileged runs of this
@@ -118,71 +118,71 @@
         </Feature>
 
         <!-- Scoped Private-LAN Firewall Rules for QuorumRAG P2P Mesh & libp2p mDNS/UDP/TCP
-             Opt out during silent install via: msiexec /i QuorumRAG-0.6.0-x86_64.msi FIREWALLRULE=0 -->
+             Opt out during silent install via: msiexec /i QuorumRAG-0.6.2-x86_64.msi FIREWALLRULE=0 -->
         <Property Id="FIREWALLRULE" Value="1" Secure="yes" />
         <CustomAction Id="AddQuorumFirewallRule_In_Program"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Mesh (Program-In)&quot; dir=in action=allow program=&quot;[INSTALLFOLDER]quorumrag.exe&quot; enable=yes profile=any" />
         <CustomAction Id="AddQuorumFirewallRule_In_UDP"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG LAN Discovery (UDP 5353-In)&quot; dir=in action=allow protocol=UDP localport=5353 enable=yes profile=private" />
         <CustomAction Id="AddQuorumFirewallRule_Out_UDP"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG LAN Discovery (UDP 5353-Out)&quot; dir=out action=allow protocol=UDP localport=5353 enable=yes profile=private" />
         <CustomAction Id="AddQuorumFirewallRule_In_TCP"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Swarm (TCP 3032-In)&quot; dir=in action=allow protocol=TCP localport=3032 enable=yes profile=private" />
         <CustomAction Id="AddQuorumFirewallRule_Out_TCP"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Swarm (TCP 3032-Out)&quot; dir=out action=allow protocol=TCP remoteport=3032 enable=yes profile=private" />
 
         <CustomAction Id="RemoveQuorumFirewallRule_In_Program"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG P2P Mesh (Program-In)&quot;" />
         <CustomAction Id="RemoveQuorumFirewallRule_In_UDP"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG LAN Discovery (UDP 5353-In)&quot;" />
         <CustomAction Id="RemoveQuorumFirewallRule_Out_UDP"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG LAN Discovery (UDP 5353-Out)&quot;" />
         <CustomAction Id="RemoveQuorumFirewallRule_In_TCP"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG P2P Swarm (TCP 3032-In)&quot;" />
         <CustomAction Id="RemoveQuorumFirewallRule_Out_TCP"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG P2P Swarm (TCP 3032-Out)&quot;" />
         <CustomAction Id="RemoveQuorumFirewallRule_Legacy"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
@@ -198,55 +198,53 @@
                       Return="asyncNoWait"
                       ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c &quot;&quot;[INSTALLFOLDER]quorumrag-open-ui.cmd&quot;&quot;" />
 
-        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.6.0-x86_64.msi REMOVEDATA=1
+        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.6.2-x86_64.msi REMOVEDATA=1
              deletes the index and logs in %ProgramData%\QuorumRAG (kept by default). -->
         <Property Id="REMOVEDATA" Value="0" Secure="yes" />
         <CustomAction Id="RemoveQuorumData"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c rmdir /s /q &quot;[CommonAppDataFolder]QuorumRAG&quot;" />
 
         <!-- Clean-replace law: an existing QuorumRAGDaemon registration or an orphaned
-             quorumrag.exe process previously wedged installs with MSI Error 1921
-             ("Service ... could not be stopped"). Before the old product is removed
-             (upgrade) or files are removed (uninstall), the installer now stops the
-             service, waits past the bounded stop path, force-kills any remaining
-             quorumrag.exe processes (orphans included), and deletes the service
-             registration, so every install proceeds from a clean slate and the new
-             ServiceInstall registers the service fresh. -->
+             quorumrag.exe process (including watch-p2p child) previously wedged installs
+             with MSI Error 1921 ("Service ... could not be stopped").
+             CRITICAL MSI SEQUENCING INVARIANT (ICE63 / Error 2613):
+             Windows Installer forbids placing ANY deferred/script action between InstallInitialize
+             and RemoveExistingProducts unless InstallExecute flushes the script immediately
+             before RemoveExistingProducts. Therefore StopDeleteQuorumServiceUpgrade runs right
+             after InstallInitialize, InstallExecute flushes it as SYSTEM, and RemoveExistingProducts
+             immediately follows InstallExecute with zero intervening actions. -->
         <CustomAction Id="StopDeleteQuorumServiceUpgrade"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
-                      ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]sc.exe stop QuorumRAGDaemon &amp; ping -n 16 127.0.0.1 &gt;nul &amp; [System64Folder]taskkill.exe /f /im quorumrag.exe &amp; [System64Folder]sc.exe delete QuorumRAGDaemon" />
+                      ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]sc.exe stop QuorumRAGDaemon &amp; ping -n 5 127.0.0.1 &gt;nul &amp; [System64Folder]taskkill.exe /f /t /im quorumrag.exe &amp; ping -n 2 127.0.0.1 &gt;nul &amp; [System64Folder]sc.exe delete QuorumRAGDaemon" />
         <CustomAction Id="StopDeleteQuorumServiceUninstall"
-                      Directory="INSTALLFOLDER"
+                      Directory="System64Folder"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
-                      ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]sc.exe stop QuorumRAGDaemon &amp; ping -n 16 127.0.0.1 &gt;nul &amp; [System64Folder]taskkill.exe /f /im quorumrag.exe &amp; [System64Folder]sc.exe delete QuorumRAGDaemon" />
-        <!-- Fresh-install lock guarantee: a leftover portable/consle quorumrag.exe would
-             hold target\release\quorumrag.exe open and break file replacement. Only runs
-             when this product is not yet Installed, so upgrades keep their graceful
-             stop handled by the deferred clean-replace action above. -->
+                      ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]sc.exe stop QuorumRAGDaemon &amp; ping -n 5 127.0.0.1 &gt;nul &amp; [System64Folder]taskkill.exe /f /t /im quorumrag.exe &amp; ping -n 2 127.0.0.1 &gt;nul &amp; [System64Folder]sc.exe delete QuorumRAGDaemon" />
+        <!-- Fresh-install lock guarantee: terminate any leftover portable/console quorumrag.exe
+             before file installation (anchored to System64Folder so working dir always exists). -->
         <CustomAction Id="KillQuorumOrphans"
-                      Directory="INSTALLFOLDER"
-                      Execute="immediate"
+                      Directory="System64Folder"
+                      Execute="deferred"
+                      Impersonate="no"
                       Return="ignore"
-                      ExeCommand="&quot;[System64Folder]taskkill.exe&quot; /f /im quorumrag.exe" />
+                      ExeCommand="&quot;[System64Folder]taskkill.exe&quot; /f /t /im quorumrag.exe" />
 
         <InstallExecuteSequence>
-            <!-- Upgrade path: clean the slate before RemoveExistingProducts uninstalls the
-                 detected related product (WiX MajorUpgrade Schedule=afterInstallInitialize)
-                 and before the new service is installed. Skipped on repair and fresh installs. -->
-            <Custom Action="StopDeleteQuorumServiceUpgrade" Before="RemoveExistingProducts" Condition="WIX_UPGRADE_DETECTED AND NOT REINSTALL" />
-            <!-- Uninstall path: RemoveExistingProducts is never scheduled, so anchor to the
-                 file-removal phase instead. Idempotent no-ops when nothing is left over. -->
-            <Custom Action="StopDeleteQuorumServiceUninstall" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT REINSTALL" />
-            <Custom Action="KillQuorumOrphans" Before="InstallInitialize" Condition="NOT Installed AND NOT REINSTALL" />
+            <Custom Action="StopDeleteQuorumServiceUpgrade" After="InstallInitialize" Condition="WIX_UPGRADE_DETECTED AND NOT REINSTALL" />
+            <InstallExecute After="StopDeleteQuorumServiceUpgrade" />
+            <!-- Uninstall path: RemoveExistingProducts is never scheduled, so anchor before
+                 StopServices/DeleteServices/RemoveFiles. Idempotent no-ops when nothing is left over. -->
+            <Custom Action="StopDeleteQuorumServiceUninstall" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT REINSTALL" />
+            <Custom Action="KillQuorumOrphans" Before="InstallFiles" Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT REINSTALL" />
             <Custom Action="AddQuorumFirewallRule_In_Program" After="InstallFiles" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
             <Custom Action="AddQuorumFirewallRule_In_UDP" After="AddQuorumFirewallRule_In_Program" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
             <Custom Action="AddQuorumFirewallRule_Out_UDP" After="AddQuorumFirewallRule_In_UDP" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />

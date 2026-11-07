@@ -5,7 +5,7 @@ set -euo pipefail
 # Generates Debian (.deb), RedHat (.rpm), and portable (.tar.gz) packages for Linux deployments.
 
 BINARY_PATH="${1:-target/release/quorumrag}"
-VERSION="${2:-0.6.1}"
+VERSION="${2:-0.6.2}"
 INPUT_ARCH="${3:-amd64}"
 DIST_DIR="${4:-deploy/linux}"
 PACKAGE_NAME="${5:-quorumrag}"
@@ -76,6 +76,7 @@ fi
 if [ -x /usr/lib/quorumrag/quorumrag-ctl ]; then
     /usr/lib/quorumrag/quorumrag-ctl pre-remove >/dev/null 2>&1 || true
 fi
+pkill -TERM -x quorumrag 2>/dev/null || true
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p /usr/bin /lib/systemd/system /usr/lib/quorumrag /usr/share/applications \
          /var/lib/quorumrag/data /var/lib/quorumrag/docs /var/log/quorumrag
@@ -134,7 +135,6 @@ Maintainer: Oshoosi Security Team <security@oshoosiclaw.dev>
 Homepage: https://github.com/oyesanyf/QuorumRAG
 Provides: ${PACKAGE_NAME}
 Replaces: ${PACKAGE_NAME}
-Conflicts: ${PACKAGE_NAME} (<< ${VERSION})
 Recommends: curl, xdg-utils
 Description: QuorumRAG Local-First P2P Agentic RAG Daemon and Web UI
  Self-contained local-first peer-to-peer Retrieval-Augmented Generation
@@ -163,7 +163,8 @@ case "$1" in
     upgrade|failed-upgrade)
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
             systemctl stop quorumrag.service >/dev/null 2>&1 || true
-        fi ;;
+        fi
+        pkill -TERM -x quorumrag 2>/dev/null || true ;;
 esac
 exit 0
 EOF
@@ -282,6 +283,15 @@ install -m 755 "${BINARY_PATH}" %{buildroot}/usr/bin/quorumrag
 install -m 644 "${SERVICE_FILE}" %{buildroot}/usr/lib/systemd/system/quorumrag.service
 install -m 755 "${CTL_FILE}" %{buildroot}/usr/lib/quorumrag/quorumrag-ctl
 install -m 644 "${DESKTOP_FILE}" %{buildroot}/usr/share/applications/quorumrag.desktop
+
+%pre
+# Upgrade path ($1 >= 2): cleanly stop older running service/processes before binary replacement.
+if [ \$1 -ge 2 ]; then
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl stop quorumrag.service >/dev/null 2>&1 || :
+    fi
+    pkill -TERM -x quorumrag 2>/dev/null || :
+fi
 
 %post
 # Fresh install and upgrade: enable + (re)start the service, then open the Web UI.
