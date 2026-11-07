@@ -12,7 +12,7 @@
 FROM ubuntu:26.04
 
 ARG TARGETARCH
-ARG VERSION=0.1.0
+ARG VERSION=0.6.0
 
 LABEL org.opencontainers.image.source="https://github.com/oyesanyf/QuorumRAG" \
       org.opencontainers.image.title="QuorumRAG" \

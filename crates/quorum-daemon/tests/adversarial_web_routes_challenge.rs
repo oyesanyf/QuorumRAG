@@ -116,7 +116,7 @@ async fn challenge_api_health() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
 
     assert_eq!(json["status"], "healthy");
-    assert_eq!(json["version"], "0.1.0");
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
     assert!(json["contract_hash"].is_string());
     assert!(!json["contract_hash"].as_str().unwrap().is_empty());
     assert!(json["storage"].is_object());

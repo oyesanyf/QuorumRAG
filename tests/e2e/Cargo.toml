@@ -1,6 +1,6 @@
 [package]
 name = "quorum-e2e"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["QuorumRAG Test Engineering Team"]
 description = "Comprehensive 4-tier opaque-box E2E test suite for QuorumRAG"

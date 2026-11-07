@@ -1,7 +1,7 @@
 use crate::error::NetworkError;
 
 pub const PROTOCOL_PREFIX: &str = "/quorum-rag/1.0.0/contract-";
-pub const AGENT_PREFIX: &str = "quorumrag/0.1.0/";
+pub const AGENT_PREFIX: &str = concat!("quorumrag/", env!("CARGO_PKG_VERSION"), "/");
 
 pub fn make_protocol_version(contract_hash_hex: &str) -> String {
     format!("{}{}", PROTOCOL_PREFIX, contract_hash_hex)

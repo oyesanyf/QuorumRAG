@@ -42,7 +42,7 @@ fn test_adversarial_contract_hash_edge_cases() {
 
     // Valid protocol and agent strings
     let valid_proto = format!("/quorum-rag/1.0.0/contract-{}", valid_hex);
-    let valid_agent = format!("quorumrag/0.1.0/{}", valid_hex);
+    let valid_agent = format!("quorumrag/{}/{}", env!("CARGO_PKG_VERSION"), valid_hex);
     assert_eq!(extract_contract_hash(&valid_proto), Some(valid_hex.clone()));
     assert_eq!(extract_contract_hash(&valid_agent), Some(valid_hex.clone()));
 

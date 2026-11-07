@@ -76,7 +76,7 @@ impl TestWebRouter {
     pub fn get_health(&self) -> HealthStatus {
         HealthStatus {
             status: "healthy".to_string(),
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             total_chunks: self.storage.len(),
             active_peers: 0,
             contract_hash: blake3::hash(&oracle_derive_contract_hash(&self.contract_spec)).to_hex().to_string(),

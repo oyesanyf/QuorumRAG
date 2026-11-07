@@ -184,7 +184,7 @@ jobs:
         with:
           name: quorumrag-linux-arm64
           path: deploy/linux-arm64/*
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # 4. macOS Universal (Apple Silicon arm64 + Intel x86_64) Native .pkg, .dmg & .tar.gz
   build-macos:
@@ -233,16 +233,13 @@ jobs:
           VERSION="${INPUT_VERSION:-0.6.0}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag --target aarch64-apple-darwin
-          cargo build --release -p quorum-daemon --bin quorumrag --target x86_64-apple-darwin || true
+          cargo build --release -p quorum-daemon --bin quorumrag --target x86_64-apple-darwin
           mkdir -p target/release
-          if [ -f target/x86_64-apple-darwin/release/quorumrag ]; then
-            lipo -create -output target/release/quorumrag \
-              target/aarch64-apple-darwin/release/quorumrag \
-              target/x86_64-apple-darwin/release/quorumrag
-          else
-            cp target/aarch64-apple-darwin/release/quorumrag target/release/quorumrag
-          fi
+          lipo -create -output target/release/quorumrag \
+            target/aarch64-apple-darwin/release/quorumrag \
+            target/x86_64-apple-darwin/release/quorumrag
           lipo -info target/release/quorumrag
+          lipo -info target/release/quorumrag | grep -E "x86_64.*arm64|arm64.*x86_64"
           ./target/release/quorumrag --version
           bash packaging/macos/build_packages.sh target/release/quorumrag "${VERSION}" universal deploy/macos quorumrag
           pkgutil --payload-files "deploy/macos/QuorumRAG-${VERSION}-macos-universal.pkg" | head -n 20
@@ -292,6 +289,11 @@ jobs:
           mkdir -p release_assets
           find dist/ -type f \( -name "*.msi" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg" -o -name "*.dmg" -o -name "*.tar.gz" \) -exec cp -f {} release_assets/ \;
           cd release_assets
+          PKG_COUNT=$(ls -1 *.msi *.zip *.deb *.rpm *.pkg *.dmg *.tar.gz 2>/dev/null | wc -l)
+          if [ "$PKG_COUNT" -lt 11 ]; then
+            echo "[-] Error: Expected at least 11 release packages across 4 targets, found only $PKG_COUNT" >&2
+            exit 1
+          fi
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
           ls -lh
