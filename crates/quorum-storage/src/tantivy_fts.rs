@@ -1198,6 +1198,164 @@ impl TantivyFtsIndex {
             min_opstamp, target_seq, MAX_ATTEMPTS, last_err
         )))
     }
+
+    /// Reconstructs the ordered full parent document text from stored Tantivy chunks
+    /// matching either `file_path` or `document_id`. Enables instant `peek_slice` and
+    /// `regex_grep` over pre-existing indexed corpora without re-crawling disk files.
+    pub(crate) fn reconstruct_parent_document(
+        &self,
+        doc_id_or_path: &str,
+    ) -> Result<Option<(quorum_types::IngestedParentDocument, u8)>, StorageError> {
+        let key = doc_id_or_path.trim();
+        if key.is_empty() {
+            return Ok(None);
+        }
+
+        self.reload_with_retry(SyncCheck::None)?;
+        let searcher = self.reader.searcher();
+
+        let path_term = Term::from_field_text(self.field_file_path, key);
+        let doc_term = Term::from_field_text(self.field_document_id, key);
+        let query = BooleanQuery::new(vec![
+            (
+                tantivy::query::Occur::Should,
+                Box::new(TermQuery::new(path_term, IndexRecordOption::Basic)),
+            ),
+            (
+                tantivy::query::Occur::Should,
+                Box::new(TermQuery::new(doc_term, IndexRecordOption::Basic)),
+            ),
+        ]);
+
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(4096).order_by_score())
+            .map_err(|e| StorageError::Tantivy(format!("Parent reconstruction lookup failed: {}", e)))?;
+
+        if top_docs.is_empty() {
+            return Ok(None);
+        }
+
+        let mut chunks = Vec::with_capacity(top_docs.len());
+        for (_score, addr) in top_docs {
+            let doc: TantivyDocument = searcher
+                .doc(addr)
+                .map_err(|e| StorageError::Tantivy(format!("Parent doc fetch failed: {}", e)))?;
+            chunks.push(self.doc_to_chunk_fast(&doc));
+        }
+
+        // Prefer exact file_path match if key was a path, otherwise lock onto primary file_path
+        let target_path = chunks
+            .iter()
+            .find(|c| c.file_path == key)
+            .map(|c| c.file_path.clone())
+            .unwrap_or_else(|| chunks[0].file_path.clone());
+        chunks.retain(|c| c.file_path == target_path);
+
+        if chunks.is_empty() {
+            return Ok(None);
+        }
+
+        fn parse_chunk_seq(chunk_id: &str) -> usize {
+            chunk_id
+                .rsplit_once(':')
+                .and_then(|(_, idx)| idx.parse::<usize>().ok())
+                .unwrap_or(usize::MAX)
+        }
+
+        chunks.sort_by(|a, b| {
+            parse_chunk_seq(&a.chunk_id)
+                .cmp(&parse_chunk_seq(&b.chunk_id))
+                .then_with(|| a.line_start.cmp(&b.line_start))
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
+
+        let primary_doc_id = chunks[0].document_id.clone();
+        let min_tier = chunks.iter().map(|c| c.access_tier).max().unwrap_or(0);
+        let title_guess =
+            crate::document_catalog::extract_title_from_chunk(&chunks[0].text_content, &target_path);
+        let author_guess =
+            crate::document_catalog::extract_author_from_chunk(&chunks[0].text_content);
+
+        let mut assembled = String::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let body = if idx == 0 {
+                chunk.text_content.trim()
+            } else {
+                strip_synthetic_chunk_preamble(&chunk.text_content)
+            };
+            if body.is_empty() {
+                continue;
+            }
+            if !assembled.is_empty() {
+                assembled.push_str("\n\n");
+            }
+            assembled.push_str(body);
+        }
+
+        let ext = Path::new(&target_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let format = if chunks[0].text_content.trim_start().starts_with("[Image Document:") {
+            quorum_types::DocumentFormat::ImageFile
+        } else {
+            quorum_types::DocumentFormat::from_extension(&ext)
+        };
+
+        let blake3_hash = blake3::hash(assembled.as_bytes()).to_hex().to_string();
+        let byte_len = assembled.len() as u64;
+        let mut metadata = HashMap::new();
+        metadata.insert("reconstructed_from_chunks".to_string(), chunks.len().to_string());
+
+        let parent = quorum_types::IngestedParentDocument {
+            doc_id: primary_doc_id,
+            blake3_hash,
+            source_path: target_path,
+            os_platform: std::env::consts::OS.to_string(),
+            format,
+            title: if title_guess.is_empty() { None } else { Some(title_guess) },
+            author: if author_guess.is_empty() || author_guess.eq_ignore_ascii_case("unknown") {
+                None
+            } else {
+                Some(author_guess)
+            },
+            created_unix_secs: 0,
+            modified_unix_secs: chrono::Utc::now().timestamp(),
+            byte_len,
+            full_text: assembled,
+            metadata,
+        };
+
+        Ok(Some((parent, min_tier)))
+    }
+}
+
+/// Strips repeated `[Document: ...]` / `Path: ...` synthetic chunk headers from chunks `1..N`
+/// when reconstructing contiguous parent text from pre-chunked Tantivy documents.
+fn strip_synthetic_chunk_preamble(text: &str) -> &str {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("[Document:") && !trimmed.starts_with("[Image Document:") {
+        return trimmed;
+    }
+    let mut byte_offset = 0usize;
+    for (idx, line) in trimmed.split_inclusive('\n').enumerate() {
+        let l = line.trim();
+        let is_header = idx < 6
+            && (l.starts_with("[Document:")
+                || l.starts_with("[Image Document:")
+                || l.starts_with("Path:")
+                || l.starts_with("Author:")
+                || l.starts_with("Title:")
+                || l.starts_with("Section:")
+                || l.is_empty());
+        if is_header {
+            byte_offset += line.len();
+        } else {
+            break;
+        }
+    }
+    trimmed[byte_offset..].trim()
 }
 
 /// Helper that prepares and executes a single Tantivy commit with an optional payload message.

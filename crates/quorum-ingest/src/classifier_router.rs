@@ -183,10 +183,44 @@ impl ClassifierRouter {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        // 4. Content classification via Google Magika (first 4KB inspection with sharing violation retry)
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        // 3b. Fast magic-byte exclusion for compiled executables and shared libraries
+        // (PE/MZ, ELF, Mach-O, WASM, DEX), even when misnamed as `.txt` or `.pdf`.
+        if let Ok(mut f) = std::fs::File::open(path) {
+            use std::io::Read;
+            let mut hdr = [0u8; 512];
+            let n = f.read(&mut hdr).unwrap_or(0);
+            if crate::document_extractor::DocumentExtractor::is_excluded_executable_or_library(
+                &hdr[..n],
+                path,
+            ) {
+                let identity = self.classifier.classify_by_extension(file_name, 1.0);
+                return FilterDecision::SkipBinary { identity };
+            }
+        }
+
+        // 4. Content classification via Google Magika (first 4KB inspection with sharing violation retry).
+        // If a known document file is exclusively locked (OS error 32 / PermissionDenied), fall back to
+        // extension classification so `DocumentExtractor` can query the user-space OS Search index.
         let identity = match self.classify_file_with_retry(path, 3) {
             Ok(id) => id,
-            Err(e) => return FilterDecision::SkipIoError { error: e.to_string() },
+            Err(e) => {
+                let is_locked = e.kind() == std::io::ErrorKind::PermissionDenied
+                    || matches!(e.raw_os_error(), Some(32) | Some(33) | Some(5));
+                let lower = file_name.to_ascii_lowercase();
+                let is_doc_ext = [
+                    ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
+                    ".odt", ".ods", ".odp", ".rtf", ".txt", ".md",
+                ]
+                .iter()
+                .any(|ext| lower.ends_with(ext));
+                if is_locked && is_doc_ext {
+                    self.classifier.classify_by_extension(file_name, 0.75)
+                } else {
+                    return FilterDecision::SkipIoError { error: e.to_string() };
+                }
+            }
         };
 
         // 5. Ingestion Routing Invariant:

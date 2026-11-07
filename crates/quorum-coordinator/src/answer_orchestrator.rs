@@ -162,21 +162,142 @@ fn strip_leading_title(s: &str) -> String {
     if i >= 2 && i < words.len() { words[i..].join(" ") } else { s.to_string() }
 }
 
+/// Returns true if a line represents a contact header, pipe-delimited metadata bar, or bare contact field.
+pub fn is_contact_bar_or_header(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    // 1. Explicit contact/metadata label prefixes
+    for prefix in &[
+        "email:", "e-mail:", "phone:", "tel:", "telephone:", "cell:",
+        "mobile:", "fax:", "contact:", "contact info:", "contact information:",
+        "address:", "location:", "linkedin:", "github:", "website:", "portfolio:"
+    ] {
+        if lower.starts_with(prefix) {
+            return true;
+        }
+    }
+
+    // 2. Email detection: unconditionally treat lines containing email addresses as contact headers
+    let has_email = lower.contains('@') && lower.split_whitespace().any(|w| w.contains('@') && w.contains('.'));
+    if has_email {
+        return true;
+    }
+
+    // 3. Contact emojis
+    if trimmed.contains('📧')
+        || trimmed.contains('📱')
+        || trimmed.contains('📞')
+        || trimmed.contains('📍')
+        || trimmed.contains('✉')
+    {
+        return true;
+    }
+
+    let has_url = lower.contains("linkedin.com")
+        || lower.contains("github.com")
+        || lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("www.");
+    let has_phone_digits = trimmed.chars().filter(|c| c.is_ascii_digit()).count() >= 7;
+
+    let ends_with_sentence_punct = trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?');
+
+    // 4. Multi-pipe or single-pipe contact bars
+    let pipe_count = trimmed.matches('|').count();
+    if pipe_count >= 2 {
+        return true;
+    }
+    if pipe_count >= 1 && !ends_with_sentence_punct {
+        return true;
+    }
+
+    // 5. Bullet delimiter detection (•, ·, ●, ▪, ◆, ■, dashes)
+    let bullet_count = trimmed.matches('•').count()
+        + trimmed.matches('·').count()
+        + trimmed.matches('●').count()
+        + trimmed.matches('▪').count()
+        + trimmed.matches('◆').count()
+        + trimmed.matches('■').count()
+        + trimmed.matches(" - ").count()
+        + trimmed.matches(" — ").count();
+    if bullet_count >= 2 && !ends_with_sentence_punct {
+        return true;
+    }
+
+    // 6. Forward-slash delimiter detection
+    let slash_count = trimmed.matches(" / ").count() + trimmed.matches('/').count();
+    if (slash_count >= 2 && (!ends_with_sentence_punct || trimmed.matches(" / ").count() >= 2))
+        || (slash_count >= 1 && (has_url || has_phone_digits))
+    {
+        return true;
+    }
+
+    if (pipe_count >= 1 || bullet_count >= 1) && (has_url || has_phone_digits) {
+        return true;
+    }
+
+    // 7. Delimiter bar with address/location tokens
+    if pipe_count >= 1 && (
+        lower.contains("new york")
+        || lower.contains("st.")
+        || lower.contains("street")
+        || lower.contains("ave")
+        || lower.contains("avenue")
+        || lower.contains("drive")
+        || lower.contains("road")
+        || lower.contains("rd.")
+    ) {
+        return true;
+    }
+
+    // 8. Short lines consisting primarily of url, phone, or website metadata
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() <= 6 && has_url {
+        return true;
+    }
+    if words.len() <= 5
+        && has_phone_digits
+        && (lower.contains("tel") || lower.contains("phone") || lower.contains("cell") || lower.contains("fax") || lower.contains("ext"))
+    {
+        return true;
+    }
+
+    false
+}
+
 fn sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let flat: Vec<char> = text.replace(['\r', '\n'], " ").chars().collect();
+    // Strip contact lines and bare headers before joining into a prose stream
+    let sanitized_lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !is_contact_bar_or_header(l))
+        .collect();
+    let sanitized_text = sanitized_lines.join(" ");
+
+    let flat: Vec<char> = sanitized_text.chars().collect();
     let mut cur = String::new();
     for (i, &ch) in flat.iter().enumerate() {
         cur.push(ch);
         // A sentence ends at . ! ? followed by whitespace or end of text, never inside "$50.00".
         let ends = matches!(ch, '.' | '!' | '?') && flat.get(i + 1).map_or(true, |n| n.is_whitespace());
         if ends && cur.trim().len() > 30 {
-            out.push(strip_leading_title(&cur.split_whitespace().collect::<Vec<_>>().join(" ")));
+            let s = strip_leading_title(&cur.split_whitespace().collect::<Vec<_>>().join(" "));
+            if !is_contact_bar_or_header(&s) {
+                out.push(s);
+            }
             cur.clear();
         }
     }
     if cur.trim().len() > 30 {
-        out.push(strip_leading_title(&cur.split_whitespace().collect::<Vec<_>>().join(" ")));
+        let s = strip_leading_title(&cur.split_whitespace().collect::<Vec<_>>().join(" "));
+        if !is_contact_bar_or_header(&s) {
+            out.push(s);
+        }
     }
     out
 }
@@ -270,11 +391,50 @@ pub fn key_passages(prompt: &str, subject: Option<&str>, texts: &[(String, Strin
     let mut scored: Vec<(usize, String, usize)> = Vec::new();
     for (idx, (_, _, text)) in texts.iter().enumerate() {
         for s in sentences(text) {
-            if s.len() > 320 || is_mostly_upper(&s) {
+            if s.len() > 320 || is_mostly_upper(&s) || is_contact_bar_or_header(&s) {
                 continue;
             }
             let low = s.to_ascii_lowercase();
-            let score = terms.iter().filter(|t| low.contains(t.as_str())).count();
+            let mut score = terms.iter().filter(|t| low.contains(t.as_str())).count() * 10;
+
+            // Prioritize executive summaries and professional profile statements
+            if low.contains("professional")
+                || low.contains("experience")
+                || low.contains("executive")
+                || low.contains("summary")
+                || low.contains("certified")
+                || low.contains("architect")
+                || low.contains("engineer")
+                || low.contains("leader")
+                || low.contains("specializ")
+            {
+                score += 15;
+            }
+
+            // Prioritize work history and substantive achievement statements
+            if low.contains("led ")
+                || low.contains("designed ")
+                || low.contains("developed ")
+                || low.contains("implemented ")
+                || low.contains("managed ")
+                || low.contains("responsible for")
+                || low.contains("served as")
+                || low.contains("architected")
+            {
+                score += 12;
+            }
+
+            // Prioritize education and advanced credentials
+            if low.contains("university")
+                || low.contains("degree")
+                || low.contains("master of")
+                || low.contains("bachelor of")
+                || low.contains("education")
+                || low.contains("cissp")
+            {
+                score += 10;
+            }
+
             if score > 0 {
                 scored.push((score, s, idx + 1));
             }

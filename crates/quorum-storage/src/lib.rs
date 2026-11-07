@@ -28,3 +28,32 @@ pub use document_catalog::{derive_work_cluster_id, DocumentCatalog, DocumentCata
 pub use engine::{CompactionStats, SearchMode, StorageEngine, StorageSearchQuery};
 pub use error::StorageError;
 pub use tantivy_fts::DistinctWorkHit;
+
+pub(crate) fn tantivy_fts_anchor_probe(anchor_text: &str) -> &str {
+    let trimmed = anchor_text.trim();
+    if !trimmed.starts_with("[Document:") && !trimmed.starts_with("[Image Document:") {
+        let mut end = trimmed.len().min(96);
+        while end > 0 && !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        return trimmed[..end].trim();
+    }
+    // Skip synthetic header lines to locate body text in raw parent document
+    for line in trimmed.lines().skip(1) {
+        let l = line.trim();
+        if l.is_empty()
+            || l.starts_with("Path:")
+            || l.starts_with("Author:")
+            || l.starts_with("Title:")
+            || l.starts_with("Section:")
+        {
+            continue;
+        }
+        let mut end = l.len().min(96);
+        while end > 0 && !l.is_char_boundary(end) {
+            end -= 1;
+        }
+        return l[..end].trim();
+    }
+    trimmed
+}

@@ -196,6 +196,16 @@ impl IngestEngine {
                 let _ = self.storage.delete_by_file_path(&path_str).await;
                 if !doc_chunks.is_empty() {
                     let _ = self.storage.insert_chunks(&doc_chunks).await?;
+                    let parent_doc = DocumentExtractor::build_ingested_parent_document(
+                        path,
+                        &file_b3,
+                        &file_b3,
+                        &content,
+                        mtime_secs,
+                        size_bytes,
+                        None,
+                    );
+                    let _ = self.storage.upsert_parent_document(&parent_doc, access_tier);
                 }
 
                 self.dedup.register_entry(FileCatalogEntry {
@@ -221,6 +231,16 @@ impl IngestEngine {
                 let file_b3 = doc_chunk.document_id.clone();
                 let _ = self.storage.delete_by_file_path(&path_str).await;
                 let _ = self.storage.insert_chunks(std::slice::from_ref(&doc_chunk)).await?;
+                let parent_doc = DocumentExtractor::build_ingested_parent_document(
+                    path,
+                    &file_b3,
+                    &file_b3,
+                    &doc_chunk.text_content,
+                    mtime_secs,
+                    size_bytes,
+                    Some(quorum_types::DocumentFormat::ImageFile),
+                );
+                let _ = self.storage.upsert_parent_document(&parent_doc, access_tier);
 
                 self.dedup.register_entry(FileCatalogEntry {
                     file_path: path.to_path_buf(),

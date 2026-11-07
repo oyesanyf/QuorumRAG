@@ -211,7 +211,26 @@ impl DocumentCatalog {
                 DELETE FROM document_catalog_fts WHERE file_path = old.file_path;
                 INSERT INTO document_catalog_fts(file_path, doc_title, doc_authors, file_name, summary_excerpt)
                 VALUES (new.file_path, new.doc_title, new.doc_authors, new.file_name, new.summary_excerpt);
-            END;",
+            END;
+
+            CREATE TABLE IF NOT EXISTS parent_documents (
+                file_path TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                blake3_hash TEXT NOT NULL,
+                os_platform TEXT NOT NULL,
+                format TEXT NOT NULL,
+                title TEXT,
+                author TEXT,
+                created_unix_secs INTEGER NOT NULL DEFAULT 0,
+                modified_unix_secs INTEGER NOT NULL DEFAULT 0,
+                byte_len INTEGER NOT NULL DEFAULT 0,
+                access_tier INTEGER NOT NULL DEFAULT 0,
+                full_text TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_parent_docs_doc_id ON parent_documents(document_id);
+            CREATE INDEX IF NOT EXISTS idx_parent_docs_hash ON parent_documents(blake3_hash);",
         )?;
 
         Ok(Self {
@@ -273,14 +292,127 @@ impl DocumentCatalog {
         Ok(())
     }
 
-    /// Deletes a document entry by its file path.
+    /// Deletes a document entry and its cached parent document by file path.
     pub fn delete_by_file_path(&self, file_path: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock();
         let rows = conn.execute(
             "DELETE FROM document_catalog WHERE file_path = ?1",
             params![file_path],
         )?;
-        Ok(rows > 0)
+        let parent_rows = conn.execute(
+            "DELETE FROM parent_documents WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        Ok((rows + parent_rows) > 0)
+    }
+
+    /// Inserts or replaces a full unchunked parent document record for RLM byte-slice & regex inspection.
+    pub fn upsert_parent_document(
+        &self,
+        doc: &quorum_types::IngestedParentDocument,
+        access_tier: u8,
+    ) -> Result<(), StorageError> {
+        let metadata_json =
+            serde_json::to_string(&doc.metadata).unwrap_or_else(|_| "{}".to_string());
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO parent_documents (
+                file_path, document_id, blake3_hash, os_platform, format,
+                title, author, created_unix_secs, modified_unix_secs, byte_len,
+                access_tier, full_text, metadata_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(file_path) DO UPDATE SET
+                document_id = excluded.document_id,
+                blake3_hash = excluded.blake3_hash,
+                os_platform = excluded.os_platform,
+                format = excluded.format,
+                title = excluded.title,
+                author = excluded.author,
+                created_unix_secs = excluded.created_unix_secs,
+                modified_unix_secs = excluded.modified_unix_secs,
+                byte_len = excluded.byte_len,
+                access_tier = excluded.access_tier,
+                full_text = excluded.full_text,
+                metadata_json = excluded.metadata_json;",
+            params![
+                doc.source_path,
+                doc.doc_id,
+                doc.blake3_hash,
+                doc.os_platform,
+                doc.format.as_str(),
+                doc.title,
+                doc.author,
+                doc.created_unix_secs,
+                doc.modified_unix_secs,
+                doc.byte_len as i64,
+                access_tier,
+                doc.full_text,
+                metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieves a stored full parent document by either `file_path` or `document_id`, along with its `access_tier`.
+    pub fn get_parent_document(
+        &self,
+        doc_id_or_path: &str,
+    ) -> Result<Option<(quorum_types::IngestedParentDocument, u8)>, StorageError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT file_path, document_id, blake3_hash, os_platform, format,
+                    title, author, created_unix_secs, modified_unix_secs, byte_len,
+                    access_tier, full_text, metadata_json
+             FROM parent_documents
+             WHERE file_path = ?1 OR document_id = ?1
+             ORDER BY modified_unix_secs DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![doc_id_or_path])?;
+        if let Some(row) = rows.next()? {
+            let source_path: String = row.get(0)?;
+            let doc_id: String = row.get(1)?;
+            let blake3_hash: String = row.get(2)?;
+            let os_platform: String = row.get(3)?;
+            let format_str: String = row.get(4)?;
+            let title: Option<String> = row.get(5)?;
+            let author: Option<String> = row.get(6)?;
+            let created_unix_secs: i64 = row.get(7)?;
+            let modified_unix_secs: i64 = row.get(8)?;
+            let byte_len_i64: i64 = row.get(9)?;
+            let access_tier: u8 = row.get(10)?;
+            let full_text: String = row.get(11)?;
+            let metadata_json: String = row.get(12)?;
+            let metadata: HashMap<String, String> =
+                serde_json::from_str(&metadata_json).unwrap_or_default();
+
+            Ok(Some((
+                quorum_types::IngestedParentDocument {
+                    doc_id,
+                    blake3_hash,
+                    source_path,
+                    os_platform,
+                    format: quorum_types::DocumentFormat::from_str_lossy(&format_str),
+                    title,
+                    author,
+                    created_unix_secs,
+                    modified_unix_secs,
+                    byte_len: byte_len_i64.max(0) as u64,
+                    full_text,
+                    metadata,
+                },
+                access_tier,
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Returns total number of full parent documents stored in SQLite.
+    pub fn count_parent_documents(&self) -> Result<usize, StorageError> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM parent_documents", [], |r| r.get(0))?;
+        Ok(count.max(0) as usize)
     }
 
     /// Retrieves an entry by its exact file path.

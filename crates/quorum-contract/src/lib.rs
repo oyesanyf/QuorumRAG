@@ -19,6 +19,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 pub mod rlm;
+pub use quorum_types::{DocumentFormat, IngestedParentDocument, RegexMatchSpan};
 pub use rlm::*;
 
 /// Error types for embedding contracts and generation engines.

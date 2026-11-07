@@ -190,8 +190,111 @@ impl DocumentExtractor {
         alnum_count < 10
     }
 
-    /// Extracts all searchable UTF-8 text from any file discovered by Magika.
+    /// Pure-Rust magic-byte & extension guard excluding compiled executables, shared libraries,
+    /// object files, debug symbols, and bytecode (PE/MZ, ELF, Mach-O, Fat Mach-O, WASM, DEX)
+    /// even when misnamed as `.txt`, `.md`, or `.pdf`.
+    pub fn is_excluded_executable_or_library(header: &[u8], path: &Path) -> bool {
+        let file_name_lower = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if matches!(
+            ext.as_str(),
+            "exe" | "dll" | "sys" | "drv" | "ocx" | "scr" | "cpl" | "efi"
+                | "so" | "dylib" | "bundle" | "a" | "lib" | "obj" | "o"
+                | "pdb" | "ilk" | "exp" | "wasm" | "pyc" | "pyo" | "pyd"
+                | "class" | "dex" | "ko"
+        ) || file_name_lower.contains(".so.")
+        {
+            return true;
+        }
+
+        if header.len() >= 4 {
+            // Linux / BSD / Solaris ELF
+            if &header[0..4] == b"\x7FELF" {
+                return true;
+            }
+            // macOS / iOS Mach-O (32-bit, 64-bit, big/little endian, Universal Fat) & Java .class
+            if matches!(
+                [header[0], header[1], header[2], header[3]],
+                [0xFE, 0xED, 0xFA, 0xCE]
+                    | [0xFE, 0xED, 0xFA, 0xCF]
+                    | [0xCE, 0xFA, 0xED, 0xFE]
+                    | [0xCF, 0xFA, 0xED, 0xFE]
+                    | [0xCA, 0xFE, 0xBA, 0xBE]
+                    | [0xBE, 0xBA, 0xFE, 0xCA]
+            ) {
+                return true;
+            }
+            // WebAssembly binary module
+            if &header[0..4] == b"\0asm" {
+                return true;
+            }
+            // Android Dalvik Executable
+            if &header[0..4] == b"dex\n" {
+                return true;
+            }
+        }
+
+        // Windows PE / COFF / DOS MZ header check (verify PE signature, DOS stub, or binary NULs
+        // so an ordinary plain-text note beginning with the letters "MZ" is never falsely rejected)
+        if header.len() >= 2 && &header[0..2] == b"MZ" {
+            if header.len() >= 0x40 {
+                let pe_off = u32::from_le_bytes([
+                    header[0x3C],
+                    header[0x3D],
+                    header[0x3E],
+                    header[0x3F],
+                ]) as usize;
+                if pe_off + 4 <= header.len() && &header[pe_off..pe_off + 4] == b"PE\0\0" {
+                    return true;
+                }
+                if header.windows(18).any(|w| w == b"This program canno" || w == b"This program must ") {
+                    return true;
+                }
+                if (0x40..=4096).contains(&pe_off) && header[2..0x3C].contains(&0) {
+                    return true;
+                }
+            } else if header[2..].contains(&0) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn is_lock_or_permission_error(err: &io::Error) -> bool {
+        err.kind() == io::ErrorKind::PermissionDenied
+            || matches!(err.raw_os_error(), Some(32) | Some(33) | Some(5))
+    }
+
+    /// Extracts all searchable UTF-8 text from any file discovered by Magika,
+    /// falling back to the user-space OS Search index (Windows Search OLE DB / macOS Spotlight)
+    /// when a document is exclusively locked by another application.
     pub fn extract_text(path: &Path, identity: &FileIdentity) -> io::Result<String> {
+        let res = Self::extract_text_inner(path, identity);
+        match res {
+            Ok(text) => Ok(text),
+            Err(e) if Self::is_lock_or_permission_error(&e) => {
+                if let Some((fallback_text, _meta)) = Self::query_os_search_index_fallback(path) {
+                    if !fallback_text.trim().is_empty() {
+                        return Ok(fallback_text);
+                    }
+                }
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn extract_text_inner(path: &Path, identity: &FileIdentity) -> io::Result<String> {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -200,10 +303,25 @@ impl DocumentExtractor {
         let label = identity.label.to_ascii_lowercase();
         let mime = identity.mime_type.to_ascii_lowercase();
 
-        // 0. Magic-byte sniffing before extension routing
+        // 0. Magic-byte sniffing & compiled executable exclusion before extension routing
+        let mut probe_buf = [0u8; 512];
         let mut magic_header = [0u8; 16];
-        if let Ok(mut f) = std::fs::File::open(path) {
-            let _ = f.read_exact(&mut magic_header);
+        match std::fs::File::open(path) {
+            Ok(mut f) => {
+                let n = f.read(&mut probe_buf).unwrap_or(0);
+                if Self::is_excluded_executable_or_library(&probe_buf[..n], path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Excluded compiled executable or shared library",
+                    ));
+                }
+                let copy_len = n.min(16);
+                magic_header[..copy_len].copy_from_slice(&probe_buf[..copy_len]);
+            }
+            Err(e) if Self::is_lock_or_permission_error(&e) => {
+                return Err(e);
+            }
+            Err(_) => {}
         }
 
         // Sniff OLE2 Compound Document: \xD0\xCF\x11\xE0 (e.g. legacy binary .doc misnamed as .pdf)
@@ -1946,28 +2064,605 @@ impl DocumentExtractor {
         s
     }
 
-    /// Extracts all worksheets, shared strings, and cell values from `.xlsx`, `.xls`, or `.ods`.
-    fn extract_spreadsheet_text(path: &Path) -> io::Result<String> {
-        let bytes = std::fs::read(path)?;
-        let entries = Self::read_zip_entries(&bytes);
-        if !entries.is_empty() {
-            let mut out = Vec::new();
-            for (name, data) in &entries {
-                if name.endswith_xml_sheet_or_strings() {
-                    let xml = String::from_utf8_lossy(data);
-                    let clean = Self::clean_html_prose(&xml);
-                    if !clean.is_empty() {
-                        out.push(clean);
+    /// Pure-Rust OpenXML (`docProps/core.xml`, `docProps/app.xml`) & OpenDocument (`meta.xml`)
+    /// internal document metadata harvester (`doc_title`, `doc_author`, `doc_revision`, etc.).
+    pub fn extract_openxml_core_props(bytes: &[u8]) -> HashMap<String, String> {
+        let mut meta = HashMap::new();
+        let entries = Self::read_zip_entries(bytes);
+        if entries.is_empty() {
+            return meta;
+        }
+
+        let extract_tag = |xml: &str, tag_names: &[&str]| -> Option<String> {
+            for tag in tag_names {
+                let open_pat = format!("<{}", tag);
+                let close_pat = format!("</{}>", tag);
+                let mut search_from = 0usize;
+                while let Some(rel_start) = xml[search_from..].find(&open_pat) {
+                    let abs_start = search_from + rel_start;
+                    let after_tag = abs_start + open_pat.len();
+                    if let Some(ch) = xml[after_tag..].chars().next() {
+                        if ch != '>' && !ch.is_ascii_whitespace() && ch != '/' {
+                            search_from = after_tag;
+                            continue;
+                        }
+                    }
+                    let Some(gt_rel) = xml[after_tag..].find('>') else {
+                        break;
+                    };
+                    let gt_abs = after_tag + gt_rel;
+                    if xml[after_tag..gt_abs].ends_with('/') {
+                        search_from = gt_abs + 1;
+                        continue;
+                    }
+                    let content_start = gt_abs + 1;
+                    if let Some(end_rel) = xml[content_start..].find(&close_pat) {
+                        let raw_inner = &xml[content_start..content_start + end_rel];
+                        let cleaned = Self::decode_html_entities(raw_inner).trim().to_string();
+                        if !cleaned.is_empty() {
+                            return Some(cleaned);
+                        }
+                        search_from = content_start + end_rel + close_pat.len();
+                    } else {
+                        break;
                     }
                 }
             }
-            if !out.is_empty() {
-                return Ok(out.join("\n\n"));
+            None
+        };
+
+        if let Some(core_bytes) = entries.get("docProps/core.xml").or_else(|| entries.get("meta.xml")) {
+            let xml = String::from_utf8_lossy(core_bytes);
+            if let Some(v) = extract_tag(&xml, &["dc:title", "title"]) {
+                meta.insert("doc_title".to_string(), v);
             }
-            return Ok(String::new());
+            if let Some(v) = extract_tag(&xml, &["dc:creator", "meta:initial-creator", "creator"]) {
+                meta.insert("doc_author".to_string(), v);
+            }
+            if let Some(v) = extract_tag(&xml, &["dc:subject", "subject"]) {
+                meta.insert("doc_subject".to_string(), v);
+            }
+            if let Some(v) = extract_tag(&xml, &["dc:description", "description"]) {
+                meta.insert("doc_description".to_string(), v);
+            }
+            if let Some(v) = extract_tag(&xml, &["cp:keywords", "meta:keyword", "keywords"]) {
+                meta.insert("doc_keywords".to_string(), v);
+            }
+            if let Some(v) = extract_tag(&xml, &["cp:lastModifiedBy", "dc:creator"]) {
+                meta.entry("doc_last_modified_by".to_string()).or_insert(v);
+            }
+            if let Some(v) = extract_tag(&xml, &["cp:revision", "meta:editing-cycles"]) {
+                meta.insert("doc_revision".to_string(), v);
+            }
+            if let Some(v) = extract_tag(&xml, &["dcterms:created", "meta:creation-date"]) {
+                meta.insert("doc_created".to_string(), v);
+            }
+            if let Some(v) = extract_tag(&xml, &["dcterms:modified", "dc:date"]) {
+                meta.insert("doc_modified".to_string(), v);
+            }
         }
 
+        if let Some(app_bytes) = entries.get("docProps/app.xml") {
+            let xml = String::from_utf8_lossy(app_bytes);
+            if let Some(v) = extract_tag(&xml, &["Application"]) {
+                meta.insert("doc_application".to_string(), v);
+            }
+            if let Some(v) = extract_tag(&xml, &["Company"]) {
+                meta.insert("doc_company".to_string(), v);
+            }
+        }
+
+        meta
+    }
+
+    /// Pure-Rust multi-sheet OpenXML (`.xlsx`) & OpenDocument (`.ods`) workbook parser.
+    /// Resolves `xl/sharedStrings.xml` indices, maps `xl/workbook.xml` sheet names, and emits
+    /// structured `=== Sheet: <name> ===` tab-delimited rows so RLM `peek_slice` and `regex_grep`
+    /// preserve complete multi-column financial and engineering tables.
+    pub fn extract_ooxml_spreadsheet_native(bytes: &[u8]) -> Option<String> {
+        let entries = Self::read_zip_entries(bytes);
+        if entries.is_empty() {
+            return None;
+        }
+
+        let extract_attr = |tag_header: &str, attr_name: &str| -> Option<String> {
+            for quote in ['"', '\''] {
+                let pat = format!("{}={}", attr_name, quote);
+                if let Some(pos) = tag_header.find(&pat) {
+                    let start = pos + pat.len();
+                    if let Some(end) = tag_header[start..].find(quote) {
+                        return Some(Self::decode_html_entities(&tag_header[start..start + end]));
+                    }
+                }
+            }
+            None
+        };
+
+        let extract_t_runs = |fragment: &str| -> String {
+            let mut buf = String::new();
+            let mut cursor = 0usize;
+            while let Some(rel) = fragment[cursor..].find('<') {
+                let lt = cursor + rel;
+                let Some(gt_rel) = fragment[lt..].find('>') else {
+                    break;
+                };
+                let gt = lt + gt_rel;
+                let header = &fragment[lt + 1..gt];
+                let tag_token = header.split_whitespace().next().unwrap_or("");
+                // Skip phonetic pronunciation runs `<rPh>...</rPh>`
+                if tag_token == "rPh" || tag_token.ends_with(":rPh") {
+                    if let Some(end_rph) = fragment[gt + 1..].find("</rPh>") {
+                        cursor = gt + 1 + end_rph + 6;
+                        continue;
+                    }
+                }
+                let is_t = (tag_token == "t" || tag_token.ends_with(":t")) && !header.ends_with('/');
+                if is_t {
+                    let val_start = gt + 1;
+                    let close_rel = fragment[val_start..]
+                        .find("</t>")
+                        .or_else(|| fragment[val_start..].find(":t>").and_then(|p| fragment[val_start..val_start + p].rfind("</")));
+                    if let Some(c_rel) = close_rel {
+                        buf.push_str(&Self::decode_html_entities(&fragment[val_start..val_start + c_rel]));
+                        cursor = val_start + c_rel + 4;
+                        continue;
+                    }
+                }
+                cursor = gt + 1;
+            }
+            buf
+        };
+
+        // 1. Parse xl/sharedStrings.xml into 0-based lookup table
+        let mut shared_strings: Vec<String> = Vec::new();
+        if let Some(ss_bytes) = entries.get("xl/sharedStrings.xml") {
+            let ss_xml = String::from_utf8_lossy(ss_bytes);
+            let mut cursor = 0usize;
+            while let Some(si_rel) = ss_xml[cursor..].find("<si") {
+                let si_start = cursor + si_rel;
+                let after = si_start + 3;
+                if let Some(ch) = ss_xml[after..].chars().next() {
+                    if ch != '>' && !ch.is_ascii_whitespace() && ch != '/' {
+                        cursor = after;
+                        continue;
+                    }
+                }
+                let Some(gt_rel) = ss_xml[after..].find('>') else { break; };
+                let gt = after + gt_rel;
+                if ss_xml[after..gt].ends_with('/') {
+                    shared_strings.push(String::new());
+                    cursor = gt + 1;
+                    continue;
+                }
+                if let Some(end_rel) = ss_xml[gt + 1..].find("</si>") {
+                    let inner = &ss_xml[gt + 1..gt + 1 + end_rel];
+                    shared_strings.push(extract_t_runs(inner));
+                    cursor = gt + 1 + end_rel + 5;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // 2. Map sheet tab names via xl/workbook.xml + xl/_rels/workbook.xml.rels
+        let mut rel_id_to_target: HashMap<String, String> = HashMap::new();
+        if let Some(rels_bytes) = entries.get("xl/_rels/workbook.xml.rels") {
+            let rels_xml = String::from_utf8_lossy(rels_bytes);
+            let mut cursor = 0usize;
+            while let Some(rel) = rels_xml[cursor..].find("<Relationship") {
+                let st = cursor + rel;
+                let Some(gt) = rels_xml[st..].find('>') else { break; };
+                let hdr = &rels_xml[st..st + gt];
+                if let (Some(id), Some(target)) = (extract_attr(hdr, "Id"), extract_attr(hdr, "Target")) {
+                    let norm = target.trim_start_matches('/');
+                    let full = if norm.starts_with("xl/") {
+                        norm.to_string()
+                    } else {
+                        format!("xl/{}", norm)
+                    };
+                    rel_id_to_target.insert(id, full);
+                }
+                cursor = st + gt + 1;
+            }
+        }
+
+        let mut ordered_sheets: Vec<(String, String)> = Vec::new();
+        if let Some(wb_bytes) = entries.get("xl/workbook.xml") {
+            let wb_xml = String::from_utf8_lossy(wb_bytes);
+            let mut cursor = 0usize;
+            let mut idx = 1usize;
+            while let Some(rel) = wb_xml[cursor..].find("<sheet") {
+                let st = cursor + rel;
+                let after = st + 6;
+                if let Some(ch) = wb_xml[after..].chars().next() {
+                    if !ch.is_ascii_whitespace() {
+                        cursor = after;
+                        continue;
+                    }
+                }
+                let Some(gt) = wb_xml[st..].find('>') else { break; };
+                let hdr = &wb_xml[st..st + gt];
+                if let Some(name) = extract_attr(hdr, "name") {
+                    let rid = extract_attr(hdr, "r:id").unwrap_or_default();
+                    let target = rel_id_to_target
+                        .get(&rid)
+                        .cloned()
+                        .unwrap_or_else(|| format!("xl/worksheets/sheet{}.xml", idx));
+                    ordered_sheets.push((name, target));
+                    idx += 1;
+                }
+                cursor = st + gt + 1;
+            }
+        }
+
+        for entry_name in entries.keys() {
+            if entry_name.starts_with("xl/worksheets/") && entry_name.ends_with(".xml") {
+                if !ordered_sheets.iter().any(|(_, t)| t == entry_name) {
+                    let fallback_name = Path::new(entry_name)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Sheet")
+                        .to_string();
+                    ordered_sheets.push((fallback_name, entry_name.clone()));
+                }
+            }
+        }
+
+        // 3. Parse each worksheet's <row> and <c> cells
+        let mut sheet_outputs: Vec<String> = Vec::new();
+        for (sheet_name, entry_path) in &ordered_sheets {
+            let Some(ws_bytes) = entries.get(entry_path) else { continue; };
+            let ws_xml = String::from_utf8_lossy(ws_bytes);
+            let mut sheet_lines = vec![format!("=== Sheet: {} ===", sheet_name)];
+            let mut row_cursor = 0usize;
+            while let Some(r_rel) = ws_xml[row_cursor..].find("<row") {
+                let r_st = row_cursor + r_rel;
+                let r_after = r_st + 4;
+                if let Some(ch) = ws_xml[r_after..].chars().next() {
+                    if ch != '>' && !ch.is_ascii_whitespace() && ch != '/' {
+                        row_cursor = r_after;
+                        continue;
+                    }
+                }
+                let Some(r_gt_rel) = ws_xml[r_after..].find('>') else { break; };
+                let r_gt = r_after + r_gt_rel;
+                if ws_xml[r_after..r_gt].ends_with('/') {
+                    row_cursor = r_gt + 1;
+                    continue;
+                }
+                let Some(r_end_rel) = ws_xml[r_gt + 1..].find("</row>") else { break; };
+                let row_inner = &ws_xml[r_gt + 1..r_gt + 1 + r_end_rel];
+                row_cursor = r_gt + 1 + r_end_rel + 6;
+
+                let mut cells: Vec<String> = Vec::new();
+                let mut c_cursor = 0usize;
+                while let Some(c_rel) = row_inner[c_cursor..].find("<c") {
+                    let c_st = c_cursor + c_rel;
+                    let c_after = c_st + 2;
+                    if let Some(ch) = row_inner[c_after..].chars().next() {
+                        if ch != '>' && !ch.is_ascii_whitespace() && ch != '/' {
+                            c_cursor = c_after;
+                            continue;
+                        }
+                    }
+                    let Some(c_gt_rel) = row_inner[c_after..].find('>') else { break; };
+                    let c_gt = c_after + c_gt_rel;
+                    let c_hdr = &row_inner[c_st..c_gt];
+                    if c_hdr.ends_with('/') {
+                        c_cursor = c_gt + 1;
+                        continue;
+                    }
+                    let Some(c_end_rel) = row_inner[c_gt + 1..].find("</c>") else { break; };
+                    let cell_inner = &row_inner[c_gt + 1..c_gt + 1 + c_end_rel];
+                    c_cursor = c_gt + 1 + c_end_rel + 4;
+
+                    let cell_type = extract_attr(c_hdr, "t").unwrap_or_default();
+                    let raw_v = if let Some(v_st) = cell_inner.find("<v>") {
+                        cell_inner[v_st + 3..]
+                            .find("</v>")
+                            .map(|v_end| Self::decode_html_entities(&cell_inner[v_st + 3..v_st + 3 + v_end]))
+                            .unwrap_or_default()
+                    } else if let Some(v_st) = cell_inner.find("<v ") {
+                        cell_inner[v_st..]
+                            .find('>')
+                            .and_then(|gt| {
+                                let st = v_st + gt + 1;
+                                cell_inner[st..].find("</v>").map(|en| Self::decode_html_entities(&cell_inner[st..st + en]))
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
+                    let resolved = match cell_type.as_str() {
+                        "s" => raw_v
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| shared_strings.get(i).cloned())
+                            .unwrap_or(raw_v),
+                        "inlineStr" => extract_t_runs(cell_inner),
+                        "b" => {
+                            if raw_v.trim() == "1" {
+                                "TRUE".to_string()
+                            } else if raw_v.trim() == "0" {
+                                "FALSE".to_string()
+                            } else {
+                                raw_v
+                            }
+                        }
+                        _ => {
+                            if !raw_v.is_empty() {
+                                raw_v
+                            } else {
+                                extract_t_runs(cell_inner)
+                            }
+                        }
+                    };
+                    let trimmed = resolved.trim();
+                    if !trimmed.is_empty() {
+                        cells.push(trimmed.replace('\t', " "));
+                    }
+                }
+
+                if !cells.is_empty() {
+                    sheet_lines.push(cells.join("\t"));
+                }
+            }
+
+            if sheet_lines.len() > 1 {
+                sheet_outputs.push(sheet_lines.join("\n"));
+            }
+        }
+
+        if !sheet_outputs.is_empty() {
+            return Some(sheet_outputs.join("\n\n"));
+        }
+
+        // OpenDocument Spreadsheet (.ods) fallback (`content.xml`)
+        if let Some(ods_bytes) = entries.get("content.xml") {
+            let xml = String::from_utf8_lossy(ods_bytes);
+            let clean = Self::clean_html_prose(&xml);
+            if !clean.trim().is_empty() {
+                return Some(clean);
+            }
+        }
+
+        None
+    }
+
+    /// Extracts all worksheets, shared strings, and cell values from `.xlsx`, `.xls`, or `.ods`.
+    fn extract_spreadsheet_text(path: &Path) -> io::Result<String> {
+        let bytes = std::fs::read(path)?;
+        if let Some(structured) = Self::extract_ooxml_spreadsheet_native(&bytes) {
+            return Ok(structured);
+        }
+        if bytes.starts_with(b"PK\x03\x04") {
+            return Ok(String::new());
+        }
         Ok(Self::extract_printable_strings(&bytes, path, "Spreadsheet"))
+    }
+
+    /// User-space OS Search index fallback for files exclusively locked by another process.
+    /// Queries Windows Search (`Search.CollatorDSO` OLE DB) on Windows or Spotlight (`mdls`) on macOS
+    /// strictly in standard user space — zero Admin privileges, zero raw `$MFT` or `Windows.edb` access.
+    pub fn query_os_search_index_fallback(path: &Path) -> Option<(String, HashMap<String, String>)> {
+        #[cfg(windows)]
+        {
+            let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let clean_path = abs.to_string_lossy().trim_start_matches(r"\\?\").to_string();
+            let ps_script = r#"
+$ErrorActionPreference = 'Stop'
+$targetPath = $args[0]
+if (-not $targetPath) { exit 1 }
+$escaped = $targetPath.Replace("'", "''")
+$conn = New-Object System.Data.OleDb.OleDbConnection("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';")
+$conn.Open()
+try {
+    $sql = "SELECT TOP 1 System.Title, System.Author, System.Subject, System.Keywords, System.Search.AutoSummary FROM SystemIndex WHERE System.ItemPathDisplay = '$escaped'"
+    $cmd = New-Object System.Data.OleDb.OleDbCommand($sql, $conn)
+    $reader = $cmd.ExecuteReader()
+    if ($reader.Read()) {
+        $obj = @{
+            title = [string]$reader.GetValue(0)
+            author = [string]$reader.GetValue(1)
+            subject = [string]$reader.GetValue(2)
+            keywords = [string]$reader.GetValue(3)
+            summary = [string]$reader.GetValue(4)
+        }
+        $obj | ConvertTo-Json -Compress
+    }
+    $reader.Close()
+} finally {
+    $conn.Close()
+}
+"#;
+            let output = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    ps_script,
+                ])
+                .arg(&clean_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+            let mut meta = HashMap::new();
+            let mut parts = Vec::new();
+            for (json_key, meta_key, label) in [
+                ("title", "doc_title", "Title"),
+                ("author", "doc_author", "Author"),
+                ("subject", "doc_subject", "Subject"),
+                ("keywords", "doc_keywords", "Keywords"),
+                ("summary", "os_search_summary", "Indexed Summary"),
+            ] {
+                if let Some(s) = val.get(json_key).and_then(|v| v.as_str()) {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        meta.insert(meta_key.to_string(), s.to_string());
+                        parts.push(format!("{}: {}", label, s));
+                    }
+                }
+            }
+            if parts.is_empty() {
+                return None;
+            }
+            meta.insert("extraction_source".to_string(), "windows_search_oledb".to_string());
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("document");
+            let text = format!(
+                "[OS Search Cached Summary — {}]\n{}",
+                file_name,
+                parts.join("\n")
+            );
+            return Some((text, meta));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let output = Command::new("mdls")
+                .arg("-name")
+                .arg("kMDItemTitle")
+                .arg("-name")
+                .arg("kMDItemAuthors")
+                .arg("-name")
+                .arg("kMDItemSubject")
+                .arg("-name")
+                .arg("kMDItemTextContent")
+                .arg(path.as_os_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if text.is_empty() || text.lines().all(|l| l.ends_with("(null)")) {
+                return None;
+            }
+            let mut meta = HashMap::new();
+            meta.insert("extraction_source".to_string(), "macos_spotlight_mdls".to_string());
+            return Some((text, meta));
+        }
+
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    /// Builds a canonical `IngestedParentDocument` record containing the unchunked full text
+    /// and internal OpenXML / PDF / OS Search metadata (`doc_title`, `doc_author`, `doc_revision`).
+    pub fn build_ingested_parent_document(
+        path: &Path,
+        doc_id: &str,
+        blake3_hash: &str,
+        full_text: &str,
+        mtime_secs: i64,
+        size_bytes: u64,
+        override_format: Option<quorum_types::DocumentFormat>,
+    ) -> quorum_types::IngestedParentDocument {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let format = if full_text.starts_with("[OS Search Cached Summary") {
+            quorum_types::DocumentFormat::OsSearchSnippetFallback
+        } else {
+            override_format.unwrap_or_else(|| quorum_types::DocumentFormat::from_extension(&ext))
+        };
+
+        let created_unix_secs = std::fs::metadata(path)
+            .and_then(|m| m.created())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(mtime_secs);
+
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert("file_size_bytes".to_string(), size_bytes.to_string());
+
+        if matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp") {
+            if let Ok(bytes) = std::fs::read(path) {
+                for (k, v) in Self::extract_openxml_core_props(&bytes) {
+                    metadata.insert(k, v);
+                }
+            }
+        }
+
+        // Parse PDF Metadata header line if present (`[PDF Metadata] Title: ... | Author: ...`)
+        for line in full_text.lines().take(5) {
+            if let Some(rest) = line.trim().strip_prefix("[PDF Metadata]") {
+                for seg in rest.split('|') {
+                    if let Some((k, v)) = seg.split_once(':') {
+                        let key_l = k.trim().to_ascii_lowercase();
+                        let val = v.trim();
+                        if val.is_empty() {
+                            continue;
+                        }
+                        match key_l.as_str() {
+                            "title" => {
+                                metadata.entry("doc_title".to_string()).or_insert_with(|| val.to_string());
+                            }
+                            "author" => {
+                                metadata.entry("doc_author".to_string()).or_insert_with(|| val.to_string());
+                            }
+                            "subject" => {
+                                metadata.entry("doc_subject".to_string()).or_insert_with(|| val.to_string());
+                            }
+                            "creator" | "producer" => {
+                                metadata.entry(format!("pdf_{}", key_l)).or_insert_with(|| val.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let title = metadata
+            .get("doc_title")
+            .cloned()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.replace(['_', '-'], " "))
+            });
+        let author = metadata
+            .get("doc_author")
+            .cloned()
+            .filter(|s| !s.trim().is_empty());
+
+        quorum_types::IngestedParentDocument {
+            doc_id: doc_id.to_string(),
+            blake3_hash: blake3_hash.to_string(),
+            source_path: path.to_string_lossy().to_string(),
+            os_platform: std::env::consts::OS.to_string(),
+            format,
+            title,
+            author,
+            created_unix_secs,
+            modified_unix_secs: mtime_secs,
+            byte_len: full_text.len() as u64,
+            full_text: full_text.to_string(),
+            metadata,
+        }
     }
 
     /// Extracts all slide text runs and speaker notes from `.pptx`, `.ppt`, or `.odp`.
@@ -2227,18 +2922,7 @@ impl DocumentExtractor {
     }
 }
 
-trait SpreadsheetXmlEntryExt {
-    fn endswith_xml_sheet_or_strings(&self) -> bool;
-}
 
-impl SpreadsheetXmlEntryExt for String {
-    fn endswith_xml_sheet_or_strings(&self) -> bool {
-        self.ends_with(".xml")
-            && (self.contains("sharedStrings")
-                || self.contains("worksheets/")
-                || self.as_str() == "content.xml")
-    }
-}
 
 #[cfg(test)]
 mod tests {

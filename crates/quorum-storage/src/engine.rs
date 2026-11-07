@@ -706,6 +706,198 @@ impl StorageEngine {
     pub async fn optimize_indices(&self) -> Result<(), StorageError> {
         self.vector_store.optimize_indices().await
     }
+
+    /// Persists a full unchunked parent document record alongside chunk indices.
+    pub fn upsert_parent_document(
+        &self,
+        doc: &quorum_types::IngestedParentDocument,
+        access_tier: u8,
+    ) -> Result<(), StorageError> {
+        self.catalog.upsert_parent_document(doc, access_tier)
+    }
+
+    /// Loads an authorized full parent document by `document_id` or `file_path`.
+    /// If the document was indexed prior to v0.6.3 and has no cached row in `parent_documents`,
+    /// automatically reconstructs the ordered full parent text from Tantivy chunks and caches it.
+    pub fn load_parent_document(
+        &self,
+        doc_id_or_path: &str,
+        max_tier: u8,
+    ) -> Result<Option<quorum_types::IngestedParentDocument>, StorageError> {
+        if let Some((doc, tier)) = self.catalog.get_parent_document(doc_id_or_path)? {
+            if tier <= max_tier {
+                return Ok(Some(doc));
+            }
+            return Ok(None);
+        }
+
+        if let Some((reconstructed, tier)) = self.fts_index.reconstruct_parent_document(doc_id_or_path)? {
+            let _ = self.catalog.upsert_parent_document(&reconstructed, tier);
+            if tier <= max_tier {
+                return Ok(Some(reconstructed));
+            }
+        }
+        Ok(None)
+    }
+
+    /// RLM environment action: reads a UTF-8 character-boundary-safe byte slice `[start_byte..end_byte]`
+    /// from the full parent document (clamped to 32 KiB per slice).
+    pub fn peek_slice(
+        &self,
+        doc_id_or_path: &str,
+        start_byte: usize,
+        end_byte: usize,
+        max_tier: u8,
+    ) -> Result<Option<String>, StorageError> {
+        const MAX_SLICE_BYTES: usize = 32_768;
+        let Some(doc) = self.load_parent_document(doc_id_or_path, max_tier)? else {
+            return Ok(None);
+        };
+        let text = &doc.full_text;
+        if text.is_empty() {
+            return Ok(Some(String::new()));
+        }
+
+        let mut safe_start = start_byte.min(text.len());
+        while safe_start > 0 && !text.is_char_boundary(safe_start) {
+            safe_start -= 1;
+        }
+        let requested_end = end_byte.max(safe_start).min(safe_start.saturating_add(MAX_SLICE_BYTES));
+        let mut safe_end = requested_end.min(text.len());
+        while safe_end < text.len() && !text.is_char_boundary(safe_end) {
+            safe_end += 1;
+        }
+        Ok(Some(text[safe_start..safe_end].to_string()))
+    }
+
+    /// RLM environment action: executes a bounded, DFA-limited case-insensitive regex grep
+    /// across the full parent document and returns byte spans plus surrounding context windows.
+    pub fn regex_grep(
+        &self,
+        doc_id_or_path: &str,
+        pattern: &str,
+        max_matches: usize,
+        max_tier: u8,
+    ) -> Result<Vec<quorum_types::RegexMatchSpan>, StorageError> {
+        let trimmed_pat = pattern.trim();
+        if trimmed_pat.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(doc) = self.load_parent_document(doc_id_or_path, max_tier)? else {
+            return Ok(Vec::new());
+        };
+
+        let compiled = regex::RegexBuilder::new(trimmed_pat)
+            .case_insensitive(true)
+            .size_limit(1 << 20)
+            .dfa_size_limit(1 << 20)
+            .build()
+            .or_else(|_| {
+                regex::RegexBuilder::new(&regex::escape(trimmed_pat))
+                    .case_insensitive(true)
+                    .size_limit(1 << 20)
+                    .dfa_size_limit(1 << 20)
+                    .build()
+            })
+            .map_err(|e| StorageError::InvalidQuery(format!("Invalid RLM regex '{}': {}", trimmed_pat, e)))?;
+
+        let cap = max_matches.clamp(1, 64);
+        let text = &doc.full_text;
+        let mut spans = Vec::new();
+        for m in compiled.find_iter(text).take(cap) {
+            let mut ctx_start = m.start().saturating_sub(240);
+            while ctx_start > 0 && !text.is_char_boundary(ctx_start) {
+                ctx_start -= 1;
+            }
+            let mut ctx_end = (m.end() + 240).min(text.len());
+            while ctx_end < text.len() && !text.is_char_boundary(ctx_end) {
+                ctx_end += 1;
+            }
+            spans.push(quorum_types::RegexMatchSpan {
+                doc_id: doc.doc_id.clone(),
+                source_path: doc.source_path.clone(),
+                start_byte: m.start(),
+                end_byte: m.end(),
+                matched_text: m.as_str().to_string(),
+                context_window: text[ctx_start..ctx_end].to_string(),
+            });
+        }
+        Ok(spans)
+    }
+
+    /// Expands a retrieved chunk's text into a wider `[start_byte..end_byte]` window from its full
+    /// parent document (`±window_bytes`), preserving surrounding table rows, headers, and dates
+    /// that were split across chunk boundaries.
+    pub fn expand_parent_window(
+        &self,
+        doc_id_or_path: &str,
+        anchor_text: &str,
+        window_bytes: usize,
+        max_tier: u8,
+    ) -> Result<Option<(usize, usize, String, Option<String>, Option<String>)>, StorageError> {
+        let Some(doc) = self.load_parent_document(doc_id_or_path, max_tier)? else {
+            return Ok(None);
+        };
+        let full = &doc.full_text;
+        if full.is_empty() {
+            return Ok(None);
+        }
+
+        let clean_anchor = crate::tantivy_fts_anchor_probe(anchor_text);
+        let (match_start, match_end) = if !clean_anchor.is_empty() {
+            if let Some(pos) = full.find(clean_anchor) {
+                (pos, (pos + anchor_text.len()).min(full.len()))
+            } else {
+                // Try a shorter 48-char probe from the middle of clean_anchor
+                let probe: String = clean_anchor.chars().take(48).collect();
+                if !probe.is_empty() {
+                    if let Some(pos) = full.find(&probe) {
+                        (pos, (pos + anchor_text.len()).min(full.len()))
+                    } else {
+                        (0, anchor_text.len().min(full.len()))
+                    }
+                } else {
+                    (0, anchor_text.len().min(full.len()))
+                }
+            }
+        } else {
+            (0, anchor_text.len().min(full.len()))
+        };
+
+        // Window expansion bounds: clamp requested window to [256, 32768] bytes.
+        let half = window_bytes.clamp(256, 32768);
+
+        // Head-match anchoring: when the anchor match is in Chunk 0 or within the first 2500 bytes
+        // of the parent document, anchor win_start at byte 0 and expand win_end to at least
+        // 10000 bytes (or window_bytes if larger), bounded by parent document length and match_end.
+        let (mut win_start, mut win_end) = if match_start <= 2500 {
+            let target_end = window_bytes
+                .max(10000)
+                .max(match_end)
+                .clamp(256, 32768)
+                .min(full.len());
+            (0, target_end)
+        } else {
+            let s = match_start.saturating_sub(half);
+            let e = match_end.saturating_add(half).min(full.len());
+            (s, e)
+        };
+
+        while win_start > 0 && !full.is_char_boundary(win_start) {
+            win_start -= 1;
+        }
+        while win_end < full.len() && !full.is_char_boundary(win_end) {
+            win_end += 1;
+        }
+
+        Ok(Some((
+            win_start,
+            win_end,
+            full[win_start..win_end].to_string(),
+            doc.title,
+            doc.author,
+        )))
+    }
 }
 
 /// When the question explicitly asks for a modality ("pictures of ...", "the song ..."),

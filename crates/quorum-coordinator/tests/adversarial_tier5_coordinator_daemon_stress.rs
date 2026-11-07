@@ -144,6 +144,9 @@ async fn challenge_tier5_query_cache_latency_and_atomic_epoch_invalidation() {
             is_external_node: false,
             origin_label: Some("local".to_string()),
             node_alias: None,
+            verbatim_quote: None,
+            byte_range: None,
+            grounding_rationale: None,
         };
 
         cache.insert(

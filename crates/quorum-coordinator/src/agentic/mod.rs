@@ -468,6 +468,16 @@ impl AgenticStateGraphRunner {
                 }
 
                 AgenticStateName::SynthesizeWithCitations => {
+                    // Live RLM Parent-Document Enrichment: expand local chunks into surrounding
+                    // parent-document byte windows and regex-grep uncovered query terms (leaving
+                    // federated P2P mesh chunks untouched).
+                    crate::rlm_orchestrator::RlmOrchestrator::enrich_retrieved_chunks_with_parent_rlm(
+                        &graph_state.current_query,
+                        &mut graph_state.retrieved_chunks,
+                        engine.local_storage.as_ref(),
+                        access_tier,
+                    );
+
                     let installed = crate::offline_engine::DeterministicOfflineSynthesisEngine::probe_installed_ollama_models_default();
                     if !installed.is_empty() {
                         let verified_tag = crate::offline_engine::DeterministicOfflineSynthesisEngine::resolve_ollama_model_tag(

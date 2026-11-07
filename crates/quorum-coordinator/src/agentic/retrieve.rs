@@ -79,6 +79,28 @@ pub const STOPWORDS: &[&str] = &[
 pub struct RetrieveMeshNode;
 
 impl RetrieveMeshNode {
+    /// Capping helper: Caps excerpts per document stem across the entire federation (max 2 per document family),
+    /// keying on document stem alone without partitioning by `source_peer`.
+    pub fn cap_document_families_federated(
+        chunks: Vec<quorum_types::ScoredChunk>,
+        max_per_family: usize,
+    ) -> Vec<quorum_types::ScoredChunk> {
+        let mut stem_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut stem_deduped: Vec<quorum_types::ScoredChunk> = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            let stem = crate::offline_engine::DeterministicOfflineSynthesisEngine::normalize_file_stem(
+                &c.chunk.file_path,
+            );
+            let count = stem_counts.entry(stem).or_insert(0);
+            if *count < max_per_family {
+                *count += 1;
+                stem_deduped.push(c);
+            }
+        }
+        stem_deduped
+    }
+
     pub async fn execute(
         state: &mut AgenticGraphState,
         engine: &ScatterGatherEngine,
@@ -1053,23 +1075,10 @@ impl RetrieveMeshNode {
             chunks = crate::offline_engine::DeterministicOfflineSynthesisEngine::stitch_parent_document_chunks(chunks);
         }
 
-        // Cap stitched sections per (source_peer, normalized document stem) (max 3 per stem per peer)
-        // so remote peer copies of the same document are NEVER dropped when the document also exists locally,
-        // while keeping multi-section career timelines intact.
-        let mut stem_counts: std::collections::HashMap<(String, String), usize> =
-            std::collections::HashMap::new();
-        let mut stem_deduped: Vec<quorum_types::ScoredChunk> = Vec::with_capacity(chunks.len());
-        for c in chunks {
-            let stem = crate::offline_engine::DeterministicOfflineSynthesisEngine::normalize_file_stem(
-                &c.chunk.file_path,
-            );
-            let count = stem_counts.entry((c.source_peer.clone(), stem)).or_insert(0);
-            if *count < 3 {
-                *count += 1;
-                stem_deduped.push(c);
-            }
-        }
-        chunks = stem_deduped;
+        // Cap stitched sections per document family stem across the entire federation (max 2 per stem)
+        // so redundant revisions (e.g. Resume_v1.pdf, Resume_v2.pdf, Resume_Final.docx) across local and mesh nodes
+        // do not starve search context diversity.
+        chunks = Self::cap_document_families_federated(chunks, 2);
 
         // Snapshot top remote peer chunks (`source_peer != "local"`), prioritizing distinct connected peers first,
         // so federated stitched results from connected computers are interleaved near the top alongside local results.

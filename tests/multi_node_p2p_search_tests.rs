@@ -433,7 +433,6 @@ impl quorum_coordinator::StorageSearcher for DelayedStorageSearcher {
         self.inner
             .search_hybrid(query_text, query_vec, max_tier, top_k)
             .await
-            .unwrap_or_default()
     }
 
     async fn search_text(
@@ -445,7 +444,6 @@ impl quorum_coordinator::StorageSearcher for DelayedStorageSearcher {
         self.inner
             .search_text(query, max_tier, top_k)
             .await
-            .unwrap_or_default()
     }
 
     async fn get_chunks_by_ids(
@@ -454,12 +452,23 @@ impl quorum_coordinator::StorageSearcher for DelayedStorageSearcher {
         max_tier: u8,
     ) -> Vec<quorum_types::DocumentChunk> {
         self.inner
-            .get_chunks_by_ids(chunk_ids)
+            .get_chunks_by_ids(chunk_ids, max_tier)
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| c.access_tier <= max_tier)
-            .collect()
+    }
+
+    fn index_epoch(&self) -> u64 {
+        self.inner.index_epoch()
+    }
+
+    fn expand_parent_window(
+        &self,
+        doc_id_or_path: &str,
+        anchor_text: &str,
+        window_bytes: usize,
+        max_tier: u8,
+    ) -> Option<(usize, usize, String, Option<String>, Option<String>)> {
+        self.inner
+            .expand_parent_window(doc_id_or_path, anchor_text, window_bytes, max_tier)
     }
 }
 
@@ -679,8 +688,16 @@ async fn test_p2p_watcher_450ms_peer_query_and_disconnect_auto_heal() {
     )
     .await;
     assert!(healed >= 1, "P2P Watcher heal must redial disconnected bootstrap peer");
+    let mut reconnected = false;
+    for _ in 0..40 {
+        if handle_a.connected_peers().await.unwrap().contains(&peer_id_b) {
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
-        handle_a.connected_peers().await.unwrap().contains(&peer_id_b),
+        reconnected,
         "P2P Watcher heal must restore live libp2p session to Peer B"
     );
 

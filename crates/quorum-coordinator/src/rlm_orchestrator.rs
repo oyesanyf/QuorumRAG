@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use quorum_contract::rlm::*;
 use crate::hardware::HardwareTelemetry;
 use crate::offline_engine::DeterministicOfflineSynthesisEngine;
+pub use rhai;
 use rhai::{Dynamic, Engine, Scope};
 
 /// Workspace state shared between the host and embedded Rhai REPL environment.
@@ -380,6 +381,342 @@ impl RlmOrchestrator {
         }
     }
 
+    /// Configures the Rhai execution engine with full `StorageSearcher` parent-document host functions:
+    /// `peek_slice(doc_id, start_byte, end_byte)` and `regex_grep(doc_id, pattern)`.
+    pub fn create_sandboxed_engine_with_storage(
+        config: &RlmConfig,
+        workspace: Arc<Mutex<RlmWorkspaceState>>,
+        fast_map_model: String,
+        storage: Arc<dyn crate::scatter_gather::StorageSearcher>,
+        max_tier: u8,
+    ) -> Engine {
+        let mut engine = Self::create_sandboxed_engine(config, workspace, fast_map_model);
+
+        let st_peek = Arc::clone(&storage);
+        engine.register_fn(
+            "peek_slice",
+            move |doc_id: &str, start_byte: i64, end_byte: i64| -> String {
+                let s = start_byte.max(0) as usize;
+                let e = end_byte.max(start_byte).max(0) as usize;
+                st_peek
+                    .peek_slice(doc_id, s, e, max_tier)
+                    .unwrap_or_default()
+            },
+        );
+
+        let st_grep = Arc::clone(&storage);
+        engine.register_fn("regex_grep", move |doc_id: &str, pattern: &str| -> rhai::Array {
+            let spans = st_grep.regex_grep(doc_id, pattern, 12, max_tier);
+            let mut arr = rhai::Array::new();
+            for sp in spans {
+                arr.push(Dynamic::from(format!(
+                    "[bytes {}..{}] {}",
+                    sp.start_byte,
+                    sp.end_byte,
+                    sp.context_window.trim()
+                )));
+            }
+            arr
+        });
+
+        engine
+    }
+
+    /// Enforces the LangExtract verbatim substring grounding invariant (`source_text.contains(quote)`).
+    /// Any citation whose `cited_text` is not an exact verbatim substring of `source_text` is rejected,
+    /// and accepted citations receive exact UTF-8 byte offsets `[start_char..end_char]` in `source_text`.
+    pub fn verify_rlm_action_citations(
+        source_text: &str,
+        citations: Vec<GroundedCitation>,
+    ) -> Vec<GroundedCitation> {
+        let mut verified = Vec::new();
+        if source_text.is_empty() {
+            return verified;
+        }
+        for mut cit in citations {
+            let stripped = cit.cited_text.trim();
+            let candidate = if stripped.starts_with('[') {
+                stripped
+                    .find(']')
+                    .map(|p| stripped[p + 1..].trim())
+                    .unwrap_or(stripped)
+            } else {
+                stripped
+            };
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Some(byte_pos) = source_text.find(candidate) {
+                cit.start_char = byte_pos;
+                cit.end_char = byte_pos + candidate.len();
+                cit.cited_text = candidate.to_string();
+                if cit.rationale.is_none() {
+                    cit.rationale = Some("Verified exact verbatim substring in parent document".to_string());
+                }
+                verified.push(cit);
+            }
+        }
+        verified
+    }
+
+    /// Selects the highest-signal verbatim line/clause from `raw_source` matching `answer` + `prompt`,
+    /// strictly guaranteeing `raw_source.contains(&quote)` and returning `(quote, rel_start_byte, rel_end_byte, overlap_terms)`.
+    pub fn extract_best_verbatim_span(
+        prompt: &str,
+        answer: &str,
+        raw_source: &str,
+    ) -> Option<(String, usize, usize, usize)> {
+        if raw_source.trim().is_empty() {
+            return None;
+        }
+
+        const STOP: &[&str] = &[
+            "the", "and", "for", "with", "that", "this", "from", "have", "has", "had",
+            "are", "was", "were", "what", "who", "where", "when", "which", "about",
+            "tell", "show", "give", "into", "their", "there", "also", "been", "more",
+        ];
+
+        let mut target_terms: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for src in [prompt, answer] {
+            for tok in src.split(|c: char| !c.is_alphanumeric()) {
+                let low = tok.to_ascii_lowercase();
+                if low.len() >= 3 && !STOP.contains(&low.as_str()) {
+                    target_terms.insert(low);
+                }
+            }
+        }
+
+        let mut best: Option<(i64, &str, usize)> = None;
+        for line in raw_source.lines() {
+            let trimmed = line.trim();
+            if trimmed.len() < 12 {
+                continue;
+            }
+            if trimmed.starts_with("[Document:")
+                || trimmed.starts_with("[Parent Document Match")
+                || trimmed.starts_with("[Image Document:")
+                || trimmed.starts_with("[Audio Document:")
+                || trimmed.starts_with("Format: ")
+                || trimmed.starts_with("Resolution: ")
+            {
+                continue;
+            }
+
+            // Clamp candidate to <= 260 bytes on a clean UTF-8 char/whitespace boundary while remaining a slice of `trimmed`
+            let candidate = if trimmed.len() <= 260 {
+                trimmed
+            } else {
+                let rough = safe_truncate_str(trimmed, 260);
+                match rough.rfind(char::is_whitespace) {
+                    Some(ws) if ws >= 60 => rough[..ws].trim(),
+                    _ => rough.trim(),
+                }
+            };
+            if candidate.len() < 12 || !raw_source.contains(candidate) {
+                continue;
+            }
+
+            let mut overlap = 0usize;
+            for tok in candidate.split(|c: char| !c.is_alphanumeric()) {
+                let low = tok.to_ascii_lowercase();
+                if target_terms.contains(&low) {
+                    overlap += 1;
+                }
+            }
+            let digit_bonus = if candidate.chars().any(|c| c.is_ascii_digit()) { 2i64 } else { 0i64 };
+            let len_bonus = (candidate.len().min(180) / 30) as i64;
+            let score = (overlap as i64) * 10 + digit_bonus + len_bonus;
+
+            if best.as_ref().map(|(b_sc, _, _)| score > *b_sc).unwrap_or(true) {
+                best = Some((score, candidate, overlap));
+            }
+        }
+
+        let (_, quote_slice, overlap) = best?;
+        let start_byte = raw_source.find(quote_slice)?;
+        let end_byte = start_byte + quote_slice.len();
+        Some((quote_slice.to_string(), start_byte, end_byte, overlap))
+    }
+
+    /// Live RLM Parent-Document Environment Pass (`expand_parent_window` + `regex_grep`):
+    /// Before synthesis, expands top local retrieved chunks into wider contiguous slices of their
+    /// unchunked `IngestedParentDocument` (`0..10000` bytes for primary search hits and document head
+    /// anchors, `±3000` bytes for trailing hits) so multi-row tables, timelines, credentials, executive
+    /// summaries, and surrounding paragraphs severed at chunk boundaries are restored intact, and runs
+    /// bounded `regex_grep` across the full parent document for any high-signal query terms not yet visible
+    /// in the local chunk window. Remote P2P `(mesh)` chunks are preserved 100% untouched.
+    pub fn enrich_retrieved_chunks_with_parent_rlm(
+        prompt: &str,
+        chunks: &mut [quorum_types::ScoredChunk],
+        storage: &dyn crate::scatter_gather::StorageSearcher,
+        max_tier: u8,
+    ) {
+        const STOPWORDS: &[&str] = &[
+            "the", "and", "for", "with", "that", "this", "from", "what", "who", "where",
+            "when", "which", "how", "tell", "about", "show", "give", "list", "find",
+            "does", "have", "has", "his", "her", "their", "details", "information",
+        ];
+
+        let query_terms: Vec<String> = prompt
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|w| w.to_ascii_lowercase())
+            .filter(|w| w.len() >= 3 && !STOPWORDS.contains(&w.as_str()))
+            .collect();
+
+        let mut enriched_local_count = 0usize;
+        for scored in chunks.iter_mut() {
+            if enriched_local_count >= 12 {
+                break;
+            }
+            // Never alter or drop federated P2P mesh peer chunks
+            if scored.is_remote
+                || (!scored.source_peer.is_empty() && !scored.source_peer.eq_ignore_ascii_case("local"))
+            {
+                continue;
+            }
+            let head = scored.chunk.text_content.trim_start();
+            if head.starts_with("[Image Document:") || head.starts_with("[Audio Document:") {
+                continue;
+            }
+
+            let doc_key = if !scored.chunk.file_path.is_empty() {
+                scored.chunk.file_path.clone()
+            } else {
+                scored.chunk.document_id.clone()
+            };
+
+            // Primary search hits and Chunk 0 title blocks expand into deep parent-document
+            // byte windows (0..10000 bytes) so executive summaries, work histories, and research bodies
+            // are included alongside contact headers. Trailing lower-rank chunks expand to 3000 bytes.
+            let is_chunk_0 = scored.chunk.chunk_id.ends_with(":0")
+                || scored.chunk.line_start <= 25
+                || serde_json::from_str::<serde_json::Value>(&scored.chunk.metadata_json)
+                    .ok()
+                    .and_then(|v| v.get("chunk_index").and_then(|idx| idx.as_u64()))
+                    .map(|idx| idx == 0)
+                    .unwrap_or(false);
+            let is_primary_hit = enriched_local_count < 6 || is_chunk_0;
+            let window_bytes = if is_primary_hit { 10000 } else { 3000 };
+
+            let Some((win_start, win_end, mut expanded_text, title_opt, author_opt)) =
+                storage.expand_parent_window(&doc_key, &scored.chunk.text_content, window_bytes, max_tier)
+            else {
+                continue;
+            };
+
+            if expanded_text.trim().is_empty() {
+                continue;
+            }
+
+            // RLM RegexGrep probe: check if any high-signal query terms occur elsewhere in the full parent document
+            let win_low = expanded_text.to_ascii_lowercase();
+            let missing_terms: Vec<String> = query_terms
+                .iter()
+                .filter(|qt| !win_low.contains(qt.as_str()))
+                .take(4)
+                .map(|qt| regex::escape(qt))
+                .collect();
+
+            if !missing_terms.is_empty() {
+                let pattern = format!("(?:{})", missing_terms.join("|"));
+                let grep_hits = storage.regex_grep(&doc_key, &pattern, 3, max_tier);
+                for hit in grep_hits {
+                    if hit.start_byte < win_start || hit.end_byte > win_end {
+                        let ctx = hit.context_window.trim();
+                        if !ctx.is_empty() && !expanded_text.contains(ctx) {
+                            expanded_text.push_str(&format!(
+                                "\n\n[Parent Document Match @ bytes {}..{}]\n{}",
+                                hit.start_byte, hit.end_byte, ctx
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Prepend OpenXML/PDF authorship & title provenance if present
+            let mut header_parts = Vec::new();
+            if let Some(t) = title_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                header_parts.push(format!("Title: \"{}\"", t));
+            }
+            if let Some(a) = author_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                header_parts.push(format!("Author: {}", a));
+            }
+            let final_text = if !header_parts.is_empty() && !expanded_text.trim_start().starts_with("[Document:") {
+                format!("[Document: {}]\n{}", header_parts.join(" | "), expanded_text)
+            } else {
+                expanded_text
+            };
+
+            let mut meta_val = serde_json::from_str::<serde_json::Value>(&scored.chunk.metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = meta_val.as_object_mut() {
+                obj.insert("parent_window_start_byte".to_string(), serde_json::json!(win_start));
+                obj.insert("parent_window_end_byte".to_string(), serde_json::json!(win_end));
+                obj.insert("rlm_parent_enriched".to_string(), serde_json::json!(true));
+            }
+            scored.chunk.metadata_json = meta_val.to_string();
+            scored.chunk.text_content = final_text;
+            enriched_local_count += 1;
+        }
+    }
+
+    /// Attaches verified verbatim quotes, exact UTF-8 byte spans, and grounding rationales
+    /// onto outgoing `Citation` records, strictly enforcing `source_text.contains(&verbatim_quote)`.
+    pub fn verify_and_attach_verbatim_grounding(
+        prompt: &str,
+        answer: &str,
+        chunks: &[&quorum_types::ScoredChunk],
+        citations: &mut [quorum_types::Citation],
+    ) {
+        for cit in citations.iter_mut() {
+            let matched = chunks
+                .iter()
+                .copied()
+                .find(|c| c.source_peer == cit.peer_id && c.chunk.file_path == cit.file_path)
+                .or_else(|| chunks.iter().copied().find(|c| c.chunk.file_path == cit.file_path));
+
+            let Some(sc) = matched else {
+                continue;
+            };
+            let raw_source = &sc.chunk.text_content;
+            let Some((quote, rel_start, rel_end, overlap_terms)) =
+                Self::extract_best_verbatim_span(prompt, answer, raw_source)
+            else {
+                continue;
+            };
+
+            // Absolute invariant: never emit a verbatim_quote that is not a literal substring of raw_source
+            if !raw_source.contains(&quote) {
+                continue;
+            }
+
+            let base_byte = serde_json::from_str::<serde_json::Value>(&sc.chunk.metadata_json)
+                .ok()
+                .and_then(|v| v.get("parent_window_start_byte").and_then(|b| b.as_u64()))
+                .unwrap_or(0) as usize;
+
+            // Adjust for optional synthetic `[Document: ...]\n` prefix line added during enrichment
+            let header_prefix_bytes = if raw_source.starts_with("[Document:") {
+                raw_source.find('\n').map(|i| i + 1).unwrap_or(0)
+            } else {
+                0
+            };
+            let adjusted_rel = rel_start.saturating_sub(header_prefix_bytes);
+            let abs_start = base_byte.saturating_add(adjusted_rel);
+            let abs_end = abs_start + (rel_end - rel_start);
+
+            cit.verbatim_quote = Some(quote.clone());
+            cit.byte_range = Some((abs_start, abs_end));
+            cit.grounding_rationale = Some(format!(
+                "Verified exact verbatim substring ({} matched query/answer term(s), bytes {}..{})",
+                overlap_terms, abs_start, abs_end
+            ));
+            if cit.snippet.trim().is_empty() || cit.snippet.trim_start().starts_with("[Document:") {
+                cit.snippet = quote;
+            }
+        }
+    }
+
     /// Computes character-span source-grounded citations across the answer text.
     pub fn compute_grounded_citations(
         answer: &str,
@@ -391,10 +728,25 @@ impl RlmOrchestrator {
         }
 
         for (idx, c) in chunks.iter().enumerate() {
-            let excerpt_len = c.text.len().min(80);
-            let sample_snippet = &c.text[..excerpt_len];
-            let start = answer.find(sample_snippet).unwrap_or(0);
-            let end = if start > 0 { start + excerpt_len } else { 0 };
+            let (quote, start, end, rationale) =
+                if let Some((q, s_b, e_b, ov)) = Self::extract_best_verbatim_span("", answer, &c.text) {
+                    (
+                        q,
+                        s_b,
+                        e_b,
+                        Some(format!("Verified verbatim span ({} term overlap)", ov)),
+                    )
+                } else {
+                    let sample_snippet = safe_truncate_str(&c.text, 80);
+                    let st = c.text.find(sample_snippet).unwrap_or(0);
+                    let en = st + sample_snippet.len();
+                    (
+                        format!("[{}] {}", idx + 1, c.text.chars().take(120).collect::<String>()),
+                        st,
+                        en,
+                        Some("Chunk head excerpt".to_string()),
+                    )
+                };
 
             let peer = c.node_id.clone().unwrap_or_else(|| {
                 if c.is_external {
@@ -409,11 +761,12 @@ impl RlmOrchestrator {
                 file_path: c.file_path.clone(),
                 start_char: start,
                 end_char: end,
-                cited_text: format!("[{}] {}", idx + 1, c.text.chars().take(120).collect::<String>()),
+                cited_text: quote,
                 confidence: c.score.clamp(0.1, 1.0),
                 node_id: peer,
                 is_external: c.is_external,
                 node_alias: c.node_alias.clone(),
+                rationale,
             });
         }
         citations
