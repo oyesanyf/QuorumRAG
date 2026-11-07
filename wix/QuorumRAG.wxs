@@ -117,16 +117,71 @@
             <ComponentRef Id="DesktopShortcuts" />
         </Feature>
 
-        <!-- Scoped Private-LAN Firewall Rule for QuorumRAG Web UI & libp2p mDNS/QUIC/TCP
+        <!-- Scoped Private-LAN Firewall Rules for QuorumRAG P2P Mesh & libp2p mDNS/UDP/TCP
              Opt out during silent install via: msiexec /i QuorumRAG-0.6.0-x86_64.msi FIREWALLRULE=0 -->
         <Property Id="FIREWALLRULE" Value="1" Secure="yes" />
-        <CustomAction Id="AddQuorumFirewallRule"
+        <CustomAction Id="AddQuorumFirewallRule_In_Program"
                       Directory="INSTALLFOLDER"
                       Execute="deferred"
                       Impersonate="no"
                       Return="ignore"
-                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Mesh&quot; dir=in action=allow program=&quot;[INSTALLFOLDER]quorumrag.exe&quot; enable=yes profile=any" />
-        <CustomAction Id="RemoveQuorumFirewallRule"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Mesh (Program-In)&quot; dir=in action=allow program=&quot;[INSTALLFOLDER]quorumrag.exe&quot; enable=yes profile=any" />
+        <CustomAction Id="AddQuorumFirewallRule_In_UDP"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG LAN Discovery (UDP 5353-In)&quot; dir=in action=allow protocol=UDP localport=5353 enable=yes profile=private" />
+        <CustomAction Id="AddQuorumFirewallRule_Out_UDP"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG LAN Discovery (UDP 5353-Out)&quot; dir=out action=allow protocol=UDP localport=5353 enable=yes profile=private" />
+        <CustomAction Id="AddQuorumFirewallRule_In_TCP"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Swarm (TCP 3032-In)&quot; dir=in action=allow protocol=TCP localport=3032 enable=yes profile=private" />
+        <CustomAction Id="AddQuorumFirewallRule_Out_TCP"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall add rule name=&quot;QuorumRAG P2P Swarm (TCP 3032-Out)&quot; dir=out action=allow protocol=TCP remoteport=3032 enable=yes profile=private" />
+
+        <CustomAction Id="RemoveQuorumFirewallRule_In_Program"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG P2P Mesh (Program-In)&quot;" />
+        <CustomAction Id="RemoveQuorumFirewallRule_In_UDP"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG LAN Discovery (UDP 5353-In)&quot;" />
+        <CustomAction Id="RemoveQuorumFirewallRule_Out_UDP"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG LAN Discovery (UDP 5353-Out)&quot;" />
+        <CustomAction Id="RemoveQuorumFirewallRule_In_TCP"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG P2P Swarm (TCP 3032-In)&quot;" />
+        <CustomAction Id="RemoveQuorumFirewallRule_Out_TCP"
+                      Directory="INSTALLFOLDER"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="&quot;[System64Folder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;QuorumRAG P2P Swarm (TCP 3032-Out)&quot;" />
+        <CustomAction Id="RemoveQuorumFirewallRule_Legacy"
                       Directory="INSTALLFOLDER"
                       Execute="deferred"
                       Impersonate="no"
@@ -192,8 +247,17 @@
                  file-removal phase instead. Idempotent no-ops when nothing is left over. -->
             <Custom Action="StopDeleteQuorumServiceUninstall" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT REINSTALL" />
             <Custom Action="KillQuorumOrphans" Before="InstallInitialize" Condition="NOT Installed AND NOT REINSTALL" />
-            <Custom Action="AddQuorumFirewallRule" After="InstallFiles" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
-            <Custom Action="RemoveQuorumFirewallRule" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="AddQuorumFirewallRule_In_Program" After="InstallFiles" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="AddQuorumFirewallRule_In_UDP" After="AddQuorumFirewallRule_In_Program" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="AddQuorumFirewallRule_Out_UDP" After="AddQuorumFirewallRule_In_UDP" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="AddQuorumFirewallRule_In_TCP" After="AddQuorumFirewallRule_Out_UDP" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="AddQuorumFirewallRule_Out_TCP" After="AddQuorumFirewallRule_In_TCP" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="RemoveQuorumFirewallRule_In_Program" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="RemoveQuorumFirewallRule_In_UDP" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="RemoveQuorumFirewallRule_Out_UDP" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="RemoveQuorumFirewallRule_In_TCP" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="RemoveQuorumFirewallRule_Out_TCP" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="RemoveQuorumFirewallRule_Legacy" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
             <Custom Action="RemoveQuorumData" After="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND REMOVEDATA=&quot;1&quot; AND NOT UPGRADINGPRODUCTCODE" />
             <Custom Action="LaunchQuorumWebUi" After="InstallFinalize" Condition="LAUNCHBROWSER=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
         </InstallExecuteSequence>

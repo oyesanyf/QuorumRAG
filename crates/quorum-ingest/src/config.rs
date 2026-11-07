@@ -360,33 +360,167 @@ impl IngestConfig {
         }
     }
 
+    /// Discovers user profile directories from Windows Registry ProfileList
+    /// (HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList),
+    /// skipping standard system SIDs (S-1-5-18 LocalSystem, S-1-5-19 LocalService, S-1-5-20 NetworkService).
+    #[cfg(target_os = "windows")]
+    fn discover_profiles_from_registry() -> Vec<PathBuf> {
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn RegOpenKeyExW(
+                hKey: *mut std::ffi::c_void,
+                lpSubKey: *const u16,
+                ulOptions: u32,
+                samDesired: u32,
+                phkResult: *mut *mut std::ffi::c_void,
+            ) -> i32;
+
+            fn RegEnumKeyExW(
+                hKey: *mut std::ffi::c_void,
+                dwIndex: u32,
+                lpName: *mut u16,
+                lpcchName: *mut u32,
+                lpReserved: *mut u32,
+                lpClass: *mut u16,
+                lpcchClass: *mut u32,
+                lpftLastWriteTime: *mut std::ffi::c_void,
+            ) -> i32;
+
+            fn RegQueryValueExW(
+                hKey: *mut std::ffi::c_void,
+                lpValueName: *const u16,
+                lpReserved: *const u32,
+                lpType: *mut u32,
+                lpData: *mut u8,
+                lpcbData: *mut u32,
+            ) -> i32;
+
+            fn RegCloseKey(hKey: *mut std::ffi::c_void) -> i32;
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn ExpandEnvironmentStringsW(
+                lpSrc: *const u16,
+                lpDst: *mut u16,
+                nSize: u32,
+            ) -> u32;
+        }
+
+        const HKEY_LOCAL_MACHINE: *mut std::ffi::c_void = 0x80000002u32 as usize as *mut std::ffi::c_void;
+        const KEY_READ: u32 = 0x20019;
+        const SKIP_SIDS: &[&str] = &["s-1-5-18", "s-1-5-19", "s-1-5-20"];
+
+        let mut profiles = Vec::new();
+        unsafe {
+            let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\0"
+                .encode_utf16()
+                .collect();
+            let mut h_profile_list: *mut std::ffi::c_void = std::ptr::null_mut();
+
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut h_profile_list) != 0 {
+                return profiles;
+            }
+
+            let mut index = 0u32;
+            let mut name_buf = [0u16; 256];
+            loop {
+                let mut name_len = name_buf.len() as u32;
+                let status = RegEnumKeyExW(
+                    h_profile_list,
+                    index,
+                    name_buf.as_mut_ptr(),
+                    &mut name_len,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                if status != 0 {
+                    break;
+                }
+                index += 1;
+
+                let sid_str = String::from_utf16_lossy(&name_buf[..name_len as usize]).to_ascii_lowercase();
+                if SKIP_SIDS.iter().any(|s| sid_str == *s || sid_str.starts_with(&format!("{}.", s))) {
+                    continue;
+                }
+
+                let sub_subkey: Vec<u16> = format!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{}\0", sid_str)
+                    .encode_utf16()
+                    .collect();
+                let mut h_sid: *mut std::ffi::c_void = std::ptr::null_mut();
+                if RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_subkey.as_ptr(), 0, KEY_READ, &mut h_sid) == 0 {
+                    let val_name: Vec<u16> = "ProfileImagePath\0".encode_utf16().collect();
+                    let mut data_type = 0u32;
+                    let mut data_size = 0u32;
+
+                    if RegQueryValueExW(
+                        h_sid,
+                        val_name.as_ptr(),
+                        std::ptr::null(),
+                        &mut data_type,
+                        std::ptr::null_mut(),
+                        &mut data_size,
+                    ) == 0 && data_size > 0 {
+                        let mut raw_data = vec![0u8; data_size as usize + 2];
+                        if RegQueryValueExW(
+                            h_sid,
+                            val_name.as_ptr(),
+                            std::ptr::null(),
+                            &mut data_type,
+                            raw_data.as_mut_ptr(),
+                            &mut data_size,
+                        ) == 0 {
+                            let u16_slice = std::slice::from_raw_parts(
+                                raw_data.as_ptr() as *const u16,
+                                data_size as usize / 2,
+                            );
+                            let trimmed_u16 = if let Some(pos) = u16_slice.iter().position(|&c| c == 0) {
+                                &u16_slice[..pos]
+                            } else {
+                                u16_slice
+                            };
+
+                            let raw_path = String::from_utf16_lossy(trimmed_u16);
+                            let src_wide: Vec<u16> = raw_path.encode_utf16().chain(Some(0)).collect();
+                            let mut dst_wide = [0u16; 1024];
+                            let exp_len = ExpandEnvironmentStringsW(
+                                src_wide.as_ptr(),
+                                dst_wide.as_mut_ptr(),
+                                dst_wide.len() as u32,
+                            );
+                            let final_path_str = if exp_len > 0 && exp_len <= dst_wide.len() as u32 {
+                                String::from_utf16_lossy(&dst_wide[..(exp_len as usize - 1)])
+                            } else {
+                                raw_path
+                            };
+
+                            let path = PathBuf::from(final_path_str);
+                            if path.is_dir() && !profiles.contains(&path) {
+                                profiles.push(path);
+                            }
+                        }
+                    }
+                    RegCloseKey(h_sid);
+                }
+            }
+            RegCloseKey(h_profile_list);
+        }
+        profiles
+    }
+
     /// Discovers real human user document roots across the host system in Session 0,
     /// strictly avoiding system profiles (LocalSystem systemprofile, LocalService, NetworkService),
     /// virtual/junction directories (All Users, Default User), hidden system profiles (Default),
-    /// and non-directory files (desktop.ini).
+    /// and non-directory files (desktop.ini), while supporting OneDrive and cloud-sync directory
+    /// reparse points without infinite recursion.
     pub fn discover_user_document_roots() -> Vec<PathBuf> {
         let mut roots = Vec::new();
 
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::fs::MetadataExt;
-
-            let mut candidate_user_dirs = Vec::new();
-
-            // 1. Primary Users directory on SystemDrive (usually C:\Users)
-            let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
-            let primary_users = PathBuf::from(format!("{}\\Users", sys_drive));
-            if primary_users.is_dir() {
-                candidate_user_dirs.push(primary_users);
-            }
-
-            // 2. Users directory on any other fixed physical data drives
-            for drive in Self::discover_physical_drives() {
-                let users_dir = drive.join("Users");
-                if users_dir.is_dir() && !candidate_user_dirs.contains(&users_dir) {
-                    candidate_user_dirs.push(users_dir);
-                }
-            }
 
             const SKIP_PROFILE_NAMES: &[&str] = &[
                 "all users",
@@ -404,6 +538,41 @@ impl IngestConfig {
             const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
             const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
+            let mut candidate_profiles = Vec::new();
+
+            // 1. Discover user profiles via Windows Registry ProfileList (Session 0 LocalSystem support)
+            for reg_profile in Self::discover_profiles_from_registry() {
+                let name = reg_profile
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !name.starts_with('.')
+                    && !name.starts_with('$')
+                    && !SKIP_PROFILE_NAMES.contains(&name.as_str())
+                    && reg_profile.is_dir()
+                    && std::fs::read_dir(&reg_profile).is_ok()
+                    && !candidate_profiles.contains(&reg_profile)
+                {
+                    candidate_profiles.push(reg_profile);
+                }
+            }
+
+            // 2. Discover user profiles via SystemDrive Users directory (usually C:\Users)
+            let mut candidate_user_dirs = Vec::new();
+            let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+            let primary_users = PathBuf::from(format!("{}\\Users", sys_drive));
+            if primary_users.is_dir() {
+                candidate_user_dirs.push(primary_users);
+            }
+
+            // 3. Discover Users directory on any other fixed physical data drives
+            for drive in Self::discover_physical_drives() {
+                let users_dir = drive.join("Users");
+                if users_dir.is_dir() && !candidate_user_dirs.contains(&users_dir) {
+                    candidate_user_dirs.push(users_dir);
+                }
+            }
+
             for users_base in candidate_user_dirs {
                 let Ok(entries) = std::fs::read_dir(&users_base) else {
                     continue;
@@ -420,7 +589,7 @@ impl IngestConfig {
                         continue;
                     }
 
-                    // Check metadata: must be a real directory and NOT a symlink or reparse point (e.g. All Users junction)
+                    // Check metadata: must be a real directory
                     let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
                         continue;
                     };
@@ -430,6 +599,8 @@ impl IngestConfig {
                     }
 
                     let attrs = sym_meta.file_attributes();
+                    // Reject junctions or hidden/system directories at the profile folder level
+                    // (e.g. All Users junction, Default User junction, Default profile)
                     if (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 {
                         continue;
                     }
@@ -439,43 +610,76 @@ impl IngestConfig {
                         continue;
                     }
 
-                    // Extract key document subfolders
-                    let mut user_roots = Vec::new();
-                    for sub in ["Documents", "Desktop", "Downloads", "Pictures"] {
-                        let sub_path = path.join(sub);
-                        if sub_path.is_dir() && std::fs::read_dir(&sub_path).is_ok() {
-                            if let Ok(meta) = std::fs::symlink_metadata(&sub_path) {
-                                if !meta.file_type().is_symlink()
-                                    && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
-                                {
-                                    user_roots.push(sub_path);
+                    if !candidate_profiles.contains(&path) {
+                        candidate_profiles.push(path);
+                    }
+                }
+            }
+
+            let mut seen_canonicals: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+            for path in candidate_profiles {
+                let mut user_roots = Vec::new();
+
+                // Helper to validate and add document roots safely:
+                // allows directory reparse points (OneDrive, cloud sync, junctions to real folders)
+                // while strictly rejecting cyclic directory loops or symlinks.
+                let mut try_add_folder = |dir: PathBuf, target_vec: &mut Vec<PathBuf>| {
+                    if !dir.is_dir() || std::fs::read_dir(&dir).is_err() {
+                        return;
+                    }
+                    // Canonicalize checks for loops and resolves targets
+                    if let Ok(canon) = std::fs::canonicalize(&dir) {
+                        if !canon.is_dir() || std::fs::read_dir(&canon).is_err() {
+                            return;
+                        }
+                        // Reject recursive loops that resolve to profile root or its ancestors
+                        if canon == path || path.starts_with(&canon) {
+                            return;
+                        }
+                        if seen_canonicals.insert(canon) {
+                            target_vec.push(dir);
+                        }
+                    } else if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+                        // If canonicalize failed, ensure it is a real directory and not a symlink
+                        if !meta.file_type().is_symlink() && dir.is_dir() && !target_vec.contains(&dir) {
+                            target_vec.push(dir);
+                        }
+                    }
+                };
+
+                // Standard document subfolders
+                for sub in ["Documents", "Desktop", "Downloads", "Pictures"] {
+                    let sub_path = path.join(sub);
+                    try_add_folder(sub_path, &mut user_roots);
+                }
+
+                // OneDrive & Cloud-sync sync directories (OneDrive, OneDrive - Business, etc.)
+                if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                    for entry in sub_entries.flatten() {
+                        let sub_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                        if sub_name.starts_with("onedrive") {
+                            let onedrive_dir = entry.path();
+                            if onedrive_dir.is_dir() && std::fs::read_dir(&onedrive_dir).is_ok() {
+                                for one_sub in ["Documents", "Desktop", "Pictures"] {
+                                    let one_sub_path = onedrive_dir.join(one_sub);
+                                    try_add_folder(one_sub_path, &mut user_roots);
                                 }
                             }
                         }
                     }
+                }
 
-                    // Also check OneDrive sync directories if present
-                    let onedrive = path.join("OneDrive");
-                    if onedrive.is_dir() && std::fs::read_dir(&onedrive).is_ok() {
-                        for sub in ["Documents", "Desktop", "Pictures"] {
-                            let one_sub = onedrive.join(sub);
-                            if one_sub.is_dir() && std::fs::read_dir(&one_sub).is_ok() && !user_roots.contains(&one_sub) {
-                                if let Ok(meta) = std::fs::symlink_metadata(&one_sub) {
-                                    if !meta.file_type().is_symlink()
-                                        && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
-                                    {
-                                        user_roots.push(one_sub);
-                                    }
-                                }
-                            }
+                if user_roots.is_empty() {
+                    if let Ok(canon) = std::fs::canonicalize(&path) {
+                        if seen_canonicals.insert(canon) {
+                            roots.push(path);
                         }
-                    }
-
-                    if user_roots.is_empty() {
+                    } else if !roots.contains(&path) {
                         roots.push(path);
-                    } else {
-                        roots.extend(user_roots);
                     }
+                } else {
+                    roots.extend(user_roots);
                 }
             }
         }

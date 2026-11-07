@@ -54,7 +54,12 @@ taskkill /f /im quorumrag.exe >nul 2>&1
 sc.exe delete "%SERVICE%"
 
 :firewall
-echo [3/4] Removing firewall rule...
+echo [3/4] Removing firewall rules...
+netsh advfirewall firewall delete rule name="QuorumRAG P2P Mesh (Program-In)" >nul 2>&1
+netsh advfirewall firewall delete rule name="QuorumRAG LAN Discovery (UDP 5353-In)" >nul 2>&1
+netsh advfirewall firewall delete rule name="QuorumRAG LAN Discovery (UDP 5353-Out)" >nul 2>&1
+netsh advfirewall firewall delete rule name="QuorumRAG P2P Swarm (TCP 3032-In)" >nul 2>&1
+netsh advfirewall firewall delete rule name="QuorumRAG P2P Swarm (TCP 3032-Out)" >nul 2>&1
 netsh advfirewall firewall delete rule name="QuorumRAG P2P Mesh" >nul 2>&1
 
 echo [4/4] Removing leftover files...

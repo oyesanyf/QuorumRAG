@@ -89,7 +89,7 @@ fn test_discover_user_document_roots_filters_system_profiles_and_junctions() {
                 );
             }
 
-            // Verify the discovered directory is NOT a symlink or reparse point
+            // Verify the discovered directory is NOT a symlink
             let sym_meta = std::fs::symlink_metadata(root)
                 .unwrap_or_else(|e| panic!("Failed to read symlink metadata for {:?}: {}", root, e));
             assert!(
@@ -98,14 +98,17 @@ fn test_discover_user_document_roots_filters_system_profiles_and_junctions() {
                 root
             );
 
+            // Under Milestone M25, directory reparse points for OneDrive and cloud-sync user folders
+            // ARE supported. Verify that if a reparse point is returned, it is a genuine traversable
+            // directory that resolves cleanly without cyclic loops.
             use std::os::windows::fs::MetadataExt;
             const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-            assert_eq!(
-                sym_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
-                0,
-                "Discovered root {:?} must not be an NTFS reparse point/junction",
-                root
-            );
+            if (sym_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                let canon = std::fs::canonicalize(root)
+                    .unwrap_or_else(|e| panic!("Reparse point root {:?} failed canonicalize: {}", root, e));
+                assert!(canon.is_dir(), "Reparse point canonical target must be a directory: {:?}", canon);
+                assert!(std::fs::read_dir(&canon).is_ok(), "Reparse point canonical target must be readable: {:?}", canon);
+            }
         }
 
         // Verify that roots do not contain raw 'All Users' or 'Default User'
@@ -891,13 +894,14 @@ fn test_adversarial_unicode_and_spaces_user_profiles() {
     }
 }
 
-/// 8. Adversarial Challenge 3: OneDrive Sync Folders and Nested Reparse Point Rejection
+/// 8. Adversarial Challenge 3: OneDrive Sync Folders and Directory Reparse Point Support
 /// - User "CloudUser" with genuine `OneDrive\Documents` and `OneDrive\Desktop`.
-/// - `OneDrive\Pictures` is present (must NOT be discovered because only Documents & Desktop are targeted).
-/// - An NTFS junction inside `OneDrive\Desktop_Junction` pointing elsewhere.
-/// - `OneDrive\Desktop` is turned into an NTFS junction -> must be rejected because it's a reparse point.
+/// - Reparse point support: `OneDrive\Documents` is created as an NTFS directory junction / reparse point
+///   (simulating Windows Cloud-Sync reparse points like OneDrive / iCloud) -> MUST be discovered!
+/// - Recursive cyclic junction: `OneDrive\CyclicLoop` pointing back to `CloudUser` -> MUST be rejected.
 /// Asserts that:
-/// - Only valid non-reparse OneDrive document folders are discovered.
+/// - Valid OneDrive directory reparse points ARE discovered and supported under Milestone M25.
+/// - Recursive junction loops are strictly rejected.
 #[cfg(target_os = "windows")]
 #[test]
 fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
@@ -909,15 +913,20 @@ fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
 
     let cloud_user = users_dir.join("CloudUser");
     let onedrive = cloud_user.join("OneDrive");
+    let target_docs = temp.path().join("CloudDocsStorage");
     let onedrive_docs = onedrive.join("Documents");
     let onedrive_desktop = onedrive.join("Desktop");
-    let onedrive_pictures = onedrive.join("Pictures");
+    let onedrive_loop = onedrive.join("CyclicLoop");
 
-    std::fs::create_dir_all(&onedrive_docs).expect("create onedrive docs");
-    std::fs::create_dir_all(&onedrive_pictures).expect("create onedrive pictures");
+    std::fs::create_dir_all(&target_docs).expect("create target docs");
+    std::fs::create_dir_all(&onedrive).expect("create onedrive dir");
+    std::fs::create_dir_all(&onedrive_desktop).expect("create onedrive desktop");
 
-    // Make Desktop a junction to another folder (e.g. Pictures)
-    create_junction(&onedrive_desktop, &onedrive_pictures).expect("create onedrive desktop junction");
+    // Create OneDrive\Documents as an NTFS junction / directory reparse point pointing to real storage
+    create_junction(&onedrive_docs, &target_docs).expect("create onedrive docs junction");
+
+    // Create a recursive cyclic loop junction pointing back to cloud_user
+    create_junction(&onedrive_loop, &cloud_user).expect("create cyclic junction loop");
 
     let temp_root_str = temp.path().to_str().expect("temp path to str");
     let _env_guard = EnvGuard::set("SystemDrive", temp_root_str);
@@ -929,22 +938,44 @@ fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
         .filter(|p| p.starts_with(&users_dir))
         .collect();
 
-    // Clean up junction
-    let _ = std::fs::remove_dir(&onedrive_desktop);
+    // Clean up junctions
+    let _ = std::fs::remove_dir(&onedrive_docs);
+    let _ = std::fs::remove_dir(&onedrive_loop);
 
-    // Only OneDrive/Documents should be accepted because Desktop was a junction and Pictures is non-target
+    // M25: OneDrive/Documents (directory reparse point) and OneDrive/Desktop MUST be accepted
     assert!(
         synthetic_roots.contains(&onedrive_docs),
-        "Must contain CloudUser/OneDrive/Documents"
+        "Must contain CloudUser/OneDrive/Documents even when it is an NTFS directory reparse point"
     );
     assert!(
-        !synthetic_roots.contains(&onedrive_desktop),
-        "Must NOT contain CloudUser/OneDrive/Desktop because it is an NTFS junction/reparse point"
+        synthetic_roots.contains(&onedrive_desktop),
+        "Must contain CloudUser/OneDrive/Desktop"
     );
+    // Recursive loop MUST be rejected
     assert!(
-        !synthetic_roots.contains(&onedrive_pictures),
-        "Must NOT contain CloudUser/OneDrive/Pictures because it is not a document root"
+        !synthetic_roots.contains(&onedrive_loop),
+        "Must NOT contain CloudUser/OneDrive/CyclicLoop because it is a recursive cyclic loop"
     );
+}
+
+/// 9. Milestone M25 Registry ProfileList and System Profile Invariants
+/// - Verifies that discover_user_document_roots never returns system SIDs (S-1-5-18, S-1-5-19, S-1-5-20).
+/// - Verifies that all discovered roots are valid directories and readable.
+#[test]
+fn test_m25_profile_list_discovery_skips_system_sids() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let discovered = IngestConfig::discover_user_document_roots();
+
+    for root in &discovered {
+        let lower = root.to_string_lossy().to_ascii_lowercase();
+        assert!(!lower.contains("s-1-5-18"), "Must not discover S-1-5-18 system profile: {:?}", root);
+        assert!(!lower.contains("s-1-5-19"), "Must not discover S-1-5-19 system profile: {:?}", root);
+        assert!(!lower.contains("s-1-5-20"), "Must not discover S-1-5-20 system profile: {:?}", root);
+        assert!(!lower.contains("systemprofile"), "Must not discover systemprofile: {:?}", root);
+        assert!(!lower.contains("localservice"), "Must not discover localservice: {:?}", root);
+        assert!(!lower.contains("networkservice"), "Must not discover networkservice: {:?}", root);
+        assert!(root.is_dir(), "Discovered path must be a directory: {:?}", root);
+    }
 }
 
 
