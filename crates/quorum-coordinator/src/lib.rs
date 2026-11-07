@@ -46,7 +46,7 @@ pub use fusion::RrfCombiner;
 pub use hardware::HardwareTelemetry;
 pub use mesh::{
     LocalOnlyDispatcher, MeshQueryDispatcher, MockMeshDispatcher, MockRemotePeer,
-    OsoosiMeshInboundHandler, SwarmMeshDispatcher,
+    global_peer_health_registry, OsoosiMeshInboundHandler, PeerHealthRegistry, PeerHealthStats, SwarmMeshDispatcher, P2P_WATCHER_CANARY_QUERY,
 };
 pub use model_router::AutoFusionRouter;
 pub use offline_engine::DeterministicOfflineSynthesisEngine;

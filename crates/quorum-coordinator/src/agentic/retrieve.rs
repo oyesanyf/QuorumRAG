@@ -282,8 +282,11 @@ impl RetrieveMeshNode {
         };
 
         // Dispatch primary query + supplemental queries concurrently via tokio::join!
-        let primary_fut = engine.execute_query_with_cached_vector_and_exclusion(
+        // Send the unbloated query (`state.current_query`) to remote P2P peers so 1.5M+ chunk remote corpora
+        // are not diluted by 7 generic BM25 expansion words, while keeping `search_query` for local storage.
+        let primary_fut = engine.execute_query_with_p2p_query_and_exclusion(
             &search_query,
+            &state.current_query,
             effective_vector,
             cached_hits_opt,
             access_tier,
@@ -292,33 +295,69 @@ impl RetrieveMeshNode {
         );
         let entity_fut = async {
             if let Some(ref q) = entity_kw_query_opt {
-                engine.search_federated_text(q, access_tier, 96).await
+                engine.local_storage.search_text(q, access_tier, 96).await
             } else {
                 Vec::new()
             }
         };
         let prompt_fut = async {
             if let Some(ref q) = prompt_kw_query_opt {
-                engine.search_federated_text(q, access_tier, 64).await
+                engine.local_storage.search_text(q, access_tier, 64).await
             } else {
                 Vec::new()
             }
         };
         let cue_fut = async {
             if let Some(ref q) = cue_query_opt {
-                engine.search_federated_text(q, access_tier, 48).await
+                engine.local_storage.search_text(q, access_tier, 48).await
             } else {
                 Vec::new()
             }
         };
 
         let (
-            (mut chunks, volatile, _duration, new_vector_hits),
+            (mut chunks, mut volatile, _duration, new_vector_hits),
             entity_hits,
             prompt_hits,
             cue_hits,
         ) = tokio::join!(primary_fut, entity_fut, prompt_fut, cue_fut);
 
+        let has_entity_matched_remote = !volatile.is_empty()
+            && (prelim_entities.is_empty()
+                || chunks.iter().any(|c| {
+                    c.is_remote && {
+                        let hay = format!(
+                            "{} {}",
+                            c.chunk.file_path.to_ascii_lowercase(),
+                            c.chunk.text_content.to_ascii_lowercase()
+                        );
+                        prelim_entities
+                            .iter()
+                            .any(|e| hay.contains(&e.to_ascii_lowercase()))
+                    }
+                }));
+        if !has_entity_matched_remote {
+            if let Some(ref entity_q) = entity_kw_query_opt {
+                if !entity_q.eq_ignore_ascii_case(&state.current_query) {
+                    let (fb_hits, fb_vol) = engine
+                        .search_federated_text_with_volatile(entity_q, access_tier, 48)
+                        .await;
+                    if !fb_vol.is_empty() {
+                        volatile.extend(fb_vol);
+                        let mut existing_remote: std::collections::HashSet<(String, String)> = chunks
+                            .iter()
+                            .filter(|c| c.is_remote)
+                            .map(|c| (c.source_peer.clone(), c.chunk.chunk_id.clone()))
+                            .collect();
+                        for hit in fb_hits.into_iter().filter(|h| h.is_remote) {
+                            if existing_remote.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
+                                chunks.push(hit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         tracing::info!(chunks = chunks.len(), volatile = volatile.len(), "Finished concurrent execute_query and supplemental federated queries");
 
         if !new_vector_hits.is_empty() && state.cached_vector_hits.is_empty() {
@@ -395,12 +434,23 @@ impl RetrieveMeshNode {
                 {
                     return false;
                 }
-                // Repo trees are excluded as code, except indexed media (e.g. D:\harfile\music\*.mp3).
+                // Repo trees are excluded as code, except indexed media, user office/PDF documents, and remote peer files.
                 let is_media = text_l.contains("[audio document:")
                     || text_l.contains("[image document:")
                     || text_l.contains("[video document:")
                     || text_l.contains("[ocr text]");
-                if !is_media && (path_l.contains("\\harfile\\") || path_l.contains("/harfile/")) {
+                let is_user_doc = file_l.ends_with(".pdf")
+                    || file_l.ends_with(".docx")
+                    || file_l.ends_with(".doc")
+                    || file_l.ends_with(".pptx")
+                    || file_l.ends_with(".xlsx")
+                    || file_l.ends_with(".rtf")
+                    || file_l.ends_with(".odt");
+                if !c.is_remote
+                    && !is_media
+                    && !is_user_doc
+                    && (path_l.contains("\\harfile\\") || path_l.contains("/harfile/"))
+                {
                     return false;
                 }
                 // Exclude coding tutorials / Google Colab notebooks / fenced code dumps when user did not ask for code
@@ -854,6 +904,20 @@ impl RetrieveMeshNode {
                 }
             };
 
+            // Stitch multi-chunk remote peer documents BEFORE term-quorum filtering (`paired.retain`)
+            // so a remote resume whose header chunk has the person's name and whose body chunk has Education
+            // merges into a single complete section instead of losing half its terms!
+            if chunks.iter().any(|c| c.is_remote) {
+                let (remote_candidates, mut local_candidates): (Vec<ScoredChunk>, Vec<ScoredChunk>) =
+                    chunks.into_iter().partition(|c| c.is_remote);
+                let stitched_remote =
+                    crate::offline_engine::DeterministicOfflineSynthesisEngine::stitch_parent_document_chunks(
+                        remote_candidates,
+                    );
+                local_candidates.extend(stitched_remote);
+                chunks = local_candidates;
+            }
+
             // Precompute criteria upfront into static structs for all candidates
             let mut paired: Vec<(ScoredChunk, ChunkScoreCriteria)> = chunks
                 .into_iter()
@@ -1007,14 +1071,31 @@ impl RetrieveMeshNode {
         }
         chunks = stem_deduped;
 
-        // Snapshot top remote peer chunks (`source_peer != "local"`) after parent-stitching and before MMR
-        // so federated stitched results from connected computers are guaranteed to appear alongside local results.
-        let preserved_remote: Vec<ScoredChunk> = chunks
-            .iter()
-            .filter(|c| c.source_peer != "local")
-            .take(4)
-            .cloned()
-            .collect();
+        // Snapshot top remote peer chunks (`source_peer != "local"`), prioritizing distinct connected peers first,
+        // so federated stitched results from connected computers are interleaved near the top alongside local results.
+        let mut preserved_remote: Vec<ScoredChunk> = Vec::new();
+        let mut seen_remote_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for rc in chunks.iter().filter(|c| c.source_peer != "local") {
+            if seen_remote_peers.insert(rc.source_peer.clone()) {
+                preserved_remote.push(rc.clone());
+                if preserved_remote.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        if preserved_remote.len() < 4 {
+            for rc in chunks.iter().filter(|c| c.source_peer != "local") {
+                if !preserved_remote
+                    .iter()
+                    .any(|p| p.source_peer == rc.source_peer && p.chunk.chunk_id == rc.chunk.chunk_id)
+                {
+                    preserved_remote.push(rc.clone());
+                    if preserved_remote.len() >= 4 {
+                        break;
+                    }
+                }
+            }
+        }
 
         // Apply Maximal Marginal Relevance (MMR) candidate diversity selection (default lambda = 0.70)
         chunks = apply_mmr_selection(chunks, effective_vector, top_k, 0.70);
@@ -1031,19 +1112,27 @@ impl RetrieveMeshNode {
         }
 
         chunks.truncate(top_k);
-        // Ensure preserved remote peer chunks are included so multi-computer evidence is always surfaced
+        // Interleave preserved remote peer chunks right after the #1 local chunk (slots 1..=4) rather than
+        // burying them at the tail behind 6+ local files so synthesis and `SOURCES` surface `(mesh)` peers prominently.
+        let mut insert_cursor = 1usize.min(chunks.len());
         for rem in preserved_remote {
-            let already_has_peer_chunk = chunks
+            if let Some(existing_idx) = chunks
                 .iter()
-                .any(|c| c.source_peer == rem.source_peer && c.chunk.chunk_id == rem.chunk.chunk_id);
-            if !already_has_peer_chunk {
-                if chunks.len() >= top_k && chunks.len() > 2 {
-                    if let Some(pos) = chunks.iter().rposition(|c| c.source_peer == "local") {
-                        chunks.remove(pos);
-                    }
+                .position(|c| c.source_peer == rem.source_peer && c.chunk.chunk_id == rem.chunk.chunk_id)
+            {
+                if existing_idx <= insert_cursor {
+                    insert_cursor = (existing_idx + 1).min(chunks.len());
+                    continue;
                 }
-                chunks.push(rem);
+                chunks.remove(existing_idx);
+            } else if chunks.len() >= top_k && chunks.len() > 2 {
+                if let Some(pos) = chunks.iter().rposition(|c| c.source_peer == "local") {
+                    chunks.remove(pos);
+                }
             }
+            let target_idx = insert_cursor.min(chunks.len());
+            chunks.insert(target_idx, rem);
+            insert_cursor = (target_idx + 1).min(chunks.len());
         }
         state.retrieved_chunks = chunks;
         state.volatile_chunks = volatile;

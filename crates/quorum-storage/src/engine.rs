@@ -283,7 +283,11 @@ impl StorageEngine {
         }
 
         let count = self.vector_store.insert_chunks(&unique_chunks).await?;
-        let _ = self.fts_index.index_chunks(&unique_chunks)?;
+        let fts_for_write = Arc::clone(&self.fts_index);
+        let chunks_for_fts = unique_chunks.clone();
+        let _ = tokio::task::spawn_blocking(move || fts_for_write.index_chunks(&chunks_for_fts))
+            .await
+            .map_err(|e| StorageError::Tantivy(format!("Tantivy index blocking task failed: {e}")))??;
 
         // Automatically hydrate document catalog for ingested files
         let _ = self.catalog.hydrate_from_chunks(&unique_chunks);
@@ -316,7 +320,11 @@ impl StorageEngine {
         max_tier: u8,
         top_k: usize,
     ) -> Result<Vec<ScoredChunk>, StorageError> {
-        let mut hits = self.fts_index.search(query, max_tier, top_k)?;
+        let fts = Arc::clone(&self.fts_index);
+        let q = query.to_string();
+        let mut hits = tokio::task::spawn_blocking(move || fts.search(&q, max_tier, top_k))
+            .await
+            .map_err(|e| StorageError::Tantivy(format!("Tantivy search blocking task failed: {e}")))??;
         prioritize_media_intent(query, &mut hits);
         Ok(hits)
     }
@@ -503,7 +511,11 @@ impl StorageEngine {
             .await
             .unwrap_or((0, 0, 0));
 
-        let fts_res = self.fts_index.compact();
+        let fts = Arc::clone(&self.fts_index);
+        let fts_res = tokio::task::spawn_blocking(move || fts.compact())
+            .await
+            .map_err(|e| StorageError::Tantivy(format!("Tantivy compact blocking task failed: {e}")))
+            .and_then(|r| r);
 
         Ok(CompactionStats {
             fragments_removed: frags_rem,
@@ -573,7 +585,11 @@ impl StorageEngine {
         }
 
         // Fast path: query Tantivy inverted index (sub-millisecond O(K) lookup)
-        let mut chunks = self.fts_index.get_chunks_by_ids(chunk_ids, true)?;
+        let fts = Arc::clone(&self.fts_index);
+        let ids_owned = chunk_ids.to_vec();
+        let mut chunks = tokio::task::spawn_blocking(move || fts.get_chunks_by_ids(&ids_owned, true))
+            .await
+            .map_err(|e| StorageError::Tantivy(format!("Tantivy point-lookup blocking task failed: {e}")))??;
         if chunks.len() >= chunk_ids.len() {
             return Ok(chunks);
         }

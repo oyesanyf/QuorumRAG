@@ -20,16 +20,16 @@ Windows Service (installed and started automatically):
     sc.exe start QuorumRAGDaemon
 
 Silent install options:
-  msiexec /i QuorumRAG-0.6.0-x86_64.msi /qn                    install + start service + open browser
-  msiexec /i QuorumRAG-0.6.0-x86_64.msi /qn LAUNCHBROWSER=0    do not open the browser
-  msiexec /i QuorumRAG-0.6.0-x86_64.msi /qn FIREWALLRULE=0     do not add the private-LAN firewall rule
+  msiexec /i QuorumRAG-0.6.1-x86_64.msi /qn                    install + start service + open browser
+  msiexec /i QuorumRAG-0.6.1-x86_64.msi /qn LAUNCHBROWSER=0    do not open the browser
+  msiexec /i QuorumRAG-0.6.1-x86_64.msi /qn FIREWALLRULE=0     do not add the private-LAN firewall rule
 
 Uninstall (stops AND deletes the QuorumRAGDaemon service completely):
   - Settings > Apps > Installed apps > "QuorumRAG P2P Agentic RAG" > Uninstall, or
   - Start Menu > QuorumRAG > "Uninstall QuorumRAG", or
-  - msiexec /x QuorumRAG-0.6.0-x86_64.msi
+  - msiexec /x QuorumRAG-0.6.1-x86_64.msi
   Add REMOVEDATA=1 to also delete the index and logs in %ProgramData%\QuorumRAG:
-    msiexec /x QuorumRAG-0.6.0-x86_64.msi REMOVEDATA=1
+    msiexec /x QuorumRAG-0.6.1-x86_64.msi REMOVEDATA=1
   If the Apps entry is missing or broken, run as administrator:
     "C:\Program Files\QuorumRAG\quorumrag-uninstall.cmd" /purge
   which removes the MSI, the service (sc delete), the firewall rule, shortcuts,

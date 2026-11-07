@@ -527,3 +527,154 @@ async fn test_adversarial_max_peer_responses_zero_fallback() {
         "Query with max_peer_responses = 0 should safely fall back to >= 1 peer response without panicking"
     );
 }
+
+#[tokio::test]
+async fn test_federated_mesh_citation_interleaved_when_six_local_docs_and_split_remote_resume_exist() {
+    reset_mesh_controller(4, true);
+
+    let remote_peer_id = "12D3KooWKHc3HiYDTmS9jymRJxHjuBEQ6Z3veB21KmzuH52iRFYu".to_string();
+    let mock_disp = Arc::new(MockMeshDispatcher::default());
+
+    // Remote peer holds a multi-chunk resume where Chunk 0 has the subject's name/credentials
+    // and Chunk 1 has the Education section (neither chunk alone has both name + university,
+    // and filename `Resume_2026.docx` does not contain the name).
+    mock_disp
+        .add_peer(MockRemotePeer {
+            peer_id: remote_peer_id.clone(),
+            latency: std::time::Duration::from_millis(5),
+            max_access_tier: 0,
+            candidate_chunks: vec![
+                CandidateChunkDto {
+                    chunk_id: "rem_resume_doc:0".to_string(),
+                    file_path: "D:/Users/remote/Documents/Resume_2026.docx".to_string(),
+                    line_start: 1,
+                    line_end: 20,
+                    score: 0.92,
+                    access_tier: 0,
+                    content: "Femi Oyesanya — CISSP Certified Principal Security Architect and Data Scientist."
+                        .to_string(),
+                },
+                CandidateChunkDto {
+                    chunk_id: "rem_resume_doc:1".to_string(),
+                    file_path: "D:/Users/remote/Documents/Resume_2026.docx".to_string(),
+                    line_start: 21,
+                    line_end: 45,
+                    score: 0.89,
+                    access_tier: 0,
+                    content: "Education: Master of Management Information Systems from University of Illinois Springfield (1992) and Bachelor of Arts in Business Administration from Alabama A&M University."
+                        .to_string(),
+                },
+            ],
+        })
+        .await;
+
+    // Local storage has 6 distinct strong matching documents (reproducing the exact user screenshot scenario)
+    let local_files = [
+        "C:/Users/local/Documents/Femi_Oyesanya_Enhanced_Resume_v3.docx",
+        "C:/Users/local/Documents/RedactX_v3_Verified_Final_Femi_Oyesanya.pdf",
+        "C:/Users/local/Documents/RedactX_v3_Rewritten_Jev_Decision_Model_Femi_Oyesanya.pdf",
+        "C:/Users/local/Documents/RedactX_v3_Jev_Like_Decision_Model_Femi_Oyesanya.pdf",
+        "C:/Users/local/Documents/RedactX_v3_Fresh_Decision_Model_Privacy_Audit_Femi_Oyesanya.pdf",
+        "C:/Users/local/Documents/Femi_Oyesanya_Enhanced_Resume.docx",
+    ];
+    let local_chunks: Vec<ScoredChunk> = local_files
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let doc = DocumentChunk::new(
+                format!("loc_doc_{}:0", i),
+                format!("loc_doc_{}", i),
+                *path,
+                1,
+                30,
+                0,
+                vec![0.1; 768],
+                format!(
+                    "Femi Oyesanya (CISSP) earned a Master of Management Information Systems from University of Illinois Springfield (1992) and a Bachelor degree from Alabama A&M University (variant {}).",
+                    i + 1
+                ),
+                None,
+            )
+            .unwrap();
+            ScoredChunk::new(doc, 0.96 - (i as f32 * 0.01), "local", false)
+        })
+        .collect();
+
+    let storage = Arc::new(EmptyOrCustomStorage { local_chunks });
+    let mut config = CoordinatorConfig::default();
+    config.max_peer_responses = 4;
+
+    let engine = Arc::new(ScatterGatherEngine::new(
+        storage,
+        mock_disp,
+        Arc::new(RwLock::new(PeerAclManager::default())),
+        config.clone(),
+        [0x55; 32],
+        "12D3KooWH8fDWJnk5gbEcyjaqfV5hK9jxV7Ck9mUiAHd3hgnk8q1".to_string(),
+    ));
+    let coordinator = quorum_coordinator::QueryCoordinator::new(engine, config);
+
+    // Verify stale local-only QueryCache entry is bypassed when require_external_citation == true
+    coordinator.cache_manager.query_cache.insert(
+        "Education and credentials of Femi Oyesanya",
+        quorum_storage::SearchMode::Hybrid,
+        SynthesisModelFamily::AutoFusion,
+        0,
+        1,
+        Vec::new(),
+        "stale".to_string(),
+        Some("stale local only".to_string()),
+        Vec::new(),
+        None,
+        None,
+    );
+    assert!(
+        coordinator
+            .cache_manager
+            .query_cache
+            .get_with_mesh_requirement(
+                "Education and credentials of Femi Oyesanya",
+                quorum_storage::SearchMode::Hybrid,
+                SynthesisModelFamily::AutoFusion,
+                0,
+                1,
+                true,
+            )
+            .is_none(),
+        "Local-only cached entry must be bypassed when mesh peers are connected"
+    );
+    coordinator.cache_clear_all();
+
+    let result = coordinator
+        .query_agentic(
+            "Education and credentials of Femi Oyesanya",
+            SynthesisModelFamily::AutoFusion,
+            8,
+            None,
+        )
+        .await
+        .expect("query_agentic must succeed");
+
+    let mesh_pos = result
+        .sources_cited
+        .iter()
+        .position(|c| c.is_external_node && c.node_id.as_deref() == Some(remote_peer_id.as_str()));
+    assert!(
+        mesh_pos.is_some(),
+        "SOURCES must include the remote mesh peer citation alongside local citations; got: {:?}",
+        result
+            .sources_cited
+            .iter()
+            .map(|c| (&c.file_path, &c.peer_id, c.is_external_node))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        mesh_pos.unwrap() <= 2,
+        "Remote mesh peer citation must be interleaved in the top 3 sources (not buried behind 6 local files), got index {}",
+        mesh_pos.unwrap()
+    );
+    assert!(
+        result.sources_cited.iter().any(|c| !c.is_external_node),
+        "SOURCES must also preserve local citations"
+    );
+}

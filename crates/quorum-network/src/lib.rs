@@ -113,15 +113,17 @@ pub async fn start_network_node(
         }
     }
 
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(128);
-    let (evt_tx, _) = tokio::sync::broadcast::channel(256);
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(1024);
+    let (evt_tx, _) = tokio::sync::broadcast::channel(512);
     let listen_addrs = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let peer_addrs = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
     let handle = NetworkSwarmHandle {
         local_peer_id,
         command_tx: cmd_tx.clone(),
         event_tx: evt_tx.clone(),
         listen_addrs: Arc::clone(&listen_addrs),
+        peer_addrs: Arc::clone(&peer_addrs),
     };
 
     let handler = inbound_handler.unwrap_or_else(|| Arc::new(DefaultInboundQueryHandler));
@@ -132,6 +134,7 @@ pub async fn start_network_node(
         command_tx: cmd_tx,
         event_tx: evt_tx,
         listen_addrs,
+        peer_addrs,
         inbound_handler: handler,
         pending_requests: HashMap::new(),
         config,

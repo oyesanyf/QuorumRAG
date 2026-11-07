@@ -267,6 +267,18 @@ pub async fn get_mesh_topology_handler(
 
     let mut peers_dto = Vec::new();
     let acl_guard = state.coordinator.engine.acl_manager.read().await;
+    let peer_addr_map: HashMap<String, String> = state
+        .swarm_handle
+        .as_ref()
+        .map(|h| {
+            h.connected_peer_addresses()
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let known_peer_map = state.p2p_watcher().load_known_peers().peer_map;
+    let health_registry = quorum_coordinator::global_peer_health_registry();
 
     for pid in &connected_peers {
         let is_quarantined = mesh_settings.quarantined_peers.contains(pid);
@@ -281,12 +293,31 @@ pub async fn get_mesh_topology_handler(
             ("Unverified Tier 0", "Unverified Tier 0", false)
         };
 
+        let raw_base_ma = peer_addr_map
+            .get(pid)
+            .or_else(|| known_peer_map.get(pid))
+            .cloned()
+            .unwrap_or_else(|| format!("/ip4/0.0.0.0/tcp/{}", mesh_settings.mesh_port));
+        let clean_base_ma = crate::p2p_watcher::strip_p2p_suffix(&raw_base_ma);
+        let full_multiaddr = format!("{}/p2p/{}", clean_base_ma, pid);
+        let socket_display = crate::p2p_watcher::format_socket_from_multiaddr(&clean_base_ma)
+            .unwrap_or_else(|| clean_base_ma.clone());
+        let pstats = health_registry.get(pid);
+        let live_rtt_ms = pstats
+            .as_ref()
+            .and_then(|s| s.last_rtt_ms.or(s.avg_rtt_ms))
+            .unwrap_or(1.0);
+        let last_seen_str = pstats
+            .as_ref()
+            .and_then(|s| s.last_seen_rfc3339.clone())
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+
         peers_dto.push(PeerNodeDto {
             peer_id: pid.clone(),
             label: format!("Peer Node ({})", &pid[..pid.len().min(12)]),
-            multiaddr: format!("/ip4/10.0.0.12/tcp/3032/p2p/{}", pid),
-            address: "10.0.0.12:3032".to_string(),
-            latency_ms: 1.2,
+            multiaddr: full_multiaddr,
+            address: socket_display,
+            latency_ms: live_rtt_ms,
             attestation_state: att_state.to_string(),
             rot_badge: rot_b.to_string(),
             access_tier: tier_val,
@@ -305,7 +336,7 @@ pub async fn get_mesh_topology_handler(
             }
             .to_string(),
             is_tpm_banned: false,
-            last_seen: Utc::now().to_rfc3339(),
+            last_seen: last_seen_str,
         });
     }
 
@@ -336,12 +367,17 @@ pub async fn get_bootstrap_peers_handler() -> impl IntoResponse {
         .clone()
         .unwrap_or_else(|| "oshoosi".to_string());
 
+    let local_lan_ip = crate::p2p_watcher::discover_local_private_ipv4_addresses()
+        .first()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
     Json(BootstrapPeersResponse {
         p2p_enabled: mesh.p2p_enabled,
         peers: mesh.bootstrap_peers,
-        public_ip: Some("10.0.0.3".to_string()),
+        public_ip: Some(local_lan_ip.clone()),
         mesh_port: port,
-        recommended_multiaddr: format!("/ip4/10.0.0.3/tcp/{}", port),
+        recommended_multiaddr: format!("/ip4/{}/tcp/{}", local_lan_ip, port),
         duckdns_template: format!("/dns4/<your-domain>.duckdns.org/tcp/{}", port),
         duckdns_domain: mesh.duckdns_domain,
         auto_bootstrap_duckdns: mesh.auto_bootstrap_duckdns,

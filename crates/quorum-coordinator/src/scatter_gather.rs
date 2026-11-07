@@ -190,7 +190,7 @@ impl<T: StorageSearcher + ?Sized> StorageSearcher for Arc<T> {
     }
 }
 
-/// 400ms Scatter-Gather Query Engine coordinating local storage and federated mesh retrieval.
+/// Scatter-Gather Query Engine coordinating local storage and federated mesh retrieval.
 pub struct ScatterGatherEngine {
     pub local_storage: Arc<dyn StorageSearcher>,
     pub mesh_dispatcher: Arc<dyn MeshQueryDispatcher>,
@@ -250,6 +250,31 @@ impl ScatterGatherEngine {
         top_k: usize,
         exclude_chunk_ids: &[String],
     ) -> (Vec<ScoredChunk>, Vec<VolatileRemoteChunk>, u64, Vec<ScoredChunk>) {
+        self.execute_query_with_p2p_query_and_exclusion(
+            query_text,
+            query_text,
+            query_vec,
+            cached_vector,
+            access_tier,
+            top_k,
+            exclude_chunk_ids,
+        )
+        .await
+    }
+
+    /// Dispatches parallel queries with a dedicated unbloated P2P query string for remote peers
+    /// while preserving expanded BM25 terms for local storage.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_query_with_p2p_query_and_exclusion(
+        &self,
+        query_text: &str,
+        p2p_query_text: &str,
+        query_vec: &[f32],
+        cached_vector: Option<&[ScoredChunk]>,
+        access_tier: u8,
+        top_k: usize,
+        exclude_chunk_ids: &[String],
+    ) -> (Vec<ScoredChunk>, Vec<VolatileRemoteChunk>, u64, Vec<ScoredChunk>) {
         let start = tokio::time::Instant::now();
         let candidate_limit = top_k * self.config.candidate_multiplier;
         let exclude_set: std::collections::HashSet<&str> =
@@ -263,70 +288,92 @@ impl ScatterGatherEngine {
             .mesh
             .p2p_enabled;
 
-        // 1 & 2. Execute Local Storage Search and Remote Peer Queries CONCURRENTLY via tokio::join!
-        // so slow local LanceDB/keyword scans never consume or starve the remote peer timeout budget.
-        let local_fut = async {
-            if let Some(cached) = cached_vector {
-                if !cached.is_empty() {
-                    let text_hits = self
-                        .local_storage
-                        .search_text(query_text, access_tier, candidate_limit)
-                        .await;
-                    let mut rrf_map: std::collections::HashMap<
-                        String,
-                        (f32, quorum_types::DocumentChunk),
-                    > = std::collections::HashMap::new();
-
-                    for (i, scored) in cached.iter().enumerate() {
-                        if exclude_set.contains(scored.chunk.chunk_id.as_str()) {
-                            continue;
-                        }
-                        let rrf = 1.0 / (60.0 + (i + 1) as f32);
-                        let entry = rrf_map
-                            .entry(scored.chunk.chunk_id.clone())
-                            .or_insert_with(|| (0.0, scored.chunk.clone()));
-                        entry.0 += rrf;
-                    }
-
-                    for (i, scored) in text_hits.into_iter().enumerate() {
-                        if exclude_set.contains(scored.chunk.chunk_id.as_str()) {
-                            continue;
-                        }
-                        let rrf = 1.0 / (60.0 + (i + 1) as f32);
-                        let entry = rrf_map
-                            .entry(scored.chunk.chunk_id.clone())
-                            .or_insert_with(|| (0.0, scored.chunk.clone()));
-                        entry.0 += rrf;
-                    }
-
-                    let mut fused_local: Vec<ScoredChunk> = rrf_map
-                        .into_iter()
-                        .map(|(_id, (score, chunk))| ScoredChunk::new(chunk, score, "local", false))
-                        .collect();
-                    fused_local.sort_by(|a, b| {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    (fused_local, cached.to_vec())
-                } else {
-                    let results = if exclude_chunk_ids.is_empty() {
-                        self.local_storage
-                            .search_hybrid(query_text, query_vec, access_tier, candidate_limit)
-                            .await
-                    } else {
-                        self.local_storage
-                            .search_hybrid_with_exclusion(
-                                query_text,
-                                query_vec,
-                                access_tier,
-                                candidate_limit,
-                                exclude_chunk_ids,
-                            )
-                            .await
+        // 1. Spawn outbound P2P query onto an independent Tokio worker task BEFORE polling local storage
+        // so TCP/Yamux frames flush onto the wire at t=0ms and are never delayed by local disk scans.
+        let effective_p2p_query = if p2p_query_text.trim().is_empty() {
+            query_text
+        } else {
+            p2p_query_text
+        };
+        let remote_handle = if p2p_enabled {
+            controller
+                .sanitize_outbound_query(effective_p2p_query)
+                .map(|sanitized_query| {
+                    let mut req = FederatedQueryRequest {
+                        query_id: Uuid::new_v4(),
+                        sender_peer_id: self.sender_peer_id.clone(),
+                        sender_pubkey: [0u8; 32],
+                        query_text: sanitized_query,
+                        embedding: query_vec.to_vec(),
+                        top_k: top_k.max(16),
+                        timestamp: Utc::now().timestamp(),
+                        signature: [0u8; 64],
                     };
-                    (results.clone(), results)
+                    let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
+                    sign_request(&self.secret_seed, &mut req, tier);
+
+                    let timeout_dur = Duration::from_millis(
+                        self.config
+                            .timeout_ms
+                            .saturating_sub(60)
+                            .max(self.config.timeout_ms * 3 / 4),
+                    );
+                    let dispatcher = Arc::clone(&self.mesh_dispatcher);
+                    tokio::spawn(async move {
+                        dispatcher
+                            .query_peers(&req, timeout_dur)
+                            .await
+                            .unwrap_or_default()
+                    })
+                })
+        } else {
+            None
+        };
+
+        // 2. Execute Local Storage Search concurrently while remote_handle runs on the Tokio pool.
+        let (local_results, new_cached_vector) = if let Some(cached) = cached_vector {
+            if !cached.is_empty() {
+                let text_hits = self
+                    .local_storage
+                    .search_text(query_text, access_tier, candidate_limit)
+                    .await;
+                let mut rrf_map: std::collections::HashMap<
+                    String,
+                    (f32, quorum_types::DocumentChunk),
+                > = std::collections::HashMap::new();
+
+                for (i, scored) in cached.iter().enumerate() {
+                    if exclude_set.contains(scored.chunk.chunk_id.as_str()) {
+                        continue;
+                    }
+                    let rrf = 1.0 / (60.0 + (i + 1) as f32);
+                    let entry = rrf_map
+                        .entry(scored.chunk.chunk_id.clone())
+                        .or_insert_with(|| (0.0, scored.chunk.clone()));
+                    entry.0 += rrf;
                 }
+
+                for (i, scored) in text_hits.into_iter().enumerate() {
+                    if exclude_set.contains(scored.chunk.chunk_id.as_str()) {
+                        continue;
+                    }
+                    let rrf = 1.0 / (60.0 + (i + 1) as f32);
+                    let entry = rrf_map
+                        .entry(scored.chunk.chunk_id.clone())
+                        .or_insert_with(|| (0.0, scored.chunk.clone()));
+                    entry.0 += rrf;
+                }
+
+                let mut fused_local: Vec<ScoredChunk> = rrf_map
+                    .into_iter()
+                    .map(|(_id, (score, chunk))| ScoredChunk::new(chunk, score, "local", false))
+                    .collect();
+                fused_local.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                (fused_local, cached.to_vec())
             } else {
                 let results = if exclude_chunk_ids.is_empty() {
                     self.local_storage
@@ -345,41 +392,29 @@ impl ScatterGatherEngine {
                 };
                 (results.clone(), results)
             }
-        };
-
-        let remote_fut = async {
-            if p2p_enabled {
-                if let Some(sanitized_query) = controller.sanitize_outbound_query(query_text) {
-                    let mut req = FederatedQueryRequest {
-                        query_id: Uuid::new_v4(),
-                        sender_peer_id: self.sender_peer_id.clone(),
-                        sender_pubkey: [0u8; 32],
-                        query_text: sanitized_query,
-                        embedding: query_vec.to_vec(),
-                        top_k: top_k.max(16),
-                        timestamp: Utc::now().timestamp(),
-                        signature: [0u8; 64],
-                    };
-                    let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
-                    sign_request(&self.secret_seed, &mut req, tier);
-
-                    let timeout_dur = Duration::from_millis(
-                        self.config.timeout_ms.saturating_sub(80).max(self.config.timeout_ms * 3 / 4),
-                    );
-                    self.mesh_dispatcher
-                        .query_peers(&req, timeout_dur)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
+        } else {
+            let results = if exclude_chunk_ids.is_empty() {
+                self.local_storage
+                    .search_hybrid(query_text, query_vec, access_tier, candidate_limit)
+                    .await
             } else {
-                Vec::new()
-            }
+                self.local_storage
+                    .search_hybrid_with_exclusion(
+                        query_text,
+                        query_vec,
+                        access_tier,
+                        candidate_limit,
+                        exclude_chunk_ids,
+                    )
+                    .await
+            };
+            (results.clone(), results)
         };
 
-        let ((local_results, new_cached_vector), remote_responses) =
-            tokio::join!(local_fut, remote_fut);
+        let remote_responses = match remote_handle {
+            Some(jh) => jh.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
 
         // 3. Ingest candidate chunks into volatile memory containers after inbound PHI/PII DLP gate
         let max_peer_responses = {
@@ -454,9 +489,14 @@ impl ScatterGatherEngine {
                     .iter()
                     .any(|sc| sc.source_peer == peer_id && sc.chunk.chunk_id == dto.chunk_id);
                 if !already_present {
+                    let derived_doc_id = dto
+                        .chunk_id
+                        .rsplit_once(':')
+                        .map(|(d, _)| d.to_string())
+                        .unwrap_or_else(|| format!("remote:{}", dto.file_path));
                     let doc_chunk = quorum_types::DocumentChunk {
                         chunk_id: dto.chunk_id,
-                        document_id: "remote_doc".to_string(),
+                        document_id: derived_doc_id,
                         file_path: dto.file_path,
                         line_start: dto.line_start,
                         line_end: dto.line_end,
@@ -480,7 +520,6 @@ impl ScatterGatherEngine {
             .map(|s| s.to_string())
             .collect();
         if !q_tokens.is_empty() && fused.len() > 1 {
-            // Precompute hit count once per chunk in fused without format!() allocations or repeated lowercasing
             let hit_counts: Vec<usize> = fused
                 .iter()
                 .map(|sc| {
@@ -496,7 +535,8 @@ impl ScatterGatherEngine {
             let max_hits = hit_counts.iter().copied().max().unwrap_or(0);
             let min_hits = hit_counts.iter().copied().min().unwrap_or(0);
             if max_hits > min_hits && max_hits == q_tokens.len() {
-                let mut decorated: Vec<(usize, ScoredChunk)> = hit_counts.into_iter().zip(fused).collect();
+                let mut decorated: Vec<(usize, ScoredChunk)> =
+                    hit_counts.into_iter().zip(fused).collect();
                 decorated.sort_by(|(ha, a), (hb, b)| {
                     (*hb == q_tokens.len())
                         .cmp(&(*ha == q_tokens.len()))
@@ -518,7 +558,7 @@ impl ScatterGatherEngine {
         (fused, volatile_chunks, duration_ms, new_cached_vector)
     }
 
-    /// Dispatches parallel queries across local storage and remote peers with strict 400ms deadline.
+    /// Dispatches parallel queries across local storage and remote peers.
     pub async fn execute_query(
         &self,
         query_text: &str,
@@ -532,13 +572,14 @@ impl ScatterGatherEngine {
         (fused, volatile, duration_ms)
     }
 
-    /// Dispatches federated text queries across local storage and remote mesh peers concurrently.
-    pub async fn search_federated_text(
+    /// Dispatches federated text queries across local storage and remote mesh peers concurrently,
+    /// returning both `ScoredChunk`s and `VolatileRemoteChunk`s.
+    pub async fn search_federated_text_with_volatile(
         &self,
         query_text: &str,
         access_tier: u8,
         top_k: usize,
-    ) -> Vec<ScoredChunk> {
+    ) -> (Vec<ScoredChunk>, Vec<VolatileRemoteChunk>) {
         let controller = crate::dlp_mesh::global_mesh_dlp_controller();
         let (p2p_enabled, max_peer_responses) = {
             let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
@@ -550,43 +591,46 @@ impl ScatterGatherEngine {
             (s.mesh.p2p_enabled, max_peers)
         };
 
-        let local_fut = self.local_storage.search_text(query_text, access_tier, top_k);
+        let peer_handle = if p2p_enabled {
+            controller
+                .sanitize_outbound_query(query_text)
+                .map(|sanitized_query| {
+                    use quorum_contract::EmbeddingGenerator;
+                    let embedder = quorum_contract::DeterministicOfflineEngine::new();
+                    let query_vec = embedder
+                        .embed_text(query_text)
+                        .unwrap_or_else(|_| vec![0.0; 768]);
 
-        let peer_req_opt = if p2p_enabled {
-            controller.sanitize_outbound_query(query_text).map(|sanitized_query| {
-                use quorum_contract::EmbeddingGenerator;
-                let embedder = quorum_contract::DeterministicOfflineEngine::new();
-                let query_vec = embedder.embed_text(query_text).unwrap_or_else(|_| vec![0.0; 768]);
-
-                let mut req = FederatedQueryRequest {
-                    query_id: Uuid::new_v4(),
-                    sender_peer_id: self.sender_peer_id.clone(),
-                    sender_pubkey: [0u8; 32],
-                    query_text: sanitized_query,
-                    embedding: query_vec,
-                    top_k,
-                    timestamp: Utc::now().timestamp(),
-                    signature: [0u8; 64],
-                };
-                let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
-                sign_request(&self.secret_seed, &mut req, tier);
-                req
-            })
+                    let mut req = FederatedQueryRequest {
+                        query_id: Uuid::new_v4(),
+                        sender_peer_id: self.sender_peer_id.clone(),
+                        sender_pubkey: [0u8; 32],
+                        query_text: sanitized_query,
+                        embedding: query_vec,
+                        top_k,
+                        timestamp: Utc::now().timestamp(),
+                        signature: [0u8; 64],
+                    };
+                    let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
+                    sign_request(&self.secret_seed, &mut req, tier);
+                    let timeout_dur = Duration::from_millis(self.config.timeout_ms);
+                    let dispatcher = Arc::clone(&self.mesh_dispatcher);
+                    tokio::spawn(async move { dispatcher.query_peers(&req, timeout_dur).await.ok() })
+                })
         } else {
             None
         };
 
-        let timeout_dur = Duration::from_millis(self.config.timeout_ms);
-        let peer_fut = async {
-            if let Some(ref req) = peer_req_opt {
-                self.mesh_dispatcher.query_peers(req, timeout_dur).await.ok()
-            } else {
-                None
-            }
+        let mut results = self
+            .local_storage
+            .search_text(query_text, access_tier, top_k)
+            .await;
+        let peer_responses_opt = match peer_handle {
+            Some(jh) => jh.await.ok().flatten(),
+            None => None,
         };
 
-        let (mut results, peer_responses_opt) = tokio::join!(local_fut, peer_fut);
-
+        let mut volatile = Vec::new();
         if let Some(responses) = peer_responses_opt {
             let mut peer_count = 0;
             for resp in responses {
@@ -608,19 +652,33 @@ impl ScatterGatherEngine {
                         false,
                     );
                     if dlp_res.allowed_to_share {
+                        chunk.content = dlp_res.scrubbed_text.clone();
+                        volatile.push(chunk.to_volatile_remote_chunk(&resp.responder_peer_id));
+                        let derived_doc_id = chunk
+                            .chunk_id
+                            .rsplit_once(':')
+                            .map(|(d, _)| d.to_string())
+                            .unwrap_or_else(|| format!("remote:{}", chunk.file_path));
                         let doc_chunk = quorum_types::DocumentChunk {
                             chunk_id: chunk.chunk_id,
-                            document_id: "remote_doc".to_string(),
+                            document_id: derived_doc_id,
                             file_path: chunk.file_path,
                             line_start: chunk.line_start,
                             line_end: chunk.line_end,
-                            blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(&dlp_res.scrubbed_text),
+                            blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(
+                                &dlp_res.scrubbed_text,
+                            ),
                             access_tier: chunk.access_tier,
                             vector: vec![0.0; 768],
                             text_content: dlp_res.scrubbed_text,
                             metadata_json: "{}".to_string(),
                         };
-                        results.push(ScoredChunk::new(doc_chunk, chunk.score, resp.responder_peer_id.clone(), true));
+                        results.push(ScoredChunk::new(
+                            doc_chunk,
+                            chunk.score,
+                            resp.responder_peer_id.clone(),
+                            true,
+                        ));
                         peer_added = true;
                     }
                 }
@@ -629,7 +687,19 @@ impl ScatterGatherEngine {
                 }
             }
         }
-        results
+        (results, volatile)
+    }
+
+    /// Dispatches federated text queries across local storage and remote mesh peers concurrently.
+    pub async fn search_federated_text(
+        &self,
+        query_text: &str,
+        access_tier: u8,
+        top_k: usize,
+    ) -> Vec<ScoredChunk> {
+        self.search_federated_text_with_volatile(query_text, access_tier, top_k)
+            .await
+            .0
     }
 }
 
@@ -669,7 +739,7 @@ impl<S: StorageSearcher> FederatedQueryCoordinator<S> {
             .search_hybrid(query_text, query_vec, access_tier, top_k)
             .await;
 
-        // 2. Parallel Remote Peer Queries bounded by 400ms hard deadline
+        // 2. Parallel Remote Peer Queries bounded by timeout_duration
         use futures::stream::{FuturesUnordered, StreamExt};
 
         let mut futures = FuturesUnordered::new();
@@ -707,12 +777,7 @@ impl<S: StorageSearcher> FederatedQueryCoordinator<S> {
             .collect();
 
         // 4. RRF
-        let fused = RrfCombiner::fuse_rankings(
-            local_results,
-            peer_lists,
-            60.0,
-            top_k,
-        );
+        let fused = RrfCombiner::fuse_rankings(local_results, peer_lists, 60.0, top_k);
 
         let duration_ms = start.elapsed().as_millis() as u64;
         (fused, volatile_chunks, duration_ms)

@@ -77,13 +77,20 @@ impl QueryCoordinator {
         let epoch = self.engine.local_storage.index_epoch();
         let access_tier = self.config.default_peer_access_tier;
 
-        // Check QueryCache
-        if let Some(cached) = self.cache_manager.query_cache.get(
+        // Check QueryCache (bypass local-only cached entry when active P2P mesh peers are connected)
+        let p2p_active = crate::dlp_mesh::global_mesh_dlp_controller()
+            .settings
+            .read()
+            .map(|s| s.mesh.p2p_enabled)
+            .unwrap_or(true)
+            && self.engine.mesh_dispatcher.peer_count() > 0;
+        if let Some(cached) = self.cache_manager.query_cache.get_with_mesh_requirement(
             prompt,
             SearchMode::Hybrid,
             SynthesisModelFamily::AutoFusion,
             access_tier,
             epoch,
+            p2p_active,
         ) {
             let execution_time_ms = start.elapsed().as_millis() as u64;
             return Ok(QueryResult {

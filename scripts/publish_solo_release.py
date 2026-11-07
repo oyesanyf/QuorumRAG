@@ -329,7 +329,7 @@ def assert_repo_boundary(root: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="QuorumRAG Solo-Developer Release Publisher")
-    parser.add_argument("--version", default="0.6.0", help="Semantic version (default: 0.6.0)")
+    parser.add_argument("--version", default="0.6.1", help="Semantic version (default: 0.6.1)")
     parser.add_argument(
         "--push-tag",
         action="store_true",

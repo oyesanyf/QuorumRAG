@@ -1,6 +1,6 @@
 use crate::error::CoordinatorError;
 use chrono::Utc;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use quorum_types::{AccessTier, FederatedQueryRequest};
 use uuid::Uuid;
 
@@ -94,9 +94,15 @@ pub fn verify_query(
         embedding,
         query_text,
     );
+    if verifying_key.is_weak() {
+        return Err(CoordinatorError::InvalidPublicKey(
+            "Weak small-order Ed25519 public key rejected".to_string(),
+        ));
+    }
+
     let signature = Signature::from_bytes(signature_bytes);
     verifying_key
-        .verify(&bytes, &signature)
+        .verify_strict(&bytes, &signature)
         .map_err(|e| CoordinatorError::InvalidSignature(e.to_string()))?;
 
     Ok(())
@@ -131,6 +137,11 @@ pub fn verify_request(
 ) -> Result<(), CoordinatorError> {
     let verifying_key = VerifyingKey::from_bytes(&request.sender_pubkey)
         .map_err(|e| CoordinatorError::InvalidPublicKey(e.to_string()))?;
+    if verifying_key.is_weak() {
+        return Err(CoordinatorError::InvalidPublicKey(
+            "Weak small-order Ed25519 public key rejected".to_string(),
+        ));
+    }
     verify_query(
         &verifying_key,
         &request.signature,

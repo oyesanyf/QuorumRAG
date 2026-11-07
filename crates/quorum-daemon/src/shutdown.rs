@@ -65,6 +65,9 @@ pub async fn shutdown_signal(notify: Arc<tokio::sync::Notify>) {
 pub async fn execute_graceful_shutdown(state: Arc<DaemonState>) {
     info!("Executing QuorumRAG graceful shutdown sequence...");
 
+    // 0. Terminate dedicated P2P Watcher OS child process promptly so service stops never block
+    state.p2p_watcher().stop_child_process();
+
     // 1. Cooperative cancellation of active reindexer
     let cancelled = state.reindex_worker.cancel_reindex();
     if cancelled {
