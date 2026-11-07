@@ -895,13 +895,14 @@ fn test_adversarial_unicode_and_spaces_user_profiles() {
 }
 
 /// 8. Adversarial Challenge 3: OneDrive Sync Folders and Directory Reparse Point Support
-/// - User "CloudUser" with genuine `OneDrive\Documents` and `OneDrive\Desktop`.
-/// - Reparse point support: `OneDrive\Documents` is created as an NTFS directory junction / reparse point
-///   (simulating Windows Cloud-Sync reparse points like OneDrive / iCloud) -> MUST be discovered!
-/// - Recursive cyclic junction: `OneDrive\CyclicLoop` pointing back to `CloudUser` -> MUST be rejected.
-/// Asserts that:
-/// - Valid OneDrive directory reparse points ARE discovered and supported under Milestone M25.
-/// - Recursive junction loops are strictly rejected.
+/// - User "CloudUser" with genuine `OneDrive\Desktop`.
+/// - Reparse point support: `OneDrive\Documents` is created as an NTFS directory junction
+///   pointing to `CloudDocsStorage` -> MUST be discovered!
+/// - Reparse point rejection: `OneDrive\Pictures` is created as an NTFS directory junction
+///   pointing back to `CloudUser` (profile root) -> MUST be rejected!
+/// - Standard profile rejection: User "LoopUser" with `Documents` as an NTFS directory junction
+///   pointing back to `LoopUser` (profile root) -> MUST be rejected!
+///   `LoopUser\Desktop` is a regular directory -> MUST be discovered!
 #[cfg(target_os = "windows")]
 #[test]
 fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
@@ -916,17 +917,26 @@ fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
     let target_docs = temp.path().join("CloudDocsStorage");
     let onedrive_docs = onedrive.join("Documents");
     let onedrive_desktop = onedrive.join("Desktop");
-    let onedrive_loop = onedrive.join("CyclicLoop");
+    let onedrive_pictures = onedrive.join("Pictures");
 
     std::fs::create_dir_all(&target_docs).expect("create target docs");
     std::fs::create_dir_all(&onedrive).expect("create onedrive dir");
     std::fs::create_dir_all(&onedrive_desktop).expect("create onedrive desktop");
 
-    // Create OneDrive\Documents as an NTFS junction / directory reparse point pointing to real storage
+    // Create OneDrive\Documents as an NTFS junction pointing to real storage (MUST be accepted)
     create_junction(&onedrive_docs, &target_docs).expect("create onedrive docs junction");
 
-    // Create a recursive cyclic loop junction pointing back to cloud_user
-    create_junction(&onedrive_loop, &cloud_user).expect("create cyclic junction loop");
+    // Create OneDrive\Pictures as a recursive cyclic junction pointing back to cloud_user (MUST be rejected)
+    create_junction(&onedrive_pictures, &cloud_user).expect("create onedrive cyclic junction loop");
+
+    // Create User "LoopUser" with cyclic standard document folder
+    let loop_user = users_dir.join("LoopUser");
+    let loop_docs = loop_user.join("Documents");
+    let loop_desktop = loop_user.join("Desktop");
+    std::fs::create_dir_all(&loop_user).expect("create loop_user dir");
+    std::fs::create_dir_all(&loop_desktop).expect("create loop_user desktop");
+    // Create LoopUser\Documents as an NTFS junction pointing back to loop_user (MUST be rejected)
+    create_junction(&loop_docs, &loop_user).expect("create standard profile cyclic loop");
 
     let temp_root_str = temp.path().to_str().expect("temp path to str");
     let _env_guard = EnvGuard::set("SystemDrive", temp_root_str);
@@ -940,21 +950,31 @@ fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
 
     // Clean up junctions
     let _ = std::fs::remove_dir(&onedrive_docs);
-    let _ = std::fs::remove_dir(&onedrive_loop);
+    let _ = std::fs::remove_dir(&onedrive_pictures);
+    let _ = std::fs::remove_dir(&loop_docs);
 
-    // M25: OneDrive/Documents (directory reparse point) and OneDrive/Desktop MUST be accepted
+    // M25 Invariant 1: Valid directory reparse point pointing to external storage MUST be accepted
     assert!(
         synthetic_roots.contains(&onedrive_docs),
         "Must contain CloudUser/OneDrive/Documents even when it is an NTFS directory reparse point"
     );
+    // M25 Invariant 2: Normal directory MUST be accepted
     assert!(
         synthetic_roots.contains(&onedrive_desktop),
         "Must contain CloudUser/OneDrive/Desktop"
     );
-    // Recursive loop MUST be rejected
     assert!(
-        !synthetic_roots.contains(&onedrive_loop),
-        "Must NOT contain CloudUser/OneDrive/CyclicLoop because it is a recursive cyclic loop"
+        synthetic_roots.contains(&loop_desktop),
+        "Must contain LoopUser/Desktop"
+    );
+    // M25 Invariant 3: Reparse points pointing to profile root or ancestor MUST be rejected
+    assert!(
+        !synthetic_roots.contains(&onedrive_pictures),
+        "Must NOT contain CloudUser/OneDrive/Pictures because it is a cyclic junction pointing to profile root"
+    );
+    assert!(
+        !synthetic_roots.contains(&loop_docs),
+        "Must NOT contain LoopUser/Documents because it is a cyclic junction pointing to profile root"
     );
 }
 
