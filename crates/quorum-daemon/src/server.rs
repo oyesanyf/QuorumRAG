@@ -20,6 +20,8 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         .route("/api/chat", post(chat::chat_sse_handler))
         .route("/api/chat/stream", get(chat_stream_compat_handler))
         .route("/api/chat/cancel", post(chat::cancel_chat_handler))
+        .route("/api/chat/active", get(chat::active_chat_tasks_handler))
+        .route("/api/chat/attach/:session_id", get(chat::chat_sse_attach_handler))
         .route("/api/chat/spellcheck", post(chat::spellcheck_handler))
         .route("/api/query", post(chat::query_handler))
         .route(

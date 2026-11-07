@@ -44,7 +44,58 @@ function secureRandomIndex(n) {
     return buf[0] % n;
 }
 
-let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
+  const STORAGE_KEY_ACTIVE_SESSION = 'quorumrag_active_session_id';
+
+  function generateNewSessionId() {
+    return 's-' + Date.now() + '-' + secureRandomToken(7);
+  }
+
+  function getSessionIdFromUrl() {
+    if (typeof window === 'undefined' || !window.location) return null;
+    const hash = window.location.hash || '';
+    const match = hash.match(/^#session=([^&]+)/);
+    if (match && match[1]) {
+      try {
+        return decodeURIComponent(match[1]);
+      } catch (_) {
+        return match[1];
+      }
+    }
+    return null;
+  }
+
+  function syncSessionPersistence(sessionId) {
+    if (sessionId) {
+      try {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem(STORAGE_KEY_ACTIVE_SESSION, sessionId);
+        }
+      } catch (_) {}
+      try {
+        if (typeof window !== 'undefined' && window.history && window.history.replaceState) {
+          const url = new URL(window.location.href);
+          url.hash = `session=${encodeURIComponent(sessionId)}`;
+          window.history.replaceState(null, '', url.toString());
+        }
+      } catch (_) {}
+    } else {
+      try {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.removeItem(STORAGE_KEY_ACTIVE_SESSION);
+        }
+      } catch (_) {}
+      try {
+        if (typeof window !== 'undefined' && window.history && window.history.replaceState) {
+          const url = new URL(window.location.href);
+          url.hash = '';
+          window.history.replaceState(null, '', url.pathname + url.search);
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Eliminate unconditional blank random session generation on startup
+  let activeSessionId = getSessionIdFromUrl() || (typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY_ACTIVE_SESSION) : null) || generateNewSessionId();
   const activeSessionSeenChunkIds = new Set();
 
   // DOM Elements
@@ -364,21 +415,29 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     } catch (_) {}
   }
 
-  async function openHistorySession(sessionId) {
-    if (!sessionId || isGenerating) return;
+  async function openHistorySession(sessionId, activeTask = null) {
+    if (!sessionId || (isGenerating && !activeTask)) return;
     try {
       const res = await fetchWithTimeout('/api/history/' + encodeURIComponent(sessionId), {}, 2500);
-      if (!res || !res.ok) return;
-      const data = await res.json();
+      if (!res || !res.ok) {
+        if (!activeTask) return;
+      }
+      const data = res && res.ok ? await res.json() : {};
       const messages = Array.isArray(data.messages) ? data.messages : [];
 
       activeSessionId = sessionId;
+      syncSessionPersistence(sessionId);
       activeSessionSeenChunkIds.clear();
       conversationHistoryTurns = [];
       chatStream.innerHTML = '';
       if (welcomeBanner) {
-        welcomeBanner.style.display = '';
-        welcomeBanner.classList.remove('hidden');
+        if (messages.length > 0 || activeTask) {
+          welcomeBanner.classList.add('hidden');
+          welcomeBanner.style.display = 'none';
+        } else {
+          welcomeBanner.style.display = '';
+          welcomeBanner.classList.remove('hidden');
+        }
       }
       if (telemetryBar) {
         telemetryBar.classList.add('hidden');
@@ -388,12 +447,20 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       let lastUserPrompt = '';
       let priorTurnsSnapshot = [];
 
-      for (const msg of messages) {
+      for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
         if (!msg) continue;
         if (msg.role === 'user') {
           lastUserPrompt = String(msg.content || '');
           appendMessage('user', lastUserPrompt);
         } else if (msg.role === 'assistant') {
+          // If this session has an active running task and this is the trailing empty assistant placeholder,
+          // skip rendering it as static text so attachToLiveChatTask can render it live!
+          const isTrailingPendingAssistant = activeTask && (i === messages.length - 1) && (!msg.content || !String(msg.content).trim());
+          if (isTrailingPendingAssistant) {
+            continue;
+          }
+
           const { bodyEl, citationsEl, headerEl, actionsEl } = createAssistantMessage();
           const rawMd = String(msg.content || '');
           bodyEl._rawMarkdown = rawMd;
@@ -412,6 +479,9 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
           }
           citationsEl._suppressMedia = answerSaysNoMatch(rawMd || bodyEl.innerText || '');
           for (const cit of cits) {
+            if (cit && cit.chunk_id) {
+              activeSessionSeenChunkIds.add(String(cit.chunk_id));
+            }
             if (cit && cit.file_path && !String(cit.file_path).startsWith('Local Neural')) {
               appendCitation(citationsEl, cit);
             }
@@ -432,6 +502,14 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
         }
       }
 
+      // If an active task is running and its prompt was not saved to SQLite yet, ensure user prompt bubble is rendered
+      if (activeTask && activeTask.prompt) {
+        const hasPromptRendered = messages.some(m => m && m.role === 'user' && m.content === activeTask.prompt);
+        if (!hasPromptRendered) {
+          appendMessage('user', activeTask.prompt);
+        }
+      }
+
       renderSidebarHistoryList(sidebarSessionsCache);
       scrollToBottom();
     } catch (_) {}
@@ -444,7 +522,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     } catch (_) {}
     sidebarSessionsCache = sidebarSessionsCache.filter(s => s.session_id !== sessionId);
     if (sessionId === activeSessionId) {
-      activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
+      activeSessionId = generateNewSessionId();
+      syncSessionPersistence(null);
       activeSessionSeenChunkIds.clear();
       conversationHistoryTurns = [];
       if (chatStream) chatStream.innerHTML = '';
@@ -464,7 +543,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       await fetch('/api/history', { method: 'DELETE' });
     } catch (_) {}
     sidebarSessionsCache = [];
-    activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
+    activeSessionId = generateNewSessionId();
+    syncSessionPersistence(null);
     activeSessionSeenChunkIds.clear();
     conversationHistoryTurns = [];
     if (chatStream) chatStream.innerHTML = '';
@@ -521,7 +601,8 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
   }
 
   btnNewChat.addEventListener('click', () => {
-    activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
+    activeSessionId = generateNewSessionId();
+    syncSessionPersistence(null);
     activeSessionSeenChunkIds.clear();
     conversationHistoryTurns = [];
     chatStream.innerHTML = '';
@@ -849,6 +930,154 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     }
   }
 
+  async function attachToLiveChatTask(activeTask) {
+    if (!activeTask || !activeTask.session_id) return;
+
+    isGenerating = true;
+    btnSend.disabled = true;
+    btnSend.classList.add('hidden');
+    if (btnStop) {
+      btnStop.classList.remove('hidden');
+    }
+    activeAbortController = new AbortController();
+    activeQueryId = activeTask.query_id;
+
+    if (welcomeBanner) {
+      welcomeBanner.classList.add('hidden');
+      welcomeBanner.style.display = 'none';
+    }
+    if (telemetryBar) {
+      telemetryBar.classList.remove('hidden');
+    }
+    resetTelemetryPills();
+
+    const { bodyEl, citationsEl, headerEl, actionsEl } = createAssistantMessage();
+    bodyEl._rawMarkdown = '';
+    bodyEl.innerHTML = '';
+    citationsEl._pendingCitations = [];
+    citationsEl._seenFiles = new Set();
+    citationsEl._hasSourcesHeading = false;
+    citationsEl._nextIndex = 0;
+    citationsEl.innerHTML = '';
+    if (actionsEl) actionsEl.innerHTML = '';
+    startThinkingIndicator(bodyEl);
+
+    try {
+      const resp = await fetch(`/api/chat/attach/${encodeURIComponent(activeTask.session_id)}`, {
+        method: 'GET',
+        signal: activeAbortController ? activeAbortController.signal : undefined,
+        headers: {
+          'Accept': 'text/event-stream'
+        }
+      });
+
+      if (!resp.ok) {
+        stopThinkingIndicator(bodyEl);
+        if (resp.status === 404) {
+          // Task already completed or moved to SQLite; reload session history
+          await openHistorySession(activeTask.session_id);
+        } else {
+          bodyEl.innerHTML = `<div style="padding:10px 12px;border-radius:8px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.08);">
+            <span>Could not attach to running query (HTTP ${resp.status}).</span>
+          </div>`;
+        }
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep partial trailing line
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) {
+            const jsonStr = trimmed.substring(5).trim();
+            if (jsonStr) {
+              try {
+                const event = JSON.parse(jsonStr);
+                handleTelemetryEvent(event, bodyEl, citationsEl, headerEl);
+              } catch (err) {
+                console.error('Failed to parse SSE event in attach stream:', jsonStr, err);
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      stopThinkingIndicator(bodyEl);
+      if (err && (err.name === 'AbortError' || err.message?.includes('stopped'))) {
+        if (bodyEl._rawMarkdown) {
+          bodyEl._rawMarkdown += '\n\n*(Generation stopped by user)*';
+        } else {
+          bodyEl.innerHTML = `<div style="color:var(--text-muted); font-style:italic;">⏹ Generation stopped by user.</div>`;
+        }
+      } else {
+        bodyEl.innerHTML = `<div style="padding:10px 12px;border-radius:8px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.08);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+          <span>Connection to running query was interrupted (${escapeHtml(err.message || 'stream closed')}).</span>
+        </div>`;
+      }
+    } finally {
+      stopThinkingIndicator(bodyEl);
+      if (bodyEl._rawMarkdown) {
+        bodyEl.style.whiteSpace = 'normal';
+        bodyEl.innerHTML = renderMarkdownHtml(bodyEl._rawMarkdown);
+        const cleanAssistantHistory = stripSourcesFooterMarkdown(bodyEl._rawMarkdown);
+        const n = conversationHistoryTurns.length;
+        const prevUser = n >= 2 ? conversationHistoryTurns[n - 2] : null;
+        if (prevUser && prevUser.role === 'user' && prevUser.content === activeTask.prompt) {
+          conversationHistoryTurns[n - 1] = { role: 'assistant', content: cleanAssistantHistory };
+        } else {
+          conversationHistoryTurns.push(
+            { role: 'user', content: activeTask.prompt },
+            { role: 'assistant', content: cleanAssistantHistory }
+          );
+        }
+      } else {
+        const cursor = bodyEl.querySelector('.typing-cursor');
+        if (cursor) cursor.remove();
+      }
+
+      const pending = citationsEl._pendingCitations || [];
+      citationsEl._seenFiles = new Set();
+      citationsEl._hasSourcesHeading = false;
+      citationsEl._nextIndex = 0;
+      citationsEl.innerHTML = '';
+      citationsEl._records = [];
+      citationsEl._gallery = null;
+      citationsEl._suppressMedia = answerSaysNoMatch(bodyEl._rawMarkdown || bodyEl.innerText || '');
+      for (const cit of pending) {
+        if (cit && cit.file_path && !String(cit.file_path).startsWith('Local Neural')) {
+          appendCitation(citationsEl, cit);
+        }
+      }
+      linkInlineCitations(bodyEl, citationsEl);
+
+      if (actionsEl) {
+        const turnHistorySnapshot = conversationHistoryTurns.slice(-14);
+        renderResponseActionsBar(actionsEl, bodyEl, citationsEl, headerEl, activeTask.prompt, turnHistorySnapshot);
+      }
+
+      activeAbortController = null;
+      activeQueryId = null;
+      isGenerating = false;
+      btnSend.disabled = false;
+      btnSend.classList.remove('hidden');
+      if (btnStop) {
+        btnStop.classList.add('hidden');
+      }
+      loadSidebarChatHistory();
+      scrollToBottom();
+    }
+  }
+
   async function submitPrompt() {
     if (spellcheckDebounceTimer) {
       clearTimeout(spellcheckDebounceTimer);
@@ -856,6 +1085,11 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     }
     let text = promptInput.value.trim();
     if (!text || isGenerating) return;
+
+    if (!activeSessionId) {
+      activeSessionId = generateNewSessionId();
+    }
+    syncSessionPersistence(activeSessionId);
 
     // Check for @extract slash command
     if (text.startsWith('@extract ')) {
@@ -2216,6 +2450,13 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
       pct = Math.min(100, Math.max(0, pct));
 
       const isRunning = phase === 'scanning_filesystem' || phase === 'chunking_and_vectorizing' || phase === 'writing_to_storage' || phase === 'compacting_indexes';
+
+      if (isRunning && !reindexPollInterval) {
+        pollReindexProgress();
+      } else if (!isRunning && reindexPollInterval && (phase === 'completed' || phase === 'failed' || phase === 'cancelled')) {
+        clearInterval(reindexPollInterval);
+        reindexPollInterval = null;
+      }
 
       if (isRunning && totalEst > 0) {
         pct = Math.max(lastMonotonicPct, pct);
@@ -6324,9 +6565,83 @@ let activeSessionId = 's-' + Date.now() + '-' + secureRandomToken(7);
     showSettingsToast('All chats and settings exported to JSON');
   };
 
-  // Load initial settings and persistent SQLite conversation history on startup
-  loadFullSettings().then(() => loadSidebarChatHistory()).catch(() => loadSidebarChatHistory());
-  loadSidebarChatHistory();
+  async function restoreActiveSessionOnStartup() {
+    try {
+      const [historyRes, activeRes] = await Promise.allSettled([
+        fetchWithTimeout('/api/history', {}, 2500),
+        fetchWithTimeout('/api/chat/active', {}, 2500)
+      ]);
+
+      let sessions = [];
+      if (historyRes.status === 'fulfilled' && historyRes.value && historyRes.value.ok) {
+        try {
+          const histData = await historyRes.value.json();
+          sessions = Array.isArray(histData.sessions) ? histData.sessions : [];
+          sidebarSessionsCache = sessions;
+          renderSidebarHistoryList(sidebarSessionsCache);
+        } catch (_) {}
+      }
+
+      let activeTasks = [];
+      if (activeRes.status === 'fulfilled' && activeRes.value && activeRes.value.ok) {
+        try {
+          const actData = await activeRes.value.json();
+          activeTasks = Array.isArray(actData.active_tasks) ? actData.active_tasks : [];
+        } catch (_) {}
+      }
+
+      const urlSession = getSessionIdFromUrl();
+      const storedSession = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY_ACTIVE_SESSION) : null;
+      const runningSession = activeTasks.length > 0 ? activeTasks[0].session_id : null;
+
+      let targetSessionId = null;
+      if (urlSession && (sessions.some(s => s.session_id === urlSession) || activeTasks.some(t => t.session_id === urlSession))) {
+        targetSessionId = urlSession;
+      } else if (storedSession && (sessions.some(s => s.session_id === storedSession) || activeTasks.some(t => t.session_id === storedSession))) {
+        targetSessionId = storedSession;
+      } else if (runningSession) {
+        targetSessionId = runningSession;
+      }
+
+      if (!targetSessionId) {
+        activeSessionId = generateNewSessionId();
+        syncSessionPersistence(null);
+        return;
+      }
+
+      const activeTask = activeTasks.find(t => t.session_id === targetSessionId) || null;
+      await openHistorySession(targetSessionId, activeTask);
+
+      if (activeTask) {
+        await attachToLiveChatTask(activeTask);
+      }
+    } catch (err) {
+      console.error('Failed to restore active session on startup:', err);
+    } finally {
+      checkReindexStatus().catch(() => {});
+    }
+  }
+
+  window.addEventListener('hashchange', () => {
+    if (isGenerating) return;
+    const urlSession = getSessionIdFromUrl();
+    if (urlSession && urlSession !== activeSessionId) {
+      openHistorySession(urlSession);
+    } else if (!urlSession && activeSessionId) {
+      btnNewChat.click();
+    }
+  });
+
+  if (typeof window !== 'undefined') {
+    window.restoreActiveSessionOnStartup = restoreActiveSessionOnStartup;
+    window.attachToLiveChatTask = attachToLiveChatTask;
+    window.getActiveSessionId = () => activeSessionId;
+  }
+
+  // Load initial settings, restore active session / attach to running task, and check reindex on startup
+  loadFullSettings()
+    .then(() => restoreActiveSessionOnStartup())
+    .catch(() => restoreActiveSessionOnStartup());
   initSettingsEventDelegation();
 
 })();
