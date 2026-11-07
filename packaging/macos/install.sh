@@ -23,6 +23,7 @@ mkdir -p /usr/local/bin /usr/local/share/quorumrag \
 
 # Stop a previous instance before replacing the binary.
 launchctl bootout "system/${LABEL}" 2>/dev/null || true
+pkill -9 -f "quorumrag" 2>/dev/null || true
 
 if [ -f "${SCRIPT_DIR}/quorumrag" ]; then
     install -m 755 "${SCRIPT_DIR}/quorumrag" /usr/local/bin/quorumrag
@@ -34,7 +35,7 @@ fi
 
 install -m 644 -o root -g wheel "${SCRIPT_DIR}/${LABEL}.plist" "${TARGET_PLIST}"
 launchctl enable "system/${LABEL}" 2>/dev/null || true
-launchctl bootstrap system "${TARGET_PLIST}"
+launchctl bootstrap system "${TARGET_PLIST}" 2>/dev/null || true
 launchctl kickstart -k "system/${LABEL}" 2>/dev/null || true
 echo "[+] LaunchDaemon ${LABEL} installed, enabled at boot, and started"
 

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.6.1",
+    [string]$Version = "0.6.2",
     [switch]$OpenBrowser = $false,
     [switch]$SkipDefenderScan = $false,
     [string]$CertThumbprint = "9A6D3B509500813058EC63183476464FAC8F015B",

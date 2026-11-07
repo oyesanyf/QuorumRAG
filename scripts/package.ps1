@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.6.1",
+    [string]$Version = "0.6.2",
     [switch]$SkipBuild = $false,
     [switch]$SkipDefenderScan = $false,
     [string]$CertThumbprint = "9A6D3B509500813058EC63183476464FAC8F015B"
@@ -218,10 +218,11 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path $MsiOut)) {
 }
 Write-Host "  -> Created MSI installer: $MsiOut" -ForegroundColor Green
 
-# Step 4: Binary MSI Database Inspection (Prove Environment Table is Absent)
+# Step 4: Binary MSI Database Inspection (Zero-Touch PATH + ICE63 Error 2613 + CustomAction Directory Audit)
 Write-Host "[4/5] Auditing compiled MSI database tables via Windows Installer COM..." -ForegroundColor Cyan
 $Installer = New-Object -ComObject WindowsInstaller.Installer
 $Database = $Installer.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $Installer, @([string]$MsiOut, [int]0))
+
 $TablesView = $Database.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $Database, @('SELECT `Name` FROM `_Tables`'))
 $TablesView.GetType().InvokeMember("Execute", "InvokeMethod", $null, $TablesView, $null) | Out-Null
 $TableNames = @()
@@ -231,11 +232,82 @@ while ($true) {
     $TableNames += $Rec.GetType().InvokeMember("StringData", "GetProperty", $null, $Rec, @(1))
 }
 [System.Runtime.InteropServices.Marshal]::ReleaseComObject($TablesView) | Out-Null
+
+# 4a. Verify CustomAction Directory_ references exist in Directory table (prevents MSI Error 2727)
+$DirView = $Database.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $Database, @('SELECT `Directory` FROM `Directory`'))
+$DirView.GetType().InvokeMember("Execute", "InvokeMethod", $null, $DirView, $null) | Out-Null
+$ValidDirs = @{}
+while ($true) {
+    $Rec = $DirView.GetType().InvokeMember("Fetch", "InvokeMethod", $null, $DirView, $null)
+    if (-not $Rec) { break }
+    $dName = $Rec.GetType().InvokeMember("StringData", "GetProperty", $null, $Rec, @(1))
+    $ValidDirs[$dName] = $true
+}
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($DirView) | Out-Null
+
+$CaView = $Database.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $Database, @('SELECT `Action`, `Type`, `Source` FROM `CustomAction`'))
+$CaView.GetType().InvokeMember("Execute", "InvokeMethod", $null, $CaView, $null) | Out-Null
+while ($true) {
+    $Rec = $CaView.GetType().InvokeMember("Fetch", "InvokeMethod", $null, $CaView, $null)
+    if (-not $Rec) { break }
+    $caName = $Rec.GetType().InvokeMember("StringData", "GetProperty", $null, $Rec, @(1))
+    $caType = [int]($Rec.GetType().InvokeMember("StringData", "GetProperty", $null, $Rec, @(2)))
+    $caSource = $Rec.GetType().InvokeMember("StringData", "GetProperty", $null, $Rec, @(3))
+    # CustomAction base type 34 (0x22 = Exe + Directory) uses Source as a foreign key into Directory table
+    if ((($caType -band 0x3F) -eq 34) -and (-not $ValidDirs.ContainsKey($caSource))) {
+        throw "MSI ERROR 2727 VIOLATION: CustomAction '$caName' references missing Directory '$caSource'!"
+    }
+}
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($CaView) | Out-Null
+
+# 4b. Verify ICE63 RemoveExistingProducts placement in InstallExecuteSequence (prevents MSI Error 2613)
+$SeqView = $Database.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $Database, @('SELECT `Action`, `Sequence` FROM `InstallExecuteSequence` ORDER BY `Sequence`'))
+$SeqView.GetType().InvokeMember("Execute", "InvokeMethod", $null, $SeqView, $null) | Out-Null
+$SeqRows = @()
+$ActionSeq = @{}
+while ($true) {
+    $Rec = $SeqView.GetType().InvokeMember("Fetch", "InvokeMethod", $null, $SeqView, $null)
+    if (-not $Rec) { break }
+    $act = $Rec.GetType().InvokeMember("StringData", "GetProperty", $null, $Rec, @(1))
+    $seq = [int]($Rec.GetType().InvokeMember("StringData", "GetProperty", $null, $Rec, @(2)))
+    $SeqRows += [PSCustomObject]@{ Action = $act; Sequence = $seq }
+    $ActionSeq[$act] = $seq
+}
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($SeqView) | Out-Null
 [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Database) | Out-Null
 [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Installer) | Out-Null
 
 if ($TableNames -contains "Environment") {
     throw "SECURITY INVARIANT VIOLATION: Compiled MSI contains an 'Environment' table!"
+}
+if (-not $ActionSeq.ContainsKey("RemoveExistingProducts")) {
+    throw "MSI UPGRADE VIOLATION: InstallExecuteSequence is missing 'RemoveExistingProducts'!"
+}
+$repSeq = $ActionSeq["RemoveExistingProducts"]
+$initSeq = if ($ActionSeq.ContainsKey("InstallInitialize")) { $ActionSeq["InstallInitialize"] } else { -1 }
+$finSeq = if ($ActionSeq.ContainsKey("InstallFinalize")) { $ActionSeq["InstallFinalize"] } else { -1 }
+if ($repSeq -lt $finSeq) {
+    $anchorName = $null
+    $anchorSeq = -1
+    foreach ($cand in @("InstallInitialize", "InstallExecute", "InstallExecuteAgain")) {
+        if ($ActionSeq.ContainsKey($cand)) {
+            $cSeq = $ActionSeq[$cand]
+            if ($cSeq -lt $repSeq -and $cSeq -gt $anchorSeq) {
+                $anchorSeq = $cSeq
+                $anchorName = $cand
+            }
+        }
+    }
+    if ($anchorSeq -lt 0 -or $repSeq -le $initSeq) {
+        throw "MSI ICE63 / ERROR 2613 VIOLATION: RemoveExistingProducts ($repSeq) is in an invalid location (InstallInitialize=$initSeq)!"
+    }
+    $intervening = @($SeqRows | Where-Object { $_.Sequence -gt $anchorSeq -and $_.Sequence -lt $repSeq } | ForEach-Object { "$($_.Action)($($_.Sequence))" })
+    if ($intervening.Count -gt 0) {
+        throw "MSI ICE63 / ERROR 2613 VIOLATION: Actions found between $anchorName($anchorSeq) and RemoveExistingProducts($repSeq): $($intervening -join ', ')"
+    }
+    Write-Host "  -> ICE63 RemoveExistingProducts sequence PASS ($anchorName=$anchorSeq -> RemoveExistingProducts=$repSeq, 0 intervening actions)." -ForegroundColor Green
+} else {
+    Write-Host "  -> ICE63 RemoveExistingProducts sequence PASS (after InstallFinalize=$finSeq -> RemoveExistingProducts=$repSeq)." -ForegroundColor Green
 }
 Write-Host "  -> MSI tables verified ($($TableNames -join ', ')); 'Environment' table is ABSENT (100% Zero-Touch PATH)." -ForegroundColor Green
 
