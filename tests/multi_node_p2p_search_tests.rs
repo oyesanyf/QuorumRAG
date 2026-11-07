@@ -107,9 +107,7 @@ async fn test_multi_node_p2p_wire_query_aggregation() {
     );
 
     // 3. Assemble Node A's QueryCoordinator with real SwarmMeshDispatcher
-    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher {
-        handle: handle_a.clone(),
-    });
+    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(handle_a.clone()));
 
     let mut coord_cfg = CoordinatorConfig::default();
     coord_cfg.max_peer_responses = 8;
@@ -283,9 +281,7 @@ async fn test_multi_node_bidirectional_hybrid_fusion() {
     handle_a.dial(tcp_addr_b).await.unwrap();
     tokio::time::sleep(Duration::from_millis(350)).await;
 
-    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher {
-        handle: handle_a.clone(),
-    });
+    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(handle_a.clone()));
 
     let mut coord_cfg = CoordinatorConfig::default();
     coord_cfg.max_peer_responses = 8;
@@ -389,9 +385,7 @@ async fn test_fresh_install_untrusted_peer_access_tier_parity() {
     handle_a.dial(tcp_addr_b).await.unwrap();
     tokio::time::sleep(Duration::from_millis(350)).await;
 
-    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher {
-        handle: handle_a.clone(),
-    });
+    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(handle_a.clone()));
 
     let mut coord_cfg = CoordinatorConfig::default();
     coord_cfg.max_peer_responses = 8;

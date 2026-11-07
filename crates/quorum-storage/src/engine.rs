@@ -337,11 +337,15 @@ impl StorageEngine {
 
         let exclude_set: HashSet<&str> = exclude_chunk_ids.iter().map(|s| s.as_str()).collect();
         let candidate_limit = (top_k + exclude_chunk_ids.len()).saturating_mul(2).clamp(16, 256);
-        let text_hits = self.search_text(text, max_tier, candidate_limit).await?;
-        let vector_hits = self
-            .search_vector(vector, max_tier, candidate_limit)
-            .await
-            .unwrap_or_default();
+        let (text_hits, vector_hits) = if !vector.is_empty() && vector.iter().any(|&v| v != 0.0) {
+            let (text_res, vector_res) = tokio::join!(
+                self.search_text(text, max_tier, candidate_limit),
+                self.search_vector(vector, max_tier, candidate_limit),
+            );
+            (text_res?, vector_res.unwrap_or_default())
+        } else {
+            (self.search_text(text, max_tier, candidate_limit).await?, Vec::new())
+        };
 
         let mut rrf_map: HashMap<String, (f32, DocumentChunk)> = HashMap::new();
 
@@ -559,18 +563,40 @@ impl StorageEngine {
         Ok(map)
     }
 
-    /// Retrieves specific chunks from LanceDB by their IDs.
+    /// Retrieves specific chunks by their IDs via point lookups.
+    ///
+    /// Queries the Tantivy BM25 inverted index first for sub-millisecond point lookup,
+    /// and only falls back to LanceDB predicate pushdown for any chunk IDs not found in Tantivy.
     pub async fn get_chunks_by_ids(&self, chunk_ids: &[String]) -> Result<Vec<DocumentChunk>, StorageError> {
-        let id_set: HashSet<&str> = chunk_ids.iter().map(|s| s.as_str()).collect();
-        let all_chunks = self.vector_store.scan_all_chunks().await?;
-        Ok(all_chunks.into_iter().filter(|c| id_set.contains(c.chunk_id.as_str())).collect())
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fast path: query Tantivy inverted index (sub-millisecond O(K) lookup)
+        let mut chunks = self.fts_index.get_chunks_by_ids(chunk_ids, true)?;
+        if chunks.len() >= chunk_ids.len() {
+            return Ok(chunks);
+        }
+
+        // Check which chunk IDs are missing from Tantivy (e.g. drift or Lance-only records)
+        let found_ids: HashSet<&str> = chunks.iter().map(|c| c.chunk_id.as_str()).collect();
+        let missing_ids: Vec<String> = chunk_ids
+            .iter()
+            .filter(|id| !found_ids.contains(id.as_str()))
+            .cloned()
+            .collect();
+
+        if !missing_ids.is_empty() {
+            let lance_chunks = self.vector_store.get_chunks_by_ids(&missing_ids).await?;
+            chunks.extend(lance_chunks);
+        }
+
+        Ok(chunks)
     }
 
-    /// Retrieves specific chunks from Tantivy by their IDs.
+    /// Retrieves specific chunks from Tantivy by their IDs via inverted-index point lookup.
     pub fn get_chunks_from_tantivy(&self, chunk_ids: &[String]) -> Result<Vec<DocumentChunk>, StorageError> {
-        let id_set: HashSet<&str> = chunk_ids.iter().map(|s| s.as_str()).collect();
-        let all_chunks = self.fts_index.scan_all_chunks()?;
-        Ok(all_chunks.into_iter().filter(|c| id_set.contains(c.chunk_id.as_str())).collect())
+        self.fts_index.get_chunks_by_ids(chunk_ids, true)
     }
 
     /// Inserts chunks exclusively into LanceDB (used during Tantivy -> LanceDB drift repair).
@@ -594,8 +620,8 @@ impl StorageEngine {
 
     /// Updates the access_tier of an existing chunk atomically across both stores.
     pub async fn update_chunk_access_tier(&self, chunk_id: &str, new_tier: u8) -> Result<(), StorageError> {
-        let all_chunks = self.vector_store.scan_all_chunks().await?;
-        if let Some(mut chunk) = all_chunks.into_iter().find(|c| c.chunk_id == chunk_id) {
+        let chunks = self.get_chunks_by_ids(&[chunk_id.to_string()]).await?;
+        if let Some(mut chunk) = chunks.into_iter().next() {
             chunk.access_tier = new_tier;
             self.update_chunk_record(&chunk).await?;
         }

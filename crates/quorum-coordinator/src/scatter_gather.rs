@@ -363,7 +363,9 @@ impl ScatterGatherEngine {
                     let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
                     sign_request(&self.secret_seed, &mut req, tier);
 
-                    let timeout_dur = Duration::from_millis(self.config.timeout_ms);
+                    let timeout_dur = Duration::from_millis(
+                        self.config.timeout_ms.saturating_sub(80).max(self.config.timeout_ms * 3 / 4),
+                    );
                     self.mesh_dispatcher
                         .query_peers(&req, timeout_dur)
                         .await
@@ -478,22 +480,26 @@ impl ScatterGatherEngine {
             .map(|s| s.to_string())
             .collect();
         if !q_tokens.is_empty() && fused.len() > 1 {
-            let count_hits = |sc: &ScoredChunk| -> usize {
-                let hay = format!(
-                    "{} {}",
-                    sc.chunk.text_content.to_ascii_lowercase(),
-                    sc.chunk.file_path.to_ascii_lowercase()
-                );
-                q_tokens.iter().filter(|tok| hay.contains(tok.as_str())).count()
-            };
-            let max_hits = fused.iter().map(count_hits).max().unwrap_or(0);
-            let min_hits = fused.iter().map(count_hits).min().unwrap_or(0);
+            // Precompute hit count once per chunk in fused without format!() allocations or repeated lowercasing
+            let hit_counts: Vec<usize> = fused
+                .iter()
+                .map(|sc| {
+                    let text_l = sc.chunk.text_content.to_ascii_lowercase();
+                    let path_l = sc.chunk.file_path.to_ascii_lowercase();
+                    q_tokens
+                        .iter()
+                        .filter(|tok| text_l.contains(tok.as_str()) || path_l.contains(tok.as_str()))
+                        .count()
+                })
+                .collect();
+
+            let max_hits = hit_counts.iter().copied().max().unwrap_or(0);
+            let min_hits = hit_counts.iter().copied().min().unwrap_or(0);
             if max_hits > min_hits && max_hits == q_tokens.len() {
-                fused.sort_by(|a, b| {
-                    let ha = count_hits(a);
-                    let hb = count_hits(b);
-                    (hb == q_tokens.len())
-                        .cmp(&(ha == q_tokens.len()))
+                let mut decorated: Vec<(usize, ScoredChunk)> = hit_counts.into_iter().zip(fused).collect();
+                decorated.sort_by(|(ha, a), (hb, b)| {
+                    (*hb == q_tokens.len())
+                        .cmp(&(*ha == q_tokens.len()))
                         .then_with(|| {
                             b.score
                                 .partial_cmp(&a.score)
@@ -501,6 +507,7 @@ impl ScatterGatherEngine {
                         })
                         .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
                 });
+                fused = decorated.into_iter().map(|(_, sc)| sc).collect();
             }
         }
         if !exclude_set.is_empty() {
@@ -525,15 +532,13 @@ impl ScatterGatherEngine {
         (fused, volatile, duration_ms)
     }
 
-    /// Dispatches federated text queries across local storage and remote mesh peers.
+    /// Dispatches federated text queries across local storage and remote mesh peers concurrently.
     pub async fn search_federated_text(
         &self,
         query_text: &str,
         access_tier: u8,
         top_k: usize,
     ) -> Vec<ScoredChunk> {
-        let mut results = self.local_storage.search_text(query_text, access_tier, top_k).await;
-
         let controller = crate::dlp_mesh::global_mesh_dlp_controller();
         let (p2p_enabled, max_peer_responses) = {
             let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
@@ -545,69 +550,82 @@ impl ScatterGatherEngine {
             (s.mesh.p2p_enabled, max_peers)
         };
 
-        if !p2p_enabled {
-            return results;
-        }
+        let local_fut = self.local_storage.search_text(query_text, access_tier, top_k);
 
-        if let Some(sanitized_query) = controller.sanitize_outbound_query(query_text) {
-            use quorum_contract::EmbeddingGenerator;
-            let embedder = quorum_contract::DeterministicOfflineEngine::new();
-            let query_vec = embedder.embed_text(query_text).unwrap_or_else(|_| vec![0.0; 768]);
+        let peer_req_opt = if p2p_enabled {
+            controller.sanitize_outbound_query(query_text).map(|sanitized_query| {
+                use quorum_contract::EmbeddingGenerator;
+                let embedder = quorum_contract::DeterministicOfflineEngine::new();
+                let query_vec = embedder.embed_text(query_text).unwrap_or_else(|_| vec![0.0; 768]);
 
-            let mut req = FederatedQueryRequest {
-                query_id: Uuid::new_v4(),
-                sender_peer_id: self.sender_peer_id.clone(),
-                sender_pubkey: [0u8; 32],
-                query_text: sanitized_query,
-                embedding: query_vec,
-                top_k,
-                timestamp: Utc::now().timestamp(),
-                signature: [0u8; 64],
-            };
-            let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
-            sign_request(&self.secret_seed, &mut req, tier);
+                let mut req = FederatedQueryRequest {
+                    query_id: Uuid::new_v4(),
+                    sender_peer_id: self.sender_peer_id.clone(),
+                    sender_pubkey: [0u8; 32],
+                    query_text: sanitized_query,
+                    embedding: query_vec,
+                    top_k,
+                    timestamp: Utc::now().timestamp(),
+                    signature: [0u8; 64],
+                };
+                let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
+                sign_request(&self.secret_seed, &mut req, tier);
+                req
+            })
+        } else {
+            None
+        };
 
-            let timeout_dur = Duration::from_millis(self.config.timeout_ms.max(1500));
-            if let Ok(responses) = self.mesh_dispatcher.query_peers(&req, timeout_dur).await {
-                let mut peer_count = 0;
-                for resp in responses {
-                    if peer_count >= max_peer_responses {
-                        break;
+        let timeout_dur = Duration::from_millis(self.config.timeout_ms);
+        let peer_fut = async {
+            if let Some(ref req) = peer_req_opt {
+                self.mesh_dispatcher.query_peers(req, timeout_dur).await.ok()
+            } else {
+                None
+            }
+        };
+
+        let (mut results, peer_responses_opt) = tokio::join!(local_fut, peer_fut);
+
+        if let Some(responses) = peer_responses_opt {
+            let mut peer_count = 0;
+            for resp in responses {
+                if peer_count >= max_peer_responses {
+                    break;
+                }
+                let mut peer_added = false;
+                for mut chunk in resp.chunks {
+                    if chunk.line_start > chunk.line_end {
+                        continue;
                     }
-                    let mut peer_added = false;
-                    for mut chunk in resp.chunks {
-                        if chunk.line_start > chunk.line_end {
-                            continue;
-                        }
-                        chunk.access_tier = chunk.access_tier.min(access_tier);
-                        let dlp_res = controller.inspect_and_enforce_text(
-                            &chunk.content,
-                            &chunk.file_path,
-                            &resp.responder_peer_id,
-                            "InboundMesh",
-                            None,
-                            false,
-                        );
-                        if dlp_res.allowed_to_share {
-                            let doc_chunk = quorum_types::DocumentChunk {
-                                chunk_id: chunk.chunk_id,
-                                document_id: "remote_doc".to_string(),
-                                file_path: chunk.file_path,
-                                line_start: chunk.line_start,
-                                line_end: chunk.line_end,
-                                blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(&dlp_res.scrubbed_text),
-                                access_tier: chunk.access_tier,
-                                vector: vec![0.0; 768],
-                                text_content: dlp_res.scrubbed_text,
-                                metadata_json: "{}".to_string(),
-                            };
-                            results.push(ScoredChunk::new(doc_chunk, chunk.score, resp.responder_peer_id.clone(), true));
-                            peer_added = true;
-                        }
+                    chunk.access_tier = chunk.access_tier.min(access_tier);
+                    let dlp_res = controller.inspect_and_enforce_text(
+                        &chunk.content,
+                        &chunk.file_path,
+                        &resp.responder_peer_id,
+                        "InboundMesh",
+                        None,
+                        false,
+                    );
+                    if dlp_res.allowed_to_share {
+                        let doc_chunk = quorum_types::DocumentChunk {
+                            chunk_id: chunk.chunk_id,
+                            document_id: "remote_doc".to_string(),
+                            file_path: chunk.file_path,
+                            line_start: chunk.line_start,
+                            line_end: chunk.line_end,
+                            blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(&dlp_res.scrubbed_text),
+                            access_tier: chunk.access_tier,
+                            vector: vec![0.0; 768],
+                            text_content: dlp_res.scrubbed_text,
+                            metadata_json: "{}".to_string(),
+                        };
+                        results.push(ScoredChunk::new(doc_chunk, chunk.score, resp.responder_peer_id.clone(), true));
+                        peer_added = true;
                     }
-                    if peer_added {
-                        peer_count += 1;
-                    }
+                }
+                if peer_added {
+                    peer_count += 1;
                 }
             }
         }

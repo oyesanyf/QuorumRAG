@@ -242,7 +242,8 @@ impl AgenticStateGraphRunner {
                         }
 
                         if let Some(ref tx) = telemetry_tx {
-                            // 1. Stream response text FIRST so citations appear strictly AFTER the response
+                            // 1. Stream response text FIRST so citations appear strictly AFTER the response.
+                            // Emitted instantaneously without sleep delay on cache hits (<5ms response).
                             if let Some(ref resp_text) = graph_state.synthesized_response {
                                 for word in resp_text.split_inclusive(' ') {
                                     if tx.is_closed() {
@@ -253,7 +254,6 @@ impl AgenticStateGraphRunner {
                                             delta: word.to_string(),
                                         })
                                         .await;
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(6)).await;
                                 }
                             }
 

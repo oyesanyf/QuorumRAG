@@ -153,21 +153,6 @@ impl RetrieveMeshNode {
 
         let exclude_chunk_ids: Vec<String> = state.seen_chunk_ids.iter().cloned().collect();
         tracing::info!(query = %search_query, exclude_count = exclude_chunk_ids.len(), "Calling execute_query_with_cached_vector_and_exclusion");
-        let (mut chunks, volatile, _duration, new_vector_hits) = engine
-            .execute_query_with_cached_vector_and_exclusion(
-                &search_query,
-                effective_vector,
-                cached_hits_opt,
-                access_tier,
-                candidate_k,
-                &exclude_chunk_ids,
-            )
-            .await;
-        tracing::info!(chunks = chunks.len(), volatile = volatile.len(), "Finished execute_query_with_cached_vector_and_exclusion");
-
-        if !new_vector_hits.is_empty() && state.cached_vector_hits.is_empty() {
-            state.cached_vector_hits = new_vector_hits;
-        }
 
         // When running in the live daemon (or when non-code user documents exist), filter out source code,
         // lock files, raw .dat blobs, and monolithic chat dumps so they never crowd out user PDF/DOCX documents.
@@ -277,18 +262,77 @@ impl RetrieveMeshNode {
                 acc
             });
 
-        if (daemon_active || !state.extracted_entities.is_empty()) && !prelim_entities.is_empty() {
-            // Key seen_ids by (source_peer, chunk_id) so identical files on both local and remote peers
-            // (which share the same BLAKE3-derived chunk_id) are both retained across the Mesh.
+        // Precompute supplemental search queries upfront so they can execute concurrently with the primary search
+        let should_run_supplemental = (daemon_active || !state.extracted_entities.is_empty()) && !prelim_entities.is_empty();
+        let entity_kw_query_opt = if should_run_supplemental {
+            Some(prelim_entities.join(" "))
+        } else {
+            None
+        };
+        let prompt_kw_query_opt = if should_run_supplemental && !prompt_only_entities.is_empty() && prompt_only_entities != prelim_entities {
+            Some(prompt_only_entities.join(" "))
+        } else {
+            None
+        };
+        let cue_terms = crate::offline_engine::DeterministicOfflineSynthesisEngine::answer_type_cue_terms(&state.original_prompt);
+        let cue_query_opt = if should_run_supplemental && !cue_terms.is_empty() && !prompt_only_entities.is_empty() {
+            Some(format!("{} {}", prompt_only_entities.join(" "), cue_terms.join(" ")))
+        } else {
+            None
+        };
+
+        // Dispatch primary query + supplemental queries concurrently via tokio::join!
+        let primary_fut = engine.execute_query_with_cached_vector_and_exclusion(
+            &search_query,
+            effective_vector,
+            cached_hits_opt,
+            access_tier,
+            candidate_k,
+            &exclude_chunk_ids,
+        );
+        let entity_fut = async {
+            if let Some(ref q) = entity_kw_query_opt {
+                engine.search_federated_text(q, access_tier, 96).await
+            } else {
+                Vec::new()
+            }
+        };
+        let prompt_fut = async {
+            if let Some(ref q) = prompt_kw_query_opt {
+                engine.search_federated_text(q, access_tier, 64).await
+            } else {
+                Vec::new()
+            }
+        };
+        let cue_fut = async {
+            if let Some(ref q) = cue_query_opt {
+                engine.search_federated_text(q, access_tier, 48).await
+            } else {
+                Vec::new()
+            }
+        };
+
+        let (
+            (mut chunks, volatile, _duration, new_vector_hits),
+            entity_hits,
+            prompt_hits,
+            cue_hits,
+        ) = tokio::join!(primary_fut, entity_fut, prompt_fut, cue_fut);
+
+        tracing::info!(chunks = chunks.len(), volatile = volatile.len(), "Finished concurrent execute_query and supplemental federated queries");
+
+        if !new_vector_hits.is_empty() && state.cached_vector_hits.is_empty() {
+            state.cached_vector_hits = new_vector_hits;
+        }
+
+        // Merge supplemental results in exact deterministic order (primary -> entity -> prompt -> cue)
+        // preserving exact deduplication and RRF scoring
+        if should_run_supplemental {
             let mut seen_ids: std::collections::HashSet<(String, String)> = chunks
                 .iter()
                 .map(|c| (c.source_peer.clone(), c.chunk.chunk_id.clone()))
                 .collect();
 
-            let entity_kw_query = prelim_entities.join(" ");
-            let entity_hits = engine
-                .search_federated_text(&entity_kw_query, access_tier, 96)
-                .await;
             for (idx, mut hit) in entity_hits.into_iter().enumerate() {
                 // Normalize supplemental BM25 scores to [0.0, 1.0] RRF scale (1.0 / (60.0 + rank))
                 hit.score = 1.0 / (60.0 + idx as f32);
@@ -297,32 +341,17 @@ impl RetrieveMeshNode {
                 }
             }
 
-            // When a follow-up query introduces its own specific entity term (e.g. "does he have cissp"),
-            // run an explicit search for that term so documents containing it are never drowned out by prior-turn terms.
-            if !prompt_only_entities.is_empty() && prompt_only_entities != prelim_entities {
-                let prompt_kw_query = prompt_only_entities.join(" ");
-                let prompt_hits = engine
-                    .search_federated_text(&prompt_kw_query, access_tier, 64)
-                    .await;
-                for (idx, mut hit) in prompt_hits.into_iter().enumerate() {
-                    hit.score = 1.0 / (60.0 + idx as f32);
-                    if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
-                        chunks.push(hit);
-                    }
+            for (idx, mut hit) in prompt_hits.into_iter().enumerate() {
+                hit.score = 1.0 / (60.0 + idx as f32);
+                if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
+                    chunks.push(hit);
                 }
             }
 
-            // Answer-type targeted search: "where does X live" -> X + address/street/phone, "how much ... X" -> X + rent/amount,
-            // so the excerpt holding the requested kind of fact is in the candidate pool, not just excerpts naming X.
-            let cue_terms = crate::offline_engine::DeterministicOfflineSynthesisEngine::answer_type_cue_terms(&state.original_prompt);
-            if !cue_terms.is_empty() && !prompt_only_entities.is_empty() {
-                let cue_query = format!("{} {}", prompt_only_entities.join(" "), cue_terms.join(" "));
-                let cue_hits = engine.search_federated_text(&cue_query, access_tier, 48).await;
-                for (idx, mut hit) in cue_hits.into_iter().enumerate() {
-                    hit.score = 1.0 / (60.0 + idx as f32);
-                    if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
-                        chunks.push(hit);
-                    }
+            for (idx, mut hit) in cue_hits.into_iter().enumerate() {
+                hit.score = 1.0 / (60.0 + idx as f32);
+                if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
+                    chunks.push(hit);
                 }
             }
         }
@@ -487,6 +516,75 @@ impl RetrieveMeshNode {
                 || query_lower.contains("picture")
                 || query_lower.contains("screenshot");
 
+            // Precompute query term forms and proper term forms once upfront to eliminate inner-loop format! allocations
+            struct QueryTermInfo {
+                term: String,
+                plural_s: Option<String>,
+                plural_es: Option<String>,
+                stem: Option<String>,
+                is_entity: bool,
+                is_prompt_entity: bool,
+            }
+
+            let query_term_info: Vec<QueryTermInfo> = query_terms
+                .iter()
+                .map(|t| {
+                    let (plural_s, plural_es, stem) = if t.len() >= 4 {
+                        let p_s = format!("{}s", t);
+                        let p_es = format!("{}es", t);
+                        let st = t
+                            .strip_suffix("es")
+                            .or_else(|| t.strip_suffix('s'))
+                            .filter(|s| s.len() >= 4)
+                            .map(|s| s.to_string());
+                        (Some(p_s), Some(p_es), st)
+                    } else {
+                        (None, None, None)
+                    };
+                    let is_entity = entity_terms.contains(t);
+                    let is_prompt_entity = prompt_only_entities.contains(t);
+                    QueryTermInfo {
+                        term: t.clone(),
+                        plural_s,
+                        plural_es,
+                        stem,
+                        is_entity,
+                        is_prompt_entity,
+                    }
+                })
+                .collect();
+
+            struct ProperTermInfo {
+                term: String,
+                plural_s: Option<String>,
+                plural_es: Option<String>,
+                stem: Option<String>,
+            }
+
+            let proper_term_info: Vec<ProperTermInfo> = proper_terms
+                .iter()
+                .map(|t| {
+                    let (plural_s, plural_es, stem) = if t.len() >= 4 {
+                        let p_s = format!("{}s", t);
+                        let p_es = format!("{}es", t);
+                        let st = t
+                            .strip_suffix("es")
+                            .or_else(|| t.strip_suffix('s'))
+                            .filter(|s| s.len() >= 4)
+                            .map(|s| s.to_string());
+                        (Some(p_s), Some(p_es), st)
+                    } else {
+                        (None, None, None)
+                    };
+                    ProperTermInfo {
+                        term: t.clone(),
+                        plural_s,
+                        plural_es,
+                        stem,
+                    }
+                })
+                .collect();
+
             // Compute score criteria once upfront per chunk
             let precompute_criteria = |c: &ScoredChunk| -> ChunkScoreCriteria {
                 let text_l = c.chunk.text_content.to_ascii_lowercase();
@@ -502,7 +600,7 @@ impl RetrieveMeshNode {
                     .filter(|w| !w.is_empty())
                     .collect();
 
-                let matches_whole_word = |term: &str| -> bool {
+                let check_match = |term: &str, p_s: Option<&str>, p_es: Option<&str>, stem: Option<&str>| -> bool {
                     if doc_tokens.contains(term) {
                         return true;
                     }
@@ -513,23 +611,20 @@ impl RetrieveMeshNode {
                     {
                         return true;
                     }
-                    // Allow simple plural/singular inflection ("letter" <-> "letters", "school" <-> "schools"),
-                    // never arbitrary prefix matches like "cover" matching "coverage" or "discover".
-                    if term.len() >= 4 {
-                        let plural_s = format!("{}s", term);
-                        let plural_es = format!("{}es", term);
-                        if doc_tokens.contains(plural_s.as_str())
-                            || doc_tokens.contains(plural_es.as_str())
-                        {
+                    // Allow simple plural/singular inflection using pre-formatted string references
+                    if let Some(ps) = p_s {
+                        if doc_tokens.contains(ps) {
                             return true;
                         }
-                        if let Some(stem) = term
-                            .strip_suffix("es")
-                            .or_else(|| term.strip_suffix('s'))
-                        {
-                            if stem.len() >= 4 && doc_tokens.contains(stem) {
-                                return true;
-                            }
+                    }
+                    if let Some(pes) = p_es {
+                        if doc_tokens.contains(pes) {
+                            return true;
+                        }
+                    }
+                    if let Some(st) = stem {
+                        if doc_tokens.contains(st) {
+                            return true;
                         }
                     }
                     false
@@ -540,21 +635,24 @@ impl RetrieveMeshNode {
                 let mut entity_hits = 0usize;
                 let mut prompt_entity_hits = 0usize;
 
-                for t in &query_terms {
-                    let is_entity = entity_terms.contains(t);
-                    let is_prompt_entity = prompt_only_entities.contains(t);
-                    let matches_text_or_name = matches_whole_word(t.as_str());
+                for qt in &query_term_info {
+                    let matches_text_or_name = check_match(
+                        qt.term.as_str(),
+                        qt.plural_s.as_deref(),
+                        qt.plural_es.as_deref(),
+                        qt.stem.as_deref(),
+                    );
 
                     if matches_text_or_name {
                         weighted_hits += 12;
                         content_matched_terms += 1;
-                        if is_entity {
+                        if qt.is_entity {
                             entity_hits += 1;
                         }
-                        if is_prompt_entity {
+                        if qt.is_prompt_entity {
                             prompt_entity_hits += 1;
                         }
-                    } else if path_l.contains(t.as_str()) {
+                    } else if path_l.contains(qt.term.as_str()) {
                         weighted_hits += 1;
                     }
                 }
@@ -562,9 +660,16 @@ impl RetrieveMeshNode {
                     weighted_hits += content_matched_terms * 8;
                 }
 
-                let proper_hits = proper_terms
+                let proper_hits = proper_term_info
                     .iter()
-                    .filter(|t| matches_whole_word(t.as_str()))
+                    .filter(|pt| {
+                        check_match(
+                            pt.term.as_str(),
+                            pt.plural_s.as_deref(),
+                            pt.plural_es.as_deref(),
+                            pt.stem.as_deref(),
+                        )
+                    })
                     .count();
 
                 let mut intent_bonus = (prompt_entity_hits as i32) * 320;
@@ -574,13 +679,12 @@ impl RetrieveMeshNode {
                     .split(|ch: char| !ch.is_alphanumeric())
                     .filter(|w| !w.is_empty())
                     .collect();
-                let file_term_hits = query_terms
+                let file_term_hits = query_term_info
                     .iter()
-                    .filter(|t| {
-                        file_tokens.contains(t.as_str())
-                            || (t.len() >= 4
-                                && (file_tokens.contains(format!("{}s", t).as_str())
-                                    || file_tokens.contains(format!("{}es", t).as_str())))
+                    .filter(|qt| {
+                        file_tokens.contains(qt.term.as_str())
+                            || qt.plural_s.as_ref().map_or(false, |s| file_tokens.contains(s.as_str()))
+                            || qt.plural_es.as_ref().map_or(false, |s| file_tokens.contains(s.as_str()))
                     })
                     .count();
                 if file_term_hits > 0 {
@@ -948,6 +1052,7 @@ impl RetrieveMeshNode {
 
 /// Maximal Marginal Relevance (MMR) selection algorithm to penalize redundant candidate chunks
 /// and maximize topical coverage diversity across the candidate pool.
+/// Operates in O(K * M * D) using unit-L2 pre-normalization and incremental max-similarity tracking.
 pub fn apply_mmr_selection(
     candidates: Vec<ScoredChunk>,
     _query_vector: &[f32],
@@ -958,37 +1063,49 @@ pub fn apply_mmr_selection(
         return candidates;
     }
 
-    let cosine_sim = |a: &[f32], b: &[f32]| -> f32 {
-        if a.len() != b.len() || a.is_empty() {
+    let embedder = quorum_contract::DeterministicOfflineEngine::new();
+    let num_candidates = candidates.len();
+
+    // 1. Pre-normalize candidate vectors to unit L2 norm once upfront.
+    // If norm is 0.0 or vector is empty, normalized vector is kept empty and has_valid_norm is false.
+    let mut norm_vectors: Vec<Vec<f32>> = Vec::with_capacity(num_candidates);
+    let mut has_valid_norm: Vec<bool> = Vec::with_capacity(num_candidates);
+
+    for c in &candidates {
+        let raw_vec = if !c.chunk.vector.is_empty() {
+            c.chunk.vector.clone()
+        } else {
+            embedder.embed_text(&c.chunk.text_content).unwrap_or_default()
+        };
+        let norm_sq: f32 = raw_vec.iter().map(|&x| x * x).sum();
+        if norm_sq > 0.0 {
+            let inv_norm = 1.0 / norm_sq.sqrt();
+            norm_vectors.push(raw_vec.into_iter().map(|x| x * inv_norm).collect());
+            has_valid_norm.push(true);
+        } else {
+            norm_vectors.push(raw_vec);
+            has_valid_norm.push(false);
+        }
+    }
+
+    let fast_sim = |idx_a: usize, idx_b: usize| -> f32 {
+        if !has_valid_norm[idx_a] || !has_valid_norm[idx_b] {
+            return 0.0;
+        }
+        let a = &norm_vectors[idx_a];
+        let b = &norm_vectors[idx_b];
+        if a.len() != b.len() {
             return 0.0;
         }
         let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm_a == 0.0 || norm_b == 0.0 {
-            0.0
-        } else {
-            (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
-        }
+        dot.clamp(-1.0, 1.0)
     };
-
-    let embedder = quorum_contract::DeterministicOfflineEngine::new();
-    let candidate_vectors: Vec<Vec<f32>> = candidates
-        .iter()
-        .map(|c| {
-            if !c.chunk.vector.is_empty() {
-                c.chunk.vector.clone()
-            } else {
-                embedder.embed_text(&c.chunk.text_content).unwrap_or_default()
-            }
-        })
-        .collect();
 
     let max_score = candidates.iter().map(|c| c.score).fold(0.001f32, f32::max);
     let mut remaining_indices: Vec<usize> = (0..candidates.len()).collect();
     let mut selected_indices: Vec<usize> = Vec::with_capacity(top_k);
 
-    // Seed selected with the highest relevance candidate
+    // 2. Seed selected with the highest relevance candidate
     let first_pos = remaining_indices
         .iter()
         .enumerate()
@@ -1001,8 +1118,16 @@ pub fn apply_mmr_selection(
         .map(|(pos, _)| pos)
         .unwrap_or(0);
 
-    selected_indices.push(remaining_indices.remove(first_pos));
+    let first_selected = remaining_indices.remove(first_pos);
+    selected_indices.push(first_selected);
 
+    // 3. Maintain incremental max similarity to any selected candidate for all remaining candidates
+    let mut max_sim_to_selected: Vec<f32> = vec![0.0; num_candidates];
+    for &cand_idx in &remaining_indices {
+        max_sim_to_selected[cand_idx] = fast_sim(cand_idx, first_selected).max(0.0);
+    }
+
+    // 4. Greedily select top_k items with O(M) evaluations per step
     while selected_indices.len() < top_k && !remaining_indices.is_empty() {
         let mut best_pos = 0;
         let mut best_mmr = f32::NEG_INFINITY;
@@ -1010,24 +1135,25 @@ pub fn apply_mmr_selection(
         for (pos, &cand_idx) in remaining_indices.iter().enumerate() {
             let cand_score = candidates[cand_idx].score;
             let norm_rel = cand_score / max_score;
-            let cand_vec = &candidate_vectors[cand_idx];
+            let max_sim = max_sim_to_selected[cand_idx];
 
-            let max_sim_to_selected = selected_indices
-                .iter()
-                .map(|&sel_idx| {
-                    let sel_vec = &candidate_vectors[sel_idx];
-                    cosine_sim(cand_vec, sel_vec)
-                })
-                .fold(0.0f32, f32::max);
-
-            let mmr_score = lambda * norm_rel - (1.0 - lambda) * max_sim_to_selected;
+            let mmr_score = lambda * norm_rel - (1.0 - lambda) * max_sim;
             if mmr_score > best_mmr {
                 best_mmr = mmr_score;
                 best_pos = pos;
             }
         }
 
-        selected_indices.push(remaining_indices.remove(best_pos));
+        let newly_selected = remaining_indices.remove(best_pos);
+        selected_indices.push(newly_selected);
+
+        // Incremental update: update max_sim_to_selected ONLY against the newly chosen candidate
+        for &cand_idx in &remaining_indices {
+            let sim = fast_sim(cand_idx, newly_selected);
+            if sim > max_sim_to_selected[cand_idx] {
+                max_sim_to_selected[cand_idx] = sim;
+            }
+        }
     }
 
     let mut selected_chunks = Vec::with_capacity(selected_indices.len());

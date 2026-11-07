@@ -118,11 +118,15 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
 #[derive(Clone)]
 pub struct SwarmMeshDispatcher {
     pub handle: NetworkSwarmHandle,
+    pub last_bootstrap_dial_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SwarmMeshDispatcher {
     pub fn new(handle: NetworkSwarmHandle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            last_bootstrap_dial_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
     }
 }
 
@@ -140,25 +144,34 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             .map_err(|e| CoordinatorError::Network(e.to_string()))?;
 
         // If no peers are currently connected (e.g., idle TCP drop or remote node restarted),
-        // proactively dial configured bootstrap_peers from OshoosiClaw Mesh settings and wait briefly.
+        // proactively dial configured bootstrap_peers from OshoosiClaw Mesh settings and wait briefly,
+        // subject to a 10-second cooldown so offline peers do not inject 450ms sleep per sub-query.
         if peers.is_empty() {
-            let bootstrap_addrs = {
-                let controller = crate::dlp_mesh::global_mesh_dlp_controller();
-                let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
-                s.mesh.bootstrap_peers.clone()
-            };
-            if !bootstrap_addrs.is_empty() {
-                for addr_str in &bootstrap_addrs {
-                    if let Ok(addr) = addr_str.trim().parse::<quorum_network::Multiaddr>() {
-                        let _ = self.handle.dial(addr).await;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let last_dial = self.last_bootstrap_dial_ms.load(std::sync::atomic::Ordering::Relaxed);
+            if now_ms.saturating_sub(last_dial) >= 10_000 {
+                self.last_bootstrap_dial_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                let bootstrap_addrs = {
+                    let controller = crate::dlp_mesh::global_mesh_dlp_controller();
+                    let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
+                    s.mesh.bootstrap_peers.clone()
+                };
+                if !bootstrap_addrs.is_empty() {
+                    for addr_str in &bootstrap_addrs {
+                        if let Ok(addr) = addr_str.trim().parse::<quorum_network::Multiaddr>() {
+                            let _ = self.handle.dial(addr).await;
+                        }
                     }
-                }
-                for _ in 0..9 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    if let Ok(rechecked) = self.handle.connected_peers().await {
-                        if !rechecked.is_empty() {
-                            peers = rechecked;
-                            break;
+                    for _ in 0..9 {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        if let Ok(rechecked) = self.handle.connected_peers().await {
+                            if !rechecked.is_empty() {
+                                peers = rechecked;
+                                break;
+                            }
                         }
                     }
                 }
@@ -322,11 +335,11 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             };
         }
 
-        // 3. Cryptographic handshake & anti-replay timestamp verification (drift <= 300s across LAN clocks)
+        // 3. Cryptographic handshake & anti-replay timestamp verification (drift <= 60s)
         let mut verified_tier = None;
         for t in 0..=3 {
             if let Ok(candidate_tier) = quorum_types::AccessTier::from_u8(t) {
-                if crate::crypto::verify_request(&req, candidate_tier, 300).is_ok() {
+                if crate::crypto::verify_request(&req, candidate_tier, 60).is_ok() {
                     verified_tier = Some(candidate_tier);
                     break;
                 }
@@ -337,7 +350,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             Some(tier) => tier.as_u8().min(max_tier),
             None => {
                 tracing::warn!(
-                    "Rejecting unverified or stale query signature (>300s drift) from peer: {}",
+                    "Rejecting unverified or stale query signature (>60s drift) from peer: {}",
                     req.sender_peer_id
                 );
                 return FederatedQueryResponse {
@@ -348,22 +361,16 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             }
         };
 
-        let mut scored = self
-            .local_storage
-            .search_hybrid(
+        let (mut scored, text_scored) = tokio::join!(
+            self.local_storage.search_hybrid(
                 &req.query_text,
                 &req.embedding,
                 effective_tier,
                 req.top_k.clamp(16, 32),
-            )
-            .await;
+            ),
+            self.local_storage.search_text(&req.query_text, effective_tier, 24)
+        );
 
-        // Also include direct text matches on the remote peer so exact entity/CVE/name queries
-        // never miss chunks when embedding vectors differ or are zeroed.
-        let text_scored = self
-            .local_storage
-            .search_text(&req.query_text, effective_tier, 24)
-            .await;
         let mut seen_ids: std::collections::HashSet<String> =
             scored.iter().map(|c| c.chunk.chunk_id.clone()).collect();
         for hit in text_scored {

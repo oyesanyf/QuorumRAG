@@ -272,9 +272,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         };
         match quorum_network::start_network_node(net_config, Some(inbound_handler)).await {
             Ok((_join, handle)) => {
-                let disp = Arc::new(quorum_coordinator::SwarmMeshDispatcher {
-                    handle: handle.clone(),
-                });
+                let disp = Arc::new(quorum_coordinator::SwarmMeshDispatcher::new(handle.clone()));
                 (disp, Some(handle))
             }
             Err(e) => {
