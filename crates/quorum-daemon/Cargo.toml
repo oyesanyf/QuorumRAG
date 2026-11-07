@@ -60,3 +60,7 @@ path = "../../tests/benchmarks_r4.rs"
 [[test]]
 name = "multi_node_p2p_search_tests"
 path = "../../tests/multi_node_p2p_search_tests.rs"
+
+[[test]]
+name = "retrieval_performance_tests"
+path = "../../tests/retrieval_performance_tests.rs"

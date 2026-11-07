@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use quorum_types::{DocumentChunk, ScoredChunk};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::merge_policy::NoMergePolicy;
-use tantivy::query::{BooleanQuery, QueryParser, RangeQuery, TermQuery};
+use tantivy::query::{BooleanQuery, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::*;
 use tantivy::index::SegmentId;
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
@@ -348,9 +348,9 @@ impl TantivyFtsIndex {
             return Ok(Vec::new());
         }
 
-        tracing::info!(query = %trimmed, "TantivyFtsIndex::search start");
+        tracing::debug!(query = %trimmed, "TantivyFtsIndex::search start");
         self.reload_with_retry(SyncCheck::None)?;
-        tracing::info!("TantivyFtsIndex::search reload_with_retry done");
+        tracing::debug!("TantivyFtsIndex::search reload_with_retry done");
         let searcher = self.reader.searcher();
         if searcher.num_docs() == 0 {
             return Ok(Vec::new());
@@ -562,6 +562,46 @@ impl TantivyFtsIndex {
             .search(&query, &TopDocs::with_limit(1).order_by_score())
             .map_err(|e| StorageError::Tantivy(e.to_string()))?;
         Ok(!hits.is_empty())
+    }
+
+    /// Retrieves specific chunks by their chunk IDs via O(K) inverted-index point lookups.
+    pub(crate) fn get_chunks_by_ids(
+        &self,
+        chunk_ids: &[String],
+        include_vector: bool,
+    ) -> Result<Vec<DocumentChunk>, StorageError> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.reload_with_retry(SyncCheck::None)?;
+        let searcher = self.reader.searcher();
+        if searcher.num_docs() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let queries: Vec<Box<dyn Query>> = chunk_ids
+            .iter()
+            .map(|id| {
+                let term = Term::from_field_text(self.field_chunk_id, id);
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>
+            })
+            .collect();
+
+        let union_query = BooleanQuery::union(queries);
+        let top_docs = searcher
+            .search(&union_query, &TopDocs::with_limit(chunk_ids.len()).order_by_score())
+            .map_err(|e| StorageError::Tantivy(format!("Point lookup failed: {}", e)))?;
+
+        let mut chunks = Vec::with_capacity(top_docs.len());
+        for (_score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher
+                .doc(doc_address)
+                .map_err(|e| StorageError::Tantivy(format!("Failed to retrieve document: {}", e)))?;
+            chunks.push(self.doc_to_chunk_internal(&doc, include_vector));
+        }
+
+        Ok(chunks)
     }
 
     /// Deletes all indexed documents matching the specified `file_path`.

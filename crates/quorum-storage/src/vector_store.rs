@@ -201,6 +201,10 @@ impl VectorStore {
             .create_index(&["file_path"], Index::BTree(Default::default()))
             .execute()
             .await;
+        let _ = table
+            .create_index(&["chunk_id"], Index::BTree(Default::default()))
+            .execute()
+            .await;
 
         let num_rows = table.count_rows(None).await.unwrap_or(0);
         if num_rows < 256 {
@@ -275,6 +279,40 @@ impl VectorStore {
             .map_err(|e| StorageError::Lance(format!("Scan query failed: {}", e)))?;
 
         let mut chunks = Vec::new();
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let batch_chunks = crate::arrow_interop::record_batch_to_chunks(&batch, self.config.vector_dimension)?;
+            chunks.extend(batch_chunks);
+        }
+        Ok(chunks)
+    }
+
+    /// Retrieves specific chunks from the vector table by their chunk_ids using SQL predicate pushdown.
+    pub(crate) async fn get_chunks_by_ids(
+        &self,
+        chunk_ids: &[String],
+    ) -> Result<Vec<DocumentChunk>, StorageError> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let list = chunk_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let predicate = format!("chunk_id IN ({list})");
+
+        let table = self.table.read().await;
+        let mut stream = table
+            .query()
+            .only_if(predicate)
+            .limit(chunk_ids.len())
+            .execute()
+            .await
+            .map_err(|e| StorageError::Lance(format!("Get chunks query failed: {}", e)))?;
+
+        let mut chunks = Vec::with_capacity(chunk_ids.len());
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result.map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
             let batch_chunks = crate::arrow_interop::record_batch_to_chunks(&batch, self.config.vector_dimension)?;

@@ -143,9 +143,30 @@ impl HardwareTelemetry {
     }
 
     fn probe_gpu() -> (Option<String>, u64, u64, usize) {
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+
+        static GPU_CACHE: OnceLock<Mutex<Option<(Instant, (Option<String>, u64, u64, usize))>>> = OnceLock::new();
+        let cache_mutex = GPU_CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(guard) = cache_mutex.lock() {
+            if let Some((ts, ref cached)) = *guard {
+                // If no GPU was detected, cache the negative result for 5 minutes (300s).
+                // If an NVIDIA GPU is present, refresh free VRAM every 30s.
+                let ttl = if cached.3 == 0 {
+                    Duration::from_secs(300)
+                } else {
+                    Duration::from_secs(30)
+                };
+                if ts.elapsed() < ttl {
+                    return cached.clone();
+                }
+            }
+        }
+
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
+            use std::path::Path;
             use std::process::Command;
 
             let candidate_binaries = [
@@ -155,6 +176,11 @@ impl HardwareTelemetry {
             ];
 
             for binary in candidate_binaries {
+                // Fast path: skip explicit file paths that do not exist on disk
+                if binary.contains('\\') && !Path::new(binary).exists() {
+                    continue;
+                }
+
                 // First attempt: 3-column query (name, memory.total, memory.free)
                 let mut cmd = Command::new(binary);
                 cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
@@ -165,7 +191,11 @@ impl HardwareTelemetry {
                         let text = String::from_utf8_lossy(&output.stdout);
                         let (name, free_mb, total_mb, count) = Self::parse_nvidia_smi_output(&text);
                         if count > 0 {
-                            return (name, free_mb, total_mb, count);
+                            let res = (name, free_mb, total_mb, count);
+                            if let Ok(mut guard) = cache_mutex.lock() {
+                                *guard = Some((Instant::now(), res.clone()));
+                            }
+                            return res;
                         }
                     }
                 }
@@ -180,7 +210,11 @@ impl HardwareTelemetry {
                         let text = String::from_utf8_lossy(&output.stdout);
                         let (name, free_mb, total_mb, count) = Self::parse_nvidia_smi_output(&text);
                         if count > 0 {
-                            return (name, free_mb, total_mb, count);
+                            let res = (name, free_mb, total_mb, count);
+                            if let Ok(mut guard) = cache_mutex.lock() {
+                                *guard = Some((Instant::now(), res.clone()));
+                            }
+                            return res;
                         }
                     }
                 }
@@ -198,7 +232,11 @@ impl HardwareTelemetry {
                     let text = String::from_utf8_lossy(&output.stdout);
                     let (name, free_mb, total_mb, count) = Self::parse_nvidia_smi_output(&text);
                     if count > 0 {
-                        return (name, free_mb, total_mb, count);
+                        let res = (name, free_mb, total_mb, count);
+                        if let Ok(mut guard) = cache_mutex.lock() {
+                            *guard = Some((Instant::now(), res.clone()));
+                        }
+                        return res;
                     }
                 }
             }
@@ -211,12 +249,20 @@ impl HardwareTelemetry {
                     let text = String::from_utf8_lossy(&output.stdout);
                     let (name, free_mb, total_mb, count) = Self::parse_nvidia_smi_output(&text);
                     if count > 0 {
-                        return (name, free_mb, total_mb, count);
+                        let res = (name, free_mb, total_mb, count);
+                        if let Ok(mut guard) = cache_mutex.lock() {
+                            *guard = Some((Instant::now(), res.clone()));
+                        }
+                        return res;
                     }
                 }
             }
         }
 
-        (None, 0, 0, 0)
+        let negative = (None, 0, 0, 0);
+        if let Ok(mut guard) = cache_mutex.lock() {
+            *guard = Some((Instant::now(), negative.clone()));
+        }
+        negative
     }
 }
