@@ -463,19 +463,19 @@ impl IngestConfig {
                         std::ptr::null_mut(),
                         &mut data_size,
                     ) == 0 && data_size > 0 {
-                        let mut raw_data = vec![0u8; data_size as usize + 2];
+                        // Ensure 2-byte alignment for wide string buffer
+                        let u16_len = (data_size as usize / 2) + 1;
+                        let mut raw_data = vec![0u16; u16_len];
                         if RegQueryValueExW(
                             h_sid,
                             val_name.as_ptr(),
                             std::ptr::null(),
                             &mut data_type,
-                            raw_data.as_mut_ptr(),
+                            raw_data.as_mut_ptr() as *mut u8,
                             &mut data_size,
                         ) == 0 {
-                            let u16_slice = std::slice::from_raw_parts(
-                                raw_data.as_ptr() as *const u16,
-                                data_size as usize / 2,
-                            );
+                            let u16_count = (data_size as usize / 2).min(raw_data.len());
+                            let u16_slice = &raw_data[..u16_count];
                             let trimmed_u16 = if let Some(pos) = u16_slice.iter().position(|&c| c == 0) {
                                 &u16_slice[..pos]
                             } else {
@@ -616,10 +616,24 @@ impl IngestConfig {
                 }
             }
 
+            fn strip_verbatim_unc_prefix(p: &std::path::Path) -> PathBuf {
+                let s = p.to_string_lossy();
+                if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+                    PathBuf::from(format!(r"\\{}", stripped))
+                } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                    PathBuf::from(stripped)
+                } else {
+                    p.to_path_buf()
+                }
+            }
+
             let mut seen_canonicals: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
             for path in candidate_profiles {
                 let mut user_roots = Vec::new();
+                let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                let clean_root = strip_verbatim_unc_prefix(&canon_path);
+                let raw_clean_root = strip_verbatim_unc_prefix(&path);
 
                 // Helper to validate and add document roots safely:
                 // allows directory reparse points (OneDrive, cloud sync, junctions to real folders)
@@ -633,10 +647,36 @@ impl IngestConfig {
                         if !canon.is_dir() || std::fs::read_dir(&canon).is_err() {
                             return;
                         }
+
+                        let clean_canon = strip_verbatim_unc_prefix(&canon);
+
                         // Reject recursive loops that resolve to profile root or its ancestors
-                        if canon == path || path.starts_with(&canon) {
+                        if canon == canon_path
+                            || canon_path.starts_with(&canon)
+                            || clean_canon == clean_root
+                            || clean_canon == raw_clean_root
+                            || clean_root.starts_with(&clean_canon)
+                            || raw_clean_root.starts_with(&clean_canon)
+                        {
                             return;
                         }
+
+                        // Reject recursive loops that resolve to dir's parent or ancestor directories
+                        if let Some(parent) = dir.parent() {
+                            let canon_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+                            let clean_parent = strip_verbatim_unc_prefix(&canon_parent);
+                            let raw_clean_parent = strip_verbatim_unc_prefix(parent);
+                            if canon == canon_parent
+                                || canon_parent.starts_with(&canon)
+                                || clean_canon == clean_parent
+                                || clean_canon == raw_clean_parent
+                                || clean_parent.starts_with(&clean_canon)
+                                || raw_clean_parent.starts_with(&clean_canon)
+                            {
+                                return;
+                            }
+                        }
+
                         if seen_canonicals.insert(canon) {
                             target_vec.push(dir);
                         }
