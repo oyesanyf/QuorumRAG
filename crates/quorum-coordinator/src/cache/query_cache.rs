@@ -78,13 +78,40 @@ impl QueryCache {
         access_tier: u8,
         index_epoch: u64,
     ) -> Option<CachedQueryEntry> {
+        self.get_with_mesh_requirement(
+            query,
+            search_mode,
+            model_family,
+            access_tier,
+            index_epoch,
+            false,
+        )
+    }
+
+    /// Probe the cache while optionally requiring at least one external mesh peer citation/chunk
+    /// so local-only entries cached before LAN peers connected never mask live mesh results.
+    pub fn get_with_mesh_requirement(
+        &self,
+        query: &str,
+        search_mode: SearchMode,
+        model_family: SynthesisModelFamily,
+        access_tier: u8,
+        index_epoch: u64,
+        require_external_citation: bool,
+    ) -> Option<CachedQueryEntry> {
         let key = derive_query_cache_key(query, search_mode, model_family, access_tier, index_epoch);
 
         {
             let map = self.map.read().ok()?;
             if let Some(entry) = map.get(&key) {
-                // Assert epoch consistency and TTL freshness
-                if entry.index_epoch == index_epoch && entry.created_at.elapsed() <= self.ttl {
+                let mesh_ok = !require_external_citation
+                    || entry.citations.iter().any(|c| c.is_external_node)
+                    || entry.chunks.iter().any(|c| c.is_remote);
+                // Assert epoch consistency, TTL freshness, and mesh coverage
+                if entry.index_epoch == index_epoch
+                    && entry.created_at.elapsed() <= self.ttl
+                    && mesh_ok
+                {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                     return Some(entry.clone());
                 }

@@ -405,6 +405,7 @@ pub struct ChatSessionData {
 pub struct ChatSessionRegistry {
     sessions: Arc<RwLock<HashMap<String, ChatSessionData>>>,
     history_db: Arc<RwLock<Option<Arc<crate::chat_history_db::ChatHistoryStore>>>>,
+    pub(crate) p2p_watcher_runtime: Arc<RwLock<Option<Arc<crate::p2p_watcher::P2pWatcherRuntime>>>>,
 }
 
 impl ChatSessionRegistry {
@@ -412,6 +413,7 @@ impl ChatSessionRegistry {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             history_db: Arc::new(RwLock::new(None)),
+            p2p_watcher_runtime: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -480,6 +482,38 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    /// Attaches an explicit `P2pWatcherRuntime` configured at daemon startup.
+    pub fn set_p2p_watcher(&self, runtime: Arc<crate::p2p_watcher::P2pWatcherRuntime>) {
+        if let Ok(mut guard) = self.sessions.p2p_watcher_runtime.write() {
+            *guard = Some(runtime);
+        }
+    }
+
+    /// Returns the active `P2pWatcherRuntime` (lazily initializing a default instance for test harnesses).
+    pub fn p2p_watcher(&self) -> Arc<crate::p2p_watcher::P2pWatcherRuntime> {
+        if let Ok(guard) = self.sessions.p2p_watcher_runtime.read() {
+            if let Some(ref existing) = *guard {
+                return Arc::clone(existing);
+            }
+        }
+        let mut wguard = self
+            .sessions
+            .p2p_watcher_runtime
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ref existing) = *wguard {
+            return Arc::clone(existing);
+        }
+        let default_rt = Arc::new(crate::p2p_watcher::P2pWatcherRuntime::new(
+            self.data_dir.clone(),
+            self.port.saturating_add(1),
+            self.coordinator.engine.secret_seed,
+            self.coordinator.engine.sender_peer_id.clone(),
+            self.swarm_handle.is_some(),
+        ));
+        *wguard = Some(Arc::clone(&default_rt));
+        default_rt
+    }
     /// Returns the persistent SQLite `ChatHistoryStore` backed by `<data_dir>/chat_history.db`.
     pub fn history_store(&self) -> Result<Arc<crate::chat_history_db::ChatHistoryStore>, String> {
         if let Ok(guard) = self.sessions.history_db.read() {

@@ -75,9 +75,14 @@ impl RrfCombiner {
 
                 let score = 1.0 / (k + (rank_0 + 1) as f32);
                 let entry = rrf_map.entry(content_hash.clone()).or_insert_with(|| {
+                    let derived_doc_id = candidate
+                        .chunk_id
+                        .rsplit_once(':')
+                        .map(|(d, _)| d.to_string())
+                        .unwrap_or_else(|| format!("remote:{}", candidate.file_path));
                     let doc_chunk = DocumentChunk {
                         chunk_id: candidate.chunk_id.clone(),
-                        document_id: "remote_doc".to_string(),
+                        document_id: derived_doc_id,
                         file_path: candidate.file_path,
                         line_start: candidate.line_start,
                         line_end: candidate.line_end,

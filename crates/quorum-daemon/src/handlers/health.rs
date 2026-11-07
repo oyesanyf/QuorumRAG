@@ -39,6 +39,16 @@ pub async fn health_handler(
     };
 
     let cache_stats = state.coordinator.cache_stats();
+    let watcher_rt = state.p2p_watcher();
+    let watcher_pid_raw = watcher_rt.watcher_pid.load(std::sync::atomic::Ordering::Acquire);
+    let watcher_pid_opt = if watcher_pid_raw > 0 { Some(watcher_pid_raw) } else { None };
+    let watcher_active = watcher_rt.enabled.load(std::sync::atomic::Ordering::Acquire);
+    let watcher_restarts = watcher_rt.watcher_restarts.load(std::sync::atomic::Ordering::Relaxed);
+    let watcher_probe_runs = watcher_rt.probe_runs.load(std::sync::atomic::Ordering::Relaxed);
+    let watcher_heal_runs = watcher_rt.heal_runs.load(std::sync::atomic::Ordering::Relaxed);
+    let watcher_zombies_evicted = watcher_rt.zombies_evicted.load(std::sync::atomic::Ordering::Relaxed);
+    let watcher_last_probe_at = watcher_rt.last_probe_at.read().ok().and_then(|g| g.clone());
+    let watcher_last_heal_at = watcher_rt.last_heal_at.read().ok().and_then(|g| g.clone());
 
     Json(serde_json::json!({
         "status": "healthy",
@@ -69,6 +79,16 @@ pub async fn health_handler(
             "connected_peers": connected_peers,
             "listen_addresses": listen_addrs,
             "local_peer_id": state.swarm_handle.as_ref().map(|s| s.local_peer_id().to_string()),
+            "p2p_watcher": {
+                "active": watcher_active,
+                "watcher_pid": watcher_pid_opt,
+                "watcher_restarts": watcher_restarts,
+                "probe_runs": watcher_probe_runs,
+                "heal_runs": watcher_heal_runs,
+                "zombies_evicted": watcher_zombies_evicted,
+                "last_probe_at": watcher_last_probe_at,
+                "last_heal_at": watcher_last_heal_at,
+            },
         },
         "active_model_family": format!("{:?}", state.default_model_family),
     }))

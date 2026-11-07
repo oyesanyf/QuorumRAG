@@ -55,6 +55,9 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
 
         // OshoosiClaw Mesh Network & TPM 2.0 Hardware RoT Endpoints
         .route("/api/mesh/tpm/status", get(mesh::get_tpm_status_handler))
+        .route("/api/mesh/watcher", get(crate::p2p_watcher::get_p2p_watcher_status_handler))
+        .route("/api/mesh/watcher/probe", post(crate::p2p_watcher::post_p2p_watcher_probe_handler))
+        .route("/api/mesh/watcher/heal", post(crate::p2p_watcher::post_p2p_watcher_heal_handler))
         .route("/api/tpm/status", get(mesh::get_tpm_status_handler))
         .route("/api/mesh/topology", get(mesh::get_mesh_topology_handler))
         .route("/api/topology", get(mesh::get_mesh_topology_handler))

@@ -1,9 +1,112 @@
 use crate::error::CoordinatorError;
+use chrono::Utc;
 use quorum_network::NetworkSwarmHandle;
 use quorum_types::{CandidateChunkDto, FederatedQueryRequest, FederatedQueryResponse};
-use std::sync::Arc;
-use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+
+/// Lightweight signed canary query string recognized by `OsoosiMeshInboundHandler`
+/// to verify end-to-end libp2p Noise + Yamux + Ed25519 request-response liveness in <1ms
+/// without touching LanceDB or Tantivy. Older peers also handle it safely as an empty-hit query.
+pub const P2P_WATCHER_CANARY_QUERY: &str = "__quorum_p2p_watcher_ping__";
+
+/// Live per-peer RTT and reliability telemetry tracked across real queries and watcher probes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PeerHealthStats {
+    pub peer_id: String,
+    pub last_rtt_ms: Option<f64>,
+    pub avg_rtt_ms: Option<f64>,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub consecutive_failures: u32,
+    pub last_chunks_returned: usize,
+    pub last_seen_rfc3339: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// Process-wide thread-safe registry of live P2P peer RTTs and failure streaks.
+#[derive(Default)]
+pub struct PeerHealthRegistry {
+    stats: std::sync::RwLock<HashMap<String, PeerHealthStats>>,
+}
+
+impl PeerHealthRegistry {
+    pub fn new() -> Self {
+        Self {
+            stats: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn record_success(&self, peer_id: &str, rtt_ms: f64, chunks_returned: usize) {
+        let mut guard = self.stats.write().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PeerHealthStats {
+                peer_id: peer_id.to_string(),
+                ..Default::default()
+            });
+        let rounded = (rtt_ms * 100.0).round() / 100.0;
+        entry.last_rtt_ms = Some(rounded);
+        entry.avg_rtt_ms = Some(match entry.avg_rtt_ms {
+            Some(prev) => ((prev * 0.7 + rounded * 0.3) * 100.0).round() / 100.0,
+            None => rounded,
+        });
+        entry.success_count = entry.success_count.saturating_add(1);
+        entry.consecutive_failures = 0;
+        entry.last_chunks_returned = chunks_returned;
+        entry.last_seen_rfc3339 = Some(Utc::now().to_rfc3339());
+        entry.last_error = None;
+    }
+
+    pub fn record_failure(&self, peer_id: &str, error_msg: impl Into<String>) {
+        let mut guard = self.stats.write().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PeerHealthStats {
+                peer_id: peer_id.to_string(),
+                ..Default::default()
+            });
+        entry.failure_count = entry.failure_count.saturating_add(1);
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.last_error = Some(error_msg.into());
+    }
+
+    pub fn get(&self, peer_id: &str) -> Option<PeerHealthStats> {
+        let guard = self.stats.read().unwrap_or_else(|e| e.into_inner());
+        guard.get(peer_id).cloned()
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, PeerHealthStats> {
+        let guard = self.stats.read().unwrap_or_else(|e| e.into_inner());
+        guard.clone()
+    }
+
+    pub fn unhealthy_peers(&self, min_consecutive_failures: u32) -> Vec<String> {
+        let guard = self.stats.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .values()
+            .filter(|s| s.consecutive_failures >= min_consecutive_failures)
+            .map(|s| s.peer_id.clone())
+            .collect()
+    }
+
+    pub fn clear_peer_failures(&self, peer_id: &str) {
+        let mut guard = self.stats.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.get_mut(peer_id) {
+            entry.consecutive_failures = 0;
+            entry.last_error = None;
+        }
+    }
+}
+
+/// Returns the singleton `PeerHealthRegistry` shared by `SwarmMeshDispatcher`, `/api/peers`, and `p2p_watcher`.
+pub fn global_peer_health_registry() -> &'static PeerHealthRegistry {
+    static REGISTRY: OnceLock<PeerHealthRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(PeerHealthRegistry::new)
+}
 
 /// Clean interface abstraction separating mesh querying mechanisms.
 #[async_trait::async_trait]
@@ -109,7 +212,6 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
     }
 
     fn peer_count(&self) -> usize {
-        // Approximate count from blocking read or 0
         0
     }
 }
@@ -151,9 +253,12 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let last_dial = self.last_bootstrap_dial_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let last_dial = self
+                .last_bootstrap_dial_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
             if now_ms.saturating_sub(last_dial) >= 10_000 {
-                self.last_bootstrap_dial_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                self.last_bootstrap_dial_ms
+                    .store(now_ms, std::sync::atomic::Ordering::Relaxed);
                 let bootstrap_addrs = {
                     let controller = crate::dlp_mesh::global_mesh_dlp_controller();
                     let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
@@ -184,12 +289,19 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
 
         use futures::stream::{FuturesUnordered, StreamExt};
 
+        let mut pending_peer_ids: HashSet<String> =
+            peers.iter().map(|p| p.to_string()).collect();
+
         let mut futures = FuturesUnordered::new();
         for peer in peers {
+            let peer_str = peer.to_string();
             let handle = self.handle.clone();
             let req = request.clone();
             futures.push(tokio::spawn(async move {
-                handle.send_query(peer, req).await
+                let started = Instant::now();
+                let res = handle.send_query(peer, req).await;
+                let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
+                (peer_str, res, rtt_ms)
             }));
         }
 
@@ -203,24 +315,90 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             }
         };
 
+        let registry = global_peer_health_registry();
+        let primary_deadline = tokio::time::Instant::now() + timeout;
+        let mut active_deadline = primary_deadline;
+        let mut got_non_empty_peer = false;
         let mut responses = Vec::new();
-        let _ = tokio::time::timeout(timeout, async {
-            while let Some(res) = futures.next().await {
-                if let Ok(Ok(resp)) = res {
+
+        loop {
+            if futures.is_empty() {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= active_deadline {
+                break;
+            }
+            let remaining = active_deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, futures.next()).await {
+                Ok(Some(Ok((peer_str, Ok(resp), rtt_ms)))) => {
+                    pending_peer_ids.remove(&peer_str);
+                    let chunks_len = resp.chunks.len();
+                    registry.record_success(&peer_str, rtt_ms, chunks_len);
+                    tracing::info!(
+                        peer = %peer_str,
+                        rtt_ms = format!("{:.1}", rtt_ms),
+                        chunks = chunks_len,
+                        "Received federated P2P mesh response"
+                    );
+                    if chunks_len > 0 && !got_non_empty_peer {
+                        got_non_empty_peer = true;
+                        // Two-stage deadline: once at least one peer has delivered real chunks,
+                        // give slower straggler peers a bounded 950ms grace window so dead/stalled
+                        // sockets never penalize responsive LAN peers.
+                        let grace_deadline =
+                            tokio::time::Instant::now() + Duration::from_millis(950);
+                        if grace_deadline < active_deadline {
+                            active_deadline = grace_deadline;
+                        }
+                    }
                     responses.push(resp);
                     if responses.len() >= max_peer_responses {
                         break;
                     }
                 }
+                Ok(Some(Ok((peer_str, Err(err), rtt_ms)))) => {
+                    pending_peer_ids.remove(&peer_str);
+                    registry.record_failure(&peer_str, err.to_string());
+                    tracing::warn!(
+                        peer = %peer_str,
+                        rtt_ms = format!("{:.1}", rtt_ms),
+                        error = %err,
+                        "Federated P2P mesh query to peer failed"
+                    );
+                }
+                Ok(Some(Err(join_err))) => {
+                    tracing::warn!("Swarm query task join error: {}", join_err);
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    // Deadline reached while remaining peers were still in flight
+                    break;
+                }
             }
-        })
-        .await;
+        }
+
+        // Any peers still pending when the primary deadline expired (not merely shortened straggler grace)
+        // are recorded as timed-out so the P2P Watcher can proactively probe & heal zombie streams.
+        if !pending_peer_ids.is_empty() && tokio::time::Instant::now() >= primary_deadline {
+            for stalled_peer in &pending_peer_ids {
+                registry.record_failure(
+                    stalled_peer,
+                    format!("Timed out after {}ms", timeout.as_millis()),
+                );
+                tracing::warn!(
+                    peer = %stalled_peer,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Federated P2P mesh query timed out waiting for peer"
+                );
+            }
+        }
 
         Ok(responses)
     }
 
     fn peer_count(&self) -> usize {
-        1
+        self.handle.connected_peer_addresses().len()
     }
 }
 
@@ -265,11 +443,11 @@ impl OsoosiMeshInboundHandler {
 #[async_trait::async_trait]
 impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
     async fn handle_query(&self, req: FederatedQueryRequest) -> FederatedQueryResponse {
-        // 1. Reject malformed payloads: embedding dimension 768, finite floats, text length <= 4096, top_k > 0
+        // 1. Reject malformed payloads: embedding dimension 768, finite floats, text length <= 4096, top_k > 0 (except signed canary ping)
         if req.embedding.len() != 768
             || !req.embedding.iter().all(|f| f.is_finite())
             || req.query_text.len() > 4096
-            || req.top_k == 0
+            || (req.top_k == 0 && req.query_text != P2P_WATCHER_CANARY_QUERY)
         {
             tracing::warn!(
                 "Rejecting malformed mesh query payload from peer: {}",
@@ -361,6 +539,16 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             }
         };
 
+        // Fast-path P2P Watcher signed canary ping: proves full libp2p + Ed25519 + ACL liveness in <1ms
+        if req.query_text == P2P_WATCHER_CANARY_QUERY {
+            global_peer_health_registry().record_success(&req.sender_peer_id, 0.5, 0);
+            return FederatedQueryResponse {
+                query_id: req.query_id,
+                responder_peer_id: self.local_peer_id.clone(),
+                chunks: Vec::new(),
+            };
+        }
+
         let (mut scored, text_scored) = tokio::join!(
             self.local_storage.search_hybrid(
                 &req.query_text,
@@ -368,7 +556,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 effective_tier,
                 req.top_k.clamp(16, 32),
             ),
-            self.local_storage.search_text(&req.query_text, effective_tier, 24)
+            self.local_storage
+                .search_text(&req.query_text, effective_tier, 24)
         );
 
         let mut seen_ids: std::collections::HashSet<String> =
@@ -440,8 +629,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             .collect();
 
         // Filter strictly to user's shared_folders and enforce PHI/PII Redact or Block
-        let safe_chunks =
-            controller.filter_and_enforce_outbound_mesh_chunks(candidate_dtos, &req.sender_peer_id);
+        let safe_chunks = controller
+            .filter_and_enforce_outbound_mesh_chunks(candidate_dtos, &req.sender_peer_id);
 
         FederatedQueryResponse {
             query_id: req.query_id,

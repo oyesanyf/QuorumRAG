@@ -190,15 +190,22 @@ impl AgenticStateGraphRunner {
                     cache_key_query = graph_state.current_query.clone();
 
                     let epoch = engine.local_storage.index_epoch();
+                    let p2p_active = crate::dlp_mesh::global_mesh_dlp_controller()
+                        .settings
+                        .read()
+                        .map(|s| s.mesh.p2p_enabled)
+                        .unwrap_or(true)
+                        && engine.mesh_dispatcher.peer_count() > 0;
                     let maybe_cached = if is_continuation {
                         None
                     } else {
-                        self.cache_manager.query_cache.get(
+                        self.cache_manager.query_cache.get_with_mesh_requirement(
                             &cache_key_query,
                             graph_state.search_mode,
                             graph_state.model_family,
                             access_tier,
                             epoch,
+                            p2p_active,
                         )
                     };
 

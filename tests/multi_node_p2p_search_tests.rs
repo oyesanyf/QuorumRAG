@@ -413,3 +413,290 @@ async fn test_fresh_install_untrusted_peer_access_tier_parity() {
     let _ = handle_a.shutdown().await;
     let _ = handle_b.shutdown().await;
 }
+
+
+struct DelayedStorageSearcher {
+    inner: Arc<StorageEngine>,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl quorum_coordinator::StorageSearcher for DelayedStorageSearcher {
+    async fn search_hybrid(
+        &self,
+        query_text: &str,
+        query_vec: &[f32],
+        max_tier: u8,
+        top_k: usize,
+    ) -> Vec<quorum_types::ScoredChunk> {
+        tokio::time::sleep(self.delay).await;
+        self.inner
+            .search_hybrid(query_text, query_vec, max_tier, top_k)
+            .await
+            .unwrap_or_default()
+    }
+
+    async fn search_text(
+        &self,
+        query: &str,
+        max_tier: u8,
+        top_k: usize,
+    ) -> Vec<quorum_types::ScoredChunk> {
+        self.inner
+            .search_text(query, max_tier, top_k)
+            .await
+            .unwrap_or_default()
+    }
+
+    async fn get_chunks_by_ids(
+        &self,
+        chunk_ids: &[String],
+        max_tier: u8,
+    ) -> Vec<quorum_types::DocumentChunk> {
+        self.inner
+            .get_chunks_by_ids(chunk_ids)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.access_tier <= max_tier)
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn test_p2p_watcher_450ms_peer_query_and_disconnect_auto_heal() {
+    let dlp_controller = global_mesh_dlp_controller();
+    {
+        let mut guard = dlp_controller.settings.write().unwrap();
+        guard.mesh.p2p_enabled = true;
+        guard.mesh.require_explicit_folder_share = true;
+        guard.mesh.shared_folders = vec![quorum_coordinator::SharedFolderEntry {
+            path: r"C:\Users\femi\Documents".to_string(),
+            label: "Documents".to_string(),
+            enabled: true,
+            access_tier: 0,
+            dlp_mode_override: None,
+            shared_at: String::new(),
+        }];
+    }
+
+    // Verify Windows extended-length verbatim path (`\\?\C:\...`) matches shared folder cleanly
+    let verbatim_doc_path = r"\\?\C:\Users\femi\Documents\Femi_Oyesanya_Enhanced_Resume_v6.docx";
+    assert!(
+        dlp_controller
+            .check_file_shared_with_mesh(verbatim_doc_path)
+            .is_some(),
+        "Windows verbatim path must normalize cleanly for shared folder matching"
+    );
+
+    // Node B: 450ms realistic large-corpus response latency (previously killed by 400ms default request_timeout)
+    let temp_dir_b = tempfile::tempdir().unwrap();
+    let storage_b = Arc::new(
+        StorageEngine::open(StorageConfig::new(temp_dir_b.path().to_path_buf()))
+            .await
+            .unwrap(),
+    );
+
+    let seed_b = [0x77u8; 32];
+    let secret_b =
+        quorum_network::libp2p::identity::ed25519::SecretKey::try_from_bytes(seed_b).unwrap();
+    let ed_kp_b = quorum_network::libp2p::identity::ed25519::Keypair::from(secret_b);
+    let peer_id_b = quorum_network::libp2p::identity::Keypair::from(ed_kp_b)
+        .public()
+        .to_peer_id();
+
+    let chunk_b = DocumentChunk::new(
+        "femi_edu_remote_v6",
+        "doc_resume_v6",
+        verbatim_doc_path,
+        1,
+        24,
+        0,
+        vec![0.12; 768],
+        "Education and Credentials: Master of Management Information Systems from University of Illinois Springfield and Master in Data Science.",
+        None,
+    )
+    .unwrap();
+    storage_b.insert_chunks(&[chunk_b]).await.unwrap();
+
+    let delayed_b: Arc<dyn quorum_coordinator::StorageSearcher> = Arc::new(DelayedStorageSearcher {
+        inner: Arc::clone(&storage_b),
+        delay: Duration::from_millis(450),
+    });
+    let inbound_b = Arc::new(OsoosiMeshInboundHandler::new(
+        delayed_b,
+        peer_id_b.to_string(),
+    ));
+
+    let mut net_config_b = NetworkConfig::new_localhost();
+    net_config_b.ed25519_seed = Some(seed_b);
+    let (_join_b, handle_b) = start_network_node(net_config_b, Some(inbound_b))
+        .await
+        .unwrap();
+
+    let addrs_b = handle_b.listen_addresses().await.unwrap();
+    let tcp_addr_b = addrs_b
+        .iter()
+        .find(|a| a.to_string().contains("/tcp/"))
+        .cloned()
+        .unwrap();
+
+    // Node A with full DaemonState + P2P Watcher endpoints
+    let temp_dir_a = tempfile::tempdir().unwrap();
+    let data_dir_a = temp_dir_a.path().to_path_buf();
+    let storage_a = Arc::new(
+        StorageEngine::open(StorageConfig::new(data_dir_a.clone()))
+            .await
+            .unwrap(),
+    );
+
+    let seed_a = [0x88u8; 32];
+    let secret_a =
+        quorum_network::libp2p::identity::ed25519::SecretKey::try_from_bytes(seed_a).unwrap();
+    let ed_kp_a = quorum_network::libp2p::identity::ed25519::Keypair::from(secret_a);
+    let peer_id_a = quorum_network::libp2p::identity::Keypair::from(ed_kp_a)
+        .public()
+        .to_peer_id();
+
+    let mut net_config_a = NetworkConfig::new_localhost();
+    net_config_a.ed25519_seed = Some(seed_a);
+    let (_join_a, handle_a) = start_network_node(net_config_a, None).await.unwrap();
+
+    handle_a.dial(tcp_addr_b.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    // Verify real peer address tracking in NetworkSwarmHandle
+    let addr_map = handle_a.connected_peer_addresses();
+    assert!(
+        addr_map.contains_key(&peer_id_b),
+        "NetworkSwarmHandle must record real connected Multiaddr for Peer B"
+    );
+
+    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(handle_a.clone()));
+    let mut coord_cfg = CoordinatorConfig::default();
+    coord_cfg.timeout_ms = 6000;
+
+    let engine = Arc::new(ScatterGatherEngine::new(
+        Arc::clone(&storage_a) as Arc<dyn quorum_coordinator::StorageSearcher>,
+        mesh_dispatcher,
+        Arc::new(tokio::sync::RwLock::new(PeerAclManager::default())),
+        coord_cfg.clone(),
+        seed_a,
+        peer_id_a.to_string(),
+    ));
+    let coordinator = Arc::new(QueryCoordinator::new(engine, coord_cfg));
+
+    // 1. Verify 450ms remote peer response succeeds cleanly (no 400ms stream abort!)
+    let res = coordinator
+        .query("University of Illinois Springfield Master in Data Science", 8)
+        .await
+        .unwrap();
+    assert!(
+        res.chunks
+            .iter()
+            .any(|c| c.chunk.chunk_id == "femi_edu_remote_v6" && c.is_remote),
+        "450ms remote peer response must succeed and preserve remote peer citation"
+    );
+
+    // 2. Build full Axum router with P2pWatcherRuntime and test /api/mesh/watcher/probe & /heal
+    let classifier = Arc::new(quorum_classifier::FileTypeClassifier::new());
+    let embedder: Arc<dyn quorum_contract::EmbeddingGenerator> =
+        Arc::new(quorum_contract::DeterministicOfflineEngine::new());
+    let dedup = Arc::new(quorum_ingest::TwoLevelDedupEngine::new());
+    let ingest_cfg = quorum_ingest::IngestConfig::default();
+    let reindex_worker = Arc::new(quorum_ingest::ReindexWorker::new(
+        ingest_cfg.clone(),
+        Arc::clone(&storage_a),
+        Arc::clone(&classifier),
+        Arc::clone(&embedder),
+        Arc::clone(&dedup),
+    ));
+    let drift_healer = Arc::new(quorum_ingest::DriftHealer::new(
+        ingest_cfg.clone(),
+        Arc::clone(&storage_a),
+        Arc::clone(&classifier),
+        Arc::clone(&embedder),
+        Arc::clone(&dedup),
+    ));
+
+    let state = Arc::new(quorum_daemon::DaemonState {
+        start_time: std::time::Instant::now(),
+        storage: storage_a,
+        coordinator,
+        reindex_worker,
+        drift_healer,
+        classifier,
+        embedder,
+        dedup,
+        swarm_handle: Some(handle_a.clone()),
+        ingest_config: ingest_cfg,
+        default_model_family: quorum_coordinator::SynthesisModelFamily::AutoFusion,
+        port: 3031,
+        host: "127.0.0.1".to_string(),
+        data_dir: data_dir_a,
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        in_flight_queries: Arc::new(quorum_daemon::InFlightQueryRegistry::new()),
+        sessions: quorum_daemon::ChatSessionRegistry::new(),
+    });
+    state.set_p2p_watcher(Arc::new(quorum_daemon::P2pWatcherRuntime::new(
+        state.data_dir.clone(),
+        3032,
+        seed_a,
+        peer_id_a.to_string(),
+        true,
+    )));
+
+    // Execute signed canary probe (<5ms fast path on OsoosiMeshInboundHandler, bypassing 450ms storage delay!)
+    let probes = quorum_daemon::p2p_watcher::run_in_daemon_canary_probe(&state).await;
+    assert_eq!(probes.len(), 1);
+    assert!(probes[0].reachable, "Signed canary probe must succeed");
+    assert!(
+        probes[0].rtt_ms < 250.0,
+        "Canary fast-path must bypass storage scan (<250ms), got {}ms",
+        probes[0].rtt_ms
+    );
+
+    // 3. Simulate sudden peer connection drop and verify P2P Watcher auto-heals via bootstrap_peers
+    {
+        let mut guard = dlp_controller.settings.write().unwrap();
+        guard.mesh.bootstrap_peers = vec![tcp_addr_b.to_string()];
+        guard.mesh.require_explicit_folder_share = false;
+    }
+    handle_a.disconnect_peer(peer_id_b).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        handle_a.connected_peers().await.unwrap().is_empty(),
+        "Peer B should be disconnected after explicit disconnect_peer"
+    );
+
+    let healed = quorum_daemon::p2p_watcher::run_in_daemon_mesh_heal(
+        &state,
+        quorum_daemon::p2p_watcher::HealMeshRequest {
+            reason: Some("integration_test_disconnect".to_string()),
+            discovered_ips: Vec::new(),
+            force_redial_all: true,
+        },
+    )
+    .await;
+    assert!(healed >= 1, "P2P Watcher heal must redial disconnected bootstrap peer");
+    assert!(
+        handle_a.connected_peers().await.unwrap().contains(&peer_id_b),
+        "P2P Watcher heal must restore live libp2p session to Peer B"
+    );
+
+    let post_heal_res = state
+        .coordinator
+        .query("University of Illinois Springfield", 8)
+        .await
+        .unwrap();
+    assert!(
+        post_heal_res
+            .chunks
+            .iter()
+            .any(|c| c.chunk.chunk_id == "femi_edu_remote_v6"),
+        "SwarmMeshDispatcher + P2P auto-redial must reconnect dropped peer and return remote chunks"
+    );
+
+    let _ = handle_a.shutdown().await;
+    let _ = handle_b.shutdown().await;
+}

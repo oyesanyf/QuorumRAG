@@ -39,6 +39,10 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub local_only: bool,
 
+    /// Disable spawning the dedicated out-of-process P2P watcher child process (`watch-p2p`)
+    #[arg(long, default_value_t = false)]
+    pub no_p2p_watcher: bool,
+
     /// Default synthesis model family: AutoFusion, Glm4Agentic, Qwen25Code, GemmaProse
     #[arg(long, default_value = "AutoFusion")]
     pub model_family: String,
@@ -94,5 +98,28 @@ pub enum Commands {
         /// Pre-warm hot query embeddings and high-frequency document chunks from persistent index
         #[arg(short, long, default_value_t = false)]
         warm: bool,
+    },
+
+    /// Run dedicated out-of-process P2P Mesh Watcher & Self-Healing Supervisor
+    WatchP2p {
+        /// Target daemon HTTP base URL (defaults to http://127.0.0.1:<port>)
+        #[arg(long)]
+        daemon_url: Option<String>,
+
+        /// Health probe & signed libp2p canary interval in seconds (default: 10)
+        #[arg(long, default_value_t = 10)]
+        interval_secs: u64,
+
+        /// Restart platform OS service (`QuorumRAGDaemon` / `quorumrag.service` / `dev.quorumrag.daemon`) if daemon stops responding
+        #[arg(long, default_value_t = false)]
+        heal_service: bool,
+
+        /// Optional parent daemon PID to monitor for clean co-termination in non-service sessions
+        #[arg(long)]
+        parent_pid: Option<u32>,
+
+        /// Run a single probe/heal pass and exit (useful for diagnostics and automated tests)
+        #[arg(long, default_value_t = false)]
+        once: bool,
     },
 }

@@ -1,6 +1,6 @@
 [Unit]
 Description=QuorumRAG Local-First P2P Agentic RAG Daemon
-Documentation=https://github.com/oyesanyf/MusicFusion/tree/main/QuorumRAG
+Documentation=https://github.com/oyesanyf/QuorumRAG
 After=network-online.target local-fs.target
 Wants=network-online.target
 

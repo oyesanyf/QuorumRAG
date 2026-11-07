@@ -311,3 +311,42 @@ async fn test_mesh_quarantined_peers_endpoint() {
     let resp_rel = app.oneshot(req_rel).await.unwrap();
     assert_eq!(resp_rel.status(), StatusCode::NOT_FOUND);
 }
+
+
+#[tokio::test]
+async fn test_mesh_p2p_watcher_status_probe_and_heal_endpoints() {
+    let app = setup_test_app().await;
+
+    // 1. GET /api/mesh/watcher must return structured P2P watcher status
+    let req_status = Request::builder()
+        .uri("/api/mesh/watcher")
+        .body(Body::empty())
+        .unwrap();
+    let resp_status = app.clone().oneshot(req_status).await.unwrap();
+    assert_eq!(resp_status.status(), StatusCode::OK);
+    let bytes_status = axum::body::to_bytes(resp_status.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let status_json: serde_json::Value = serde_json::from_slice(&bytes_status).unwrap();
+    assert!(status_json["p2p_enabled"].is_boolean());
+    assert!(status_json["peer_probes"].is_array());
+    assert!(status_json["probe_runs"].is_u64());
+
+    // 2. POST /api/mesh/watcher/probe must run a real probe pass and return OK
+    let req_probe = Request::builder()
+        .method("POST")
+        .uri("/api/mesh/watcher/probe")
+        .body(Body::empty())
+        .unwrap();
+    let resp_probe = app.clone().oneshot(req_probe).await.unwrap();
+    assert_eq!(resp_probe.status(), StatusCode::OK);
+
+    // 3. POST /api/mesh/watcher/heal must run a heal pass and return OK
+    let req_heal = Request::builder()
+        .method("POST")
+        .uri("/api/mesh/watcher/heal")
+        .body(Body::empty())
+        .unwrap();
+    let resp_heal = app.oneshot(req_heal).await.unwrap();
+    assert_eq!(resp_heal.status(), StatusCode::OK);
+}

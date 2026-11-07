@@ -15,7 +15,7 @@ pub struct NetworkConfig {
     pub gossip_topic: String,
     /// Enable mDNS LAN discovery
     pub enable_mdns: bool,
-    /// Request-Response timeout (default: 400ms)
+    /// Request-Response timeout (default: 12s for million-chunk LAN indexes + DLP redaction)
     pub request_timeout: Duration,
     /// Gemma embedding contract hash hex for handshake verification
     pub contract_hash_hex: String,
@@ -31,7 +31,7 @@ impl Default for NetworkConfig {
             bootstrap_peers: Vec::new(),
             gossip_topic: "quorum-rag-query-broadcast".to_string(),
             enable_mdns: true,
-            request_timeout: Duration::from_millis(400),
+            request_timeout: Duration::from_secs(12),
             contract_hash_hex: contract.derive_contract_hash_hex(),
         }
     }

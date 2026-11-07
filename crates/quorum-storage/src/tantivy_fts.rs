@@ -294,7 +294,7 @@ impl TantivyFtsIndex {
                 continue 'batch_attempt;
             }
 
-            let next_seq = self.last_commit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let next_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
             let commit_res = {
                 let writer = Self::get_or_recreate_writer(&self.index, &mut writer_guard)?;
                 commit_single(writer, Some(&format!("seq:{}", next_seq)))
@@ -303,6 +303,7 @@ impl TantivyFtsIndex {
             match commit_res {
                 Ok(op) => {
                     self.last_commit_opstamp.store(op, Ordering::Release);
+                    self.last_commit_seq.store(next_seq, Ordering::Release);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -473,12 +474,20 @@ impl TantivyFtsIndex {
                 continue;
             }
 
-            // Indexed media (audio/image chunks) are user content even inside a repo tree such as
-            // D:\harfile\music, so only code/config files under the repo root are demoted.
+            // Indexed media and user office/PDF documents are user content even inside a repo tree
+            // such as D:\harfile\music, so only code/config files under the repo root are demoted.
             let is_media_chunk = chunk.text_content.trim_start().starts_with("[Audio Document:")
                 || chunk.text_content.trim_start().starts_with("[Image Document:")
                 || chunk.text_content.trim_start().starts_with("[Video Document:");
+            let is_user_doc = file_l.ends_with(".pdf")
+                || file_l.ends_with(".docx")
+                || file_l.ends_with(".doc")
+                || file_l.ends_with(".pptx")
+                || file_l.ends_with(".xlsx")
+                || file_l.ends_with(".rtf")
+                || file_l.ends_with(".odt");
             let is_low_priority_code_or_repo = (!is_media_chunk
+                && !is_user_doc
                 && (path_l.contains("\\harfile\\") || path_l.contains("/harfile/")))
                 || file_l.ends_with(".rs")
                 || file_l.ends_with(".py")
@@ -626,7 +635,7 @@ impl TantivyFtsIndex {
         let mut recovery_attempts = 0;
         const MAX_RECOVERIES: usize = 10;
         'delete_attempt: loop {
-            let next_seq = self.last_commit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let next_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
             let delete_res = {
                 let writer = Self::get_or_recreate_writer(&self.index, &mut writer_guard)?;
                 let _ = writer.delete_term(term.clone());
@@ -636,6 +645,7 @@ impl TantivyFtsIndex {
             match delete_res {
                 Ok(op) => {
                     self.last_commit_opstamp.store(op, Ordering::Release);
+                    self.last_commit_seq.store(next_seq, Ordering::Release);
                     break 'delete_attempt;
                 }
                 Err(e) => {
@@ -672,11 +682,12 @@ impl TantivyFtsIndex {
             .map_err(|_| StorageError::Tantivy("Tantivy writer mutex poisoned".into()))?;
 
         // 1. Commit any pending uncommitted additions/deletions before merging
-        let pre_seq = self.last_commit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let pre_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
         if let Ok(w) = Self::get_or_recreate_writer(&self.index, &mut writer_guard) {
             match commit_single(w, Some(&format!("seq:{}", pre_seq))) {
                 Ok(op) => {
                     self.last_commit_opstamp.store(op, Ordering::Release);
+                    self.last_commit_seq.store(pre_seq, Ordering::Release);
                 }
                 Err(e) => {
                     tracing::warn!("Tantivy writer error during compact pre-commit; recreating: {}", e);
@@ -708,11 +719,12 @@ impl TantivyFtsIndex {
                 };
                 match writer.merge(&segment_ids).wait() {
                     Ok(_merged) => {
-                        let post_seq = self.last_commit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                        let post_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
                         if let Ok(w) = Self::get_or_recreate_writer(&self.index, &mut writer_guard) {
                             match commit_single(w, Some(&format!("seq:{}", post_seq))) {
                                 Ok(op) => {
                                     self.last_commit_opstamp.store(op, Ordering::Release);
+                                    self.last_commit_seq.store(post_seq, Ordering::Release);
                                 }
                                 Err(e) => {
                                     tracing::warn!("Commit after merge failed: {}", e);
@@ -933,7 +945,7 @@ impl TantivyFtsIndex {
         let mut recovery_attempts = 0;
         const MAX_RECOVERIES: usize = 10;
         'delete_attempt: loop {
-            let next_seq = self.last_commit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let next_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
             let delete_res = {
                 let writer = Self::get_or_recreate_writer(&self.index, &mut writer_guard)?;
                 let _ = writer.delete_term(term.clone());
@@ -943,6 +955,7 @@ impl TantivyFtsIndex {
             match delete_res {
                 Ok(op) => {
                     self.last_commit_opstamp.store(op, Ordering::Release);
+                    self.last_commit_seq.store(next_seq, Ordering::Release);
                     break 'delete_attempt;
                 }
                 Err(e) => {
@@ -982,7 +995,7 @@ impl TantivyFtsIndex {
         let mut recovery_attempts = 0;
         const MAX_RECOVERIES: usize = 10;
         'clear_attempt: loop {
-            let next_seq = self.last_commit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let next_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
             let clear_res = {
                 let writer = Self::get_or_recreate_writer(&self.index, &mut writer_guard)?;
                 let _ = writer.delete_all_documents();
@@ -992,6 +1005,7 @@ impl TantivyFtsIndex {
             match clear_res {
                 Ok(op) => {
                     self.last_commit_opstamp.store(op, Ordering::Release);
+                    self.last_commit_seq.store(next_seq, Ordering::Release);
                     break 'clear_attempt;
                 }
                 Err(e) => {
@@ -1035,7 +1049,7 @@ impl TantivyFtsIndex {
             return Ok(());
         }
 
-        const MAX_ATTEMPTS: usize = 300;
+        const MAX_ATTEMPTS: usize = 1000;
         let mut last_err = String::new();
 
         for attempt in 1..=MAX_ATTEMPTS {
@@ -1053,7 +1067,11 @@ impl TantivyFtsIndex {
             };
 
             let disk_seq = parse_commit_seq(&meta);
-            if target_seq > 0 && (disk_seq < target_seq || meta.opstamp < min_opstamp) {
+            let merge_payloadless_ok =
+                disk_seq == 0 && meta.opstamp > min_opstamp && matches!(check, SyncCheck::None);
+            if target_seq > 0
+                && ((!merge_payloadless_ok && disk_seq < target_seq) || meta.opstamp < min_opstamp)
+            {
                 last_err = format!(
                     "On-disk metadata stale: seq {} < target {}, opstamp {} < min {}",
                     disk_seq, target_seq, meta.opstamp, min_opstamp

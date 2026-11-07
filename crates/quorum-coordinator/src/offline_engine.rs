@@ -593,11 +593,26 @@ impl DeterministicOfflineSynthesisEngine {
                 acc
             });
 
+        // Stitch multi-chunk parent documents upfront when enabled so multi-chunk resumes/reports
+        // (both local and remote mesh peers) combine header + education/body sections BEFORE whole-word quorum filtering!
+        let early_ui_stitch = crate::dlp_mesh::global_mesh_dlp_controller()
+            .settings
+            .read()
+            .map(|g| g.ui.parent_document_retrieval)
+            .unwrap_or(true);
+        let stitched_input_storage: Vec<ScoredChunk>;
+        let effective_input_chunks: &[ScoredChunk] = if early_ui_stitch && chunks.len() > 1 {
+            stitched_input_storage = Self::stitch_parent_document_chunks(chunks.to_vec());
+            stitched_input_storage.as_slice()
+        } else {
+            chunks
+        };
+
         // Filter and rank retrieved chunks using whole-word token matching and multi-term quorum threshold
         let mut scored_matches: Vec<(&ScoredChunk, usize, usize, i32)> = Vec::new();
         let mut seen_snippets: Vec<String> = Vec::new();
 
-        for scored in chunks {
+        for scored in effective_input_chunks {
             let path_l = scored.chunk.file_path.to_ascii_lowercase();
             let file_l = std::path::Path::new(&scored.chunk.file_path)
                 .file_name()
@@ -623,11 +638,21 @@ impl DeterministicOfflineSynthesisEngine {
                 || raw_head.contains("[Image Document:")
                 || raw_head.contains("[Video Document:")
                 || raw_head.contains("[OCR Text]");
+            let is_user_doc = file_l.ends_with(".pdf")
+                || file_l.ends_with(".docx")
+                || file_l.ends_with(".doc")
+                || file_l.ends_with(".pptx")
+                || file_l.ends_with(".xlsx")
+                || file_l.ends_with(".rtf")
+                || file_l.ends_with(".odt");
             if !requests_code
                 && (SOURCE_CODE_EXTENSIONS
                     .iter()
                     .any(|ext| file_l.ends_with(ext))
-                    || (!is_media_chunk && (path_l.contains("\\harfile\\") || path_l.contains("/harfile/")))
+                    || (!scored.is_remote
+                        && !is_media_chunk
+                        && !is_user_doc
+                        && (path_l.contains("\\harfile\\") || path_l.contains("/harfile/")))
                     || text_l.contains("```python")
                     || text_l.contains("```javascript")
                     || text_l.contains("```js")
@@ -936,29 +961,60 @@ impl DeterministicOfflineSynthesisEngine {
         };
 
         // Keep top N deduplicated RAG chunks for comprehensive multi-paragraph synthesis,
-        // while ensuring matched remote peer chunks (`source_peer != "local"`) are always preserved!
-        let matched_remote_chunks: Vec<ScoredChunk> = scored_matches
-            .iter()
-            .filter(|(c, _, _, _)| c.source_peer != "local")
-            .take(4)
-            .map(|(c, _, _, _)| (*c).clone())
-            .collect();
+        // prioritizing distinct remote peers first and interleaving matched remote peer chunks (`source_peer != "local"`)
+        // right after slot 0 so Ollama chat, fast-model retry, and offline synthesis all cite `(mesh)` peers prominently!
+        let mut matched_remote_chunks: Vec<ScoredChunk> = Vec::new();
+        let mut seen_remote_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| c.source_peer != "local") {
+            if seen_remote_peers.insert(c.source_peer.clone()) {
+                matched_remote_chunks.push((*c).clone());
+                if matched_remote_chunks.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        if matched_remote_chunks.len() < 4 {
+            for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| c.source_peer != "local") {
+                if !matched_remote_chunks
+                    .iter()
+                    .any(|m| m.source_peer == c.source_peer && m.chunk.chunk_id == c.chunk.chunk_id)
+                {
+                    matched_remote_chunks.push((*c).clone());
+                    if matched_remote_chunks.len() >= 4 {
+                        break;
+                    }
+                }
+            }
+        }
         let mut candidate_chunks: Vec<ScoredChunk> = scored_matches
             .into_iter()
             .take(chunk_limit)
             .map(|(c, _, _, _)| c.clone())
             .collect();
-        for rem in matched_remote_chunks {
-            if !candidate_chunks
-                .iter()
-                .any(|c| c.source_peer == rem.source_peer && c.chunk.chunk_id == rem.chunk.chunk_id)
-            {
-                candidate_chunks.push(rem);
-            }
-        }
 
         if ui.parent_document_retrieval {
             candidate_chunks = Self::stitch_parent_document_chunks(candidate_chunks);
+        }
+
+        let mut remote_insert_cursor = 1usize.min(candidate_chunks.len());
+        for rem in matched_remote_chunks {
+            if let Some(existing_pos) = candidate_chunks
+                .iter()
+                .position(|c| c.source_peer == rem.source_peer && c.chunk.file_path == rem.chunk.file_path)
+            {
+                if existing_pos <= remote_insert_cursor {
+                    remote_insert_cursor = (existing_pos + 1).min(candidate_chunks.len());
+                    continue;
+                }
+                let promoted = candidate_chunks.remove(existing_pos);
+                let target_idx = remote_insert_cursor.min(candidate_chunks.len());
+                candidate_chunks.insert(target_idx, promoted);
+                remote_insert_cursor = (target_idx + 1).min(candidate_chunks.len());
+            } else {
+                let target_idx = remote_insert_cursor.min(candidate_chunks.len());
+                candidate_chunks.insert(target_idx, rem);
+                remote_insert_cursor = (target_idx + 1).min(candidate_chunks.len());
+            }
         }
 
         if is_continuation && !prior_text.is_empty() {
@@ -1005,7 +1061,7 @@ impl DeterministicOfflineSynthesisEngine {
                 if !installed.is_empty() {
                     let hw = crate::hardware::HardwareTelemetry::probe();
                     let failed_model = Self::resolve_ollama_model_tag(model_tag, &hw, &installed);
-                    let top_refs = &matched_chunk_refs[..matched_chunk_refs.len().min(5)];
+                    let top_refs = &matched_chunk_refs[..matched_chunk_refs.len().min(6)];
                     for fast in crate::answer_orchestrator::fast_fallback_models(&installed, &failed_model).iter().take(2) {
                         tracing::warn!(failed = %failed_model, retry = %fast, "Primary synthesis failed; retrying with faster local model");
                         if let Some((text, cits)) =
@@ -3644,9 +3700,16 @@ impl DeterministicOfflineSynthesisEngine {
             return chunks.to_vec();
         }
         let threshold = ((best * 3 + 3) / 4).max(1);
+        let remote_threshold = ((best + 1) / 2).max(1);
         let kept: Vec<&'a ScoredChunk> = scored
             .into_iter()
-            .filter(|(n, _)| *n >= threshold)
+            .filter(|(n, c)| {
+                if c.is_remote && !c.source_peer.eq_ignore_ascii_case("local") {
+                    *n >= remote_threshold
+                } else {
+                    *n >= threshold
+                }
+            })
             .map(|(_, c)| c)
             .collect();
         if kept.is_empty() {
@@ -5267,7 +5330,25 @@ impl DeterministicOfflineSynthesisEngine {
                     Self::remap_and_compact_citations(&consolidated_prose, &unique_file_chunks, true);
                 // Preserve remote peer sources (`source_peer != "local"`) even if the LLM only cited [1]..[4]
                 // so multi-computer evidence is always surfaced in the Sources panel and citation cards!
-                for &rc in matched_chunks.iter().filter(|c| c.source_peer != "local").take(4) {
+                let remote_source_pool: Vec<&ScoredChunk> = {
+                    let pruned_remote: Vec<&ScoredChunk> = pruned_chunks
+                        .iter()
+                        .copied()
+                        .filter(|c| c.source_peer != "local")
+                        .take(4)
+                        .collect();
+                    if pruned_remote.is_empty() {
+                        matched_chunks
+                            .iter()
+                            .copied()
+                            .filter(|c| c.source_peer != "local")
+                            .take(4)
+                            .collect()
+                    } else {
+                        pruned_remote
+                    }
+                };
+                for rc in remote_source_pool {
                     if !compacted_chunks
                         .iter()
                         .any(|c| c.source_peer == rc.source_peer && c.chunk.file_path == rc.chunk.file_path)

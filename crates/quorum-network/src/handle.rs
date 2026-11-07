@@ -1,6 +1,7 @@
 use crate::error::NetworkError;
 use libp2p::{Multiaddr, PeerId};
 use quorum_types::{FederatedQueryRequest, FederatedQueryResponse};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 
@@ -35,6 +36,10 @@ pub enum NetworkCommand {
     GetListenAddresses {
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
+    DisconnectPeer {
+        peer_id: PeerId,
+        reply: oneshot::Sender<Result<(), NetworkError>>,
+    },
     SendInboundReply {
         channel: libp2p::request_response::ResponseChannel<FederatedQueryResponse>,
         response: FederatedQueryResponse,
@@ -48,6 +53,7 @@ pub struct NetworkSwarmHandle {
     pub(crate) command_tx: mpsc::Sender<NetworkCommand>,
     pub(crate) event_tx: broadcast::Sender<NetworkEvent>,
     pub(crate) listen_addrs: Arc<RwLock<Vec<Multiaddr>>>,
+    pub(crate) peer_addrs: Arc<std::sync::RwLock<HashMap<PeerId, Multiaddr>>>,
 }
 
 impl NetworkSwarmHandle {
@@ -107,6 +113,22 @@ impl NetworkSwarmHandle {
 
     pub async fn listen_addresses(&self) -> Result<Vec<Multiaddr>, NetworkError> {
         Ok(self.listen_addrs.read().await.clone())
+    }
+
+    pub fn connected_peer_addresses(&self) -> HashMap<PeerId, Multiaddr> {
+        self.peer_addrs.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub async fn disconnect_peer(&self, peer_id: PeerId) -> Result<(), NetworkError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NetworkCommand::DisconnectPeer {
+                peer_id,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| NetworkError::ChannelClosed)?;
+        rx.await.map_err(|_| NetworkError::ChannelClosed)?
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<NetworkEvent> {

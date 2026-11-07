@@ -768,7 +768,13 @@ impl OsoosiMeshDlpController {
 
     /// Normalizes a filesystem path for safe, case-insensitive prefix comparison on Windows/Unix.
     pub fn normalize_folder_path(raw: &str) -> Option<String> {
-        let trimmed = raw.trim().replace('/', "\\");
+        let mut trimmed = raw.trim().replace('/', "\\");
+        if let Some(rest) = trimmed.strip_prefix("\\\\?\\") {
+            if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("unc\\") {
+                return None;
+            }
+            trimmed = rest.to_string();
+        }
         if trimmed.is_empty()
             || trimmed.contains("..")
             || trimmed.contains("%2e")
