@@ -1,7 +1,6 @@
 use axum::extract::{Json, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -55,6 +54,7 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelChatRequest {
     pub query_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// In-flight chat query cancellation handler: `POST /api/chat/cancel`.
@@ -62,14 +62,30 @@ pub async fn cancel_chat_handler(
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<CancelChatRequest>,
 ) -> impl IntoResponse {
-    let cancelled = if let Some(ref qid) = payload.query_id {
-        state.in_flight_queries.cancel(qid)
+    let (cancelled, _qid, sid) = if let Some(ref qid) = payload.query_id {
+        let sid = state.in_flight_queries.get_by_query_id(qid).map(|t| t.session_id.clone());
+        let res = state.in_flight_queries.cancel(qid);
+        (res, Some(qid.clone()), sid)
+    } else if let Some(ref sid) = payload.session_id {
+        let qid = state.in_flight_queries.get_by_session_id(sid).map(|t| t.query_id.clone());
+        let res = state.in_flight_queries.cancel_session(sid);
+        (res, qid, Some(sid.clone()))
     } else {
-        state.in_flight_queries.cancel_all() > 0
+        let count = state.in_flight_queries.cancel_all();
+        (count > 0, None, None)
     };
+
+    if cancelled {
+        if let Some(ref session_id) = sid {
+            if let Ok(hist_store) = state.history_store() {
+                let _ = hist_store.record_cancelled_turn(session_id, "*[Generation stopped by user]*");
+            }
+        }
+    }
 
     info!(
         query_id = ?payload.query_id,
+        session_id = ?payload.session_id,
         cancelled,
         "Chat query cancellation requested via /api/chat/cancel"
     );
@@ -79,9 +95,107 @@ pub async fn cancel_chat_handler(
         Json(serde_json::json!({
             "status": "cancelled",
             "cancelled": cancelled,
-            "query_id": payload.query_id
+            "query_id": payload.query_id,
+            "session_id": payload.session_id
         })),
     )
+}
+
+/// Returns active running chat tasks: `GET /api/chat/active`.
+pub async fn active_chat_tasks_handler(
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
+    let tasks = state.in_flight_queries.list_active();
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "active_tasks": tasks,
+        })),
+    )
+}
+
+/// Builds an SSE stream from an `ActiveChatTask` that first replays all snapshot events
+/// and then streams live broadcast events until terminal completion.
+pub fn create_chat_task_sse_stream(
+    task: Arc<crate::state::ActiveChatTask>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(2048);
+    let (snapshot, mut broadcast_rx) = task.snapshot_and_subscribe();
+    let is_already_done = task.completed.load(std::sync::atomic::Ordering::SeqCst);
+
+    tokio::spawn(async move {
+        // 1. Replay buffered events from snapshot
+        for event in snapshot {
+            let is_terminal = matches!(
+                event,
+                AgenticTelemetryEvent::ExecutionFinished { .. }
+                    | AgenticTelemetryEvent::ExecutionError { .. }
+            );
+            let json_line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+            if sse_tx.send(Ok(Event::default().data(json_line))).await.is_err() {
+                return;
+            }
+            if is_terminal {
+                return;
+            }
+        }
+
+        if is_already_done {
+            return;
+        }
+
+        // 2. Stream live events from broadcast channel
+        loop {
+            match broadcast_rx.recv().await {
+                Ok(event) => {
+                    let is_terminal = matches!(
+                        event,
+                        AgenticTelemetryEvent::ExecutionFinished { .. }
+                            | AgenticTelemetryEvent::ExecutionError { .. }
+                    );
+                    let json_line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                    if sse_tx.send(Ok(Event::default().data(json_line))).await.is_err() {
+                        return;
+                    }
+                    if is_terminal {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!("SSE client broadcast receiver lagged by {} events", skipped);
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return;
+                }
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(sse_rx);
+    Sse::new(stream).keep_alive(KeepAlive::default().interval(Duration::from_secs(15)))
+}
+
+/// Live SSE Re-Attach endpoint: `GET /api/chat/attach/:session_id`.
+pub async fn chat_sse_attach_handler(
+    State(state): State<Arc<DaemonState>>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if let Some(task) = state.in_flight_queries.get_by_session_id(&session_id) {
+        info!(session_id = %session_id, query_id = %task.query_id, "Re-attaching SSE stream to chat task");
+        create_chat_task_sse_stream(task).into_response()
+    } else {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "not_found",
+                "message": format!("No active or recent chat task found for session '{}'", session_id),
+                "session_id": session_id,
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// SSE Streaming chat endpoint: `POST /api/chat`.
@@ -94,13 +208,10 @@ pub async fn chat_sse_handler(
         .query_id
         .clone()
         .unwrap_or_else(|| format!("q-{}", uuid::Uuid::new_v4()));
-
-    info!(
-        query_id = %query_id,
-        prompt = %payload.prompt,
-        history_turns = payload.history.len(),
-        "Received /api/chat SSE streaming request"
-    );
+    let session_id = payload
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
 
     let prompt = payload.prompt.trim().to_string();
     let history = payload.history;
@@ -115,18 +226,58 @@ pub async fn chat_sse_handler(
         Some("AutoFusion") | Some("auto_fusion") => SynthesisModelFamily::AutoFusion,
         _ => state.default_model_family,
     };
+    let model_label = format!("{:?}", family);
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<AgenticTelemetryEvent>(16384);
+    info!(
+        query_id = %query_id,
+        session_id = %session_id,
+        prompt = %prompt,
+        history_turns = history.len(),
+        model_family = %model_label,
+        "Received /api/chat SSE streaming request"
+    );
+
+    // Save pending turn in SQLite immediately so mid-flight refresh preserves session and prompt
+    if let Ok(hist_store) = state.history_store() {
+        if let Err(e) = hist_store.record_pending_turn(&session_id, &prompt, &model_label) {
+            error!("Failed to record pending chat turn to SQLite: {}", e);
+        }
+    }
+
+    let (task, in_flight_guard) = state.in_flight_queries.register_task(
+        query_id.clone(),
+        session_id.clone(),
+        prompt.clone(),
+        model_label.clone(),
+    );
+
+    let (task_tx, mut task_rx) = tokio::sync::mpsc::channel::<AgenticTelemetryEvent>(16384);
+    let collector_task = {
+        let task = Arc::clone(&task);
+        tokio::spawn(async move {
+            while let Some(event) = task_rx.recv().await {
+                task.record_event(event);
+            }
+            // Ensure a terminal event exists in the event log if coordinator aborted without one
+            let has_terminal = {
+                let log = task.event_log.lock().unwrap();
+                log.iter().any(|e| matches!(e,
+                    AgenticTelemetryEvent::ExecutionFinished { .. } |
+                    AgenticTelemetryEvent::ExecutionError { .. }
+                ))
+            };
+            if !has_terminal {
+                task.record_event(AgenticTelemetryEvent::ExecutionError {
+                    failed_state: quorum_coordinator::types::AgenticStateName::SynthesizeWithCitations,
+                    error_message: "Query execution stopped".to_string(),
+                    fallback_action: "Terminated in-flight stream".to_string(),
+                });
+            }
+        })
+    };
+
     let coordinator = Arc::clone(&state.coordinator);
     let bypass_cache = payload.bypass_cache;
-    let (in_flight_entry, in_flight_guard) = state.in_flight_queries.register(query_id);
-    let task_token = in_flight_entry.token.clone();
-    let task_tx = tx.clone();
-
-    let session_id = payload
-        .session_id
-        .clone()
-        .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
     let prompt_lower = prompt.to_ascii_lowercase();
     let is_continuation_or_exclusion =
         quorum_coordinator::DeterministicOfflineSynthesisEngine::is_continuation_query(&prompt_lower)
@@ -144,81 +295,82 @@ pub async fn chat_sse_handler(
     let sessions_registry = state.sessions.clone();
     let session_id_task = session_id.clone();
     let state_for_history = Arc::clone(&state);
-    let model_label = format!("{:?}", family);
 
-    let join_handle = tokio::spawn(async move {
-        let _guard = in_flight_guard;
-        if prompt.is_empty() {
-            let _ = task_tx
-                .send(AgenticTelemetryEvent::ExecutionError {
-                    failed_state: quorum_coordinator::types::AgenticStateName::ClassifyIntent,
-                    error_message: "Prompt query string cannot be empty".to_string(),
-                    fallback_action: "Aborting execution".to_string(),
-                })
-                .await;
-            return;
-        }
+    let query_task = {
+        let task = Arc::clone(&task);
+        let task_tx = task_tx.clone();
+        tokio::spawn(async move {
+            let _guard = in_flight_guard;
+            if prompt.is_empty() {
+                let _ = task_tx
+                    .send(AgenticTelemetryEvent::ExecutionError {
+                        failed_state: quorum_coordinator::types::AgenticStateName::ClassifyIntent,
+                        error_message: "Prompt query string cannot be empty".to_string(),
+                        fallback_action: "Aborting execution".to_string(),
+                    })
+                    .await;
+                drop(task_tx);
+                let _ = collector_task.await;
+                task.mark_completed();
+                return;
+            }
 
-        if bypass_cache {
-            let _ = coordinator.cache_manager.query_cache.clear();
-        }
+            if bypass_cache {
+                let _ = coordinator.cache_manager.query_cache.clear();
+            }
 
-        match coordinator
-            .query_agentic_with_history_and_session(&prompt, history, family, top_k, session_seen, Some(task_tx.clone()))
-            .await
-        {
-            Ok(_result) => {
-                let newly_seen: Vec<String> = _result
-                    .chunks
-                    .iter()
-                    .map(|c| c.chunk.chunk_id.clone())
-                    .collect();
-                sessions_registry.record_seen_chunks(&session_id_task, &newly_seen);
+            match coordinator
+                .query_agentic_with_history_and_session(&prompt, history, family, top_k, session_seen, Some(task_tx.clone()))
+                .await
+            {
+                Ok(_result) => {
+                    let newly_seen: Vec<String> = _result
+                        .chunks
+                        .iter()
+                        .map(|c| c.chunk.chunk_id.clone())
+                        .collect();
+                    sessions_registry.record_seen_chunks(&session_id_task, &newly_seen);
 
-                // Persist completed user + assistant turn & citations to `<data_dir>/chat_history.db`
-                if let Ok(hist_store) = state_for_history.history_store() {
-                    let responder_peer = if coordinator.engine.sender_peer_id.trim().is_empty() {
-                        "local"
-                    } else {
-                        coordinator.engine.sender_peer_id.as_str()
-                    };
-                    if let Err(e) = hist_store.record_turn(
-                        &session_id_task,
-                        &prompt,
-                        &_result.synthesis_prompt,
-                        &_result.sources_cited,
-                        responder_peer,
-                        &model_label,
-                    ) {
-                        error!("Failed to persist chat turn to SQLite history: {}", e);
+                    if let Ok(hist_store) = state_for_history.history_store() {
+                        let responder_peer = if coordinator.engine.sender_peer_id.trim().is_empty() {
+                            "local"
+                        } else {
+                            coordinator.engine.sender_peer_id.as_str()
+                        };
+                        if let Err(e) = hist_store.record_turn(
+                            &session_id_task,
+                            &prompt,
+                            &_result.synthesis_prompt,
+                            &_result.sources_cited,
+                            responder_peer,
+                            &model_label,
+                        ) {
+                            error!("Failed to persist chat turn to SQLite history: {}", e);
+                        }
                     }
                 }
-                // TokenDelta events and trailing CitationEmitted + ExecutionFinished events
-                // have already been streamed in real time by AgenticStateGraphRunner.
-            }
-            Err(e) => {
-                if !task_token.is_cancelled() && !task_tx.is_closed() {
-                    error!("Error in query_agentic_with_history: {}", e);
-                    let _ = task_tx
-                        .send(AgenticTelemetryEvent::ExecutionError {
-                            failed_state: quorum_coordinator::types::AgenticStateName::SynthesizeWithCitations,
-                            error_message: e.to_string(),
-                            fallback_action: "Returned partial graph state".to_string(),
-                        })
-                        .await;
+                Err(e) => {
+                    if !task.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                        error!("Error in query_agentic_with_history: {}", e);
+                        let _ = task_tx
+                            .send(AgenticTelemetryEvent::ExecutionError {
+                                failed_state: quorum_coordinator::types::AgenticStateName::SynthesizeWithCitations,
+                                error_message: e.to_string(),
+                                fallback_action: "Returned partial graph state".to_string(),
+                            })
+                            .await;
+                    }
                 }
             }
-        }
-    });
+            drop(task_tx);
+            let _ = collector_task.await;
+            task.mark_completed();
+        })
+    };
 
-    in_flight_entry.set_abort_handle(join_handle.abort_handle());
+    task.set_abort_handle(query_task.abort_handle());
 
-    let stream = ReceiverStream::new(rx).map(|event| {
-        let json_line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-        Ok::<Event, Infallible>(Event::default().data(json_line))
-    });
-
-    Sse::new(stream).keep_alive(KeepAlive::default().interval(Duration::from_secs(15)))
+    create_chat_task_sse_stream(task)
 }
 
 /// One-shot query endpoint: `POST /api/query`.

@@ -1,17 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
 use quorum_classifier::FileTypeClassifier;
 use quorum_contract::EmbeddingGenerator;
-use quorum_coordinator::{QueryCoordinator, SynthesisModelFamily};
+use quorum_coordinator::{AgenticTelemetryEvent, QueryCoordinator, SynthesisModelFamily};
 use quorum_ingest::{DriftHealer, IngestConfig, ReindexWorker, TwoLevelDedupEngine};
 use quorum_network::NetworkSwarmHandle;
 use quorum_storage::StorageEngine;
 
+/// Default retention window for completed chat tasks before memory pruning (30 seconds).
+pub const DEFAULT_TASK_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+/// Token for cooperative query cancellation checks.
 #[derive(Clone, Default)]
 pub struct InFlightCancelToken(Arc<AtomicBool>);
 
@@ -27,36 +32,187 @@ impl InFlightCancelToken {
     }
 }
 
-#[derive(Clone)]
-pub struct InFlightEntry {
+/// Rich active chat task tracking background execution, buffered event logs, and broadcast channels.
+pub struct ActiveChatTask {
+    pub query_id: String,
+    pub session_id: String,
+    pub prompt: String,
+    pub model_family: String,
+    pub started_at_ms: u64,
+    pub completed_at_ms: Arc<AtomicU64>,
+    pub completed: Arc<AtomicBool>,
+    pub cancelled: Arc<AtomicBool>,
     pub token: InFlightCancelToken,
-    pub abort_handle: Arc<std::sync::Mutex<Option<AbortHandle>>>,
+    pub abort_handle: Arc<Mutex<Option<AbortHandle>>>,
+    pub event_log: Arc<Mutex<Vec<AgenticTelemetryEvent>>>,
+    pub broadcaster: broadcast::Sender<AgenticTelemetryEvent>,
 }
 
-impl InFlightEntry {
+impl ActiveChatTask {
+    pub fn new(
+        query_id: String,
+        session_id: String,
+        prompt: String,
+        model_family: String,
+    ) -> Self {
+        let (broadcaster, _) = broadcast::channel(8192);
+        let started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        Self {
+            query_id,
+            session_id,
+            prompt,
+            model_family,
+            started_at_ms,
+            completed_at_ms: Arc::new(AtomicU64::new(0)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            token: InFlightCancelToken::new(),
+            abort_handle: Arc::new(Mutex::new(None)),
+            event_log: Arc::new(Mutex::new(Vec::new())),
+            broadcaster,
+        }
+    }
+
     pub fn set_abort_handle(&self, handle: AbortHandle) {
         if let Ok(mut lock) = self.abort_handle.lock() {
             *lock = Some(handle);
         }
     }
-}
 
-pub struct InFlightGuard {
-    pub query_id: String,
-    pub registry: Arc<RwLock<HashMap<String, InFlightEntry>>>,
-}
+    pub fn is_running(&self) -> bool {
+        !self.completed.load(Ordering::SeqCst) && !self.cancelled.load(Ordering::SeqCst)
+    }
 
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if let Ok(mut map) = self.registry.write() {
-            map.remove(&self.query_id);
+    pub fn is_completed(&self) -> bool {
+        self.completed.load(Ordering::SeqCst)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_completed(&self) {
+        self.completed.store(true, Ordering::SeqCst);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.completed_at_ms.store(now_ms, Ordering::SeqCst);
+    }
+
+    pub fn cancel(&self) -> bool {
+        let was_running = !self.completed.load(Ordering::SeqCst)
+            && !self.cancelled.swap(true, Ordering::SeqCst);
+        if was_running {
+            self.token.cancel();
+            self.record_event(AgenticTelemetryEvent::ExecutionError {
+                failed_state: quorum_coordinator::types::AgenticStateName::SynthesizeWithCitations,
+                error_message: "Query cancelled by user".to_string(),
+                fallback_action: "Terminated in-flight execution".to_string(),
+            });
+            if let Ok(mut lock) = self.abort_handle.lock() {
+                if let Some(handle) = lock.take() {
+                    handle.abort();
+                }
+            }
+            self.mark_completed();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records an event to the internal replay log and broadcasts it to live subscribers atomically.
+    pub fn record_event(&self, event: AgenticTelemetryEvent) {
+        if let Ok(mut log) = self.event_log.lock() {
+            log.push(event.clone());
+            let _ = self.broadcaster.send(event);
+        }
+    }
+
+    /// Takes a consistent snapshot of all buffered events and subscribes to future broadcast events atomically.
+    pub fn snapshot_and_subscribe(
+        &self,
+    ) -> (Vec<AgenticTelemetryEvent>, broadcast::Receiver<AgenticTelemetryEvent>) {
+        if let Ok(log) = self.event_log.lock() {
+            let snapshot = log.clone();
+            let rx = self.broadcaster.subscribe();
+            (snapshot, rx)
+        } else {
+            (Vec::new(), self.broadcaster.subscribe())
         }
     }
 }
 
+/// JSON summary of active running chat task for `GET /api/chat/active`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActiveChatTaskSummary {
+    pub query_id: String,
+    pub session_id: String,
+    pub prompt: String,
+    pub model_family: String,
+    pub started_at_ms: u64,
+}
+
+/// Backward-compatible handle for in-flight tasks and cancellation.
+#[derive(Clone)]
+pub struct InFlightEntry {
+    pub token: InFlightCancelToken,
+    pub abort_handle: Arc<Mutex<Option<AbortHandle>>>,
+    pub task: Arc<ActiveChatTask>,
+}
+
+impl InFlightEntry {
+    pub fn set_abort_handle(&self, handle: AbortHandle) {
+        self.task.set_abort_handle(handle);
+    }
+}
+
+/// Guard dropped when background worker completes, marking task completed and pruning stale tasks.
+pub struct InFlightGuard {
+    pub query_id: String,
+    pub registry: Arc<RwLock<HashMap<String, Arc<ActiveChatTask>>>>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let grace_ms = DEFAULT_TASK_GRACE_PERIOD.as_millis() as u64;
+
+        if let Ok(mut map) = self.registry.write() {
+            if let Some(task) = map.get(&self.query_id) {
+                if !task.completed.load(Ordering::SeqCst) {
+                    task.mark_completed();
+                }
+            }
+            // Opportunistic prune of stale completed tasks exceeding retention window
+            map.retain(|_, task| {
+                if !task.completed.load(Ordering::SeqCst) && !task.cancelled.load(Ordering::SeqCst) {
+                    true
+                } else {
+                    let completed_at = task.completed_at_ms.load(Ordering::SeqCst);
+                    if completed_at == 0 {
+                        true
+                    } else {
+                        now_ms.saturating_sub(completed_at) < grace_ms
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Thread-safe registry mapping `query_id` to rich `ActiveChatTask` state.
 #[derive(Clone, Default)]
 pub struct InFlightQueryRegistry {
-    queries: Arc<RwLock<HashMap<String, InFlightEntry>>>,
+    queries: Arc<RwLock<HashMap<String, Arc<ActiveChatTask>>>>,
 }
 
 impl InFlightQueryRegistry {
@@ -66,50 +222,172 @@ impl InFlightQueryRegistry {
         }
     }
 
-    pub fn register(&self, query_id: String) -> (InFlightEntry, InFlightGuard) {
-        let entry = InFlightEntry {
-            token: InFlightCancelToken::new(),
-            abort_handle: Arc::new(std::sync::Mutex::new(None)),
-        };
+    /// Registers a rich active chat task with full event buffering and broadcasting.
+    pub fn register_task(
+        &self,
+        query_id: String,
+        session_id: String,
+        prompt: String,
+        model_family: String,
+    ) -> (Arc<ActiveChatTask>, InFlightGuard) {
+        let task = Arc::new(ActiveChatTask::new(
+            query_id.clone(),
+            session_id,
+            prompt,
+            model_family,
+        ));
         if let Ok(mut map) = self.queries.write() {
-            map.insert(query_id.clone(), entry.clone());
+            map.insert(query_id.clone(), Arc::clone(&task));
         }
         let guard = InFlightGuard {
             query_id,
             registry: Arc::clone(&self.queries),
         };
+        (task, guard)
+    }
+
+    /// Backward-compatible registration helper for tests and callers with only `query_id`.
+    pub fn register(&self, query_id: String) -> (InFlightEntry, InFlightGuard) {
+        let session_id = format!("s-{}", query_id);
+        let (task, guard) = self.register_task(
+            query_id,
+            session_id,
+            String::new(),
+            "AutoFusion".to_string(),
+        );
+        let entry = InFlightEntry {
+            token: task.token.clone(),
+            abort_handle: Arc::clone(&task.abort_handle),
+            task,
+        };
         (entry, guard)
     }
 
+    /// Retrieves active or recently completed chat task by `query_id`.
+    pub fn get_by_query_id(&self, query_id: &str) -> Option<Arc<ActiveChatTask>> {
+        self.prune_stale(DEFAULT_TASK_GRACE_PERIOD);
+        if let Ok(map) = self.queries.read() {
+            map.get(query_id).cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Retrieves active or recently completed chat task by `session_id`.
+    pub fn get_by_session_id(&self, session_id: &str) -> Option<Arc<ActiveChatTask>> {
+        self.prune_stale(DEFAULT_TASK_GRACE_PERIOD);
+        if let Ok(map) = self.queries.read() {
+            // Prefer running task first
+            let running = map
+                .values()
+                .filter(|t| t.session_id == session_id && t.is_running())
+                .max_by_key(|t| t.started_at_ms);
+            if let Some(t) = running {
+                return Some(Arc::clone(t));
+            }
+            // Fallback to recent completed task within retention window
+            map.values()
+                .filter(|t| t.session_id == session_id)
+                .max_by_key(|t| t.started_at_ms)
+                .cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Lists summaries of all currently running tasks for `GET /api/chat/active`.
+    pub fn list_active(&self) -> Vec<ActiveChatTaskSummary> {
+        self.prune_stale(DEFAULT_TASK_GRACE_PERIOD);
+        if let Ok(map) = self.queries.read() {
+            let mut list: Vec<ActiveChatTaskSummary> = map
+                .values()
+                .filter(|t| t.is_running())
+                .map(|t| ActiveChatTaskSummary {
+                    query_id: t.query_id.clone(),
+                    session_id: t.session_id.clone(),
+                    prompt: t.prompt.clone(),
+                    model_family: t.model_family.clone(),
+                    started_at_ms: t.started_at_ms,
+                })
+                .collect();
+            list.sort_by_key(|s| std::cmp::Reverse(s.started_at_ms));
+            list
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Alias for `list_active()`
+    pub fn get_active_tasks(&self) -> Vec<ActiveChatTaskSummary> {
+        self.list_active()
+    }
+
+    /// Cancels a running query by `query_id`.
     pub fn cancel(&self, query_id: &str) -> bool {
         if let Ok(map) = self.queries.read() {
-            if let Some(entry) = map.get(query_id) {
-                entry.token.cancel();
-                if let Ok(mut lock) = entry.abort_handle.lock() {
-                    if let Some(handle) = lock.take() {
-                        handle.abort();
-                    }
-                }
-                return true;
+            if let Some(task) = map.get(query_id) {
+                return task.cancel();
             }
         }
         false
     }
 
+    /// Cancels running queries matching `session_id`.
+    pub fn cancel_session(&self, session_id: &str) -> bool {
+        if let Ok(map) = self.queries.read() {
+            let mut any = false;
+            for task in map.values() {
+                if task.session_id == session_id && task.is_running() {
+                    task.cancel();
+                    any = true;
+                }
+            }
+            return any;
+        }
+        false
+    }
+
+    /// Cancels all running queries.
     pub fn cancel_all(&self) -> usize {
         let mut count = 0;
         if let Ok(map) = self.queries.read() {
-            for entry in map.values() {
-                entry.token.cancel();
-                if let Ok(mut lock) = entry.abort_handle.lock() {
-                    if let Some(handle) = lock.take() {
-                        handle.abort();
-                    }
+            for task in map.values() {
+                if task.is_running() {
+                    task.cancel();
+                    count += 1;
                 }
-                count += 1;
             }
         }
         count
+    }
+
+    /// Prunes completed or cancelled tasks whose grace retention window has elapsed.
+    pub fn prune_stale(&self, grace_period: Duration) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let grace_ms = grace_period.as_millis() as u64;
+
+        if let Ok(mut map) = self.queries.write() {
+            map.retain(|_, task| {
+                if !task.completed.load(Ordering::SeqCst) && !task.cancelled.load(Ordering::SeqCst) {
+                    true
+                } else {
+                    let completed_at = task.completed_at_ms.load(Ordering::SeqCst);
+                    if completed_at == 0 {
+                        true
+                    } else {
+                        now_ms.saturating_sub(completed_at) < grace_ms
+                    }
+                }
+            });
+        }
+    }
+
+    /// Prunes completed or cancelled tasks with default grace period.
+    pub fn prune_stale_default(&self) {
+        self.prune_stale(DEFAULT_TASK_GRACE_PERIOD);
     }
 }
 

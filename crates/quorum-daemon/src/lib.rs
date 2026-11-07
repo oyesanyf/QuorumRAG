@@ -11,4 +11,8 @@ pub use chat_history_db::{
 };
 pub use cli::{Cli, Commands};
 pub use server::build_router;
-pub use state::{ChatSessionData, ChatSessionRegistry, DaemonState, InFlightCancelToken, InFlightQueryRegistry};
+pub use state::{
+    ActiveChatTask, ActiveChatTaskSummary, ChatSessionData, ChatSessionRegistry, DaemonState,
+    InFlightCancelToken, InFlightEntry, InFlightGuard, InFlightQueryRegistry,
+    DEFAULT_TASK_GRACE_PERIOD,
+};

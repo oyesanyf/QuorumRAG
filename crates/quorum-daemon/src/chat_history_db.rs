@@ -216,6 +216,149 @@ impl ChatHistoryStore {
         Ok(())
     }
 
+    /// Records a pending user prompt at the initiation of generation before synthesis completes.
+    /// Creates the session if absent, inserts the user prompt and a placeholder empty assistant row.
+    /// If regenerating the same prompt, clears the existing assistant row for re-streaming.
+    pub fn record_pending_turn(
+        &self,
+        session_id: &str,
+        user_prompt: &str,
+        model_family: &str,
+    ) -> rusqlite::Result<()> {
+        let sid = session_id.trim();
+        let clean_prompt = user_prompt.trim();
+        if sid.is_empty() || clean_prompt.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp_millis();
+        let model_str = if model_family.trim().is_empty() {
+            "AutoFusion"
+        } else {
+            model_family.trim()
+        };
+
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = guard.transaction()?;
+
+        let exists: Option<String> = tx
+            .query_row(
+                "SELECT title FROM chat_sessions WHERE session_id = ?1",
+                params![sid],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if exists.is_none() {
+            let title = Self::derive_title(clean_prompt);
+            tx.execute(
+                "INSERT INTO chat_sessions (session_id, title, model_family, created_at, updated_at, message_count)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 0)",
+                params![sid, title, model_str, now],
+            )?;
+        }
+
+        let last_two: Vec<(i64, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, role, content FROM chat_messages
+                 WHERE session_id = ?1
+                 ORDER BY id DESC LIMIT 2",
+            )?;
+            let mapped = stmt.query_map(params![sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            mapped.flatten().collect()
+        };
+
+        let is_regenerating = last_two.len() >= 2
+            && last_two[0].1 == "assistant"
+            && last_two[1].1 == "user"
+            && last_two[1].2.trim() == clean_prompt;
+
+        if is_regenerating {
+            tx.execute(
+                "UPDATE chat_messages
+                 SET content = '', citations_json = '[]', responder_peer_id = 'local', created_at = ?1
+                 WHERE id = ?2",
+                params![now, last_two[0].0],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO chat_messages (session_id, role, content, citations_json, responder_peer_id, created_at)
+                 VALUES (?1, 'user', ?2, '[]', 'local', ?3)",
+                params![sid, clean_prompt, now],
+            )?;
+            tx.execute(
+                "INSERT INTO chat_messages (session_id, role, content, citations_json, responder_peer_id, created_at)
+                 VALUES (?1, 'assistant', '', '[]', 'local', ?2)",
+                params![sid, now + 1],
+            )?;
+        }
+
+        let msg_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?1",
+            params![sid],
+            |r| r.get(0),
+        )?;
+
+        tx.execute(
+            "UPDATE chat_sessions
+             SET updated_at = ?1, model_family = ?2, message_count = ?3
+             WHERE session_id = ?4",
+            params![now + 1, model_str, msg_count, sid],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Updates a pending empty assistant row upon cancellation so no empty orphan rows remain in history.
+    pub fn record_cancelled_turn(
+        &self,
+        session_id: &str,
+        cancellation_reason: &str,
+    ) -> rusqlite::Result<()> {
+        let sid = session_id.trim();
+        if sid.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp_millis();
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = guard.transaction()?;
+
+        let row: Option<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, content FROM chat_messages
+                 WHERE session_id = ?1 AND role = 'assistant'
+                 ORDER BY id DESC LIMIT 1",
+            )?;
+            stmt.query_row(params![sid], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?
+        };
+
+        if let Some((row_id, content)) = row {
+            if content.trim().is_empty() {
+                tx.execute(
+                    "UPDATE chat_messages SET content = ?1, created_at = ?2 WHERE id = ?3",
+                    params![cancellation_reason, now, row_id],
+                )?;
+                tx.execute(
+                    "UPDATE chat_sessions SET updated_at = ?1 WHERE session_id = ?2",
+                    params![now, sid],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Alias for record_cancelled_turn with optional message.
+    pub fn mark_turn_cancelled(
+        &self,
+        session_id: &str,
+        cancellation_msg: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let reason = cancellation_msg.unwrap_or("*[Generation stopped by user]*");
+        self.record_cancelled_turn(session_id, reason)
+    }
+
     /// Lists persisted conversation sessions ordered by most recently active first.
     pub fn list_sessions(&self, limit: usize) -> rusqlite::Result<Vec<ChatSessionSummary>> {
         let cap = limit.clamp(1, 500) as i64;
