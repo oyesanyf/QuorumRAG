@@ -284,6 +284,9 @@ impl ScoredChunk {
             is_external_node: is_ext,
             origin_label,
             node_alias: None,
+            verbatim_quote: None,
+            byte_range: None,
+            grounding_rationale: None,
         }
     }
 }
@@ -320,6 +323,18 @@ pub struct Citation {
 
     #[serde(default)]
     pub node_alias: Option<String>,
+
+    /// Exact verbatim substring verified to appear inside the source parent document or chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbatim_quote: Option<String>,
+
+    /// Exact UTF-8 byte span `(start_byte, end_byte)` of `verbatim_quote` within the parent document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_range: Option<(usize, usize)>,
+
+    /// Brief provenance rationale explaining why this verified quote supports the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding_rationale: Option<String>,
 }
 
 /// Data transfer object for transmitting candidate chunks across the network or between layers.
@@ -639,6 +654,9 @@ impl VolatileRemoteChunk {
             is_external_node: is_ext,
             origin_label,
             node_alias: None,
+            verbatim_quote: None,
+            byte_range: None,
+            grounding_rationale: None,
         }
     }
 }
@@ -722,6 +740,94 @@ pub struct RecacheResponse {
     pub cleared_entries: usize,
     pub warmed_entries: usize,
     pub duration_ms: u64,
+}
+
+/// Canonical document format classification for full-document parent storage and multimodal indexing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocumentFormat {
+    PlainText,
+    Markdown,
+    SourceCode,
+    Pdf,
+    WordDocx,
+    Spreadsheet,
+    ImageFile,
+    OsSearchSnippetFallback,
+}
+
+impl DocumentFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PlainText => "PlainText",
+            Self::Markdown => "Markdown",
+            Self::SourceCode => "SourceCode",
+            Self::Pdf => "Pdf",
+            Self::WordDocx => "WordDocx",
+            Self::Spreadsheet => "Spreadsheet",
+            Self::ImageFile => "ImageFile",
+            Self::OsSearchSnippetFallback => "OsSearchSnippetFallback",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "Markdown" | "markdown" | "md" => Self::Markdown,
+            "SourceCode" | "source_code" | "code" => Self::SourceCode,
+            "Pdf" | "pdf" => Self::Pdf,
+            "WordDocx" | "word_docx" | "docx" | "doc" => Self::WordDocx,
+            "Spreadsheet" | "spreadsheet" | "xlsx" | "xls" | "csv" | "ods" => Self::Spreadsheet,
+            "ImageFile" | "image_file" | "image" => Self::ImageFile,
+            "OsSearchSnippetFallback" | "os_search_snippet_fallback" => {
+                Self::OsSearchSnippetFallback
+            }
+            _ => Self::PlainText,
+        }
+    }
+
+    pub fn from_extension(ext_lower: &str) -> Self {
+        match ext_lower {
+            "md" | "markdown" | "rst" | "adoc" => Self::Markdown,
+            "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "go" | "java" | "c" | "cpp" | "h"
+            | "hpp" | "cs" | "rb" | "php" | "swift" | "kt" | "scala" | "sql" | "sh" | "ps1"
+            | "toml" | "yaml" | "yml" | "json" | "html" | "css" | "xml" => Self::SourceCode,
+            "pdf" => Self::Pdf,
+            "docx" | "doc" | "rtf" | "odt" | "pptx" | "epub" => Self::WordDocx,
+            "xlsx" | "xls" | "ods" | "csv" | "tsv" => Self::Spreadsheet,
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "svg" | "ico"
+            | "heic" | "avif" => Self::ImageFile,
+            _ => Self::PlainText,
+        }
+    }
+}
+
+/// Full unchunked parent document record persisted alongside chunk indices so RLM orchestration
+/// can inspect surrounding byte windows, multi-sheet tables, and regex matches without chunk-boundary loss.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestedParentDocument {
+    pub doc_id: String,
+    pub blake3_hash: String,
+    pub source_path: String,
+    pub os_platform: String,
+    pub format: DocumentFormat,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub created_unix_secs: i64,
+    pub modified_unix_secs: i64,
+    pub byte_len: u64,
+    pub full_text: String,
+    #[serde(default)]
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// Byte-range regex match within a parent document returned by RLM `regex_grep`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegexMatchSpan {
+    pub doc_id: String,
+    pub source_path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub matched_text: String,
+    pub context_window: String,
 }
 
 #[cfg(test)]

@@ -368,8 +368,14 @@ impl FileTypeClassifier {
 
     /// Inspect magic bytes at the beginning of the stream.
     fn match_magic_headers(&self, bytes: &[u8], filename_hint: Option<&str>) -> Option<FileIdentity> {
-        // MZ / PE Executable (Windows exe, dll, sys)
-        if bytes.starts_with(b"MZ") {
+        // MZ / PE Executable (Windows exe, dll, sys) — require binary/NUL bytes in DOS header or executable extension
+        // so plain UTF-8 text documents beginning with ASCII "MZ" are not misclassified as PE binaries.
+        if bytes.starts_with(b"MZ")
+            && (bytes[2..bytes.len().min(64)].iter().any(|&b| b == 0 || b > 0x7E)
+                || filename_hint
+                    .and_then(|n| Path::new(n).extension().and_then(|e| e.to_str()))
+                    .is_some_and(is_binary_executable_extension))
+        {
             return Some(FileIdentity::new(
                 "pebin",
                 "application/x-dosexec",

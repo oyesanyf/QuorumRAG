@@ -71,7 +71,36 @@ pub struct RlmStepTrace {
     pub duration_ms: u64,
 }
 
-/// Exact character-span grounded citation emitted during RLM synthesis.
+/// Canonical state-environment actions emitted by the Recursive Language Model (RLM) controller.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum RlmAction {
+    SearchCorpus {
+        query: String,
+        limit: usize,
+    },
+    PeekSlice {
+        doc_id: String,
+        start_byte: usize,
+        end_byte: usize,
+    },
+    RegexGrep {
+        doc_id: String,
+        pattern: String,
+    },
+    SpawnSubQuery {
+        doc_id: String,
+        start_byte: usize,
+        end_byte: usize,
+        sub_prompt: String,
+    },
+    FinalAnswer {
+        answer: String,
+        citations: Vec<GroundedCitation>,
+    },
+}
+
+/// Exact character/byte-span grounded citation emitted during RLM synthesis.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroundedCitation {
     pub document_id: String,
@@ -85,6 +114,9 @@ pub struct GroundedCitation {
     pub is_external: bool,
     #[serde(default)]
     pub node_alias: Option<String>,
+    /// Optional provenance rationale explaining how this exact verbatim span grounds the claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
 }
 
 /// Summary and citations contributed by an external mesh peer.

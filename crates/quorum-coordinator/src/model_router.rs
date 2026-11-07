@@ -16,6 +16,11 @@ impl AutoFusionRouter {
             || hw.free_vram_mb >= Self::GEMMA4_26B_MIN_FREE_VRAM_MB
     }
 
+    /// Returns true when `gemma4:26b` fits inside available GPU VRAM without host CPU spill.
+    pub fn can_gpu_accelerate_gemma4_26b(hw: &HardwareTelemetry) -> bool {
+        hw.free_vram_mb >= Self::GEMMA4_26B_MIN_FREE_VRAM_MB
+    }
+
     /// Selects model family, tag, and rationale based on intent, retrieved chunks, and hardware telemetry.
     pub fn select_model(
         requested_family: SynthesisModelFamily,
@@ -198,7 +203,17 @@ impl AutoFusionRouter {
                             ),
                         );
                     }
-                    let chosen_tag = Self::find_best_installed_chat_model(Some(&ideal_tag), hw, installed_models)
+                    let vram_aware_pref = if hw.free_vram_mb >= 4_500
+                        && hw.free_vram_mb < 14_000
+                        && installed_models
+                            .iter()
+                            .any(|m| m.to_ascii_lowercase().starts_with("qwen2.5:7b"))
+                    {
+                        "qwen2.5:7b"
+                    } else {
+                        ideal_tag.as_str()
+                    };
+                    let chosen_tag = Self::find_best_installed_chat_model(Some(vram_aware_pref), hw, installed_models)
                         .unwrap_or(ideal_tag);
                     return (
                         SynthesisModelFamily::Qwen25Code,
@@ -212,7 +227,7 @@ impl AutoFusionRouter {
                     );
                 }
 
-                // If multi-document context > 16KB or multi-hop (> 6 chunks) -> GLM-4-9B or Gemma 4 26B
+                // If multi-document context > 16KB or multi-hop (> 6 chunks) -> VRAM-resident Qwen-7B / GLM-4-9B or GPU-backed Gemma 4 26B
                 let total_chars: usize = chunks.iter().map(|c| c.chunk.text_content.len()).sum();
                 if total_chars > 16_000 || chunks.len() > 6 {
                     if installed_models.is_empty() {
@@ -226,7 +241,18 @@ impl AutoFusionRouter {
                             ),
                         );
                     }
-                    let pref = if Self::can_run_gemma4_26b(hw) { "gemma4:26b" } else { "glm4:9b" };
+                    let pref = if Self::can_gpu_accelerate_gemma4_26b(hw) {
+                        "gemma4:26b"
+                    } else if hw.free_vram_mb >= 4_500
+                        && hw.free_vram_mb < Self::GEMMA4_26B_MIN_FREE_VRAM_MB
+                        && installed_models
+                            .iter()
+                            .any(|m| m.to_ascii_lowercase().starts_with("qwen2.5:7b"))
+                    {
+                        "qwen2.5:7b"
+                    } else {
+                        "glm4:9b"
+                    };
                     let chosen_tag = Self::find_best_installed_chat_model(Some(pref), hw, installed_models)
                         .unwrap_or_else(|| "glm4:9b".to_string());
                     return (
@@ -256,8 +282,15 @@ impl AutoFusionRouter {
                         )
                     }
                 } else {
-                    let preferred_target = if Self::can_run_gemma4_26b(hw) {
+                    let preferred_target = if Self::can_gpu_accelerate_gemma4_26b(hw) {
                         "gemma4:26b"
+                    } else if hw.free_vram_mb >= 4_500
+                        && hw.free_vram_mb < Self::GEMMA4_26B_MIN_FREE_VRAM_MB
+                        && installed_models
+                            .iter()
+                            .any(|m| m.to_ascii_lowercase().starts_with("qwen2.5:7b"))
+                    {
+                        "qwen2.5:7b"
                     } else if hw.free_ram_gb >= 12.0 || hw.free_vram_mb >= 4500 {
                         "glm4:9b"
                     } else {

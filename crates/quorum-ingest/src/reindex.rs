@@ -227,9 +227,10 @@ impl ReindexWorker {
                 continue;
             }
 
-            // Check if chunk already has OCR text
+            // Upgrade legacy image chunks missing either OCR text or Multimodal Vision caption
             let has_ocr = chunk.text_content.contains("[OCR Text]");
-            if has_ocr {
+            let has_vision = chunk.text_content.contains("[Visual Description]");
+            if has_ocr && has_vision {
                 continue;
             }
 
@@ -286,6 +287,16 @@ impl ReindexWorker {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
+                let parent_doc = DocumentExtractor::build_ingested_parent_document(
+                    file_path,
+                    &upgraded_chunk.document_id,
+                    &upgraded_chunk.document_id,
+                    &upgraded_chunk.text_content,
+                    mtime_secs,
+                    bytes.len() as u64,
+                    Some(quorum_types::DocumentFormat::ImageFile),
+                );
+                let _ = self.storage.upsert_parent_document(&parent_doc, access_tier);
 
                 self.dedup.register_entry(FileCatalogEntry {
                     file_path: file_path.to_path_buf(),
@@ -402,6 +413,23 @@ impl ReindexWorker {
 
             let _ = self.storage.delete_by_file_path(&path_str).await;
             self.storage.insert_chunks(&doc_chunks).await?;
+            let upgraded_mtime = std::fs::metadata(file_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let upgraded_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(content.len() as u64);
+            let parent_doc = DocumentExtractor::build_ingested_parent_document(
+                file_path,
+                &file_b3,
+                &file_b3,
+                &content,
+                upgraded_mtime,
+                upgraded_size,
+                None,
+            );
+            let _ = self.storage.upsert_parent_document(&parent_doc, access_tier);
 
             if let Ok(meta) = std::fs::metadata(file_path) {
                 let mtime_secs = meta
@@ -589,6 +617,7 @@ impl ReindexWorker {
         }
 
         let mut batch_chunks: Vec<DocumentChunk> = Vec::with_capacity(options.batch_size);
+        let mut batch_parents: Vec<(quorum_types::IngestedParentDocument, u8)> = Vec::new();
 
         for candidate in all_candidates {
             if cancel_flag.load(Ordering::SeqCst) {
@@ -729,6 +758,19 @@ impl ReindexWorker {
                             }
                         }
 
+                        if !content.is_empty() {
+                            let parent_doc = DocumentExtractor::build_ingested_parent_document(
+                                path,
+                                &file_b3,
+                                &file_b3,
+                                &content,
+                                candidate.mtime_secs,
+                                candidate.size_bytes,
+                                None,
+                            );
+                            batch_parents.push((parent_doc, access_tier));
+                        }
+
                         // Register in Level-1 catalog
                         dedup.register_entry(FileCatalogEntry {
                             file_path: path.clone(),
@@ -759,6 +801,16 @@ impl ReindexWorker {
                             embedder.as_ref(),
                         ) {
                             let file_b3 = doc_chunk.document_id.clone();
+                            let parent_doc = DocumentExtractor::build_ingested_parent_document(
+                                path,
+                                &file_b3,
+                                &file_b3,
+                                &doc_chunk.text_content,
+                                candidate.mtime_secs,
+                                candidate.size_bytes,
+                                Some(quorum_types::DocumentFormat::ImageFile),
+                            );
+                            batch_parents.push((parent_doc, access_tier));
                             dedup.register_entry(FileCatalogEntry {
                                 file_path: path.clone(),
                                 file_blake3: file_b3,
@@ -815,7 +867,12 @@ impl ReindexWorker {
                     if !options.dry_run {
                         Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
                         let _ = storage.insert_chunks(&batch_chunks).await?;
+                        for (pdoc, ptier) in batch_parents.drain(..) {
+                            let _ = storage.upsert_parent_document(&pdoc, ptier);
+                        }
                         let _ = storage.bump_index_epoch("reindex_micro_batch");
+                    } else {
+                        batch_parents.clear();
                     }
                     batch_chunks.clear();
                     tokio::task::yield_now().await;
@@ -831,8 +888,15 @@ impl ReindexWorker {
             if !batch_chunks.is_empty() && !options.dry_run {
                 Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
                 let _ = storage.insert_chunks(&batch_chunks).await?;
+                for (pdoc, ptier) in batch_parents.drain(..) {
+                    let _ = storage.upsert_parent_document(&pdoc, ptier);
+                }
                 let _ = storage.bump_index_epoch("reindex_final_flush");
                 batch_chunks.clear();
+            } else if !batch_parents.is_empty() && !options.dry_run {
+                for (pdoc, ptier) in batch_parents.drain(..) {
+                    let _ = storage.upsert_parent_document(&pdoc, ptier);
+                }
             }
 
         // Compaction phase if full rebuild

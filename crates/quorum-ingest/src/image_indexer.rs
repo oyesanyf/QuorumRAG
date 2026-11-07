@@ -831,74 +831,219 @@ if ($engine) {
         None
     }
 
-    /// Ingest-time bounded Ollama vision inspection (moondream:latest / llava:7b).
-    pub fn extract_vision_description(bytes: &[u8]) -> Option<String> {
+    /// Discovers installed multimodal vision models from Ollama `/api/tags` using a strict 400ms
+    /// health-probe connect timeout and a 30-second in-process cache.
+    fn discover_installed_vision_models(addr: std::net::SocketAddr) -> Vec<String> {
         use std::io::{Read, Write};
-        use std::net::{SocketAddr, TcpStream};
-        use std::time::Duration;
+        use std::net::TcpStream;
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
 
-        const MAX_VISION_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-
-        if bytes.is_empty() || bytes.len() > MAX_VISION_IMAGE_BYTES {
-            return None;
+        static VISION_MODEL_CACHE: OnceLock<Mutex<Option<(Instant, Vec<String>)>>> = OnceLock::new();
+        let cache = VISION_MODEL_CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(guard) = cache.lock() {
+            if let Some((ts, ref cached)) = *guard {
+                if ts.elapsed() < Duration::from_secs(30) {
+                    return cached.clone();
+                }
+            }
         }
 
-        let addr: SocketAddr = "127.0.0.1:11434".parse().ok()?;
-        let encoded = Self::base64_encode(bytes);
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(400)) else {
+            return Vec::new();
+        };
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
 
-        // Preference order: lightweight moondream first, then llava
-        let models = ["moondream:latest", "moondream", "llava:7b", "llava"];
+        let req = format!(
+            "GET /api/tags HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            addr
+        );
+        if stream.write_all(req.as_bytes()).is_err() {
+            return Vec::new();
+        }
+        let mut raw = Vec::new();
+        if stream.read_to_end(&mut raw).is_err() {
+            return Vec::new();
+        }
+        let text = String::from_utf8_lossy(&raw);
+        let Some(body_at) = text
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .or_else(|| text.find("\n\n").map(|i| i + 2))
+        else {
+            return Vec::new();
+        };
+
+        let mut installed_names: Vec<String> = Vec::new();
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(text[body_at..].trim()) {
+            if let Some(arr) = val.get("models").and_then(|m| m.as_array()) {
+                for item in arr {
+                    if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                        installed_names.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        let preferred_prefixes = [
+            "moondream:latest",
+            "moondream",
+            "llava:7b",
+            "llava:latest",
+            "llava",
+            "qwen2.5vl",
+            "minicpm-v",
+            "llama3.2-vision",
+            "bakllava",
+            "gemma3",
+            "gemma4",
+        ];
+
+        let mut ordered = Vec::new();
+        for pref in preferred_prefixes {
+            for inst in &installed_names {
+                let il = inst.to_ascii_lowercase();
+                if (il == pref || il.starts_with(&format!("{}:", pref)) || il.starts_with(pref))
+                    && !ordered.contains(inst)
+                {
+                    ordered.push(inst.clone());
+                }
+            }
+        }
+
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some((Instant::now(), ordered.clone()));
+        }
+        ordered
+    }
+
+    /// Generates a rich semantic scene, object, animal, color, and text caption for an image file
+    /// via a local Ollama multimodal vision model (`moondream:latest` / `llava`).
+    pub fn caption_image_with_ollama(
+        path: &Path,
+        ollama_url: &str,
+        vision_model: &str,
+    ) -> Result<String, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("Failed to read image {}: {}", path.display(), e))?;
+        let trimmed_url = ollama_url
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
+        let host_port = trimmed_url.split('/').next().unwrap_or("127.0.0.1:11434");
+        let addr: std::net::SocketAddr = host_port
+            .parse()
+            .or_else(|_| "127.0.0.1:11434".parse())
+            .map_err(|e| format!("Invalid Ollama socket address: {}", e))?;
+        // Strict loopback SSRF guard: vision captioning only talks to loopback Ollama
+        if !addr.ip().is_loopback() {
+            return Err("Ollama vision endpoint must be a loopback address".to_string());
+        }
+        Self::caption_image_bytes_with_ollama(&bytes, addr, Some(vision_model))
+    }
+
+    fn caption_image_bytes_with_ollama(
+        bytes: &[u8],
+        addr: std::net::SocketAddr,
+        preferred_model: Option<&str>,
+    ) -> Result<String, String> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        const MAX_VISION_IMAGE_BYTES: usize = 12 * 1024 * 1024;
+        if bytes.is_empty() || bytes.len() > MAX_VISION_IMAGE_BYTES {
+            return Err("Image empty or exceeds 12 MiB vision cap".to_string());
+        }
+
+        let mut models = Vec::new();
+        if let Some(m) = preferred_model.map(str::trim).filter(|s| !s.is_empty()) {
+            models.push(m.to_string());
+        }
+        for discovered in Self::discover_installed_vision_models(addr) {
+            if !models.contains(&discovered) {
+                models.push(discovered);
+            }
+        }
+        if models.is_empty() {
+            models.push("moondream:latest".to_string());
+            models.push("llava:7b".to_string());
+        }
+
+        let encoded = Self::base64_encode(bytes);
+        let mut last_err = String::from("No installed Ollama vision model responded");
+
+        let read_timeout_ms = if preferred_model.is_some() { 20_000 } else { 6_000 };
+        let max_vision_tokens = if preferred_model.is_some() { 320 } else { 192 };
 
         for model in models {
             let payload = serde_json::json!({
                 "model": model,
-                "prompt": "Describe this image concisely in 2 to 3 sentences: subjects, scene layout, key colors, and visible text.",
+                "prompt": "Describe every object, animal, person, visible text, color, setting, and scene layout in this image in clear detail for a document search index.",
                 "images": [&encoded],
                 "stream": false,
                 "keep_alive": "10m",
-                "options": { "temperature": 0.1, "num_predict": 120 }
+                "options": { "temperature": 0.1, "num_predict": max_vision_tokens }
             })
             .to_string();
 
             let request = format!(
-                "POST /api/generate HTTP/1.0\r\nHost: 127.0.0.1:11434\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-                payload.len()
+                "POST /api/generate HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                addr,
+                payload.len(),
+                payload
             );
 
-            let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
-                return None; // Ollama daemon not running on port 11434; fail fast
+            // Fast 400ms TCP connect probe so offline systems never stall; bounded read timeout
+            let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(400)) else {
+                return Err("Ollama daemon offline on loopback port".to_string());
             };
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(3000)));
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(read_timeout_ms)));
 
-            if stream.write_all(request.as_bytes()).is_err() {
+            if let Err(e) = stream.write_all(request.as_bytes()) {
+                last_err = e.to_string();
                 continue;
             }
 
             let mut raw = Vec::new();
-            if stream.read_to_end(&mut raw).is_err() {
+            if let Err(e) = stream.read_to_end(&mut raw) {
+                last_err = e.to_string();
                 continue;
             }
 
             let text = String::from_utf8_lossy(&raw);
             if !text.lines().next().is_some_and(|l| l.contains(" 200")) {
+                last_err = format!("Model '{}' returned non-200 HTTP status", model);
                 continue;
             }
 
-            let body_at = text.find("\r\n\r\n").map(|i| i + 4).or_else(|| text.find("\n\n").map(|i| i + 2));
-            let Some(body_at) = body_at else { continue; };
+            let body_at = text
+                .find("\r\n\r\n")
+                .map(|i| i + 4)
+                .or_else(|| text.find("\n\n").map(|i| i + 2));
+            let Some(body_at) = body_at else {
+                continue;
+            };
 
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(text[body_at..].trim()) {
                 if let Some(desc) = val.get("response").and_then(|r| r.as_str()) {
                     let normalized = Self::normalize_ocr_text(desc);
                     let trimmed = normalized.trim();
-                    if trimmed.len() >= 10 {
-                        return Some(trimmed.to_string());
+                    if trimmed.len() >= 8 {
+                        return Ok(trimmed.to_string());
                     }
                 }
             }
         }
-        None
+
+        Err(last_err)
+    }
+
+    /// Ingest-time bounded Ollama vision inspection (`moondream:latest` / `llava` via `/api/tags`).
+    pub fn extract_vision_description(bytes: &[u8]) -> Option<String> {
+        let addr: std::net::SocketAddr = "127.0.0.1:11434".parse().ok()?;
+        Self::caption_image_bytes_with_ollama(bytes, addr, None).ok()
     }
 
 

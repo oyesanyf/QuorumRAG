@@ -637,7 +637,8 @@ impl DeterministicOfflineSynthesisEngine {
             let is_media_chunk = raw_head.contains("[Audio Document:")
                 || raw_head.contains("[Image Document:")
                 || raw_head.contains("[Video Document:")
-                || raw_head.contains("[OCR Text]");
+                || raw_head.contains("[OCR Text]")
+                || raw_head.contains("[Visual Description]");
             let is_user_doc = file_l.ends_with(".pdf")
                 || file_l.ends_with(".docx")
                 || file_l.ends_with(".doc")
@@ -668,6 +669,7 @@ impl DeterministicOfflineSynthesisEngine {
             }
 
             let has_ocr_content = raw_head.contains("[OCR Text]")
+                || raw_head.contains("[Visual Description]")
                 || query_terms.iter().any(|qt| text_l.contains(qt.as_str()));
             if !asks_image
                 && !has_ocr_content
@@ -1025,7 +1027,7 @@ impl DeterministicOfflineSynthesisEngine {
         let matched_chunk_refs: Vec<&ScoredChunk> = matched_chunks.iter().collect();
 
         if !matched_chunk_refs.is_empty() {
-            let citations: Vec<Citation> = Self::build_deduplicated_citations(&matched_chunk_refs);
+            let mut citations: Vec<Citation> = Self::build_deduplicated_citations(&matched_chunk_refs);
 
             // 1. Use the local LLM strictly to orchestrate a natural, direct, citation-backed answer
             // from the retrieved local RAG chunks (never invoked when matched_chunks is empty).
@@ -1084,7 +1086,7 @@ impl DeterministicOfflineSynthesisEngine {
                 let mut in_code_fence = false;
                 for line in cleaned.lines() {
                     let trimmed = line.trim();
-                    if trimmed.is_empty() {
+                    if trimmed.is_empty() || Self::is_contact_bar_or_header(trimmed) {
                         continue;
                     }
                     if trimmed.contains("fileciteturn0file0") || trimmed.contains("sandbox:/mnt/data") {
@@ -1141,7 +1143,13 @@ impl DeterministicOfflineSynthesisEngine {
                 let mut grounded_summary = String::new();
                 for line in cleaned_first.lines() {
                     let t = line.trim();
-                    if t.is_empty() || t.starts_with('#') || t.contains("fileciteturn0file0") || t.contains("sandbox:/mnt/data") {
+                    if t.is_empty()
+                        || t.starts_with('#')
+                        || t.contains("fileciteturn0file0")
+                        || t.contains("sandbox:/mnt/data")
+                        || Self::is_contact_bar_or_header(t)
+                        || !Self::is_sentence_like(t)
+                    {
                         continue;
                     }
                     let t_low = t.to_ascii_lowercase();
@@ -1161,23 +1169,74 @@ impl DeterministicOfflineSynthesisEngine {
                     }
                 }
                 if grounded_summary.is_empty() {
-                    if let Some(first_line) = cleaned_first.lines().find(|l| {
+                    if let Some(first_prose) = cleaned_first.lines().find(|l| {
                         let trimmed = l.trim();
-                        !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.contains("fileciteturn0file0") && !trimmed.contains("sandbox:/mnt/data")
+                        !trimmed.is_empty()
+                            && !trimmed.starts_with('#')
+                            && !trimmed.contains("fileciteturn0file0")
+                            && !trimmed.contains("sandbox:/mnt/data")
+                            && !Self::is_contact_bar_or_header(trimmed)
+                            && Self::is_sentence_like(trimmed)
                     }) {
-                        grounded_summary = first_line.trim().to_string();
+                        grounded_summary = first_prose.trim().to_string();
                     }
                 }
 
-                // A title/heading line ("FEMI OYESANYA, CISSP", "SIMPLE LEASE AGREEMENT") is not a description:
-                // use the first prose line of the top excerpt instead when one exists.
+                // If Chunk 0 contains only headers and contact bars, look across subsequent matched chunks
                 if !Self::is_sentence_like(&grounded_summary) {
-                    if let Some(prose) = cleaned_first
-                        .lines()
-                        .map(str::trim)
-                        .find(|l| Self::is_sentence_like(l) && !l.contains("fileciteturn0file0"))
-                    {
-                        grounded_summary = prose.to_string();
+                    for other_chunk in &matched_chunks {
+                        let other_cleaned = Self::clean_chunk_text(&other_chunk.chunk.text_content);
+                        if let Some(prose) = other_cleaned.lines().map(str::trim).find(|l| {
+                            !l.is_empty()
+                                && !l.starts_with('#')
+                                && !l.contains("fileciteturn0file0")
+                                && !l.contains("sandbox:/mnt/data")
+                                && !Self::is_contact_bar_or_header(l)
+                                && Self::is_sentence_like(l)
+                        }) {
+                            grounded_summary = prose.to_string();
+                            break;
+                        }
+                    }
+                }
+
+                // If still not sentence-like or contains contact tokens, search across candidate body paragraphs
+                if !Self::is_sentence_like(&grounded_summary)
+                    || grounded_summary.contains('|')
+                    || grounded_summary.contains('@')
+                    || grounded_summary.contains(" / ")
+                    || grounded_summary.contains('●')
+                    || grounded_summary.contains('▪')
+                {
+                    for para in &body_paragraphs {
+                        let clean_p = if let Some(pos) = para.rfind("**[") {
+                            para[..pos].trim()
+                        } else {
+                            para.trim()
+                        };
+                        for line in clean_p.lines().map(str::trim) {
+                            if !line.is_empty()
+                                && !line.starts_with('#')
+                                && !line.starts_with('-')
+                                && !Self::is_contact_bar_or_header(line)
+                                && Self::is_sentence_like(line)
+                                && !line.contains('|')
+                                && !line.contains('@')
+                                && !line.contains(" / ")
+                                && !line.contains('●')
+                                && !line.contains('▪')
+                            {
+                                grounded_summary = line.to_string();
+                                break;
+                            }
+                        }
+                        if !grounded_summary.is_empty()
+                            && Self::is_sentence_like(&grounded_summary)
+                            && !grounded_summary.contains('|')
+                            && !grounded_summary.contains('@')
+                        {
+                            break;
+                        }
                     }
                 }
 
@@ -1199,17 +1258,7 @@ impl DeterministicOfflineSynthesisEngine {
                         subject_name.as_deref().unwrap_or("This subject")
                     )
                 } else if !grounded_summary.is_empty() {
-                    let clean_sum = grounded_summary.trim_end_matches('.');
-                    let prefix_trimmed = prefix.trim_end();
-                    if clean_sum.to_ascii_lowercase().starts_with(&prefix_trimmed.to_ascii_lowercase()) {
-                        format!("{} **[1]**", clean_sum)
-                    } else if prefix.ends_with("is ") && (clean_sum.to_ascii_lowercase().starts_with("a ") || clean_sum.to_ascii_lowercase().starts_with("an ")) {
-                        format!("{}{} **[1]**", prefix, clean_sum)
-                    } else if prefix.ends_with("is ") {
-                        format!("{}a {} **[1]**", prefix, clean_sum)
-                    } else {
-                        format!("{}{} **[1]**", prefix, clean_sum)
-                    }
+                    Self::synthesize_grounded_opening(&prefix, &grounded_summary, subject_name.as_deref())
                 } else {
                     format!("{}grounded in `{}` **[1]**", prefix, file_name)
                 };
@@ -1218,14 +1267,22 @@ impl DeterministicOfflineSynthesisEngine {
             }
 
             if !client_disconnected {
-                let fallback_subject = prefix.trim_end().strip_suffix(" is").map(|s| s.trim().to_string());
-                match crate::answer_orchestrator::render_grounded_sections(
+                let fallback_subject = prefix
+                    .trim_end()
+                    .strip_suffix(" is")
+                    .or_else(|| prefix.trim_end().strip_suffix(" was"))
+                    .map(|s| s.trim().to_string());
+
+                // Preserve substantive body paragraphs (executive summaries, work history, education)
+                answer_parts.extend(body_paragraphs);
+
+                // Append structured grounded sections if facts or key passages were extracted
+                if let Some(sections) = crate::answer_orchestrator::render_grounded_sections(
                     prompt_eff,
                     fallback_subject.as_deref(),
                     &matched_chunk_refs,
                 ) {
-                    Some(sections) => answer_parts.push(sections),
-                    None => answer_parts.extend(body_paragraphs),
+                    answer_parts.push(sections);
                 }
             } else {
                 answer_parts.extend(body_paragraphs);
@@ -1254,6 +1311,12 @@ impl DeterministicOfflineSynthesisEngine {
                     std::thread::sleep(std::time::Duration::from_millis(6));
                 }
             }
+            crate::rlm_orchestrator::RlmOrchestrator::verify_and_attach_verbatim_grounding(
+                prompt_eff,
+                &clean_answer,
+                &matched_chunk_refs,
+                &mut citations,
+            );
             (synthesized_rag, citations)
         } else {
             let fallback = format!(
@@ -1348,15 +1411,165 @@ impl DeterministicOfflineSynthesisEngine {
         counts.into_iter().next()
     }
 
+    /// Returns true if a line represents a contact header, pipe-delimited metadata bar, or bare contact field.
+    #[inline]
+    pub fn is_contact_bar_or_header(line: &str) -> bool {
+        if crate::answer_orchestrator::is_contact_bar_or_header(line) {
+            return true;
+        }
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains('@') && lower.split_whitespace().any(|w| w.contains('@')) {
+            return true;
+        }
+        let has_phone_digits = trimmed.chars().filter(|c| c.is_ascii_digit()).count() >= 7;
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        if has_phone_digits && words.len() <= 4 {
+            if trimmed.chars().all(|c| c.is_ascii_digit() || "()-+. /#,:".contains(c) || c.is_whitespace() || c.is_alphabetic()) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// True when a line reads like prose (mixed case with at least one lowercase word), not an
-    /// ALL-CAPS title such as "SIMPLE LEASE AGREEMENT".
+    /// ALL-CAPS title such as "SIMPLE LEASE AGREEMENT" and not a contact bar.
     pub fn is_sentence_like(line: &str) -> bool {
+        if Self::is_contact_bar_or_header(line) {
+            return false;
+        }
+        if line.contains('|')
+            || line.contains('@')
+            || line.contains(" / ")
+            || line.contains('●')
+            || line.contains('▪')
+            || line.contains('◆')
+            || line.contains('■')
+            || line.contains('•')
+            || line.contains('·')
+        {
+            return false;
+        }
         let letters: Vec<char> = line.chars().filter(|c| c.is_alphabetic()).collect();
         if letters.len() < 12 {
             return false;
         }
         let lower = letters.iter().filter(|c| c.is_lowercase()).count();
         lower * 2 > letters.len() && line.split_whitespace().count() >= 4
+    }
+
+    pub fn choose_indefinite_article(word: &str) -> &'static str {
+        let w = word.trim().to_ascii_lowercase();
+        if w.is_empty() {
+            return "a";
+        }
+        // Acronyms pronounced with initial vowel sounds
+        if w.starts_with("ai") || w == "ai" || w.starts_with("mba") || w.starts_with("msc") || w.starts_with("llm") {
+            return "an";
+        }
+        // Acronyms pronounced with initial consonant sounds
+        if w.starts_with("cissp") || w.starts_with("cisa") || w.starts_with("cism") || w.starts_with("ceh") {
+            return "a";
+        }
+        // Words with silent 'h'
+        if w.starts_with("hour") || w.starts_with("honest") || w.starts_with("honor") {
+            return "an";
+        }
+        // Words starting with 'u' or 'o' with initial consonant sounds /juː/ or /w/
+        if w.starts_with("uni") || w.starts_with("use") || w.starts_with("user") || w.starts_with("one") {
+            return "a";
+        }
+        let first_char = w.chars().next().unwrap_or(' ');
+        if matches!(first_char, 'a' | 'e' | 'i' | 'o' | 'u') {
+            "an"
+        } else {
+            "a"
+        }
+    }
+
+    pub fn synthesize_grounded_opening(prefix: &str, clean_sum: &str, subject_name: Option<&str>) -> String {
+        let clean_sum = clean_sum.trim().trim_end_matches('.');
+        let prefix_trimmed = prefix.trim_end();
+        let lower_sum = clean_sum.to_ascii_lowercase();
+        let lower_pref = prefix_trimmed.to_ascii_lowercase();
+
+        // 0. Ensure candidate opening string does NOT contain contact tokens or bare contact bars
+        let has_contact = clean_sum.contains('|')
+            || clean_sum.contains('@')
+            || clean_sum.contains(" / ")
+            || clean_sum.contains('●')
+            || clean_sum.contains('▪')
+            || clean_sum.contains('◆')
+            || clean_sum.contains('■')
+            || clean_sum.contains('•')
+            || clean_sum.contains('·')
+            || Self::is_contact_bar_or_header(clean_sum);
+        if has_contact {
+            let subj = subject_name.unwrap_or("This subject");
+            return format!("{} appears in the following retrieved documents **[1]**.", subj);
+        }
+
+        // 1. If clean_sum already starts with prefix ("Femi is", "Femi Oyesanya is")
+        if lower_sum.starts_with(&lower_pref) {
+            return format!("{} **[1]**", clean_sum);
+        }
+
+        // 2. If subject_name is present and clean_sum starts with subject or pronouns
+        if let Some(subj) = subject_name {
+            let subj_low = subj.to_ascii_lowercase();
+            if lower_sum.starts_with(&subj_low) {
+                return format!("{} **[1]**", clean_sum);
+            }
+            for pronoun in &["he ", "she ", "they "] {
+                if lower_sum.starts_with(pronoun) {
+                    let rest = &clean_sum[pronoun.len()..];
+                    return format!("{} {} **[1]**", subj, rest);
+                }
+            }
+        }
+
+        // 3. If prefix ends with copula "is " or "was "
+        if prefix.ends_with("is ") || prefix.ends_with("was ") {
+            let copula = if prefix.ends_with("is ") { "is" } else { "was" };
+            let subj_prefix = prefix_trimmed.strip_suffix(copula).unwrap_or(prefix_trimmed).trim();
+
+            let first_word = lower_sum.split_whitespace().next().unwrap_or("");
+
+            // 3a. If clean_sum starts with an article or determiner ("a ", "an ", "the ")
+            if lower_sum.starts_with("a ") || lower_sum.starts_with("an ") || lower_sum.starts_with("the ") {
+                return format!("{}{} **[1]**", prefix, clean_sum);
+            }
+
+            // 3b. If clean_sum starts with an adverb or participle
+            if lower_sum.starts_with("currently ")
+                || lower_sum.starts_with("formerly ")
+                || lower_sum.starts_with("serving ")
+                || lower_sum.starts_with("working ")
+                || (first_word.ends_with("ing") && first_word.len() > 4)
+            {
+                return format!("{}{} **[1]**", prefix, clean_sum);
+            }
+
+            // 3c. If clean_sum starts with a 3rd-person singular verb
+            if matches!(
+                first_word,
+                "leads" | "manages" | "serves" | "specializes" | "oversees" | "directs" | "focuses" | "holds" | "coordinates" | "conducts"
+            ) {
+                return format!("{} {} **[1]**", subj_prefix, clean_sum);
+            }
+
+            // 3d. If clean_sum starts with a preposition
+            if matches!(first_word, "with" | "in" | "at" | "for" | "from") {
+                return format!("{} **[1]**", clean_sum);
+            }
+
+            // 3e. Standard indefinite article insertion with proper phonetic a/an
+            let article = Self::choose_indefinite_article(first_word);
+            return format!("{}{} {} **[1]**", prefix, article, clean_sum);
+        }
+
+        // 4. Default prefix concatenation
+        format!("{}{} **[1]**", prefix, clean_sum)
     }
 
     pub fn format_question_restated_prefix(prompt: &str) -> String {
@@ -3720,8 +3933,8 @@ impl DeterministicOfflineSynthesisEngine {
     }
 
     /// Deduplicates excerpts from multiple copies/exports of the same document on disk (e.g. `RedactX-v3.pdf` and
-    /// `RedactX-v3 (1).pdf`) WITHIN the same peer by collapsing chunks that share an identical 160-character alphanumeric
-    /// opening signature, while preserving distinct peer copies (`source_peer != "local"`).
+    /// `RedactX-v3 (1).pdf`) across all peers by collapsing chunks that share an identical 120-character alphanumeric
+    /// opening signature or title stem, preventing redundant revisions from starving context diversity across local and mesh nodes.
     pub fn dedup_near_identical_excerpts<'a>(chunks: Vec<&'a ScoredChunk>) -> Vec<&'a ScoredChunk> {
         use std::collections::HashSet;
         let mut seen_sigs: HashSet<String> = HashSet::new();
@@ -3732,10 +3945,19 @@ impl DeterministicOfflineSynthesisEngine {
                 .chars()
                 .filter(|ch| ch.is_alphanumeric())
                 .flat_map(|ch| ch.to_lowercase())
-                .take(160)
+                .take(120)
                 .collect();
-            let peer_sig = format!("{}::{}", c.source_peer, sig);
-            if sig.len() < 40 || seen_sigs.insert(peer_sig) {
+            let stem = Self::normalize_file_stem(&c.chunk.file_path);
+            let effective_sig = if sig.len() >= 40 {
+                sig
+            } else if !stem.is_empty() {
+                format!("stem::{}", stem)
+            } else {
+                sig
+            };
+            if effective_sig.len() < 40 && !effective_sig.starts_with("stem::") {
+                out.push(c);
+            } else if seen_sigs.insert(effective_sig) {
                 out.push(c);
             }
         }
@@ -4581,7 +4803,7 @@ impl DeterministicOfflineSynthesisEngine {
                 "gemma4:26b",
                 "glm4:9b",
             ]
-        } else {
+        } else if crate::model_router::AutoFusionRouter::can_gpu_accelerate_gemma4_26b(hw) {
             &[
                 "gemma4:26b",
                 "glm4:9b",
@@ -4594,6 +4816,20 @@ impl DeterministicOfflineSynthesisEngine {
                 "qwen2.5:3b",
                 "gemma2:2b",
                 "qwen2.5:1.5b",
+            ]
+        } else {
+            &[
+                "qwen2.5:7b",
+                "glm4:9b",
+                "gemma2:9b",
+                "mistral:latest",
+                "gemma3:4b",
+                "qwen2.5:3b",
+                "gemma2:2b",
+                "qwen2.5:1.5b",
+                "qwen2.5:14b",
+                "gemma4:26b",
+                "qwen2.5:32b",
             ]
         };
 
@@ -4623,6 +4859,43 @@ impl DeterministicOfflineSynthesisEngine {
 
         // 4. Default hardware tier if no chat models installed
         crate::model_router::AutoFusionRouter::size_qwen_by_hardware(hw)
+    }
+
+    /// Builds Ollama chat options enforcing minimum 16K context window (`num_ctx >= 16384`)
+    /// and 1500 predict tokens (`num_predict >= 1500`) for thorough multi-paragraph RAG synthesis.
+    pub fn build_ollama_chat_options(
+        temp: f32,
+        per_hop_predict: usize,
+        num_ctx: usize,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "temperature": temp,
+            "num_predict": per_hop_predict.max(1500),
+            "num_ctx": num_ctx.max(16384),
+            "num_thread": 16,
+            "top_p": 0.9,
+            "repeat_last_n": 256,
+            "repeat_penalty": 1.12
+        })
+    }
+
+    /// Formats the base system prompt requesting thorough multi-paragraph answers with bracketed inline citations `[N]`.
+    pub fn build_ollama_chat_system_prompt(voice_directive: &str) -> String {
+        let base_system = "You are QuorumRAG, an exhaustive, strictly factual multi-document research synthesis engine. \
+            Your ONLY task is to write a comprehensive, deeply detailed, thorough multi-paragraph Markdown response answering ONLY the user's question \
+            by synthesizing all concrete facts across ALL provided source documents (`[1]`, `[2]`, `[3]`, etc.) below, \
+            providing bracketed inline citations `[N]` referencing grounded sources throughout your prose. \
+            \n\
+            Follow these strict rules:\n\
+            1. QUESTION-RESTATING OPENING: Always begin your answer immediately with a natural declarative sentence (not a `#` heading) that restates and directly answers the user's question using the concrete facts in the provided documents.\n\
+            2. DIRECT FACTUAL SYNTHESIS & DEEP SPECIFICITY (NEVER REFUSE OR DISCLAIM): Synthesize ALL concrete facts, exact dates, years, metrics, table values, roles, employers, degrees, certifications, properties, agreements, addresses, phone numbers, financial terms, visual scene descriptions, or research findings about the subject present in the provided parent-expanded documents. Include specific numbers, timelines, and exact details rather than vague high-level summaries. Never say \"The user's query is not directly addressed\" or complain about what type of documents are provided—report what the documents actually establish about the subject!\n\
+            3. ZERO META-FILLER & ZERO REPETITION: Never begin with greetings or meta-announcements (never say \"Based on the documents provided...\", \"According to the text...\", \"Your sacred dissertation-style preface...\", or \"Click here to download\"). Never repeat the same sentence or paragraph more than once. Write complete, grammatical sentences.\n\
+            3a. ANSWER FIRST: The first sentence must contain the actual answer (a name, number, date, amount, place, or definition) when the excerpts contain it. Never restate the question as a title, never write \"The user's question asks...\", \"Firstly, let us consider...\", or analyse excerpts one by one. Silently ignore excerpts that are unrelated to the question. If the excerpts do not contain the answer, say so in one sentence and summarise only what they do say about the subject.\n\
+            3b. STRICT GROUNDING (NO INVENTION, NO CROSS-SUBJECT BLEED): State ONLY facts that literally appear in the numbered source documents of THIS request. Never carry over facts about a different person or subject from earlier chat turns, and never invent profiles, platforms (LinkedIn, GitHub), courses, or credentials that the documents do not state. If the sources are a different kind of document (for example leases naming the subject as landlord), describe exactly what those documents say about the subject (role, dates, tenants, rent, addresses) and nothing else.\n\
+            4. MULTI-FILE SYNTHESIS & INLINE CITATIONS: You are given excerpts from MULTIPLE distinct files (`[1]`, `[2]`, `[3]`, `[4]`, etc.). Look across ALL provided documents and cite multiple document numbers inline using simple bracketed numbers (`[1]`, `[2]`, `[3]`, `[4]`, etc.) referencing grounded sources throughout your response. Never write XML tags like `<document>` or `<Document Index=...>`.\n\
+            5. CLEAN STRUCTURE: Organize your response into thorough, flowing paragraphs and `###` section headings where helpful (after the opening paragraph). Never include line numbers `(Lines X-Y)`.\n\
+            6. CROSS-CITATION ENTITY & ACCOUNT CONSOLIDATION: When multiple source documents mention the exact same bank account number (even with minor formatting or payee variations such as `#1569837451` vs `1569837451 F A Breure`), monetary fee (`$195` vs `$195.00`), street address, phone number, email, or legal rule, state that shared account number, fee, or rule ONCE in a single unified clause noting any payee or tenant qualifiers and citing all relevant documents together (e.g. `Chase Bank account #1569837451 (also listed under F A Breure) [3], [5]`). Never write the same account number, fee amount, or rule twice in a compound sentence or across paragraphs.";
+        format!("{}{}", base_system, voice_directive)
     }
 
     /// Multi-turn real-time streaming orchestration via local Ollama `POST /api/chat` (100% offline, zero internet access).
@@ -4723,15 +4996,21 @@ impl DeterministicOfflineSynthesisEngine {
         let max_output_tokens = ui.max_output_tokens.clamp(256, 262144);
         let _agentic_loop_enabled = ui.agentic_loop_enabled;
 
-        let (per_hop_predict, num_ctx) = if hw.free_ram_gb >= 32.0 || hw.free_vram_mb >= 16_000 {
-            (max_output_tokens.clamp(1024, 16384), 32768usize)
-        } else if hw.free_ram_gb >= 18.0 || hw.free_vram_mb >= 12_000 {
-            (max_output_tokens.clamp(1024, 8192), 16384usize)
-        } else if hw.free_ram_gb >= 12.0 || hw.free_vram_mb >= 6_000 {
-            (max_output_tokens.clamp(512, 4096), 8192usize)
-        } else {
-            (max_output_tokens.clamp(256, 2048), 4096usize)
-        };
+        // Keep KV cache inside GPU VRAM when a mid-tier discrete GPU (<16 GB VRAM) is active,
+        // Milestone M29: Enforce at least 16K context window (num_ctx >= 16384) and at least 1500 predict tokens
+        // (num_predict >= 1500) so large multi-document evidence context is fully ingested and answers are thorough.
+        let (raw_predict, raw_ctx) =
+            if hw.free_vram_mb >= 16_000 || (hw.gpu_count == 0 && hw.free_ram_gb >= 48.0) {
+                (max_output_tokens.clamp(1500, 16384), 32768usize)
+            } else if hw.free_vram_mb >= 6_000 || (hw.gpu_count == 0 && hw.free_ram_gb >= 18.0) {
+                (max_output_tokens.clamp(1500, 8192), 16384usize)
+            } else if hw.free_ram_gb >= 12.0 || hw.free_vram_mb >= 4_500 {
+                (max_output_tokens.clamp(1500, 4096), 16384usize)
+            } else {
+                (max_output_tokens.clamp(1500, 2048), 16384usize)
+            };
+        let per_hop_predict = raw_predict.max(1500);
+        let num_ctx = raw_ctx.max(16384);
 
         let voice_directive = if ui.natural_human_voice {
             " Write in a clear, natural human voice with zero robotic filler."
@@ -4743,21 +5022,7 @@ impl DeterministicOfflineSynthesisEngine {
         let clean_prompt_for_prefix = prompt.split(" (Subject context:").next().unwrap_or(prompt);
         let expected_prefix = Self::format_question_restated_prefix(clean_prompt_for_prefix);
 
-        let base_system = "You are QuorumRAG, an exhaustive, strictly factual multi-document research synthesis engine. \
-            Your ONLY task is to write a comprehensive, deeply detailed, multi-paragraph Markdown response answering ONLY the user's question \
-            by synthesizing all concrete facts across ALL provided source documents (`[1]`, `[2]`, `[3]`, etc.) below. \
-            \n\
-            Follow these strict rules:\n\
-            1. QUESTION-RESTATING OPENING: Always begin your answer immediately with a natural declarative sentence (not a `#` heading) that restates and directly answers the user's question using the concrete facts in the provided documents.\n\
-            2. DIRECT FACTUAL SYNTHESIS (NEVER REFUSE OR DISCLAIM): Synthesize ALL concrete facts, roles, properties, agreements, addresses, phone numbers, financial terms, credentials, career experience, education, or research findings about the subject present in the provided documents. Never say \"The user's query is not directly addressed\" or complain about what type of documents are provided—report what the documents actually establish about the subject!\n\
-            3. ZERO META-FILLER & ZERO REPETITION: Never begin with greetings or meta-announcements (never say \"Based on the documents provided...\", \"According to the text...\", \"Your sacred dissertation-style preface...\", or \"Click here to download\"). Never repeat the same sentence or paragraph more than once. Write complete, grammatical sentences.\n\
-            3a. ANSWER FIRST: The first sentence must contain the actual answer (a name, number, date, amount, place, or definition) when the excerpts contain it. Never restate the question as a title, never write \"The user's question asks...\", \"Firstly, let us consider...\", or analyse excerpts one by one. Silently ignore excerpts that are unrelated to the question. If the excerpts do not contain the answer, say so in one sentence and summarise only what they do say about the subject.\n\
-            3b. STRICT GROUNDING (NO INVENTION, NO CROSS-SUBJECT BLEED): State ONLY facts that literally appear in the numbered source documents of THIS request. Never carry over facts about a different person or subject from earlier chat turns, and never invent profiles, platforms (LinkedIn, GitHub), courses, or credentials that the documents do not state. If the sources are a different kind of document (for example leases naming the subject as landlord), describe exactly what those documents say about the subject (role, dates, tenants, rent, addresses) and nothing else.\n\
-            4. MULTI-FILE SYNTHESIS & INLINE CITATIONS: You are given excerpts from MULTIPLE distinct files (`[1]`, `[2]`, `[3]`, `[4]`, etc.). Look across ALL provided documents and cite multiple document numbers inline using simple bracketed numbers (`[1]`, `[2]`, `[3]`, `[4]`, etc.) throughout your response. Never write XML tags like `<document>` or `<Document Index=...>`.\n\
-            5. CLEAN STRUCTURE: Organize your response into thorough, flowing paragraphs and `###` section headings where helpful (after the opening paragraph). Never include line numbers `(Lines X-Y)`.\n\
-            6. CROSS-CITATION ENTITY & ACCOUNT CONSOLIDATION: When multiple source documents mention the exact same bank account number (even with minor formatting or payee variations such as `#1569837451` vs `1569837451 F A Breure`), monetary fee (`$195` vs `$195.00`), street address, phone number, email, or legal rule, state that shared account number, fee, or rule ONCE in a single unified clause noting any payee or tenant qualifiers and citing all relevant documents together (e.g. `Chase Bank account #1569837451 (also listed under F A Breure) [3], [5]`). Never write the same account number, fee amount, or rule twice in a compound sentence or across paragraphs.";
-
-        let system_prompt = format!("{}{}", base_system, voice_directive);
+        let system_prompt = Self::build_ollama_chat_system_prompt(voice_directive);
 
         messages.push(serde_json::json!({
             "role": "system",
@@ -5067,15 +5332,7 @@ impl DeterministicOfflineSynthesisEngine {
                     "messages": current_messages,
                     "stream": true,
                     "keep_alive": "24h",
-                    "options": {
-                        "temperature": temp,
-                        "num_predict": per_hop_predict,
-                        "num_ctx": num_ctx,
-                        "num_thread": 16,
-                        "top_p": 0.9,
-                        "repeat_last_n": 256,
-                        "repeat_penalty": 1.12
-                    }
+                    "options": Self::build_ollama_chat_options(temp, per_hop_predict, num_ctx)
                 });
                 if Self::model_uses_thinking_flag(target_model) {
                     if let Some(obj) = payload_val.as_object_mut() {
@@ -5358,7 +5615,13 @@ impl DeterministicOfflineSynthesisEngine {
                 }
                 let sources_block = Self::format_sources_block(&compacted_chunks);
                 let final_with_sources = format!("{}{}", compacted_prose.trim(), sources_block);
-                let turn_citations = Self::build_deduplicated_citations(&compacted_chunks);
+                let mut turn_citations = Self::build_deduplicated_citations(&compacted_chunks);
+                crate::rlm_orchestrator::RlmOrchestrator::verify_and_attach_verbatim_grounding(
+                    prompt,
+                    &compacted_prose,
+                    &compacted_chunks,
+                    &mut turn_citations,
+                );
                 Some((final_with_sources, turn_citations))
             }
         };

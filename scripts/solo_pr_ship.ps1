@@ -76,7 +76,7 @@ $pythonExe = if (Test-Path "C:\Python314\python.exe") {
 
 if ($BuildInstallers -and (Test-Path "scripts\package.ps1")) {
     Write-Host "[0a/5] Building Windows MSI & portable release bundle..." -ForegroundColor Magenta
-    & powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\package.ps1" -Version "0.6.2"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\package.ps1" -Version "0.6.3"
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Installer packaging failed. Aborting PR shipping."
         exit $LASTEXITCODE

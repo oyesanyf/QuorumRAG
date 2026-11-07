@@ -483,6 +483,9 @@ mod tests {
                 is_external_node: true,
                 origin_label: Some("mesh".to_string()),
                 node_alias: None,
+                verbatim_quote: None,
+                byte_range: None,
+                grounding_rationale: None,
             };
             store
                 .record_turn(

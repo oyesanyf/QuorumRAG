@@ -63,6 +63,44 @@ pub trait StorageSearcher: Send + Sync {
     fn index_epoch(&self) -> u64 {
         1
     }
+
+    fn load_parent_document(
+        &self,
+        _doc_id_or_path: &str,
+        _max_tier: u8,
+    ) -> Option<quorum_types::IngestedParentDocument> {
+        None
+    }
+
+    fn peek_slice(
+        &self,
+        _doc_id_or_path: &str,
+        _start_byte: usize,
+        _end_byte: usize,
+        _max_tier: u8,
+    ) -> Option<String> {
+        None
+    }
+
+    fn regex_grep(
+        &self,
+        _doc_id_or_path: &str,
+        _pattern: &str,
+        _max_matches: usize,
+        _max_tier: u8,
+    ) -> Vec<quorum_types::RegexMatchSpan> {
+        Vec::new()
+    }
+
+    fn expand_parent_window(
+        &self,
+        _doc_id_or_path: &str,
+        _anchor_text: &str,
+        _window_bytes: usize,
+        _max_tier: u8,
+    ) -> Option<(usize, usize, String, Option<String>, Option<String>)> {
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -130,6 +168,69 @@ impl StorageSearcher for quorum_storage::StorageEngine {
     fn index_epoch(&self) -> u64 {
         self.index_epoch()
     }
+
+    fn load_parent_document(
+        &self,
+        doc_id_or_path: &str,
+        max_tier: u8,
+    ) -> Option<quorum_types::IngestedParentDocument> {
+        quorum_storage::StorageEngine::load_parent_document(self, doc_id_or_path, max_tier)
+            .ok()
+            .flatten()
+    }
+
+    fn peek_slice(
+        &self,
+        doc_id_or_path: &str,
+        start_byte: usize,
+        end_byte: usize,
+        max_tier: u8,
+    ) -> Option<String> {
+        quorum_storage::StorageEngine::peek_slice(
+            self,
+            doc_id_or_path,
+            start_byte,
+            end_byte,
+            max_tier,
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn regex_grep(
+        &self,
+        doc_id_or_path: &str,
+        pattern: &str,
+        max_matches: usize,
+        max_tier: u8,
+    ) -> Vec<quorum_types::RegexMatchSpan> {
+        quorum_storage::StorageEngine::regex_grep(
+            self,
+            doc_id_or_path,
+            pattern,
+            max_matches,
+            max_tier,
+        )
+        .unwrap_or_default()
+    }
+
+    fn expand_parent_window(
+        &self,
+        doc_id_or_path: &str,
+        anchor_text: &str,
+        window_bytes: usize,
+        max_tier: u8,
+    ) -> Option<(usize, usize, String, Option<String>, Option<String>)> {
+        quorum_storage::StorageEngine::expand_parent_window(
+            self,
+            doc_id_or_path,
+            anchor_text,
+            window_bytes,
+            max_tier,
+        )
+        .ok()
+        .flatten()
+    }
 }
 
 #[async_trait::async_trait]
@@ -187,6 +288,44 @@ impl<T: StorageSearcher + ?Sized> StorageSearcher for Arc<T> {
 
     fn index_epoch(&self) -> u64 {
         (**self).index_epoch()
+    }
+
+    fn load_parent_document(
+        &self,
+        doc_id_or_path: &str,
+        max_tier: u8,
+    ) -> Option<quorum_types::IngestedParentDocument> {
+        (**self).load_parent_document(doc_id_or_path, max_tier)
+    }
+
+    fn peek_slice(
+        &self,
+        doc_id_or_path: &str,
+        start_byte: usize,
+        end_byte: usize,
+        max_tier: u8,
+    ) -> Option<String> {
+        (**self).peek_slice(doc_id_or_path, start_byte, end_byte, max_tier)
+    }
+
+    fn regex_grep(
+        &self,
+        doc_id_or_path: &str,
+        pattern: &str,
+        max_matches: usize,
+        max_tier: u8,
+    ) -> Vec<quorum_types::RegexMatchSpan> {
+        (**self).regex_grep(doc_id_or_path, pattern, max_matches, max_tier)
+    }
+
+    fn expand_parent_window(
+        &self,
+        doc_id_or_path: &str,
+        anchor_text: &str,
+        window_bytes: usize,
+        max_tier: u8,
+    ) -> Option<(usize, usize, String, Option<String>, Option<String>)> {
+        (**self).expand_parent_window(doc_id_or_path, anchor_text, window_bytes, max_tier)
     }
 }
 

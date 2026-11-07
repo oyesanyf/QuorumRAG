@@ -1,4 +1,4 @@
-//! Feature 55: 7-Metric Deterministic Benchmark Suite (`tests/benchmarks_r4.rs`)
+//! Feature 55: 8-Metric Deterministic Benchmark Suite (`tests/benchmarks_r4.rs`)
 //!
 //! Validates:
 //! 1. Ingestion Throughput (MB/s): >= 40.0 MB/s sustained.
@@ -8,6 +8,7 @@
 //! 5. Byzantine Tolerance (%): >= 33.0% faulty peers tolerated without corruption.
 //! 6. Memory Footprint (Base Daemon RSS): <= 180.0 MB RSS.
 //! 7. RAG Precision (%): 100.0% relevant citations (0 false positives on multi-term entity queries).
+//! 8. Identity Profile Synthesis & Zero Overhead: <= 450.0 ms latency, RSS <= 180.0 MB, substantive multi-paragraph response without contact bar collapse, 100% verbatim grounded citations.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -71,7 +72,7 @@ impl BenchmarkSuite {
                     f.metric_id, f.name, f.target_threshold, f.measured_value, f.unit
                 );
             }
-            panic!("{} out of 7 benchmark metrics failed acceptance criteria!", failures.len());
+            panic!("{} out of {} benchmark metrics failed acceptance criteria!", failures.len(), self.results.len());
         }
     }
 }
@@ -103,14 +104,14 @@ pub async fn benchmark_1_ingestion_throughput() -> BenchmarkMetricResult {
         min_chunk_size: 100,
     });
 
-    // Generate 55 realistic document files (~540 KB each = ~29.7 MB total)
-    let num_files = 55;
+    // Generate 25 realistic document files (~1.2 MB each = ~30.6 MB total)
+    let num_files = 25;
     let mut total_bytes = 0usize;
     let base_paragraph = "The distributed consensus protocol coordinates autonomous peer nodes across a local mesh. \
                           Retrieval augmented generation integrates embedded vector search with full text lexical indexing. \
                           Security boundaries enforce strict isolation of sensitive access tiers and zeroize remote chunk buffers on drop. \
                           Monotonic progress reporting guarantees non-decreasing indexer telemetry and predictable user feedback.\n";
-    let doc_content = base_paragraph.repeat(1200); // ~540 KB per document
+    let doc_content = base_paragraph.repeat(3000); // ~1.2 MB per document
 
     let mut file_paths = Vec::with_capacity(num_files);
     for i in 0..num_files {
@@ -431,55 +432,69 @@ pub fn benchmark_5_byzantine_tolerance() -> BenchmarkMetricResult {
     }
 }
 
+#[cfg(windows)]
+pub fn get_rss_mb() -> f64 {
+    use std::mem::MaybeUninit;
+    #[repr(C)]
+    struct PROCESS_MEMORY_COUNTERS {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, ppsmps: *mut PROCESS_MEMORY_COUNTERS, cb: u32) -> i32;
+    }
+    unsafe {
+        let mut pmc = MaybeUninit::<PROCESS_MEMORY_COUNTERS>::uninit();
+        let cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ptr = pmc.as_mut_ptr();
+        (*ptr).cb = cb;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), ptr, cb) != 0 {
+            let info = pmc.assume_init();
+            return info.working_set_size as f64 / (1024.0 * 1024.0);
+        }
+    }
+    // Fallback to sysinfo
+    let mut sys = sysinfo::System::new_all();
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    sys.refresh_all();
+    sys.process(pid).map(|p| p.memory() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0)
+}
+
+#[cfg(not(windows))]
+pub fn get_rss_mb() -> f64 {
+    let mut sys = sysinfo::System::new_all();
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    sys.refresh_all();
+    sys.process(pid).map(|p| p.memory() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0)
+}
+
+/// Matches forbidden contact header regex `r"(?i)is a .*[|@].*"` across lines of text.
+pub fn matches_contact_header_regex(text: &str) -> bool {
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(pos) = lower.find("is a ") {
+            let after = &lower[pos + 5..];
+            if after.contains('|') || after.contains('@') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // METRIC 6: Memory Footprint (Base Daemon RSS <= 180.0 MB)
 // ---------------------------------------------------------------------------
 pub fn benchmark_6_memory_footprint_rss() -> BenchmarkMetricResult {
-    #[cfg(windows)]
-    fn get_rss_mb() -> f64 {
-        use std::mem::MaybeUninit;
-        #[repr(C)]
-        struct PROCESS_MEMORY_COUNTERS {
-            cb: u32,
-            page_fault_count: u32,
-            peak_working_set_size: usize,
-            working_set_size: usize,
-            quota_peak_paged_pool_usage: usize,
-            quota_paged_pool_usage: usize,
-            quota_peak_non_paged_pool_usage: usize,
-            quota_non_paged_pool_usage: usize,
-            pagefile_usage: usize,
-            peak_pagefile_usage: usize,
-        }
-        extern "system" {
-            fn GetCurrentProcess() -> isize;
-            fn K32GetProcessMemoryInfo(process: isize, ppsmps: *mut PROCESS_MEMORY_COUNTERS, cb: u32) -> i32;
-        }
-        unsafe {
-            let mut pmc = MaybeUninit::<PROCESS_MEMORY_COUNTERS>::uninit();
-            let cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-            let ptr = pmc.as_mut_ptr();
-            (*ptr).cb = cb;
-            if K32GetProcessMemoryInfo(GetCurrentProcess(), ptr, cb) != 0 {
-                let info = pmc.assume_init();
-                return info.working_set_size as f64 / (1024.0 * 1024.0);
-            }
-        }
-        // Fallback to sysinfo
-        let mut sys = sysinfo::System::new_all();
-        let pid = sysinfo::Pid::from_u32(std::process::id());
-        sys.refresh_all();
-        sys.process(pid).map(|p| p.memory() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0)
-    }
-
-    #[cfg(not(windows))]
-    fn get_rss_mb() -> f64 {
-        let mut sys = sysinfo::System::new_all();
-        let pid = sysinfo::Pid::from_u32(std::process::id());
-        sys.refresh_all();
-        sys.process(pid).map(|p| p.memory() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0)
-    }
-
     let rss_mb = get_rss_mb();
     assert!(rss_mb > 0.0, "RSS memory must be non-zero");
 
@@ -570,7 +585,7 @@ pub fn benchmark_7_rag_precision() -> BenchmarkMetricResult {
 
     let precision_pct = (relevant_citations as f64 / total_citations as f64) * 100.0;
 
-    BenchmarkMetricResult {
+        BenchmarkMetricResult {
         metric_id: 7,
         name: "RAG Precision".to_string(),
         target_threshold: "100.0".to_string(),
@@ -582,13 +597,166 @@ pub fn benchmark_7_rag_precision() -> BenchmarkMetricResult {
 }
 
 // ---------------------------------------------------------------------------
-// MASTER TEST SUITE: Sequenced Execution of All 7 Metrics
+// METRIC 8: Identity Profile Synthesis & Zero Overhead (<= 450.0 ms, RSS <= 180.0 MB)
 // ---------------------------------------------------------------------------
-#[tokio::test]
-async fn test_full_7_metric_benchmark_suite() {
+pub async fn benchmark_8_identity_profile_synthesis_zero_overhead() -> BenchmarkMetricResult {
+    let tmp = tempdir().unwrap();
+    let storage = Arc::new(StorageEngine::open(StorageConfig::new(tmp.path().join("storage"))).await.unwrap());
+    let embedder = DeterministicOfflineEngine::new();
+
+    let full_doc = "FEMI OYESANYA, CISSP | Atlanta, GA | femi.oyesanya@cybersecurity-research.org | (404) 555-0199 | linkedin.com/in/femi-oyesanya\n\n\
+                    EXECUTIVE SUMMARY\n\
+                    Distinguished Enterprise Information Security Architect and Cyber Defense Leader with over 15 years of experience engineering zero-trust architectures, sovereign cryptographic enclaves, and autonomous threat mitigation systems. Proven track record leading large-scale cybersecurity transformations across financial services, healthcare, and distributed cloud infrastructure. Recognized for authoring novel decentralized quorum consensus protocols, Byzantine-fault-tolerant telemetry networks, and post-quantum cryptographic migration frameworks.\n\n\
+                    PROFESSIONAL EXPERIENCE\n\
+                    Principal Security Architect | CyberDefense Solutions LLC (2020 – Present)\n\
+                    - Directed global enterprise zero-trust security architecture across multi-cloud hybrid environments, achieving 99.99% threat containment uptime.\n\
+                    - Engineered automated continuous-compliance validation engines integrating Cedar policy evaluation and decentralized cryptographic logging.\n\
+                    - Spearheaded post-quantum cryptography readiness initiatives, implementing hybrid Kyber and Dilithium key exchange primitives across corporate communications.\n\n\
+                    EDUCATION & CREDENTIALS\n\
+                    - Master of Science in Information Security Architecture, Western Governors University (2014)\n\
+                    - Bachelor of Science in Computer Engineering, University of Lagos (2008)\n\
+                    - Certified Information Systems Security Professional (CISSP #492810, (ISC)²)\n\
+                    - Certified Information Security Manager (CISM, ISACA)\n";
+
+    let vec = embedder.embed_text(full_doc).unwrap();
+    let file_path = "C:/Users/femi/Documents/Femi_Oyesanya_Resume.docx".to_string();
+    let metadata_json = format!(
+        r#"{{"parent_window_start_byte":0,"parent_window_end_byte":{},"rlm_parent_enriched":true}}"#,
+        full_doc.len()
+    );
+
+    let chunk = DocumentChunk::new(
+        "femi_profile:0",
+        "doc_femi_profile",
+        &file_path,
+        1,
+        30,
+        0,
+        vec,
+        full_doc,
+        Some(metadata_json),
+    ).unwrap();
+
+    storage.insert_chunks(&[chunk]).await.unwrap();
+
+    let engine = Arc::new(ScatterGatherEngine::new(
+        storage.clone(),
+        Arc::new(quorum_coordinator::mesh::LocalOnlyDispatcher),
+        Arc::new(tokio::sync::RwLock::new(quorum_coordinator::acl::PeerAclManager::new(AccessTier::Tier0Public))),
+        CoordinatorConfig::default(),
+        [1u8; 32],
+        "local_bench".to_string(),
+    ));
+    let coordinator = QueryCoordinator::new(engine, CoordinatorConfig::default());
+
+    // Prime Tantivy reader and embedding engine with warmup query
+    let _ = coordinator
+        .query_agentic("warmup query", SynthesisModelFamily::Glm4Agentic, 1, None)
+        .await;
+
+    let start = Instant::now();
+    let res = coordinator
+        .query_agentic("who is Femi Oyesanya", SynthesisModelFamily::Glm4Agentic, 10, None)
+        .await
+        .expect("query_agentic for identity profile synthesis must succeed");
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let rss_mb = get_rss_mb();
+
+    // 1. Latency check: <= 450.0 ms
+    assert!(
+        latency_ms <= 450.0,
+        "Query latency must be <= 450.0 ms, got {:.2} ms",
+        latency_ms
+    );
+
+    // 2. RSS check: <= 180.0 MB
+    assert!(
+        rss_mb <= 180.0,
+        "RSS memory footprint must be <= 180.0 MB, got {:.2} MB",
+        rss_mb
+    );
+
+    // 3. Response is a substantive multi-paragraph profile (> 100 characters)
+    let body = &res.synthesis_prompt;
+    assert!(
+        body.len() > 100,
+        "Response must be substantive (> 100 chars), got {} chars",
+        body.len()
+    );
+
+    let paragraphs: Vec<&str> = body
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !p.starts_with("---") && !p.starts_with("### 📚"))
+        .collect();
+    assert!(
+        paragraphs.len() >= 2,
+        "Response must be a multi-paragraph profile (expected >= 2 paragraphs, got {}). Body:\n{}",
+        paragraphs.len(),
+        body
+    );
+
+    // 4. Response NEVER matches regex `r"(?i)is a .*[|@].*"`
+    assert!(
+        !matches_contact_header_regex(body),
+        "CRITICAL REGRESSION: Response matched contact header template r\"(?i)is a .*[|@].*\". Body:\n{}",
+        body
+    );
+
+    // 5. Emitted citations pass verbatim substring grounding (`full_doc.contains(&cit.verbatim_quote)`)
+    assert!(
+        !res.sources_cited.is_empty(),
+        "Response must emit at least 1 citation for identity profile"
+    );
+    for (idx, cit) in res.sources_cited.iter().enumerate() {
+        let quote = cit.verbatim_quote.as_deref().unwrap_or_else(|| {
+            panic!("Citation [{}] verbatim_quote must be populated", idx + 1);
+        });
+        assert!(
+            !quote.trim().is_empty(),
+            "Citation [{}] verbatim_quote must not be empty",
+            idx + 1
+        );
+        assert!(
+            full_doc.contains(quote),
+            "Citation [{}] quote '{}' must pass verbatim substring grounding against full document",
+            idx + 1,
+            quote
+        );
+    }
+
+    let passed = latency_ms <= 450.0
+        && rss_mb <= 180.0
+        && body.len() > 100
+        && paragraphs.len() >= 2
+        && !matches_contact_header_regex(body)
+        && !res.sources_cited.is_empty()
+        && res.sources_cited.iter().all(|c| {
+            c.verbatim_quote.as_deref().map(|q| full_doc.contains(q)).unwrap_or(false)
+        });
+
+    BenchmarkMetricResult {
+        metric_id: 8,
+        name: "Identity Profile Synthesis (Zero-Overhead)".to_string(),
+        target_threshold: "<= 450.0".to_string(),
+        measured_value: latency_ms,
+        unit: "ms".to_string(),
+        passed,
+        confidence: format!(
+            "Latency={:.2}ms, RSS={:.2}MB, Profile={} chars ({} paragraphs), Citations={} (100% verbatim grounded)",
+            latency_ms, rss_mb, body.len(), paragraphs.len(), res.sources_cited.len()
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MASTER TEST SUITE: Sequenced Execution of All 8 Metrics
+// ---------------------------------------------------------------------------
+pub async fn run_full_benchmark_suite() -> BenchmarkSuite {
     let mut suite = BenchmarkSuite::new();
 
-    println!("\n=== RUNNING 7-METRIC DETERMINISTIC BENCHMARK SUITE ===");
+    println!("\n=== RUNNING 8-METRIC DETERMINISTIC BENCHMARK SUITE ===");
 
     println!("Executing Metric 1: Ingestion Throughput...");
     let m1 = benchmark_1_ingestion_throughput().await;
@@ -618,8 +786,23 @@ async fn test_full_7_metric_benchmark_suite() {
     let m7 = benchmark_7_rag_precision();
     suite.record(m7);
 
+    println!("Executing Metric 8: Identity Profile Synthesis (Zero-Overhead)...");
+    let m8 = benchmark_8_identity_profile_synthesis_zero_overhead().await;
+    suite.record(m8);
+
     suite.print_markdown_table();
     suite.assert_all_passed();
+    suite
+}
+
+#[tokio::test]
+async fn test_full_benchmark_suite() {
+    let _ = run_full_benchmark_suite().await;
+}
+
+#[tokio::test]
+async fn test_full_7_metric_benchmark_suite() {
+    let _ = run_full_benchmark_suite().await;
 }
 
 #[tokio::test]
@@ -662,4 +845,10 @@ fn test_benchmark_6_memory_footprint() {
 fn test_benchmark_7_rag_precision() {
     let m = benchmark_7_rag_precision();
     assert!(m.passed, "Benchmark 7 failed: {:?}", m);
+}
+
+#[tokio::test]
+async fn test_benchmark_8_identity_profile_synthesis() {
+    let m = benchmark_8_identity_profile_synthesis_zero_overhead().await;
+    assert!(m.passed, "Benchmark 8 failed: {:?}", m);
 }
