@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "quorumrag")]
 #[command(author = "QuorumRAG Team")]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "QuorumRAG: Local-First P2P Retrieval-Augmented Generation Daemon & ChatGPT Web UI", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
