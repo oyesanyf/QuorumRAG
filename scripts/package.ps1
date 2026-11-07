@@ -106,8 +106,8 @@ if (-not $SkipBuild) {
         $LASTEXITCODE = $cargoExit
         break
     }
-    if (-not $buildOk) {
-        throw "cargo build --release failed"
+    if (-not $buildOk -or $cargoExit -ne 0) {
+        throw "cargo build --release failed with exit code $cargoExit"
     }
 } else {
     Write-Host "[1/5] Skipping cargo build (-SkipBuild)" -ForegroundColor Gray
@@ -148,7 +148,13 @@ $WinDeployDir = Join-Path $ProjectRoot "deploy\windows"
 New-Item -ItemType Directory -Force -Path $WinDeployDir | Out-Null
 Get-ChildItem -Path $WinDeployDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-$PortableStage = Join-Path $WinDeployDir "portable_stage\QuorumRAG-$Version-windows-x86_64"
+# Ensure old staging directories (deploy\windows\portable_stage) are completely cleaned
+$PortableStageBase = Join-Path $WinDeployDir "portable_stage"
+if (Test-Path $PortableStageBase) {
+    Remove-Item -Path $PortableStageBase -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$PortableStage = Join-Path $PortableStageBase "QuorumRAG-$Version-windows-x86_64"
 New-Item -ItemType Directory -Force -Path $PortableStage | Out-Null
 Copy-Item -Path $ReleaseExe -Destination (Join-Path $PortableStage "quorumrag.exe") -Force
 Copy-Item -Path (Join-Path $ProjectRoot "packaging\windows\quorumrag-launch.cmd") -Destination (Join-Path $PortableStage "quorumrag-launch.cmd") -Force
@@ -158,8 +164,8 @@ Copy-Item -Path (Join-Path $ProjectRoot "packaging\windows\quorumrag-uninstall.c
 
 $ZipOut = Join-Path $WinDeployDir "QuorumRAG-$Version-windows-x86_64.zip"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::CreateFromDirectory((Split-Path $PortableStage -Parent), $ZipOut)
-Remove-Item -Path (Split-Path $PortableStage -Parent) -Recurse -Force
+[System.IO.Compression.ZipFile]::CreateFromDirectory($PortableStageBase, $ZipOut)
+Remove-Item -Path $PortableStageBase -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "  -> Created portable archive: $ZipOut" -ForegroundColor Green
 
 # Step 3: Resolve WiX v5 CLI & Compile QuorumRAG-<Version>-x86_64.msi
