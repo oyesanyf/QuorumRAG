@@ -9,7 +9,7 @@ Production-grade, local-first, peer-to-peer Retrieval-Augmented Generation (RAG)
 - **Hybrid Search Engine**: LanceDB dense vector embeddings paired with co-located Tantivy BM25 full-text indexing, evaluated via Reciprocal Rank Fusion (RRF) and parent-document window expansion.
 - **Multimodal Ingestion**: Documents (PDF, DOCX, XLSX, PPTX, TXT, MD), images (local Ollama vision captioning), and audio, with magic-byte exclusion of binaries and executables (`.exe`, `.dll`, ELF, Mach-O).
 - **100% Verbatim Citation Grounding**: LLM synthesis and deterministic offline synthesis verify `slice_text.contains(&verbatim_quote)` on every cited excerpt.
-- **Ed25519-Authenticated `libp2p` Mesh**: Cryptographically signed scatter-gather retrieval across private LAN/WAN peers with Microsoft Presidio + GLiNER (`urchade/gliner_multi_pii-v1`) HIPAA PHI/PII Data Loss Prevention (DLP).
+- **Ed25519-Authenticated `libp2p` Mesh**: Cryptographically signed scatter-gather retrieval across private LAN/WAN peers with Microsoft Presidio + GLiNER (`urchade/gliner_multi_pii-v1`) + VaultGemma-1B / RedactX-v3 Three-Engine Airlock HIPAA PHI/PII Data Loss Prevention (DLP).
 - **Structured Peer Query Diagnostics**: Real-time reporting of connected swarm nodes, queried peers, and per-peer outcomes (status, chunk count, cited count, timeout, policy blocks) rendered directly in the Web UI.
 - **Zero-Stub Production Architecture**: Single self-contained binary daemon that automatically binds open ports, manages local indexes, and launches the browser interface.
 
@@ -198,10 +198,10 @@ cargo build --release -p quorum-daemon --bin quorumrag
 |---|---|
 | [`crates/`](crates) | Rust workspace crates (see [Workspace layout](#workspace-layout)) |
 | [`crates/quorum-daemon/src/`](crates/quorum-daemon/src) | HTTP handlers, CLI router, shutdown signals, Windows service harness (`win_service.rs`) |
-| [`crates/quorum-coordinator/src/`](crates/quorum-coordinator/src) | Answer orchestrator, offline engine, scatter-gather, DLP mesh, and sovereign marketplace engine |
+| [`crates/quorum-coordinator/src/`](crates/quorum-coordinator/src) | Answer orchestrator, offline engine, scatter-gather, DLP mesh, sovereign marketplace engine, and autonomous bounty runner (`bounty_runner.rs`) |
 | [`crates/quorum-ui/assets/`](crates/quorum-ui/assets) | Embedded responsive ChatGPT-style Web UI (`index.html`, `app.js`, `styles.css`) |
 | [`crates/quorum-network/src/`](crates/quorum-network/src) | Libp2p Swarm, Noise authentication, Ed25519 request signing, and peer discovery |
-| [`crates/quorum-storage/src/`](crates/quorum-storage/src) | Embedded LanceDB vector tables and Tantivy full-text search indexes |
+| [`crates/quorum-storage/src/`](crates/quorum-storage/src) | Embedded LanceDB vector tables, Tantivy full-text search indexes, and dataset builder (`dataset_builder.rs`) |
 | [`crates/quorum-ingest/src/`](crates/quorum-ingest/src) | Google Magika content detector, multithreaded crawler, and document chunkers |
 | [`packaging/windows/`](packaging/windows) | Launcher scripts, browser launcher, and complete-uninstall utilities for MSI |
 | [`packaging/linux/`](packaging/linux) | deb/rpm builders, systemd unit file (`quorumrag.service`), and control helper |
@@ -225,7 +225,7 @@ The Sovereign AI Training Data Marketplace allows opted-in subscribers to moneti
 ```mermaid
 flowchart TD
     subgraph SubscriberNode["Subscriber Node (Default: opt_in_enabled = false, Jurisdiction = US Only)"]
-        A["Local Corpus & Multi-Step RLM Traces"] -->|"1. Explicit User Opt-In + HITL Review"| B["MarketplaceSanitizer (Presidio + GLiNER + Path/Contact Scrub)"]
+        A["Local Corpus & Multi-Step RLM Traces"] -->|"1. Explicit User Opt-In + HITL Review"| B["MarketplaceSanitizer (Three-Engine Airlock: Presidio + GLiNER + VaultGemma-1B / RedactX-v3)"]
         B -->|"2. Semantic Trade-Secret Filter (<=15 Code Lines, 0 RFC1918 IPs, 0 Secrets)"| C["100% Verbatim Citation Grounding Gate (10,000 bps, >=64 Tokens)"]
         C -->|"3. BLAKE3 Content Hash + Ed25519 Node Signature"| D["Binary BLAKE3 Merkle Tree + Keyed-BLAKE3 Encrypted Batch"]
     end
@@ -246,7 +246,7 @@ flowchart TD
 ### 4-Stage Sovereign Pipeline
 
 1. **Stage 1 -- Local Privacy Scrubbing, Trade-Secret Filtering & Quality Attestation**:
-   Automated PII/PHI de-identification via Presidio Analyzer and GLiNER, zero raw file leakage, semantic code filters (rejects trajectories with `> 15` code lines or high-entropy secrets), and 10,000 bps (100.00%) citation grounding verification.
+   Automated PII/PHI de-identification via the **Three-Engine Airlock**: Tier 1 Microsoft Presidio (ContextEnhancer + rule/regex recognizers), Tier 2 GLiNER (`urchade/gliner_multi_pii-v1` zero-shot span NER), and Tier 3 VaultGemma-1B / RedactX-v3 (Differential Privacy $(\epsilon, \delta)$ de-identification, boundary quasi-identifier scrubbing, and abstractive takeaway synthesis), zero raw file leakage, semantic code filters (rejects trajectories with `> 15` code lines or high-entropy secrets), and 10,000 bps (100.00%) citation grounding verification.
 2. **Stage 2 -- Zero-Knowledge Data Catalog Manifests**:
    Signed Ed25519 manifests containing record counts, verified token volume, and binary BLAKE3 Merkle roots. Tiered anti-scraping prevents mass harvesting.
 3. **Stage 3 -- Commit-and-Reveal Cryptographic Escrow**:
@@ -258,7 +258,7 @@ flowchart TD
 
 | Guard Layer | Threat Vector Blocked | Technical Enforcement |
 |---|---|---|
-| **Layer 1: Zero Raw Documents & Semantic Filter** | Accidental data harvesting, PII/PHI leakage, proprietary code | `opt_in_enabled = false` default (`403 Forbidden`); Presidio + GLiNER scrubbers; trade secret rejection filter ([`marketplace_engine.rs`](crates/quorum-coordinator/src/marketplace_engine.rs)). |
+| **Layer 1: Zero Raw Documents & Semantic Filter** | Accidental data harvesting, PII/PHI leakage, proprietary code | `opt_in_enabled = false` default (`403 Forbidden`); Three-Engine Airlock (Microsoft Presidio + GLiNER + VaultGemma-1B / RedactX-v3) scrubbers; trade secret rejection filter ([`marketplace_engine.rs`](crates/quorum-coordinator/src/marketplace_engine.rs)). |
 | **Layer 2: GeoIP + ASN Proxy Firewall** | Adversary connections (`CN`, `HK`, `MO`, `RU`, `IR`, `KP`, etc.) and datacenter VPN proxies | Blocks foreign adversary CIDRs and `HIGH_RISK_DATACENTER_PROXY_ASNS` (Alibaba Cloud, Tencent Cloud, Huawei, China Telecom, DigitalOcean, Vultr, Linode, OVH, Hetzner, etc.). |
 | **Layer 3: Buyer Jurisdiction Certificate & FOCI/UBO** | Shell companies or adversary-controlled subsidiaries | Requires authority-signed `Ed25519` `BuyerJurisdictionCertificate` with non-covered-person attestation (DOJ 28 CFR Part 202) and verified LEI/DUNS identifier. |
 | **Layer 4: Pinned Egress CIDRs & TPM 2.0 Binding** | Proxy forwarding and cluster credential relaying | Validates caller IP against pinned corporate CIDRs and matches hardware `bound_tpm_pubkey_blake3` via constant-time comparison. |

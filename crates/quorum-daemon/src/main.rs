@@ -48,7 +48,7 @@ fn init_tracing(cli: &Cli) {
     tracing_subscriber::fmt().with_env_filter(filter()).init();
 }
 
-fn main() -> anyhow::Result<()> {
+pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli);
 

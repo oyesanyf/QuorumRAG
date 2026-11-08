@@ -4,6 +4,7 @@ data/
 .quorumrag-live-data/
 .quorumrag-rag-index/
 /deploy/
+/dist/
 /.witness/
 # agent scratch space and local logs
 /.agents/

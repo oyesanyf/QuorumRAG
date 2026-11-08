@@ -370,7 +370,7 @@ fn test_classifier_router_sharing_violation_recovers_when_lock_released() {
 #[test]
 fn test_classifier_router_sharing_violation_fails_cleanly_on_persistent_lock() {
     let dir = tempdir().unwrap();
-    let file_path = dir.path().join("persistently_locked.txt");
+    let file_path = dir.path().join("persistently_locked.unknown");
     std::fs::write(&file_path, "Locked").unwrap();
 
     let router = ClassifierRouter::new(IngestConfig::default());

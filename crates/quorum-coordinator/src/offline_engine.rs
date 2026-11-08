@@ -1154,7 +1154,7 @@ impl DeterministicOfflineSynthesisEngine {
                     if trim_chunk.len() < 35 && matched_chunks.len() > 1 && matched_chunks.iter().any(|other| other.chunk.text_content.trim().len() > 100) {
                         continue;
                     }
-                    let excerpt: String = trim_chunk.chars().take(800).collect();
+                    let excerpt = Self::truncate_to_sentence_boundary(trim_chunk, 800);
                     body_paragraphs.push(format!("{} **[{}]**", excerpt.trim(), idx + 1));
                 }
             }
@@ -1458,6 +1458,13 @@ impl DeterministicOfflineSynthesisEngine {
         {
             return false;
         }
+        if lower.contains("department of homeland security")
+            || lower.contains("form g-28")
+            || lower.contains("omb no.")
+            || lower.contains("111 massachusetts avenue")
+        {
+            return true;
+        }
         if crate::answer_orchestrator::is_contact_bar_or_header(line) {
             return true;
         }
@@ -1478,6 +1485,17 @@ impl DeterministicOfflineSynthesisEngine {
     /// ALL-CAPS title such as "SIMPLE LEASE AGREEMENT" and not a contact bar.
     pub fn is_sentence_like(line: &str) -> bool {
         if Self::is_contact_bar_or_header(line) {
+            return false;
+        }
+        let line_low = line.to_ascii_lowercase();
+        if line_low.contains("department of homeland security")
+            || line_low.contains("form g-28")
+            || line_low.contains("notice of entry of appearance")
+            || line_low.contains("omb no.")
+            || line_low.contains("part 1. information about attorney")
+            || line_low.contains("instructions for notice of entry")
+            || line_low.contains("111 massachusetts avenue")
+        {
             return false;
         }
         if line.contains('|')
@@ -1641,7 +1659,13 @@ impl DeterministicOfflineSynthesisEngine {
     }
 
     pub fn format_question_restated_prefix(prompt: &str) -> String {
-        let trimmed = prompt.trim();
+        let (spelled_prompt, _) = Self::correct_query_spelling(prompt, false);
+        let eff_prompt = if !spelled_prompt.trim().is_empty() {
+            spelled_prompt.as_str()
+        } else {
+            prompt
+        };
+        let trimmed = eff_prompt.trim();
         if trimmed.is_empty() {
             return String::new();
         }
@@ -1952,27 +1976,39 @@ impl DeterministicOfflineSynthesisEngine {
     ) -> Vec<(&'a ScoredChunk, u32)> {
         let all_explicit_unit = !matched_chunks.is_empty()
             && matched_chunks.iter().all(|c| (0.85..=1.0).contains(&c.score));
-        let mut seen_keys = std::collections::HashSet::new();
-        let mut out: Vec<(&'a ScoredChunk, u32)> = Vec::new();
+
+        let mut families: Vec<(String, String)> = Vec::new();
+        let mut family_chunks: std::collections::HashMap<(String, String), Vec<&'a ScoredChunk>> =
+            std::collections::HashMap::new();
+
         for &c in matched_chunks {
-            let file_name = std::path::Path::new(&c.chunk.file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&c.chunk.file_path);
-            let dedup_key = (c.source_peer.to_ascii_lowercase(), file_name.to_ascii_lowercase());
-            if !seen_keys.insert(dedup_key) {
-                continue;
+            let family_key = (
+                c.source_peer.to_ascii_lowercase(),
+                Self::derive_document_family_key(&c.chunk.file_path),
+            );
+            if !family_chunks.contains_key(&family_key) {
+                families.push(family_key.clone());
             }
-            let unique_idx = out.len();
-            let mut pct = Self::calibrated_accuracy_percent(c.score, unique_idx);
-            if !all_explicit_unit {
-                if let Some(&(_, prev_pct)) = out.last() {
-                    if pct >= prev_pct {
-                        pct = prev_pct.saturating_sub(2).max(70);
+            family_chunks.entry(family_key).or_default().push(c);
+        }
+
+        let mut out: Vec<(&'a ScoredChunk, u32)> = Vec::new();
+        for key in families {
+            if let Some(chunks) = family_chunks.get(&key) {
+                if let Some(canonical) = Self::pick_canonical_document_for_family(chunks) {
+                    let unique_idx = out.len();
+                    let best_score = chunks.iter().map(|c| c.score).fold(canonical.score, f32::max);
+                    let mut pct = Self::calibrated_accuracy_percent(best_score, unique_idx);
+                    if !all_explicit_unit {
+                        if let Some(&(_, prev_pct)) = out.last() {
+                            if pct >= prev_pct {
+                                pct = prev_pct.saturating_sub(2).max(70);
+                            }
+                        }
                     }
+                    out.push((canonical, pct));
                 }
             }
-            out.push((c, pct));
         }
         out
     }
@@ -1984,7 +2020,7 @@ impl DeterministicOfflineSynthesisEngine {
             .map(|(c, pct)| {
                 let mut cit = c.to_citation();
                 let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
-                cit.snippet = cleaned.chars().take(240).collect();
+                cit.snippet = Self::truncate_to_sentence_boundary(&cleaned, 240).to_string();
                 cit.score = pct as f32 / 100.0;
                 cit
             })
@@ -2208,6 +2244,148 @@ impl DeterministicOfflineSynthesisEngine {
         s.trim_end_matches(|c: char| c == '_' || c == '-' || c.is_whitespace()).to_string()
     }
 
+    /// Derives the canonical document family key for deduplicating revisions, copies, and formats
+    /// (e.g. `RedactX_v3_*`, `Femi_Oyesanya_Enhanced_Resume*`, `Oyesanya_Femi_0754749_*`) to 1 canonical document
+    /// per family while preserving distinct document types and multimodal image/audio assets
+    /// (e.g. `Checkmarx Social Media Assets - Femi Oyesanya.png`).
+    pub fn derive_document_family_key(file_path: &str) -> String {
+        let path = std::path::Path::new(file_path);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_media = matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "mp3" | "wav" | "ogg" | "flac" | "m4a"
+        );
+
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file_path);
+        let mut s = stem.to_ascii_lowercase();
+
+        // 1. Strip file extension artifacts if double-dotted (e.g. file.docx.pdf)
+        if s.ends_with(".docx") || s.ends_with(".pdf") || s.ends_with(".doc") || s.ends_with(".txt") {
+            s = s.rsplit_once('.').map(|(base, _)| base).unwrap_or(&s).to_string();
+        }
+
+        // 2. Strip copy numbers: (1), (2), _(1), etc.
+        if let Ok(copy_re) = regex::Regex::new(r"[\s_]*\(\d+\)") {
+            s = copy_re.replace_all(&s, "").to_string();
+        }
+
+        // 3. Strip revision, evaluation report, and technical specification descriptors
+        let patterns = [
+            "_evaluation_report", "-evaluation-report", "-evaluation_report", "_evaluation-report",
+            "_technical_specification", "-technical-specification", "-technical_specification",
+            "_technical_report", "-technical-report", "-technical_report",
+            "_benchmarks", "-benchmarks", "_benchmark", "-benchmark",
+            "_final", "-final", ".final",
+            "_draft", "-draft", ".draft",
+            "_corrected", "-corrected",
+            "_rewritten", "-rewritten",
+            "_typesetting", "-typesetting",
+            "_arxiv", "-arxiv",
+            "_copy", "-copy",
+            "_annotated", "-annotated",
+            "_revised", "-revised",
+            "_update", "-update",
+        ];
+        for pat in patterns {
+            s = s.replace(pat, "");
+        }
+
+        // 4. Strip 4-digit years (e.g. _2024, _2025, _2026, -2026) and ISO dates
+        if let Ok(year_re) = regex::Regex::new(r"[-_](?:19|20)\d{2}(?:[-_]\d{2}[-_]\d{2})?") {
+            s = year_re.replace_all(&s, "").to_string();
+        }
+
+        // 5. Strip version patterns: _v\d+, -v\d+, _v\d+\.\d+ anywhere in the stem
+        if let Ok(ver_re) = regex::Regex::new(r"[-_]v\d+(?:\.\d+)?(?:[-_]|$)") {
+            s = ver_re.replace_all(&s, "_").to_string();
+        }
+
+        // 6. Clean up punctuation and whitespace into clean snake_case
+        let clean_words: Vec<&str> = s
+            .split(|c: char| c == '_' || c == '-' || c == '.' || c.is_whitespace())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let base_key = clean_words.join("_");
+
+        if is_media {
+            format!("media_{}_{}", ext, base_key)
+        } else {
+            base_key
+        }
+    }
+
+    /// Evaluates candidate chunks within a document family and selects the single most canonical document.
+    /// Priority: Newer 4-digit year > Final over Draft > Higher version (v3 > v2 > v1) > Modern format (.docx/.pdf > .doc > .txt) > Local over remote > Higher chunk score.
+    pub fn pick_canonical_document_for_family<'a>(
+        chunks: &[&'a ScoredChunk],
+    ) -> Option<&'a ScoredChunk> {
+        if chunks.is_empty() {
+            return None;
+        }
+
+        let score_chunk = |c: &ScoredChunk| -> i32 {
+            let mut score = (c.score * 100.0) as i32;
+            let s = c.chunk.file_path.to_ascii_lowercase();
+
+            // Locality
+            if c.source_peer.is_empty() || c.source_peer.eq_ignore_ascii_case("local") {
+                score += 10;
+            }
+
+            // Format preference
+            if s.ends_with(".docx") {
+                score += 30;
+            } else if s.ends_with(".pdf") {
+                score += 25;
+            } else if s.ends_with(".doc") {
+                score += 0;
+            } else if s.ends_with(".txt") {
+                score -= 10;
+            }
+
+            // Status preference
+            if s.contains("_final") || s.contains("-final") || s.contains(".final") {
+                score += 40;
+            }
+            if s.contains("_draft") || s.contains("-draft") || s.contains(".draft") {
+                score -= 40;
+            }
+
+            // Version preference
+            if s.contains("_v3") || s.contains("-v3") || s.contains("v3.") {
+                score += 30;
+            } else if s.contains("_v2") || s.contains("-v2") || s.contains("v2.") {
+                score += 20;
+            } else if s.contains("_v1") || s.contains("-v1") || s.contains("v1.") {
+                score += 10;
+            }
+
+            // Year preference (2020..=2030)
+            for y in (2020..=2030).rev() {
+                if s.contains(&format!("{y}")) {
+                    score += (y - 2020) * 15;
+                    break;
+                }
+            }
+
+            // Penalize (1), (2) copies
+            if s.contains("(1)") || s.contains("(2)") || s.contains(" copy") || s.contains("-copy") {
+                score -= 50;
+            }
+
+            score
+        };
+
+        chunks.iter().copied().max_by_key(|c| score_chunk(c))
+    }
+
     /// Fast synchronous sub-LLM query helper against local Ollama for Rhai REPL Map batches.
     pub fn fast_sub_llm_query(model_tag: &str, prompt: &str) -> Option<String> {
         use std::io::{Read, Write};
@@ -2316,21 +2494,78 @@ impl DeterministicOfflineSynthesisEngine {
                             let prev_text = prev.chunk.text_content.trim();
 
                             if !prev_text.contains(curr_text) {
-                                let max_overlap = 200.min(prev_text.len()).min(curr_text.len());
-                                let overlap_len = (1..=max_overlap)
-                                    .rev()
-                                    .find(|&len| {
-                                        prev_text.is_char_boundary(prev_text.len() - len)
-                                            && curr_text.is_char_boundary(len)
-                                            && prev_text.ends_with(&curr_text[..len])
-                                    })
-                                    .unwrap_or(0);
-
-                                if overlap_len > 15 {
-                                    prev.chunk.text_content.push_str(&curr_text[overlap_len..]);
+                                if curr_text.contains(prev_text) {
+                                    prev.chunk.text_content = curr_text.to_string();
                                 } else {
-                                    prev.chunk.text_content.push_str("\n\n");
-                                    prev.chunk.text_content.push_str(curr_text);
+                                    let overlap_tail = if prev_text.len() > 600 {
+                                        let mut tail_start = prev_text.len() - 600;
+                                        while !prev_text.is_char_boundary(tail_start) && tail_start < prev_text.len() {
+                                            tail_start += 1;
+                                        }
+                                        &prev_text[tail_start..]
+                                    } else {
+                                        prev_text
+                                    };
+
+                                    let overlap_head = if curr_text.len() > 600 {
+                                        let mut head_end = 600;
+                                        while !curr_text.is_char_boundary(head_end) && head_end > 0 {
+                                            head_end -= 1;
+                                        }
+                                        &curr_text[..head_end]
+                                    } else {
+                                        curr_text
+                                    };
+
+                                    // 1. Check exact suffix match
+                                    let max_overlap = 250.min(overlap_tail.len()).min(overlap_head.len());
+                                    let exact_overlap = (1..=max_overlap)
+                                        .rev()
+                                        .find(|&len| {
+                                            overlap_tail.is_char_boundary(overlap_tail.len() - len)
+                                                && overlap_head.is_char_boundary(len)
+                                                && overlap_tail.ends_with(&overlap_head[..len])
+                                        })
+                                        .unwrap_or(0);
+
+                                    if exact_overlap > 15 {
+                                        prev.chunk.text_content.push_str(&curr_text[exact_overlap..]);
+                                    } else {
+                                        // 2. Phrase-level matching: find longest sequence of consecutive words (>= 3 words)
+                                        let head_words: Vec<&str> = overlap_head.split_whitespace().collect();
+                                        let mut best_overlap_offset: Option<usize> = None;
+
+                                        for window_size in (3..=8.min(head_words.len())).rev() {
+                                            let phrase = head_words[..window_size].join(" ");
+                                            if overlap_tail.contains(&phrase) {
+                                                if let Some(pos) = curr_text.find(&phrase) {
+                                                    let mut after = pos + phrase.len();
+                                                    while after < curr_text.len()
+                                                        && (curr_text.as_bytes()[after] == b'.'
+                                                            || curr_text.as_bytes()[after] == b' '
+                                                            || curr_text.as_bytes()[after] == b'\n'
+                                                            || curr_text.as_bytes()[after] == b'\r')
+                                                    {
+                                                        after += 1;
+                                                    }
+                                                    best_overlap_offset = Some(after);
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        if let Some(offset) = best_overlap_offset {
+                                            if offset < curr_text.len() {
+                                                if !prev.chunk.text_content.ends_with(' ') && !prev.chunk.text_content.ends_with('\n') {
+                                                    prev.chunk.text_content.push(' ');
+                                                }
+                                                prev.chunk.text_content.push_str(&curr_text[offset..]);
+                                            }
+                                        } else {
+                                            prev.chunk.text_content.push_str("\n\n");
+                                            prev.chunk.text_content.push_str(curr_text);
+                                        }
+                                    }
                                 }
                             }
 
@@ -3192,12 +3427,16 @@ impl DeterministicOfflineSynthesisEngine {
     /// Answer-type cue score: rewards chunks that contain the *kind* of fact a natural-language question asks for
     /// (a street address / ZIP for "where does X live", a `$` amount for "how much", a date for "when", a phone or
     /// email for "contact"), so the excerpt that actually answers the question ranks above excerpts that merely
-    /// mention the subject. `text_l` must be lowercase.
+    /// Answer-type cue score: rewards chunks that contain the *kind* of fact a natural-language question asks for
+    /// (a street address / ZIP for "where does X live", a `$` amount for "how much", a date for "when", a phone or
+    /// email for "contact"), so the excerpt that actually answers the question ranks above excerpts that merely
+    /// mention the subject. `text_l` is normalized to lowercase internally.
     pub fn answer_type_cue_score(prompt: &str, text_l: &str) -> i32 {
         let q = prompt.to_ascii_lowercase();
+        let text_lower = text_l.to_ascii_lowercase();
         let qw: Vec<&str> = q.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
         let has = |w: &str| qw.contains(&w);
-        let tokens: Vec<&str> = text_l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+        let tokens: Vec<&str> = text_lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
         let tok = |w: &str| tokens.contains(&w);
         let mut score = 0i32;
 
@@ -3205,14 +3444,29 @@ impl DeterministicOfflineSynthesisEngine {
             .iter()
             .any(|w| has(w));
         if asks_location {
-            if tokens.iter().any(|t| t.len() == 5 && t.chars().all(|c| c.is_ascii_digit())) {
+            let is_form_agency = text_lower.contains("form g-28")
+                || text_lower.contains("department of homeland security")
+                || text_lower.contains("citizenship and immigration")
+                || text_lower.contains("uscis")
+                || text_lower.contains("lockbox")
+                || text_lower.contains("instructions for form")
+                || text_lower.contains("111 massachusetts");
+
+            const AGENCY_ZIPS: &[&str] = &["20529", "20530", "20210", "20588", "20500", "20531"];
+            let has_non_agency_zip = tokens.iter().any(|t| {
+                t.len() == 5 && t.chars().all(|c| c.is_ascii_digit()) && !AGENCY_ZIPS.contains(t)
+            });
+
+            if !is_form_agency && has_non_agency_zip {
                 score += 220;
             }
-            let cues = ["address", "street", "st", "avenue", "ave", "road", "rd", "drive", "lane", "city", "suite", "apt"]
-                .iter()
-                .filter(|w| tok(w))
-                .count();
-            score += (cues.min(3) as i32) * 60;
+            if !is_form_agency {
+                let cues = ["address", "street", "st", "avenue", "ave", "road", "rd", "drive", "lane", "city", "suite", "apt"]
+                    .iter()
+                    .filter(|w| tok(w))
+                    .count();
+                score += (cues.min(3) as i32) * 60;
+            }
         }
 
         let asks_amount = q.contains("how much")
@@ -3221,10 +3475,10 @@ impl DeterministicOfflineSynthesisEngine {
                 .iter()
                 .any(|w| has(w));
         if asks_amount {
-            if text_l.contains('$') {
+            if text_lower.contains('$') {
                 score += 200;
             }
-            if text_l.contains("per month") || text_l.contains("per day") || text_l.contains("per year") {
+            if text_lower.contains("per month") || text_lower.contains("per day") || text_lower.contains("per year") {
                 score += 60;
             }
         }
@@ -3249,7 +3503,7 @@ impl DeterministicOfflineSynthesisEngine {
             if tok("phone") || tok("tel") || tok("mobile") {
                 score += 120;
             }
-            if text_l.contains('@') || tok("email") {
+            if text_lower.contains('@') || tok("email") {
                 score += 120;
             }
         }
@@ -3281,7 +3535,7 @@ impl DeterministicOfflineSynthesisEngine {
             if role_hits > 0 && has_year_or_present {
                 score += 65;
             }
-            if text_l.contains("[content_types].xml") || text_l.contains("word/document.xml") {
+            if text_lower.contains("[content_types].xml") || text_lower.contains("word/document.xml") {
                 score -= 220;
             }
         }
@@ -3779,7 +4033,8 @@ impl DeterministicOfflineSynthesisEngine {
         }
         let cues = Self::answer_type_cue_terms(prompt);
         if cues.is_empty() {
-            return chars[..max_chars].iter().collect();
+            let slice: String = chars[..max_chars].iter().collect();
+            return Self::truncate_to_sentence_boundary(&slice, max_chars).to_string();
         }
         let lower: String = text.to_ascii_lowercase();
         let lower_chars: Vec<char> = lower.chars().collect();
@@ -3789,15 +4044,18 @@ impl DeterministicOfflineSynthesisEngine {
         };
         let q = prompt.to_ascii_lowercase();
         if cues.contains(&"address") {
-            // first 5-digit token (ZIP)
+            // first 5-digit token (ZIP) that is not an agency ZIP
             let mut run = 0usize;
             for (i, c) in lower_chars.iter().enumerate() {
                 if c.is_ascii_digit() {
                     run += 1;
                 } else {
                     if run == 5 {
-                        anchor = Some(i - 5);
-                        break;
+                        let zip_str: String = lower_chars[i - 5..i].iter().collect();
+                        if zip_str != "20529" && zip_str != "20530" && zip_str != "20210" && zip_str != "20588" {
+                            anchor = Some(i - 5);
+                            break;
+                        }
                     }
                     run = 0;
                 }
@@ -3818,7 +4076,17 @@ impl DeterministicOfflineSynthesisEngine {
         }
         let start = anchor.map(|a| a.saturating_sub(200)).unwrap_or(0);
         let start = start.min(chars.len().saturating_sub(max_chars));
-        chars[start..start + max_chars].iter().collect()
+        let end = (start + max_chars).min(chars.len());
+        let slice: String = chars[start..end].iter().collect();
+        let mut text_slice = slice.as_str();
+        if start > 0 {
+            if let Some(first_ws) = text_slice.find(char::is_whitespace) {
+                if first_ws < 60 {
+                    text_slice = text_slice[first_ws..].trim_start();
+                }
+            }
+        }
+        Self::truncate_to_sentence_boundary(text_slice, max_chars).to_string()
     }
 
     /// Byte index just past the last sentence terminator that is followed by whitespace (or a paragraph break).
@@ -3841,6 +4109,33 @@ impl DeterministicOfflineSynthesisEngine {
             }
         }
         found
+    }
+
+    /// Truncates text cleanly to whole sentence boundaries within `max_chars`.
+    /// Never cuts words in half (falls back to whitespace boundary if no sentence terminal is found).
+    pub fn truncate_to_sentence_boundary(text: &str, max_chars: usize) -> &str {
+        let trimmed = text.trim();
+        if trimmed.chars().count() <= max_chars {
+            return trimmed;
+        }
+        let budget = trimmed
+            .char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(trimmed.len());
+        let slice = &trimmed[..budget];
+        if let Some(boundary) = Self::last_sentence_boundary(slice) {
+            if boundary >= budget / 2 {
+                return slice[..boundary].trim();
+            }
+        }
+        // Fallback: snap to last whitespace so words are never cut mid-word
+        if let Some(last_ws) = slice.rfind(char::is_whitespace) {
+            if last_ws >= budget / 3 {
+                return slice[..last_ws].trim();
+            }
+        }
+        slice.trim()
     }
 
     /// Splits `segment` into sentences (keeping their trailing whitespace/paragraph breaks) and drops those that
@@ -3954,7 +4249,16 @@ impl DeterministicOfflineSynthesisEngine {
         }
         let end = (best_start + max_chars).min(chars.len());
         let begin = end.saturating_sub(max_chars);
-        chars[begin..end].iter().collect()
+        let slice: String = chars[begin..end].iter().collect();
+        let mut text_slice = slice.as_str();
+        if begin > 0 {
+            if let Some(first_ws) = text_slice.find(char::is_whitespace) {
+                if first_ws < 60 {
+                    text_slice = text_slice[first_ws..].trim_start();
+                }
+            }
+        }
+        Self::truncate_to_sentence_boundary(text_slice, max_chars).to_string()
     }
 
     /// True for Markdown ordered-list lines such as `1. **Python**: ...` or `2) Rust`.
@@ -4121,12 +4425,25 @@ impl DeterministicOfflineSynthesisEngine {
                 .join(" ")
         };
         let prompt_norm = norm(prompt);
+        let (spelled_prompt, _) = Self::correct_query_spelling(prompt, false);
+        let spelled_prompt_norm = norm(&spelled_prompt);
         let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
 
         // 0. drop any heading line that merely echoes the question ("### When Did Michael Lewis's Lease Start?")
         lines.retain(|l| {
             let t = l.trim();
-            !(t.starts_with('#') && !prompt_norm.is_empty() && norm(t.trim_start_matches('#').trim_matches('*')) == prompt_norm)
+            if !t.starts_with('#') {
+                return true;
+            }
+            let stripped = norm(t.trim_start_matches('#').trim_matches('*'));
+            if !prompt_norm.is_empty() && (stripped == prompt_norm || stripped == spelled_prompt_norm) {
+                return false;
+            }
+            let stripped_spelled = norm(&Self::correct_spelling(&stripped));
+            if !spelled_prompt_norm.is_empty() && (stripped_spelled == spelled_prompt_norm || stripped_spelled == prompt_norm) {
+                return false;
+            }
+            true
         });
 
         // 1. drop an echoed-question first line
@@ -4137,7 +4454,8 @@ impl DeterministicOfflineSynthesisEngine {
                 continue;
             }
             let fn_ = norm(f.trim_start_matches('#').trim_matches('*'));
-            if !prompt_norm.is_empty() && fn_ == prompt_norm && lines.len() > 1 {
+            let fn_spelled = norm(&Self::correct_spelling(&fn_));
+            if (!prompt_norm.is_empty() && (fn_ == prompt_norm || fn_ == spelled_prompt_norm || fn_spelled == spelled_prompt_norm)) && lines.len() > 1 {
                 lines.remove(0);
                 continue;
             }
@@ -4184,7 +4502,14 @@ impl DeterministicOfflineSynthesisEngine {
         let mut out: Vec<String> = Vec::new();
         for line in lines {
             let t = line.trim();
-            if t.is_empty() || t.starts_with('#') || t.starts_with('-') || t.starts_with('*') || t.starts_with('|') || Self::is_numbered_list_item(t) {
+            if t.starts_with('#') {
+                let hashes: String = line.chars().take_while(|&c| c == '#' || c.is_whitespace()).collect();
+                let heading_content = line[hashes.len()..].trim();
+                let corrected_heading = Self::correct_spelling(heading_content);
+                out.push(format!("{}{}", hashes, corrected_heading));
+                continue;
+            }
+            if t.is_empty() || t.starts_with('-') || t.starts_with('*') || t.starts_with('|') || Self::is_numbered_list_item(t) {
                 out.push(line);
                 continue;
             }
@@ -5253,20 +5578,38 @@ impl DeterministicOfflineSynthesisEngine {
         };
         let active_excerpts: &[&ScoredChunk] = &pruned_chunks[..pruned_chunks.len().min(max_excerpts)];
 
-        // Assign 1-based citation numbers strictly by DISTINCT source filename across `active_excerpts`,
-        // so multiple chunks from the same file share one `[doc_num]` and `[8]` can NEVER be emitted when 7 files exist.
+        // Assign 1-based citation numbers strictly by canonical document family across `active_excerpts`,
+        // so multiple chunks or revisions from the same document family share one `[doc_num]`.
         let mut unique_file_chunks: Vec<&ScoredChunk> = Vec::new();
         let mut file_to_doc_num: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        let mut canonical_file_for_family: std::collections::HashMap<(String, String), String> = std::collections::HashMap::new();
+        let mut families_seen: Vec<(String, String)> = Vec::new();
+        let mut family_to_chunks: std::collections::HashMap<(String, String), Vec<&ScoredChunk>> = std::collections::HashMap::new();
+
         for &c in active_excerpts {
-            let file_name = std::path::Path::new(&c.chunk.file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&c.chunk.file_path);
-            let key = (c.source_peer.to_ascii_lowercase(), file_name.to_ascii_lowercase());
-            if !file_to_doc_num.contains_key(&key) {
-                let next_num = unique_file_chunks.len() + 1;
-                file_to_doc_num.insert(key, next_num);
-                unique_file_chunks.push(c);
+            let fam_key = (
+                c.source_peer.to_ascii_lowercase(),
+                Self::derive_document_family_key(&c.chunk.file_path),
+            );
+            if !family_to_chunks.contains_key(&fam_key) {
+                families_seen.push(fam_key.clone());
+            }
+            family_to_chunks.entry(fam_key).or_default().push(c);
+        }
+
+        for fam_key in families_seen {
+            let chunks = family_to_chunks.get(&fam_key).unwrap();
+            let canonical = Self::pick_canonical_document_for_family(chunks).unwrap_or(chunks[0]);
+            let next_num = unique_file_chunks.len() + 1;
+            unique_file_chunks.push(canonical);
+            canonical_file_for_family.insert(fam_key.clone(), canonical.chunk.file_path.clone());
+
+            for c in chunks {
+                let file_name = std::path::Path::new(&c.chunk.file_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&c.chunk.file_path);
+                file_to_doc_num.insert((c.source_peer.to_ascii_lowercase(), file_name.to_ascii_lowercase()), next_num);
             }
         }
 
@@ -5332,6 +5675,10 @@ impl DeterministicOfflineSynthesisEngine {
         let context_blocks = active_excerpts
             .iter()
             .map(|c| {
+                let fam_key = (
+                    c.source_peer.to_ascii_lowercase(),
+                    Self::derive_document_family_key(&c.chunk.file_path),
+                );
                 let file_name_base = std::path::Path::new(&c.chunk.file_path)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -5341,11 +5688,19 @@ impl DeterministicOfflineSynthesisEngine {
                     .get(&lookup_key)
                     .copied()
                     .unwrap_or(1);
+                let canon_path = canonical_file_for_family
+                    .get(&fam_key)
+                    .map(|s| s.as_str())
+                    .unwrap_or(&c.chunk.file_path);
+                let canon_name_base = std::path::Path::new(canon_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(canon_path);
                 let file_name = if !c.source_peer.is_empty() && !c.source_peer.eq_ignore_ascii_case("local") {
                     let short_peer: String = c.source_peer.chars().take(8).collect();
-                    format!("{} (Peer: {})", file_name_base, short_peer)
+                    format!("{} (Peer: {})", canon_name_base, short_peer)
                 } else {
-                    file_name_base.to_string()
+                    canon_name_base.to_string()
                 };
                 let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
                 let compact_text: String = if !prior_answer_text.is_empty() {
@@ -5739,9 +6094,10 @@ impl DeterministicOfflineSynthesisEngine {
                     }
                 };
                 for rc in remote_source_pool {
+                    let rc_fam = Self::derive_document_family_key(&rc.chunk.file_path);
                     if !compacted_chunks
                         .iter()
-                        .any(|c| c.source_peer == rc.source_peer && c.chunk.file_path == rc.chunk.file_path)
+                        .any(|c| c.source_peer == rc.source_peer && Self::derive_document_family_key(&c.chunk.file_path) == rc_fam)
                     {
                         compacted_chunks.push(rc);
                     }
@@ -5847,6 +6203,9 @@ impl DeterministicOfflineSynthesisEngine {
             ("whic", "which"),
             ("wich", "which"),
             ("hwo", "how"),
+            ("whi", "who"),
+            ("whos", "who's"),
+            ("whoo", "who"),
             ("abotu", "about"),
             ("abuot", "about"),
             ("abot", "about"),
@@ -6102,9 +6461,17 @@ impl DeterministicOfflineSynthesisEngine {
                 replacement = Some(core_lower.clone());
             }
 
+            let is_first_upper = core.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && (!has_shouting_words || tok_idx == 0);
             let mut final_word = replacement.unwrap_or_else(|| core.to_string());
-            // When normalizing a shouting query (e.g. "what DOES IT DO?" or "WHAT REDACTX"), capitalize the first word of the sentence
-            if has_shouting_words && tok_idx == 0 {
+            if is_first_upper {
+                let mut chars = final_word.chars();
+                if let Some(first) = chars.next() {
+                    if first.is_lowercase() {
+                        final_word = format!("{}{}", first.to_uppercase(), chars.as_str());
+                    }
+                }
+            } else if has_shouting_words && tok_idx == 0 {
                 let mut chars = final_word.chars();
                 if let Some(first) = chars.next() {
                     if first.is_lowercase() {
@@ -7461,4 +7828,157 @@ mod tests {
             ocr_ans
         );
     }
+
+    #[test]
+    fn test_m34_document_family_key_derivation_and_canonical_picking() {
+        // 1. RedactX revisions all collapse to "redactx"
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("RedactX_v3_evaluation_report.pdf"),
+            "redactx"
+        );
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("RedactX_v3_technical_specification.docx"),
+            "redactx"
+        );
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("RedactX_v3_final.pdf"),
+            "redactx"
+        );
+
+        // 2. Femi resume revisions all collapse to "femi_oyesanya_enhanced_resume"
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("Femi_Oyesanya_Enhanced_Resume_2026.docx"),
+            "femi_oyesanya_enhanced_resume"
+        );
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("Femi_Oyesanya_Enhanced_Resume_v2.docx"),
+            "femi_oyesanya_enhanced_resume"
+        );
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("Femi_Oyesanya_Enhanced_Resume_Final.pdf"),
+            "femi_oyesanya_enhanced_resume"
+        );
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("Femi_Oyesanya_Enhanced_Resume (1).pdf"),
+            "femi_oyesanya_enhanced_resume"
+        );
+
+        // 3. Multimodal image/audio assets preserve their extension so they don't collapse into text documents
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("Checkmarx Social Media Assets - Femi Oyesanya.png"),
+            "media_png_checkmarx_social_media_assets_femi_oyesanya"
+        );
+
+        // 4. Distinct document types remain distinct
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("Oyesanya_Femi_0754749_Offer_Letter.pdf"),
+            "oyesanya_femi_0754749_offer_letter"
+        );
+        assert_eq!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("Oyesanya_Femi_0754749_2024_W2.pdf"),
+            "oyesanya_femi_0754749_w2"
+        );
+        assert_ne!(
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("Oyesanya_Femi_0754749_Offer_Letter.pdf"),
+            DeterministicOfflineSynthesisEngine::derive_document_family_key("Oyesanya_Femi_0754749_2024_W2.pdf")
+        );
+
+        // 5. Canonical Document Picker selects the 2026 .docx resume over older revisions, drafts, and (1) copies
+        let c1 = quorum_types::DocumentChunk::new("c1", "d1", "Femi_Oyesanya_Enhanced_Resume (1).pdf", 1, 10, 0, vec![0.1; 768], "content", None).unwrap();
+        let c2 = quorum_types::DocumentChunk::new("c2", "d2", "Femi_Oyesanya_Enhanced_Resume_v2.docx", 1, 10, 0, vec![0.1; 768], "content", None).unwrap();
+        let c3 = quorum_types::DocumentChunk::new("c3", "d3", "Femi_Oyesanya_Enhanced_Resume_Final.pdf", 1, 10, 0, vec![0.1; 768], "content", None).unwrap();
+        let c4 = quorum_types::DocumentChunk::new("c4", "d4", "Femi_Oyesanya_Enhanced_Resume_2026.docx", 1, 10, 0, vec![0.1; 768], "content", None).unwrap();
+
+        let s1 = ScoredChunk::new(c1, 0.90, "local", false);
+        let s2 = ScoredChunk::new(c2, 0.88, "local", false);
+        let s3 = ScoredChunk::new(c3, 0.89, "local", false);
+        let s4 = ScoredChunk::new(c4, 0.92, "local", false);
+
+        let candidate_chunks = vec![&s1, &s2, &s3, &s4];
+        let picked = DeterministicOfflineSynthesisEngine::pick_canonical_document_for_family(&candidate_chunks).unwrap();
+        assert_eq!(picked.chunk.file_path, "Femi_Oyesanya_Enhanced_Resume_2026.docx");
+
+        // 6. Test deduplicated_chunks_with_scores outputs only 1 entry for the family
+        let deduped = DeterministicOfflineSynthesisEngine::deduplicated_chunks_with_scores(&candidate_chunks);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].0.chunk.file_path, "Femi_Oyesanya_Enhanced_Resume_2026.docx");
+        assert_eq!(deduped[0].1, 92); // unit accuracy percentage from best score 0.92
+
+        let sources = DeterministicOfflineSynthesisEngine::format_sources_block(&candidate_chunks);
+        assert!(sources.contains("Femi_Oyesanya_Enhanced_Resume_2026.docx"));
+        assert!(!sources.contains("Femi_Oyesanya_Enhanced_Resume (1).pdf"));
+        assert!(!sources.contains("Femi_Oyesanya_Enhanced_Resume_v2.docx"));
+    }
+
+    #[test]
+    fn test_m34_truncate_to_sentence_boundary() {
+        let long_text = "Femi Oyesanya is an enterprise cybersecurity architect. He specializes in cloud security architecture and Zero Trust frameworks. His remediation workflows automate security scanning in CI/CD pipelines. This sentence should be excluded.";
+        // Truncate with budget of 150 characters
+        let truncated = DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(long_text, 150);
+        assert!(
+            truncated.ends_with('.'),
+            "Truncated text must end on sentence boundary: got '{}'",
+            truncated
+        );
+        assert!(
+            !truncated.contains("This sentence should be excluded"),
+            "Truncated text must stay within budget"
+        );
+        assert!(
+            truncated.contains("cloud security architecture"),
+            "Truncated text must preserve complete earlier sentences"
+        );
+    }
+
+    #[test]
+    fn test_m34_answer_type_cue_score_suppresses_agency_zips_and_forms() {
+        let q = "where does Femi live?";
+        let form_g28_chunk = "Department of Homeland Security Form G-28 Notice of Entry of Appearance. Mailing address is 111 Massachusetts Avenue, NW, Washington, DC 20529.".to_ascii_lowercase();
+        let home_chunk = "Femi resides at 2913 Castiglione St, New Orleans, LA 70119. He has lived there since 2018.".to_ascii_lowercase();
+
+        let form_score = DeterministicOfflineSynthesisEngine::answer_type_cue_score(q, &form_g28_chunk);
+        let home_score = DeterministicOfflineSynthesisEngine::answer_type_cue_score(q, &home_chunk);
+
+        assert_eq!(
+            form_score, 0,
+            "Form G-28 with USCIS agency address and ZIP 20529 must receive 0 location boost, got {}",
+            form_score
+        );
+        assert!(
+            home_score >= 220,
+            "Genuine residential address with ZIP 70119 must receive at least +220 boost, got {}",
+            home_score
+        );
+        assert!(home_score > form_score);
+    }
+
+    #[test]
+    fn test_m34_title_spellcheck_and_question_echo_stripping() {
+        // 1. Spellcheck fixes "whi is Femi Oyesanya" -> "who is Femi Oyesanya"
+        let (spelled, _) = DeterministicOfflineSynthesisEngine::correct_query_spelling("whi is Femi Oyesanya", false);
+        assert_eq!(spelled, "who is Femi Oyesanya");
+
+        // 2. format_question_restated_prefix properly handles typo query
+        let prefix = DeterministicOfflineSynthesisEngine::format_question_restated_prefix("whi is Femi Oyesanya");
+        assert_eq!(prefix, "Femi Oyesanya is ");
+
+        // 3. Typo question echo heading is stripped completely when answering that question
+        let answer_with_typo_heading = "### Whi Is Femi Oyesanya\n\nFemi Oyesanya is a cloud security engineer [1].";
+        let cleaned = DeterministicOfflineSynthesisEngine::strip_question_echo_and_meta(
+            answer_with_typo_heading,
+            "whi is Femi Oyesanya"
+        );
+        assert!(!cleaned.contains("###"), "Question echo heading must be stripped: got '{}'", cleaned);
+        assert!(cleaned.contains("Femi Oyesanya is a cloud security engineer [1]."));
+
+        // 4. Non-matching typo heading is corrected to valid title case ("Whi" -> "Who")
+        let other_answer = "### Whi Is Femi Oyesanya\n\nFemi Oyesanya holds a degree in cybersecurity [1].";
+        let cleaned_other = DeterministicOfflineSynthesisEngine::strip_question_echo_and_meta(
+            other_answer,
+            "tell me about Femi's education"
+        );
+        assert!(cleaned_other.contains("### Who Is Femi Oyesanya"), "Typo heading must be normalized: got '{}'", cleaned_other);
+        assert!(!cleaned_other.contains("### Whi Is"), "Typo heading must not echo 'Whi'");
+    }
 }
+

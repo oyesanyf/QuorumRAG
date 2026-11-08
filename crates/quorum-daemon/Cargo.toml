@@ -10,6 +10,10 @@ description = "Single executable launcher and Axum 0.7 daemon for QuorumRAG"
 name = "quorumrag"
 path = "src/main.rs"
 
+[[bin]]
+name = "quorum-desktop"
+path = "src/desktop_main.rs"
+
 [dependencies]
 # Workspace crates
 quorum-types = { workspace = true }

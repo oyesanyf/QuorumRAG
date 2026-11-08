@@ -14,15 +14,21 @@ QuorumRAG provides an **Opt-In Sovereign AI Training Data Marketplace** that ena
 
 Implemented in [`crates/quorum-coordinator/src/marketplace_engine.rs`](../crates/quorum-coordinator/src/marketplace_engine.rs) and [`crates/quorum-contract/src/marketplace.rs`](../crates/quorum-contract/src/marketplace.rs):
 
-### Layer 1: Zero Raw Documents, Automated PII/PHI Scrubbing & Semantic Trade-Secret Filter
+### Layer 1: Zero Raw Documents, Three-Engine Airlock De-Identification & Semantic Trade-Secret Filter
 - **Never Exports Raw Files**: Raw PDFs, Word documents, spreadsheets, and local file paths are never sold or transmitted.
-- **Automated De-Identification (`MarketplaceSanitizer::scrub_text`)**: Runs `OsoosiMeshDlpController` (Microsoft Presidio Analyzer/Anonymizer + GLiNER `urchade/gliner_multi_pii-v1`) and deterministic regex sanitizers to scrub personal names, emails, phone numbers, SSNs, subscriber/client identifiers, and Windows/POSIX paths (`[REDACTED:PERSON]`, `[REDACTED:EMAIL]`, `[REDACTED:PHONE]`, `[REDACTED:SSN]`, `[REDACTED:LOCAL_PATH]`).
+- **Three-Engine Airlock De-Identification (`MarketplaceSanitizer::scrub_text`)**:
+  - **Tier 1 (Microsoft Presidio)**: Rule, regex, and lemma-based pattern recognition (`ContextEnhancer`) for standard syntactic entities (SSNs, phone numbers, emails, IP addresses, credit cards).
+  - **Tier 2 (GLiNER `urchade/gliner_multi_pii-v1`)**: Bi-encoder span transformer for open-vocabulary named entity recognition covering clinical conditions, medications, hospital systems, and identities (`[REDACTED:GLINER_*]`).
+  - **Tier 3 (VaultGemma-1B / RedactX-v3 Policy Engine)**: Differential Privacy $(\epsilon, \delta)$ de-identification, boundary quasi-identifier detection (`scan_quasi_identifiers` -> `[REDACTED:VAULTGEMMA_QUASI_ID]`), and abstractive takeaway synthesis for intermediate RLM steps (`synthesize_abstracted_takeaway`) to prevent verbatim code or sensitive file leakage.
+  - **Local Path & Contact Scrubbers**: Eliminates Windows drive paths (`C:\...`, `D:\...`), UNC paths, POSIX paths (`/Users/...`, `/home/...`), and subscriber-specific organization aliases (`[REDACTED:LOCAL_PATH]`, `[REDACTED:SUBSCRIBER]`).
 - **Semantic Trade-Secret & Proprietary Code Filter (`contains_trade_secret_or_proprietary_code`)**: Deterministically blocks any trajectory containing:
   - Fenced or syntactic source code blocks exceeding `15` lines,
   - Internal RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) or IPv6 ULA (`fc00::/7`) network topology addresses,
   - Internal corporate FQDNs (`.internal`, `.corp`, `.lan`, `.localdomain`, `.priv`),
   - PEM/OpenSSH private keys, cloud tokens (`AKIA...`, `ghp_...`, `sk-...`), or high-entropy secrets (Shannon entropy `> 4.70 bits/char`).
 - **100% Verbatim Citation Grounding (`grounding_score_bps == 10_000`)**: Every citation must pass `slice_text.contains(verbatim_quote)` and every trajectory must contain `>= 64` tokens before signing with the node's `Ed25519` private key.
+- **Parent-Window Trajectory Harvesting (`DatasetBuilder`)**: Extracts parent document byte windows (0..10,000 bytes) and anchors verbatim citation quotes from stored chunks in `crates/quorum-storage/src/dataset_builder.rs`.
+- **Autonomous Bounty Runner (`BountyRunner`)**: Autonomous bounty evaluation with zero-touch safety gating in `crates/quorum-coordinator/src/bounty_runner.rs`, matching active bounties against sovereign policies and airlock sanitization.
 
 ### Layer 2: Foreign GeoIP + Chinese Cloud U.S.-PoP & Anonymous VPS/VPN ASN Firewall
 - **Direct Foreign Adversary CIDR & GeoIP Block**: Rejects connections and proxy hops (`X-Forwarded-For`, `CF-Connecting-IP`, `X-Real-IP`) originating from `CN`, `HK`, `MO`, `RU`, `IR`, `KP`, `BY`, `CU`, `VE` (`FOREIGN_ADVERSARY_IPV4_CIDRS` and `BLOCKED_ADVERSARY_JURISDICTIONS`).
@@ -73,6 +79,8 @@ Implemented in [`crates/quorum-coordinator/src/marketplace_engine.rs`](../crates
 ## 4. Verification Suite
 
 ```bash
-cargo test -p quorum-contract -p quorum-coordinator --lib marketplace
-cargo test -p quorum-daemon --test marketplace_sovereign_escrow_tests
+cargo test -p quorum-coordinator --lib marketplace_engine -j 2
+cargo test -p quorum-coordinator --lib bounty_runner -j 2
+cargo test -p quorum-storage --lib dataset_builder -j 2
+cargo test -p quorum-daemon --test marketplace_sovereign_escrow_tests -j 2
 ```

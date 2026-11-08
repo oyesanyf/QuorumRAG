@@ -308,6 +308,7 @@ async fn test_active_chat_tasks_endpoint_and_reattach_flow() {
             final_state: quorum_coordinator::types::AgenticStateName::SynthesizeWithCitations,
             model_name: "AutoFusion".to_string(),
             responder_peer_id: "local".to_string(),
+            peer_diagnostics: None,
         };
         task_clone.event_log.lock().unwrap().push(ev_finished.clone());
         let _ = task_clone.broadcaster.send(ev_finished);
