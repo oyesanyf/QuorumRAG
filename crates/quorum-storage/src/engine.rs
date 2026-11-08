@@ -508,12 +508,30 @@ impl StorageEngine {
         if file_paths.is_empty() {
             return Ok(());
         }
-        self.vector_store.delete_by_file_paths(file_paths).await?;
-        for p in file_paths {
+        let existing_paths: Vec<String> = file_paths
+            .iter()
+            .filter(|p| self.fts_index.has_file_path(p))
+            .cloned()
+            .collect();
+        if existing_paths.is_empty() {
+            return Ok(());
+        }
+        self.vector_store.delete_by_file_paths(&existing_paths).await?;
+        for p in &existing_paths {
             let _ = self.fts_index.delete_by_file_path(p);
             let _ = self.catalog.delete_by_file_path(p);
         }
         Ok(())
+    }
+
+    /// O(1) check whether `chunk_id` is already indexed in Tantivy.
+    pub fn has_chunk_id_in_fts(&self, chunk_id: &str) -> bool {
+        self.fts_index.has_chunk_id(chunk_id).unwrap_or(false)
+    }
+
+    /// Fast FST dictionary scan of all unique `file_path` strings currently indexed in Tantivy.
+    pub fn list_indexed_file_paths_in_fts(&self) -> HashSet<String> {
+        self.fts_index.list_indexed_file_paths()
     }
 
     /// Performs maintenance: compacts small Lance files, cleans up older snapshots, and merges Tantivy segments.

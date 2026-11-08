@@ -1035,3 +1035,141 @@ async fn test_6_domestic_us_proxy_and_shell_company_evasion_invariant() {
         .unwrap();
     assert_eq!(bad_tpm_res.status(), StatusCode::FORBIDDEN);
 }
+
+/// Test 9: Verify explicit user consent checkbox, folder-scoped Opt-In (`opt_in_folders`),
+/// Ed25519-signed & BLAKE3 hash-chained `consent_ledger`, and split Settings tabs in `index.html` / `app.js`.
+#[tokio::test]
+async fn test_9_explicit_consent_checkbox_folder_scoped_opt_in_and_signed_consent_ledger() {
+    let (app, _state, _tmp) = setup_marketplace_test_app().await;
+
+    // 1. Default status must be Opt-Out with genesis DEFAULT_OPT_OUT_INITIALIZED ledger entry
+    let status_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/marketplace/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_res.status(), StatusCode::OK);
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(status_res).await).unwrap();
+    assert_eq!(status_json["opt_in_enabled"], serde_json::json!(false));
+    assert_eq!(status_json["user_consent_checked"], serde_json::json!(false));
+    assert_eq!(status_json["opt_in_folders"], serde_json::json!([]));
+    let genesis_ledger = status_json["consent_ledger"].as_array().unwrap();
+    assert!(!genesis_ledger.is_empty());
+    assert_eq!(genesis_ledger[0]["action"], "DEFAULT_OPT_OUT_INITIALIZED");
+
+    // 2. Attempting to Opt-In with user_consent_checked = false must fail closed with 403 Forbidden
+    let unconsented_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/opt-in")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "opt_in_enabled": true,
+                        "user_consent_checked": false,
+                        "opt_in_folders": ["D:\\Research"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unconsented_res.status(), StatusCode::FORBIDDEN);
+
+    // 3. Opting in with explicit consent and specific folders persists folders and appends OPT_IN_AGREED to consent_ledger
+    let opt_in_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/opt-in")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "opt_in_enabled": true,
+                        "user_consent_checked": true,
+                        "opt_in_folders": ["D:\\Research", "C:\\Projects"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opt_in_res.status(), StatusCode::OK);
+    let opt_in_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(opt_in_res).await).unwrap();
+    assert_eq!(opt_in_json["opt_in_enabled"], serde_json::json!(true));
+    assert_eq!(opt_in_json["user_consent_checked"], serde_json::json!(true));
+    assert_eq!(
+        opt_in_json["opt_in_folders"],
+        serde_json::json!(["D:\\Research", "C:\\Projects"])
+    );
+    let ledger_after_optin = opt_in_json["consent_ledger"].as_array().unwrap();
+    assert!(ledger_after_optin.len() >= 2);
+    assert_eq!(ledger_after_optin[0]["action"], "OPT_IN_AGREED");
+    assert_eq!(
+        ledger_after_optin[0]["opt_in_folders"],
+        serde_json::json!(["D:\\Research", "C:\\Projects"])
+    );
+    assert_eq!(
+        ledger_after_optin[0]["prev_entry_hash_blake3"],
+        ledger_after_optin[1]["entry_hash_blake3"]
+    );
+
+    // 4. Verify index.html and app.js expose dedicated split Settings pages (marketplace, marketplace-ledger, diagnostics)
+    let index_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(read_body_bytes(index_res).await).unwrap();
+    assert!(html.contains("data-tab=\"marketplace\""));
+    assert!(html.contains("data-tab=\"marketplace-ledger\""));
+    assert!(html.contains("data-tab=\"diagnostics\""));
+    assert!(!html.contains("data-tab=\"marketplace\" onclick="));
+
+    // 5. Verify POST /api/documents/add uploads, indexes a new document, and appends to opt_in_folders
+    let add_doc_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/documents/add")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "uploaded_files": [{
+                            "file_name": "new_sovereign_notes.txt",
+                            "content_text": "QuorumRAG multi-engine privacy scrubber and folder-scoped Opt-In specification."
+                        }],
+                        "add_to_opt_in": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add_doc_res.status(), StatusCode::OK);
+    let add_doc_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(add_doc_res).await).unwrap();
+    assert_eq!(add_doc_json["status"], "added_and_indexed");
+    assert_eq!(add_doc_json["added_count"], 1);
+}

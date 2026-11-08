@@ -115,8 +115,15 @@ jobs:
 
           echo "[PASS] All QuorumRAG security invariants verified."
 
-          if [ "${PR_AUTHOR}" = "oyesanyf" ] || [ "${PR_AUTHOR}" = "dependabot[bot]" ] || [ "${PR_ASSOCIATION}" = "OWNER" ] || [ "${PR_ASSOCIATION}" = "MEMBER" ] || [ "${PR_ASSOCIATION}" = "COLLABORATOR" ]; then
-            gh pr review "${PR_NUMBER}" --repo "${REPO}" --approve \
-              --body "[PASS] QuorumRAG Invariant Gate & Review Bot: Verified contributor (@${PR_AUTHOR}, ${PR_ASSOCIATION}), commit ${PR_HEAD_SHA} (${FILE_COUNT} file(s)), Zero-Touch PATH compliance, zero private keys, and hermetic build scripts." || true
+          if [ "${PR_AUTHOR}" = "oyesanyf" ] && [ "${PR_ASSOCIATION}" = "OWNER" ] && [ "${PR_HEAD_REPO}" = "${REPO}" ]; then
+            cat <<EOF > /tmp/quorum_review_body.md
+[PASS] QuorumRAG Solo-Developer Invariant Gate & Review Bot: Verified repository owner (@${PR_AUTHOR}, ${PR_ASSOCIATION}), commit ${PR_HEAD_SHA} (${FILE_COUNT} file(s)), Zero-Touch PATH compliance, zero private keys, and hermetic build scripts.
+EOF
+            gh pr review "${PR_NUMBER}" --repo "${REPO}" --approve --body-file /tmp/quorum_review_body.md || true
             gh pr merge "${PR_NUMBER}" --repo "${REPO}" --squash || gh pr merge "${PR_NUMBER}" --repo "${REPO}" --auto --squash || true
+          else
+            cat <<EOF > /tmp/quorum_manual_review.md
+[INFO] QuorumRAG Invariant Gate passed for @${PR_AUTHOR} (${PR_ASSOCIATION}). Per repository governance policy, only solo-developer PRs by @oyesanyf are auto-approved; all other contributor PRs require manual review and approval by @oyesanyf before merging.
+EOF
+            gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file /tmp/quorum_manual_review.md || true
           fi

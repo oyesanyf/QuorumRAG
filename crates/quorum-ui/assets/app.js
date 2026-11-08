@@ -2889,18 +2889,40 @@ function secureRandomIndex(n) {
     }
   }
 
+  let cachedMarketplaceStatus = null;
+
+  async function fetchMarketplaceData() {
+    try {
+      const resp = await fetch('/api/v1/marketplace/status');
+      if (!resp.ok) return null;
+      cachedMarketplaceStatus = await resp.json();
+      if (typeof window.refreshMarketplaceStatus === 'function') {
+        window.refreshMarketplaceStatus();
+      }
+      return cachedMarketplaceStatus;
+    } catch (_) {
+      return null;
+    }
+  }
+
   async function openSettingsView(tab = 'general') {
     activeSettingsTab = tab;
+    const mktModal = document.getElementById('modal-marketplace');
+    if (mktModal) mktModal.classList.add('hidden');
     if (typeof initSettingsEventDelegation === 'function') initSettingsEventDelegation();
     if (settingsView) settingsView.classList.remove('hidden');
     highlightSettingsNav(tab);
-    await loadFullSettings();
-    if (tab === 'mesh' || tab === 'storage') {
+    await Promise.all([
+      loadFullSettings(),
+      fetchMarketplaceData()
+    ]);
+    if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace') {
       await fetchMeshData();
       await fetchBrowseFolders(currentBrowsePath);
     }
     renderSettingsTabContent(activeSettingsTab, settingsSearchInput ? settingsSearchInput.value : '');
   }
+  window._jumpSettingsTab = openSettingsView;
 
   function closeSettingsView() {
     if (settingsView) settingsView.classList.add('hidden');
@@ -2946,10 +2968,15 @@ function secureRandomIndex(n) {
 
   document.querySelectorAll('#settings-nav-list .chatgpt-nav-item').forEach(btn => {
     btn.addEventListener('click', async () => {
+      const mktModal = document.getElementById('modal-marketplace');
+      if (mktModal) mktModal.classList.add('hidden');
       const tab = btn.dataset.tab || 'general';
       activeSettingsTab = tab;
       highlightSettingsNav(tab);
-      if (tab === 'mesh' || tab === 'storage') {
+      if (tab === 'general' || tab === 'marketplace' || tab === 'marketplace-ledger') {
+        await fetchMarketplaceData();
+      }
+      if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace') {
         await fetchMeshData();
         await fetchBrowseFolders(currentBrowsePath);
       }
@@ -2966,14 +2993,26 @@ function secureRandomIndex(n) {
         const match = !q || label.includes(q) || tab.includes(q)
           || (q.includes('phi') && tab === 'dlp')
           || (q.includes('redact') && tab === 'dlp')
-          || (q.includes('folder') && (tab === 'mesh' || tab === 'storage'))
+          || ((q.includes('opt') || q.includes('sell') || q.includes('consent') || q.includes('personal') || q.includes('market')) && (tab === 'marketplace' || tab === 'marketplace-ledger'))
+          || ((q.includes('ledger') || q.includes('bounty') || q.includes('revenue')) && tab === 'marketplace-ledger')
+          || ((q.includes('stream') || q.includes('reindex') || q.includes('drift') || q.includes('diag')) && tab === 'diagnostics')
+          || (q.includes('folder') && (tab === 'marketplace' || tab === 'mesh' || tab === 'storage'))
           || (q.includes('share') && tab === 'mesh');
         btn.style.display = match ? 'flex' : 'none';
       });
-      if (q.includes('phi') || q.includes('dlp') || q.includes('redact') || q.includes('hipaa')) {
+      if (q.includes('opt') || q.includes('sell') || q.includes('consent') || q.includes('personal') || q.includes('market')) {
+        activeSettingsTab = 'marketplace';
+        highlightSettingsNav('marketplace');
+      } else if (q.includes('ledger') || q.includes('bounty') || q.includes('revenue')) {
+        activeSettingsTab = 'marketplace-ledger';
+        highlightSettingsNav('marketplace-ledger');
+      } else if (q.includes('stream') || q.includes('reindex') || q.includes('drift') || q.includes('diag')) {
+        activeSettingsTab = 'diagnostics';
+        highlightSettingsNav('diagnostics');
+      } else if (q.includes('phi') || q.includes('dlp') || q.includes('redact') || q.includes('hipaa')) {
         activeSettingsTab = 'dlp';
         highlightSettingsNav('dlp');
-      } else if (q.includes('mesh') || q.includes('folder') || q.includes('share') || q.includes('peer')) {
+      } else if (q.includes('mesh') || q.includes('share') || q.includes('peer')) {
         activeSettingsTab = 'mesh';
         highlightSettingsNav('mesh');
       }
@@ -3878,6 +3917,263 @@ function secureRandomIndex(n) {
           renderSettingsTabContent('archived', '');
           showSettingsToast('All saved and archived chats cleared');
           break;
+
+        case 'mkt-save-optin-general': {
+          e.preventDefault();
+          const chk = document.getElementById('chk-general-optin-consent');
+          if (!chk || !chk.checked) {
+            showSettingsToast('⚠ Please check the consent agreement box first to Opt-In (Opt-Out by default)');
+            return;
+          }
+          const curFolders = (cachedMarketplaceStatus && Array.isArray(cachedMarketplaceStatus.opt_in_folders))
+            ? cachedMarketplaceStatus.opt_in_folders
+            : [];
+          const resp = await fetch('/api/v1/marketplace/opt-in', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              opt_in_enabled: true,
+              user_consent_checked: true,
+              opt_in_folders: curFolders,
+              consent_statement: `User explicitly checked the consent agreement box and opted in (${curFolders.length} selected folder(s)) to sell de-identified SFT/DPO trajectories through the 3-Engine Airlock (VaultGemma-1B RedactX-v3 + Presidio + GLiNER).`
+            })
+          });
+          if (!resp.ok) {
+            const errObj = await resp.json().catch(() => ({}));
+            showSettingsToast('⚠ ' + (errObj.error || 'Failed to save Opt-In'));
+            return;
+          }
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast('✓ Opt-In Consent agreed & signed into Consent Ledger');
+          break;
+        }
+
+        case 'mkt-save-optin': {
+          e.preventDefault();
+          const chk = document.getElementById('chk-mkt-consent');
+          if (!chk || !chk.checked) {
+            showSettingsToast('⚠ Please check the explicit consent agreement box first to Opt-In (Opt-Out by default)');
+            return;
+          }
+          const jurSel = document.getElementById('mkt-jurisdiction-select');
+          const priceInp = document.getElementById('mkt-price-cents');
+          const curFolders = (cachedMarketplaceStatus && Array.isArray(cachedMarketplaceStatus.opt_in_folders))
+            ? cachedMarketplaceStatus.opt_in_folders
+            : [];
+          const fiveEyes = !!(jurSel && jurSel.value === 'FIVE_EYES');
+          const priceCents = Number(priceInp && priceInp.value ? priceInp.value : 5000);
+          const resp = await fetch('/api/v1/marketplace/opt-in', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              opt_in_enabled: true,
+              user_consent_checked: true,
+              opt_in_folders: curFolders,
+              five_eyes_enabled: fiveEyes,
+              price_per_1k_records_cents: priceCents,
+              consent_statement: `User explicitly checked the consent agreement box and opted in ${curFolders.length} folder(s) (${curFolders.join(', ') || 'selected scope'}) to sell de-identified SFT/DPO trajectories through the 3-Engine Airlock (VaultGemma-1B RedactX-v3 + Presidio + GLiNER).`
+            })
+          });
+          if (!resp.ok) {
+            const errObj = await resp.json().catch(() => ({}));
+            showSettingsToast('⚠ ' + (errObj.error || 'Failed to save Opt-In'));
+            return;
+          }
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast('✓ Opt-In Consent & Folder Scope signed into Consent Ledger');
+          break;
+        }
+
+        case 'mkt-revoke-optout': {
+          e.preventDefault();
+          const curFolders = (cachedMarketplaceStatus && Array.isArray(cachedMarketplaceStatus.opt_in_folders))
+            ? cachedMarketplaceStatus.opt_in_folders
+            : [];
+          const resp = await fetch('/api/v1/marketplace/opt-in', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              opt_in_enabled: false,
+              user_consent_checked: false,
+              opt_in_folders: curFolders,
+              consent_statement: 'User opted out (default state). Zero personal or AI training data may be sold.'
+            })
+          });
+          if (resp.ok) {
+            await fetchMarketplaceData();
+            renderSettingsTabContent(activeSettingsTab, '');
+            showSettingsToast('🔒 Opt-Out restored (0 data sold) & recorded in Consent Ledger');
+          }
+          break;
+        }
+
+        case 'mkt-toggle-folder': {
+          e.preventDefault();
+          const targetPath = (actionEl.dataset.folderPath || '').trim();
+          if (!targetPath) return;
+          const mkt = cachedMarketplaceStatus || {};
+          const curFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders.slice() : [];
+          const existingIdx = curFolders.findIndex(f => f.toLowerCase() === targetPath.toLowerCase());
+          let toastText = '';
+          if (existingIdx >= 0) {
+            curFolders.splice(existingIdx, 1);
+            toastText = 'Removed folder from Opt-In scope: ' + targetPath;
+          } else {
+            curFolders.push(targetPath);
+            toastText = '✓ Added folder to Opt-In scope: ' + targetPath;
+          }
+          await fetch('/api/v1/marketplace/opt-in', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              opt_in_enabled: !!mkt.opt_in_enabled,
+              user_consent_checked: !!mkt.user_consent_checked,
+              opt_in_folders: curFolders
+            })
+          });
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast(toastText);
+          break;
+        }
+
+        case 'mkt-add-input-folder': {
+          e.preventDefault();
+          const inp = document.getElementById('mkt-folder-input');
+          const targetPath = (inp && inp.value.trim()) ? inp.value.trim() : (currentBrowsePath || '').trim();
+          if (!targetPath) {
+            showSettingsToast('Enter a folder path or select a drive/folder below first');
+            if (inp) inp.focus();
+            return;
+          }
+          const mkt = cachedMarketplaceStatus || {};
+          const curFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders.slice() : [];
+          if (!curFolders.some(f => f.toLowerCase() === targetPath.toLowerCase())) {
+            curFolders.push(targetPath);
+          }
+          await fetch('/api/v1/marketplace/opt-in', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              opt_in_enabled: !!mkt.opt_in_enabled,
+              user_consent_checked: !!mkt.user_consent_checked,
+              opt_in_folders: curFolders
+            })
+          });
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast('✓ Added folder to Opt-In scope: ' + targetPath);
+          break;
+        }
+
+        case 'mkt-remove-folder': {
+          e.preventDefault();
+          const targetPath = (actionEl.dataset.folderPath || '').trim();
+          if (!targetPath) return;
+          const mkt = cachedMarketplaceStatus || {};
+          const curFolders = (Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders : [])
+            .filter(f => f.toLowerCase() !== targetPath.toLowerCase());
+          await fetch('/api/v1/marketplace/opt-in', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              opt_in_enabled: !!mkt.opt_in_enabled,
+              user_consent_checked: !!mkt.user_consent_checked,
+              opt_in_folders: curFolders
+            })
+          });
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast('Removed folder from Opt-In scope: ' + targetPath);
+          break;
+        }
+
+        case 'mkt-harvest': {
+          e.preventDefault();
+          const resp = await fetch('/api/v1/marketplace/harvest', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+          });
+          const resData = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            showSettingsToast('⚠ Blocked (' + resp.status + '): ' + (resData.error || 'Enable Opt-In first'));
+            return;
+          }
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast(`✓ Harvested & scrubbed ${resData.accepted_count || 0} record(s) via 3-Engine Airlock`);
+          break;
+        }
+
+        case 'mkt-approve': {
+          e.preventDefault();
+          const resp = await fetch('/api/v1/marketplace/approve-batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+          });
+          const resData = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            showSettingsToast('⚠ Blocked (' + resp.status + '): ' + (resData.error || 'Harvest a batch first'));
+            return;
+          }
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast('✓ Batch sealed & signed (HITL approved)');
+          break;
+        }
+
+        case 'mkt-submit-bounty': {
+          e.preventDefault();
+          const bountyId = actionEl.dataset.bountyId;
+          if (!bountyId) return;
+          const resp = await fetch('/api/v1/marketplace/bounties/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bounty_id: bountyId })
+          });
+          const resData = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            showSettingsToast('⚠ ' + (resData.error || 'Approve & seal a batch before submitting to bounty'));
+            return;
+          }
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast(`✓ Fulfilled bounty ${bountyId} ($${((resData.payout_cents || 0) / 100).toFixed(2)} credited to Ledger)`);
+          break;
+        }
+
+        case 'add-new-doc-path': {
+          e.preventDefault();
+          const inp = document.getElementById('new-doc-path-input');
+          const chkOptIn = document.getElementById('chk-add-doc-optin');
+          const pathVal = inp ? inp.value.trim() : '';
+          if (!pathVal) {
+            showSettingsToast('Enter a document or folder path first, or click "+ Upload New Documents"');
+            if (inp) inp.focus();
+            return;
+          }
+          const resp = await fetch('/api/documents/add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              local_paths: [pathVal],
+              add_to_opt_in: !!(chkOptIn && chkOptIn.checked)
+            })
+          });
+          const resData = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            showSettingsToast('⚠ ' + (resData.error || 'Failed to add document path'));
+            return;
+          }
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast(`✓ Added & indexed: ${pathVal}`);
+          break;
+        }
       }
     });
 
@@ -4011,6 +4307,39 @@ function secureRandomIndex(n) {
             reader.readAsText(file);
           }
           break;
+
+        case 'upload-new-documents': {
+          const files = changeEl.files ? Array.from(changeEl.files) : [];
+          if (files.length === 0) break;
+          const chkOptIn = document.getElementById('chk-add-doc-optin');
+          const addToOptIn = !!(chkOptIn && chkOptIn.checked);
+          showSettingsToast(`Uploading & indexing ${files.length} document(s)...`);
+          const readAsBase64 = (f) => new Promise((resolve, reject) => {
+            const r = new FileReader();
+            r.onload = (ev) => resolve({ file_name: f.name, content_base64: String(ev.target.result || '') });
+            r.onerror = (err) => reject(err);
+            r.readAsDataURL(f);
+          });
+          try {
+            const uploaded_files = await Promise.all(files.map(readAsBase64));
+            const resp = await fetch('/api/documents/add', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ uploaded_files, add_to_opt_in: addToOptIn })
+            });
+            const resData = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              showSettingsToast('⚠ ' + (resData.error || 'Failed to upload documents'));
+              break;
+            }
+            await fetchMarketplaceData();
+            renderSettingsTabContent(activeSettingsTab, '');
+            showSettingsToast(`✓ Added & indexed ${resData.added_count || files.length} new document(s)`);
+          } catch (err) {
+            showSettingsToast('⚠ Upload failed: ' + err.message);
+          }
+          break;
+        }
       }
     });
 
@@ -4057,11 +4386,73 @@ function secureRandomIndex(n) {
       </div>
     `).join('');
 
+    const mkt = cachedMarketplaceStatus || {
+      opt_in_enabled: false,
+      user_consent_checked: false,
+      opt_in_folders: [],
+      allowed_jurisdictions: ['US'],
+      five_eyes_enabled: false,
+      price_per_1k_records_cents: 5000,
+      consent_ledger: [],
+      all_ledgers: [],
+      bounties: []
+    };
+    const optInFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders : [];
+    const consentLedger = Array.isArray(mkt.consent_ledger) ? mkt.consent_ledger : [];
+
+    const quickSubTabsBar = (activeSub) => `
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid var(--border-color);">
+        <button type="button" class="pill-btn" data-action="jump-tab" data-tab="general" style="${activeSub === 'general' ? 'background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;' : ''}">⚙️ General</button>
+        <button type="button" class="pill-btn" data-action="jump-tab" data-tab="marketplace" style="${activeSub === 'marketplace' ? 'background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;' : ''}">💎 Data Opt-In &amp; Folders (${optInFolders.length})</button>
+        <button type="button" class="pill-btn" data-action="jump-tab" data-tab="marketplace-ledger" style="${activeSub === 'marketplace-ledger' ? 'background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;' : ''}">📜 Consent &amp; Revenue Ledger (${consentLedger.length})</button>
+        <button type="button" class="pill-btn" data-action="jump-tab" data-tab="diagnostics" style="${activeSub === 'diagnostics' ? 'background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;' : ''}">🔬 Deep Research &amp; Diagnostics</button>
+      </div>
+    `;
+
     if (tab === 'general') {
       const lang = ui.language || 'Auto';
       const efforts = ui.reasoning_efforts || '6 selected';
+      const folderSummaryText = optInFolders.length > 0
+        ? optInFolders.map(f => `<code>${escapeHtml(f)}</code>`).join(', ')
+        : '<span style="color:var(--text-muted);">No folders selected yet (Not Global — click "Select Opt-In Folders" to choose specific folders)</span>';
+
       settingsContent.innerHTML = `
-        <h2 class="settings-page-title" style="margin-bottom:18px;">General</h2>
+        <h2 class="settings-page-title" style="margin-bottom:10px;">General</h2>
+        ${quickSubTabsBar('general')}
+
+        <div class="settings-card" style="border:1.5px solid ${mkt.opt_in_enabled ? '#10a37f' : 'rgba(99,102,241,0.45)'};">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+            <div>
+              <div style="font-weight:700; font-size:15px;">💎 Sell / Share De-Identified Personal &amp; AI Training Data (Opt-Out by Default)</div>
+              <div style="font-size:12.5px; color:var(--text-muted); margin-top:2px;">
+                Disabled by default (<code>opt_in_enabled: false</code>). You must explicitly check the agreement box and select specific folders to Opt-In.
+              </div>
+            </div>
+            <span style="font-size:11.5px; font-weight:700; padding:4px 10px; border-radius:999px; background:${mkt.opt_in_enabled ? 'rgba(16,163,127,0.2)' : 'rgba(239,68,68,0.18)'}; color:${mkt.opt_in_enabled ? '#10a37f' : '#f87171'};">
+              ${mkt.opt_in_enabled ? `✅ OPT-IN ACTIVE (${optInFolders.length} Folder(s))` : '🔒 OPT-OUT BY DEFAULT (0 Data Sold)'}
+            </span>
+          </div>
+
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; padding:10px 12px; border-radius:8px; background:rgba(255,255,255,0.03); border:1px solid var(--border-color); font-size:13px; line-height:1.45;">
+            <input type="checkbox" id="chk-general-optin-consent" ${mkt.opt_in_enabled && mkt.user_consent_checked ? 'checked' : ''} style="width:18px; height:18px; margin-top:2px; accent-color:#10a37f; cursor:pointer;">
+            <span>
+              <strong>I explicitly check and agree to Opt-In</strong> to sell de-identified SFT/DPO trajectories strictly from my selected Opt-In folders (scrubbed by the 3-Engine Airlock: <code>VaultGemma-1B RedactX-v3</code> + <code>Presidio</code> + <code>GLiNER</code>). I understand this is Opt-Out by default and my signed consent is saved to the Consent Ledger.
+            </span>
+          </label>
+
+          <div style="margin-top:10px; font-size:12.5px;">
+            <strong>Selected Opt-In Folders (${optInFolders.length}):</strong> ${folderSummaryText}
+          </div>
+
+          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
+            <button type="button" class="pill-btn" data-action="mkt-save-optin-general" style="background:#10a37f; color:#fff; border-color:#10a37f; font-weight:600;">✅ Agree &amp; Save Opt-In to Ledger</button>
+            <button type="button" class="pill-btn" data-action="mkt-revoke-optout" style="border-color:#f87171; color:#f87171;">🔒 Opt-Out &amp; Revoke (Default)</button>
+            <button type="button" class="pill-btn" data-action="jump-tab" data-tab="marketplace">📁 Select Opt-In Folders &amp; Add Documents (${optInFolders.length}) →</button>
+            <button type="button" class="pill-btn" data-action="jump-tab" data-tab="marketplace-ledger">📜 View Consent &amp; Revenue Ledger (${consentLedger.length}) →</button>
+          </div>
+        </div>
+
+        <div class="settings-section-heading">Language &amp; Reasoning</div>
         <div class="settings-card">
           <div class="settings-row">
             <div class="settings-row-info">
@@ -4091,7 +4482,7 @@ function secureRandomIndex(n) {
           </div>
         </div>
 
-        <div class="settings-section-heading">Model, Retrieval &amp; Subsystems</div>
+        <div class="settings-section-heading">Model &amp; Retrieval Defaults</div>
         <div class="settings-card">
           <div class="settings-row">
             <div class="settings-row-info">
@@ -4124,6 +4515,287 @@ function secureRandomIndex(n) {
             </div>
             <input id="sw-auto-reindex" type="checkbox" class="quorum-switch" ${ui.auto_reindex_enabled !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="auto_reindex_enabled" data-toast-message="Drive indexing preference saved">
           </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Streaming, Hardware Sizing &amp; Core Diagnostics</span>
+              <div class="settings-row-desc">Moved to a dedicated page so Settings stays concise and easy to navigate.</div>
+            </div>
+            <button type="button" class="pill-btn" data-action="jump-tab" data-tab="diagnostics">🔬 Open Deep Research &amp; Diagnostics →</button>
+          </div>
+        </div>
+      `;
+    } else if (tab === 'marketplace') {
+      const optInSet = new Set(optInFolders.map(f => f.toLowerCase()));
+      const mktBrowserItemsHtml = (cachedBrowseDirs || []).map(d => {
+        const isOptedIn = optInSet.has(String(d.path || '').toLowerCase());
+        return `
+          <div class="folder-browser-item" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <span class="folder-item-label" style="cursor:pointer; flex:1;" data-action="browse-dir" data-folder-path="${escapeHtml(d.path)}" title="Browse inside ${escapeHtml(d.path)}">
+              ${d.is_drive ? '💽' : '📁'} ${escapeHtml(d.name)} <span style="font-size:11px; color:var(--text-muted);">(${escapeHtml(d.path)})</span>
+            </span>
+            <button type="button" class="${isOptedIn ? 'btn-secondary' : 'btn-primary'}" style="padding:3px 10px; font-size:11.5px; cursor:pointer; ${isOptedIn ? 'color:#10a37f; border-color:#10a37f;' : ''}" data-action="mkt-toggle-folder" data-folder-path="${escapeHtml(d.path)}">
+              ${isOptedIn ? '✓ Opted In (Click to Remove)' : '+ Opt-In This Folder'}
+            </button>
+          </div>
+        `;
+      }).join('');
+
+      const selectedFoldersHtml = optInFolders.length === 0
+        ? `<div style="padding:12px; border-radius:8px; background:rgba(255,255,255,0.03); border:1px dashed var(--border-color); color:var(--text-muted); font-size:13px;">
+             No folders opted in yet. Opt-In is <strong>folder-scoped (not global)</strong> — select one or more folders below or enter a path to specify which folders you want to opt in for.
+           </div>`
+        : optInFolders.map(folder => `
+            <div class="settings-row" style="padding:8px 0;">
+              <div class="settings-row-info">
+                <span class="settings-row-label">📁 <code>${escapeHtml(folder)}</code></span>
+                <div class="settings-row-desc">Included in Opt-In de-identified training trajectory scope (3-Engine Airlock scrubbed)</div>
+              </div>
+              <button type="button" class="pill-btn-danger" data-action="mkt-remove-folder" data-folder-path="${escapeHtml(folder)}">Remove Folder</button>
+            </div>
+          `).join('');
+
+      settingsContent.innerHTML = `
+        <h2 class="settings-page-title" style="margin-bottom:6px;">💎 Data Opt-In &amp; Folders (Sell Personal / AI Data)</h2>
+        <p class="settings-page-subtitle" style="margin-bottom:12px;">
+          Opt-Out by default (<code>opt_in_enabled: false</code>). Check the agreement box and choose the specific folders you want to Opt-In for (not global). Every decision is signed and saved to the Consent Ledger.
+        </p>
+        ${quickSubTabsBar('marketplace')}
+
+        <!-- STEP 1: EXPLICIT OPT-IN CONSENT CHECKBOX & SOVEREIGN LOCK -->
+        <div class="settings-card" style="border:1.5px solid ${mkt.opt_in_enabled ? '#10a37f' : 'rgba(239,68,68,0.35)'};">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+            <div style="font-weight:700; font-size:15px;">Step 1: Explicit User Consent Agreement (Opt-Out by Default)</div>
+            <span style="font-size:11.5px; font-weight:700; padding:4px 10px; border-radius:999px; background:${mkt.opt_in_enabled ? 'rgba(16,163,127,0.2)' : 'rgba(239,68,68,0.2)'}; color:${mkt.opt_in_enabled ? '#10a37f' : '#f87171'};">
+              ${mkt.opt_in_enabled ? '✅ OPT-IN ACTIVE (' + (mkt.allowed_jurisdictions || ['US']).join(', ') + ' LOCK)' : '🔒 DISABLED BY DEFAULT (403 Fail-Closed)'}
+            </span>
+          </div>
+
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; padding:12px; border-radius:8px; background:rgba(255,255,255,0.04); border:1px solid var(--border-color); font-size:13.5px; line-height:1.5;">
+            <input type="checkbox" id="chk-mkt-consent" ${mkt.opt_in_enabled && mkt.user_consent_checked ? 'checked' : ''} style="width:18px; height:18px; margin-top:3px; accent-color:#10a37f; cursor:pointer;">
+            <span>
+              <strong>I explicitly check and agree to Opt-In</strong> to sell de-identified SFT/DPO training trajectories strictly from my selected folders below. All records pass through the 3-Engine Airlock (<code>VaultGemma-1B RedactX-v3</code> + <code>Microsoft Presidio</code> + <code>GLiNER</code>) with zero raw files ever exported. My consent is cryptographically signed (Ed25519) and recorded in the Consent Audit Ledger.
+            </span>
+          </label>
+
+          <div class="settings-row" style="margin-top:10px;">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Sovereign Lock Policy (DOJ 28 CFR Part 202)</span>
+              <div class="settings-row-desc">Hard-blocks <code>CN, HK, MO, RU, IR, KP, BY, CU, VE</code> and high-risk datacenter/VPN ASNs.</div>
+            </div>
+            <select id="mkt-jurisdiction-select" class="pill-select">
+              <option value="US_ONLY" ${!mkt.five_eyes_enabled ? 'selected' : ''}>US Only (DOJ 28 CFR Part 202 Sovereign Lock)</option>
+              <option value="FIVE_EYES" ${mkt.five_eyes_enabled ? 'selected' : ''}>Five Eyes Allied (US, CA, GB, AU, NZ)</option>
+            </select>
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Floor Price (Cents per 1,000 SFT/DPO Records)</span>
+              <div class="settings-row-desc">Minimum price in cents per 1k records (<code>5000</code> = $50.00 / 1k records).</div>
+            </div>
+            <input type="number" id="mkt-price-cents" class="settings-input" style="width:120px;" min="100" step="100" value="${mkt.price_per_1k_records_cents || 5000}">
+          </div>
+
+          <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:14px;">
+            <button type="button" class="pill-btn" data-action="mkt-save-optin" style="background:#10a37f; color:#fff; border-color:#10a37f; font-weight:600;">✅ Agree &amp; Save Opt-In (Write to Ledger)</button>
+            <button type="button" class="pill-btn" data-action="mkt-revoke-optout" style="border-color:#f87171; color:#f87171;">🔒 Opt-Out &amp; Revoke (Default OFF)</button>
+            <button type="button" class="pill-btn" data-action="jump-tab" data-tab="marketplace-ledger">📜 Open Consent &amp; Revenue Ledger (${consentLedger.length}) →</button>
+          </div>
+        </div>
+
+        <!-- STEP 2: FOLDER-SCOPED OPT-IN SELECTION (NOT GLOBAL) -->
+        <div class="settings-section-heading">Step 2: Select Specific Folders to Opt-In (Folder-Scoped — Never Global)</div>
+        <div class="settings-card">
+          <div style="font-size:13px; color:var(--text-muted); margin-bottom:10px;">
+            Choose the specific folders you want to Opt-In for. Files outside your selected folders are never included in training data synthesis.
+          </div>
+
+          ${selectedFoldersHtml}
+
+          <div style="display:flex; gap:8px; margin-top:14px; flex-wrap:wrap;">
+            <input type="text" id="mkt-folder-input" class="settings-input" style="flex:1; min-width:240px;" placeholder="Enter folder path to Opt-In (e.g. D:\\Research or C:\\Projects)..." value="${escapeHtml(currentBrowsePath || '')}">
+            <button type="button" class="pill-btn" data-action="mkt-add-input-folder" style="background:var(--accent); color:#fff; border-color:var(--accent);">+ Add Folder to Opt-In</button>
+          </div>
+
+          <div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--border-color);">
+            <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+              <span style="font-size:13px; font-weight:600;">Browse Physical Drives &amp; Folders to Opt-In: <code>${escapeHtml(currentBrowsePath || 'Physical Drives (D:\\, C:\\)')}</code></span>
+              <div style="display:flex; gap:6px;">
+                <button type="button" class="pill-btn" data-action="browse-dir" data-folder-path="">💽 Drives Root</button>
+                ${currentBrowseParentPath ? `<button type="button" class="pill-btn" data-action="browse-dir" data-folder-path="${escapeHtml(currentBrowseParentPath)}">⬆ Up One Level</button>` : ''}
+                ${currentBrowsePath ? `<button type="button" class="pill-btn" style="border-color:#10a37f; color:#10a37f;" data-action="mkt-toggle-folder" data-folder-path="${escapeHtml(currentBrowsePath)}">+ Opt-In Current Folder (${escapeHtml(currentBrowsePath)})</button>` : ''}
+              </div>
+            </div>
+            <div class="folder-browser-list" style="max-height:220px; overflow-y:auto;">
+              ${mktBrowserItemsHtml || '<div style="padding:10px; font-size:12.5px; color:var(--text-muted);">Click "Drives Root" above to browse physical drives and select folders.</div>'}
+            </div>
+          </div>
+        </div>
+
+        <!-- STEP 3: ADD NEW DOCUMENTS (UPLOAD FILES OR INDEX LOCAL DOCUMENT PATH) -->
+        <div class="settings-section-heading">Step 3: Add New Documents (Upload Files or Index Document Path)</div>
+        <div class="settings-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+            <div>
+              <div style="font-weight:700; font-size:14.5px;">📄 Add New Documents to QuorumRAG Index &amp; Opt-In Scope</div>
+              <div style="font-size:12.5px; color:var(--text-muted); margin-top:2px;">
+                Upload new files (<code>.pdf, .docx, .doc, .txt, .md, .csv, .json, .png, .jpg</code>) via native file picker or index any local document path.
+              </div>
+            </div>
+            <div>
+              <input type="file" id="add-new-docs-file-input" multiple accept=".pdf,.docx,.doc,.txt,.md,.csv,.json,.png,.jpg,.jpeg" style="display:none;" data-change-action="upload-new-documents">
+              <button type="button" class="pill-btn" data-action="trigger-file-click" data-target-id="add-new-docs-file-input" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">
+                📄 + Upload New Documents
+              </button>
+            </div>
+          </div>
+
+          <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; margin-bottom:10px;">
+            <input type="checkbox" id="chk-add-doc-optin" checked style="width:16px; height:16px; accent-color:#10a37f; cursor:pointer;">
+            <span>Also include newly added documents in my Opt-In scope (<code>opt_in_folders</code>)</span>
+          </label>
+
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <input type="text" id="new-doc-path-input" class="settings-input" style="flex:1; min-width:240px;" placeholder="Or enter a local document or folder path to index (e.g. D:\\Docs\\Paper.pdf)...">
+            <button type="button" class="pill-btn" data-action="add-new-doc-path">+ Add &amp; Index Document Path</button>
+          </div>
+        </div>
+      `;
+    } else if (tab === 'marketplace-ledger') {
+      const consentRowsHtml = consentLedger.length === 0
+        ? `<tr><td colspan="6" style="padding:10px; text-align:center; color:var(--text-muted);">No consent ledger entries recorded yet.</td></tr>`
+        : consentLedger.map(e => {
+            const foldersList = Array.isArray(e.opt_in_folders) && e.opt_in_folders.length > 0
+              ? e.opt_in_folders.map(f => `<code>${escapeHtml(f)}</code>`).join(', ')
+              : '<span style="color:var(--text-muted);">None (0 folders)</span>';
+            const badgeColor = e.opt_in_enabled ? '#10a37f' : '#f87171';
+            return `
+              <tr style="border-bottom:1px solid var(--border-color); font-size:12px;">
+                <td style="padding:7px 6px; white-space:nowrap;">${escapeHtml((e.timestamp_iso || '').replace('T', ' ').slice(0, 19))}</td>
+                <td style="padding:7px 6px;"><span style="font-weight:700; color:${badgeColor};">${escapeHtml(e.action)}</span></td>
+                <td style="padding:7px 6px;">${e.user_consent_checked ? '✓ Checked &amp; Agreed' : '✗ Opted Out'}</td>
+                <td style="padding:7px 6px;">${foldersList}</td>
+                <td style="padding:7px 6px;">${escapeHtml((e.allowed_jurisdictions || ['US']).join(', '))} ($${((e.price_per_1k_records_cents || 5000) / 100).toFixed(2)}/1k)</td>
+                <td style="padding:7px 6px; font-family:monospace; font-size:11px;" title="BLAKE3: ${escapeHtml(e.entry_hash_blake3 || '')} | Ed25519 Sig: ${escapeHtml(e.ed25519_signature_hex || '')}">
+                  ${escapeHtml((e.entry_hash_blake3 || '').slice(0, 14))}…
+                </td>
+              </tr>
+            `;
+          }).join('');
+
+      const latestManifest = mkt.latest_manifest;
+      const manifestSummary = latestManifest
+        ? `Batch ID: ${latestManifest.batch_id}\nOrigin Node: ${latestManifest.origin_node_id} (Ed25519 Signed)\nSFT Records: ${latestManifest.sft_record_count} | DPO Pairs: ${latestManifest.dpo_record_count} | Verified Tokens: ${latestManifest.total_tokens}\nBLAKE3 Merkle Root: ${latestManifest.merkle_root_blake3}`
+        : 'No harvested batch yet. Enable Opt-In on the "Data Opt-In & Folders" tab, then click "Harvest & Sanitize Preview" above.';
+
+      const peerShares = (mkt.latest_ledger && mkt.latest_ledger.peer_shares)
+        ? Object.values(mkt.latest_ledger.peer_shares)
+        : [];
+      const contribRowsHtml = peerShares.length === 0
+        ? `<tr><td colspan="6" style="padding:10px; text-align:center; color:var(--text-muted);">No sealed pool revenue ledger yet. Approve &amp; seal a batch and submit to a bounty below.</td></tr>`
+        : peerShares.map(s => `
+            <tr style="border-bottom:1px solid var(--border-color); font-size:12px;">
+              <td style="padding:7px 6px;"><code>${escapeHtml(s.origin_node_id)}</code></td>
+              <td style="padding:7px 6px; text-align:right;">${s.unique_records_accepted}</td>
+              <td style="padding:7px 6px; text-align:right;">${s.duplicate_records_dropped}</td>
+              <td style="padding:7px 6px; text-align:right;">${s.verified_tokens_accepted}</td>
+              <td style="padding:7px 6px; text-align:right;">${s.revenue_share_bps} bps (${(s.revenue_share_bps / 100).toFixed(2)}%)</td>
+              <td style="padding:7px 6px; text-align:right; font-weight:700; color:#10a37f;">$${((s.estimated_payout_cents || 0) / 100).toFixed(2)}</td>
+            </tr>
+          `).join('');
+
+      const bountiesList = Array.isArray(mkt.bounties) ? mkt.bounties : [];
+      const bountiesHtml = bountiesList.map(b => `
+        <div class="settings-row" style="padding:8px 0;">
+          <div class="settings-row-info">
+            <span class="settings-row-label">🏆 ${escapeHtml(b.title)} <span style="font-size:11.5px; color:#10a37f;">($${((b.reward_per_1k_records_cents || 0) / 100).toFixed(2)} / 1k records)</span></span>
+            <div class="settings-row-desc">Sponsor: ${escapeHtml(b.sponsor_entity_name)} • Jurisdiction: <code>${escapeHtml(b.jurisdiction_iso)}</code> • Tags: <code>${escapeHtml((b.required_domain_tags || []).join(', '))}</code></div>
+          </div>
+          <button type="button" class="pill-btn" data-action="mkt-submit-bounty" data-bounty-id="${escapeHtml(b.bounty_id)}">Submit Sealed Batch</button>
+        </div>
+      `).join('');
+
+      settingsContent.innerHTML = `
+        <h2 class="settings-page-title" style="margin-bottom:6px;">📜 Opt-In Consent &amp; Revenue Ledger</h2>
+        <p class="settings-page-subtitle" style="margin-bottom:12px;">
+          Tamper-evident BLAKE3 hash-chained &amp; Ed25519-signed User Consent Ledger, 3-Engine Privacy Scrubber, and Federated Swarm Revenue Share Ledger.
+        </p>
+        ${quickSubTabsBar('marketplace-ledger')}
+
+        <!-- 1. CRYPTOGRAPHIC CONSENT AUDIT LEDGER -->
+        <div class="settings-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
+            <div style="font-weight:700; font-size:14.5px;">1. Signed Opt-In / Opt-Out Consent Audit Ledger (<code>consent_ledger</code>)</div>
+            <button type="button" class="pill-btn" data-action="jump-tab" data-tab="marketplace">⚙️ Change Opt-In or Folders →</button>
+          </div>
+          <div style="overflow-x:auto;">
+            <table style="width:100%; border-collapse:collapse; text-align:left;">
+              <thead>
+                <tr style="border-bottom:1px solid var(--border-color); font-size:11.5px; color:var(--text-muted);">
+                  <th style="padding:6px;">Timestamp (UTC)</th>
+                  <th style="padding:6px;">Action</th>
+                  <th style="padding:6px;">User Consent</th>
+                  <th style="padding:6px;">Opt-In Folders</th>
+                  <th style="padding:6px;">Lock &amp; Floor Price</th>
+                  <th style="padding:6px;">BLAKE3 / Ed25519</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${consentRowsHtml}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- 2. 3-ENGINE PRIVACY AIRLOCK & HITL BATCH SEALING -->
+        <div class="settings-section-heading">2. 3-Engine Privacy Scrubber (VaultGemma-1B RedactX-v3 + Presidio + GLiNER) &amp; HITL Sealing</div>
+        <div class="settings-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
+            <span style="font-size:13px; color:var(--text-muted);">Staged Batches: <strong>${mkt.staged_batches_count || 0}</strong> | HITL Approved &amp; Sealed: <strong>${mkt.approved_batches_count || 0}</strong></span>
+            <div style="display:flex; gap:8px;">
+              <button type="button" class="pill-btn" data-action="mkt-harvest">🌾 Harvest &amp; Sanitize Preview</button>
+              <button type="button" class="pill-btn" data-action="mkt-approve" style="background:#10a37f; color:#fff; border-color:#10a37f;">✍️ Approve &amp; Seal Batch (HITL)</button>
+            </div>
+          </div>
+          <pre style="font-size:12px; font-family:monospace; background:rgba(0,0,0,0.35); padding:10px; border-radius:8px; white-space:pre-wrap; margin:0; max-height:150px; overflow-y:auto;">${escapeHtml(manifestSummary)}</pre>
+        </div>
+
+        <!-- 3. FEDERATED SWARM CONTRIBUTION LEDGER & US BOUNTIES -->
+        <div class="settings-section-heading">3. Federated Swarm Pool ContributionLedger (10,000 bps Revenue Split) &amp; Active Bounties</div>
+        <div class="settings-card">
+          <div style="overflow-x:auto; margin-bottom:14px;">
+            <table style="width:100%; border-collapse:collapse; text-align:left;">
+              <thead>
+                <tr style="border-bottom:1px solid var(--border-color); font-size:11.5px; color:var(--text-muted);">
+                  <th style="padding:6px;">Peer Node ID</th>
+                  <th style="padding:6px; text-align:right;">Unique BLAKE3 Records</th>
+                  <th style="padding:6px; text-align:right;">Duplicates Dropped</th>
+                  <th style="padding:6px; text-align:right;">Verified Tokens</th>
+                  <th style="padding:6px; text-align:right;">Revenue Share</th>
+                  <th style="padding:6px; text-align:right;">Est. Payout</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${contribRowsHtml}
+              </tbody>
+            </table>
+          </div>
+          <div style="border-top:1px solid var(--border-color); padding-top:10px;">
+            <div style="font-weight:600; font-size:13px; margin-bottom:6px;">Active Sovereign AI Training Bounties</div>
+            ${bountiesHtml || '<div style="font-size:12.5px; color:var(--text-muted);">No active bounties for current jurisdiction.</div>'}
+          </div>
+        </div>
+      `;
+    } else if (tab === 'diagnostics') {
+      settingsContent.innerHTML = `
+        <h2 class="settings-page-title" style="margin-bottom:6px;">🔬 Deep Research, Streaming &amp; Diagnostics</h2>
+        <p class="settings-page-subtitle" style="margin-bottom:12px;">
+          Core QuorumRAG indexing subsystems, token streaming controls, dynamic RAM/VRAM hardware sizing, and live platform diagnostics.
+        </p>
+        ${quickSubTabsBar('diagnostics')}
+
+        <div class="settings-section-heading">QuorumRAG Core Subsystems</div>
+        <div class="settings-card">
           <div class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">QuorumRAG Core Subsystems</span>
