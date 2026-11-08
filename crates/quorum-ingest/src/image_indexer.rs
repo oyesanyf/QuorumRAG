@@ -795,11 +795,6 @@ impl ImageIndexer {
 
 
 
-    #[cfg(not(windows))]
-    pub fn run_native_windows_ocr(_bytes: &[u8]) -> Option<String> {
-        None
-    }
-
     /// PowerShell WinRT fallback for Windows when in-process COM apartment or stream parsing needs an external runner.
     #[cfg(windows)]
     pub fn run_powershell_winrt_ocr(path: &Path) -> Option<String> {
