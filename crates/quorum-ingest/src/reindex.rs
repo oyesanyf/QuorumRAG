@@ -585,36 +585,48 @@ impl ReindexWorker {
             .collect();
         let chunker = TextChunker::new(ChunkerConfig::default());
 
-        // Phase 1: Decoupled Upfront Discovery across all target slices
+        // Phase 1: Decoupled Upfront Discovery across all target slices (Semaphore-bounded parallel crawl)
         let mut all_candidates: Vec<DiscoveredCandidate> = Vec::new();
         let mut seen_paths: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+        let crawl_concurrency = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(4, 16))
+            .unwrap_or(8);
+        let crawl_semaphore = Arc::new(tokio::sync::Semaphore::new(crawl_concurrency));
+        let mut crawl_futures = FuturesUnordered::new();
 
         for target in &targets {
             if !target.exists() {
                 warn!("Target path does not exist, skipping: {}", target.display());
                 continue;
             }
-
             if cancel_flag.load(Ordering::SeqCst) {
                 return Err(IngestError::Cancelled);
             }
-
             let cfg_clone = config.clone();
             let target_clone = target.clone();
-            let candidates = tokio::task::spawn_blocking(move || {
-                crate::throttling::set_background_thread_priority();
-                let crawler = FilesystemCrawler::new(cfg_clone);
-                crawler.crawl_path_sync(&target_clone)
-            })
-            .await
-            .map_err(|e| IngestError::Io(std::io::Error::other(format!("Crawl task panicked: {}", e))))??;
+            let sem_clone = Arc::clone(&crawl_semaphore);
+            crawl_futures.push(async move {
+                let _permit = sem_clone.acquire_owned().await.map_err(|_| IngestError::Cancelled)?;
+                tokio::task::spawn_blocking(move || {
+                    crate::throttling::set_background_thread_priority();
+                    let crawler = FilesystemCrawler::new(cfg_clone);
+                    crawler.crawl_path_sync(&target_clone)
+                })
+                .await
+                .map_err(|e| IngestError::Io(std::io::Error::other(format!("Crawl task panicked: {}", e))))?
+            });
+        }
 
+        while let Some(crawl_res) = crawl_futures.next().await {
+            if cancel_flag.load(Ordering::SeqCst) {
+                return Err(IngestError::Cancelled);
+            }
+            let candidates = crawl_res?;
             for candidate in candidates {
                 if seen_paths.insert(candidate.path.clone()) {
                     all_candidates.push(candidate);
                 }
             }
-
             {
                 let mut lock = progress.write().await;
                 if let Some(ref mut p) = *lock {
@@ -705,8 +717,10 @@ impl ReindexWorker {
                 let permit = semaphore.clone().acquire_owned().await.map_err(|_| IngestError::Cancelled)?;
                 let embedder_c = Arc::clone(&embedder);
                 let dedup_c = Arc::clone(&dedup);
+                let storage_c = Arc::clone(&storage);
                 let chunker_c = chunker.clone();
                 let force_reembed = options.force_reembed;
+                let full_rebuild = options.full_rebuild;
 
                 futures.push(tokio::task::spawn_blocking(move || {
                     let _permit = permit;
@@ -714,7 +728,8 @@ impl ReindexWorker {
                     let outcome = process_candidate_sync(
                         candidate,
                         access_tier,
-                        force_reembed,
+                        force_reembed || full_rebuild,
+                        storage_c,
                         embedder_c,
                         dedup_c,
                         chunker_c,
@@ -732,6 +747,18 @@ impl ReindexWorker {
             if let Some(join_res) = futures.next().await {
                 match join_res {
                     Ok(outcome) => match outcome {
+                        CandidateOutcome::AlreadyIndexedInFts {
+                            catalog_entry,
+                            size_bytes,
+                        } => {
+                            dedup.register_entry(catalog_entry);
+                            let mut lock = progress.write().await;
+                            if let Some(ref mut p) = *lock {
+                                p.files_scanned += 1;
+                                p.files_skipped_unmodified += 1;
+                                p.bytes_processed += size_bytes;
+                            }
+                        }
                         CandidateOutcome::Processed {
                             chunks,
                             parent_doc,
@@ -989,6 +1016,10 @@ impl ReindexWorker {
 
 /// Internal candidate outcome from multithreaded processing task.
 enum CandidateOutcome {
+    AlreadyIndexedInFts {
+        catalog_entry: FileCatalogEntry,
+        size_bytes: u64,
+    },
     Processed {
         chunks: Vec<DocumentChunk>,
         parent_doc: Option<(quorum_types::IngestedParentDocument, u8)>,
@@ -1007,6 +1038,7 @@ fn process_candidate_sync(
     candidate: DiscoveredCandidate,
     access_tier: u8,
     force_reembed: bool,
+    storage: Arc<StorageEngine>,
     embedder: Arc<dyn EmbeddingGenerator>,
     dedup: Arc<TwoLevelDedupEngine>,
     chunker: TextChunker,
@@ -1025,6 +1057,18 @@ fn process_candidate_sync(
             };
 
             let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
+            if !force_reembed && storage.has_chunk_id_in_fts(&format!("{}:0", file_b3)) {
+                return CandidateOutcome::AlreadyIndexedInFts {
+                    catalog_entry: FileCatalogEntry {
+                        file_path: path.clone(),
+                        file_blake3: file_b3,
+                        mtime_secs: candidate.mtime_secs,
+                        size_bytes: candidate.size_bytes,
+                        chunk_hashes: Vec::new(),
+                    },
+                    size_bytes: candidate.size_bytes,
+                };
+            }
             let raw_chunks = chunker.chunk_text(&content);
             let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
             let path_str = path.to_string_lossy().to_string();
@@ -1129,6 +1173,20 @@ fn process_candidate_sync(
                     };
                 }
             };
+
+            let img_b3 = blake3::hash(&bytes).to_hex().to_string();
+            if !force_reembed && storage.has_chunk_id_in_fts(&format!("{}:image:0", img_b3)) {
+                return CandidateOutcome::AlreadyIndexedInFts {
+                    catalog_entry: FileCatalogEntry {
+                        file_path: path.clone(),
+                        file_blake3: img_b3,
+                        mtime_secs: candidate.mtime_secs,
+                        size_bytes: candidate.size_bytes,
+                        chunk_hashes: Vec::new(),
+                    },
+                    size_bytes: candidate.size_bytes,
+                };
+            }
 
             match ImageIndexer::index_image(
                 path,

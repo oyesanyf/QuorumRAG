@@ -1,0 +1,3 @@
+# Every pull request from external or team contributors requires explicit review and approval by @oyesanyf.
+# Only @oyesanyf uses the automated solo-developer PR ship workflow (scripts/solo_pr_ship.ps1).
+* @oyesanyf

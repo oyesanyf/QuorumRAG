@@ -82,11 +82,12 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         .route("/api/cache/recache", post(cache::recache_handler))
         .route("/api/cache/stats", get(cache::cache_stats_handler))
 
-        // Reindex Worker Endpoints
+        // Reindex Worker & Add New Documents Endpoints
         .route("/api/reindex", post(reindex::start_reindex_handler))
         .route("/api/reindex/status", get(reindex::reindex_status_handler))
         .route("/api/index/status", get(reindex::reindex_status_handler))
         .route("/api/reindex/cancel", post(reindex::cancel_reindex_handler))
+        .route("/api/documents/add", post(reindex::add_documents_handler))
 
         // Drift Healing Endpoints
         .route("/api/drift/fix", post(drift::fix_drift_handler))

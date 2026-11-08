@@ -13,7 +13,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use quorum_contract::{
     BuyerJurisdictionCertificate, ContributionLedger, DataBountySpec, DataCatalogManifest,
     EscrowReceiptToken, SanitizedRlmStep, SanitizedTrainingRecord, TrainingRecordFormat,
@@ -54,6 +54,12 @@ pub struct MarketplaceStore {
 pub struct MarketplaceConfigState {
     /// Strictly disabled by default (`false`).
     pub opt_in_enabled: bool,
+    /// Explicit user consent agreement checkbox state (`false` by default).
+    pub user_consent_checked: bool,
+    /// Exact consent agreement statement signed by the user.
+    pub consent_statement: String,
+    /// Folder-scoped Opt-In allowlist (`opt_in_folders`). Only trajectories from these folders are opted in (not global).
+    pub opt_in_folders: Vec<String>,
     /// Strictly `["US"]` by default.
     pub allowed_jurisdictions: Vec<String>,
     /// Optional subscriber toggle to allow Five Eyes (`["US", "CA", "GB", "AU", "NZ"]`).
@@ -66,6 +72,12 @@ pub struct MarketplaceConfigState {
 pub struct OptInConfigRequest {
     pub opt_in_enabled: bool,
     #[serde(default)]
+    pub user_consent_checked: Option<bool>,
+    #[serde(default)]
+    pub consent_statement: Option<String>,
+    #[serde(default)]
+    pub opt_in_folders: Option<Vec<String>>,
+    #[serde(default)]
     pub five_eyes_enabled: Option<bool>,
     #[serde(default)]
     pub allowed_jurisdictions: Option<Vec<String>>,
@@ -73,6 +85,27 @@ pub struct OptInConfigRequest {
     pub price_per_1k_records_cents: Option<u64>,
     #[serde(default)]
     pub authority_pubkey_hex: Option<String>,
+}
+
+/// Hash-chained, Ed25519-signed Consent & Data Sale Audit Ledger entry stored in SQLite (`consent_ledger`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsentLedgerEntry {
+    pub entry_id: String,
+    pub action: String,
+    pub opt_in_enabled: bool,
+    pub user_consent_checked: bool,
+    pub consent_statement: String,
+    #[serde(default)]
+    pub opt_in_folders: Vec<String>,
+    pub allowed_jurisdictions: Vec<String>,
+    pub price_per_1k_records_cents: u64,
+    pub origin_node_id: String,
+    pub origin_pubkey_hex: String,
+    pub prev_entry_hash_blake3: String,
+    pub entry_hash_blake3: String,
+    pub ed25519_signature_hex: String,
+    pub timestamp_unix_secs: i64,
+    pub timestamp_iso: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +256,23 @@ impl MarketplaceStore {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS consent_ledger (
+                entry_id TEXT PRIMARY KEY,
+                action TEXT NOT NULL,
+                opt_in_enabled INTEGER NOT NULL,
+                user_consent_checked INTEGER NOT NULL,
+                consent_statement TEXT NOT NULL,
+                opt_in_folders_json TEXT NOT NULL DEFAULT '[]',
+                allowed_jurisdictions_json TEXT NOT NULL,
+                price_per_1k_records_cents INTEGER NOT NULL,
+                origin_node_id TEXT NOT NULL,
+                origin_pubkey_hex TEXT NOT NULL,
+                prev_entry_hash_blake3 TEXT NOT NULL,
+                entry_hash_blake3 TEXT NOT NULL,
+                ed25519_signature_hex TEXT NOT NULL,
+                timestamp_unix_secs INTEGER NOT NULL,
+                timestamp_iso TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS staged_batches (
                 batch_id TEXT PRIMARY KEY,
                 manifest_json TEXT NOT NULL,
@@ -251,10 +301,22 @@ impl MarketplaceStore {
         )
         .map_err(|e| format!("Failed to initialize marketplace SQLite schema: {e}"))?;
 
+        // Ensure opt_in_folders_json column exists on upgraded databases
+        let _ = conn.execute(
+            "ALTER TABLE consent_ledger ADD COLUMN opt_in_folders_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+
         // Seed defaults ONLY if not present (opt_in_enabled MUST default to false, allowed_jurisdictions MUST default to ["US"])
         let default_auth_pub_hex = bytes_to_hex(&self.default_authority_pubkey);
         let defaults = [
             ("opt_in_enabled", "false"),
+            ("user_consent_checked", "false"),
+            (
+                "consent_statement",
+                "Opt-Out by Default: No personal or AI training data may be sold unless the user explicitly checks the consent agreement box, selects specific Opt-In folders, and clicks Opt-In.",
+            ),
+            ("opt_in_folders", "[]"),
             ("allowed_jurisdictions", "[\"US\"]"),
             ("five_eyes_enabled", "false"),
             ("price_per_1k_records_cents", "5000"),
@@ -266,6 +328,23 @@ impl MarketplaceStore {
                 params![k, v],
             )
             .map_err(|e| format!("Failed to seed config {k}: {e}"))?;
+        }
+
+        // Seed genesis default Opt-Out entry into consent_ledger if table is empty
+        let existing_consent_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM consent_ledger", [], |r| r.get(0))
+            .unwrap_or(0);
+        if existing_consent_count == 0 {
+            let _ = self.append_consent_ledger_entry_with_conn(
+                &conn,
+                "DEFAULT_OPT_OUT_INITIALIZED",
+                false,
+                false,
+                "Opt-Out by Default: Zero personal or AI training data sold without explicit user checkbox consent and folder selection.",
+                &[],
+                &["US".to_string()],
+                5_000,
+            );
         }
 
         // Seed default US sovereign AI training data bounties
@@ -327,6 +406,146 @@ impl MarketplaceStore {
         Ok(())
     }
 
+    fn append_consent_ledger_entry_with_conn(
+        &self,
+        conn: &Connection,
+        action: &str,
+        opt_in_enabled: bool,
+        user_consent_checked: bool,
+        consent_statement: &str,
+        opt_in_folders: &[String],
+        allowed_jurisdictions: &[String],
+        price_per_1k_records_cents: u64,
+    ) -> Result<ConsentLedgerEntry, String> {
+        let prev_hash: String = conn
+            .query_row(
+                "SELECT entry_hash_blake3 FROM consent_ledger ORDER BY timestamp_unix_secs DESC, rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "0".repeat(64));
+
+        let now_dt = Utc::now();
+        let timestamp_unix_secs = now_dt.timestamp();
+        let timestamp_iso = now_dt.to_rfc3339();
+        let entry_id = format!("consent-{}", uuid::Uuid::new_v4());
+        let folders_json = serde_json::to_string(opt_in_folders)
+            .unwrap_or_else(|_| "[]".to_string());
+        let allowed_json = serde_json::to_string(allowed_jurisdictions)
+            .unwrap_or_else(|_| "[\"US\"]".to_string());
+
+        let canonical_payload = format!(
+            "QuorumRAG-ConsentLedger-v2|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            entry_id,
+            action,
+            opt_in_enabled,
+            user_consent_checked,
+            consent_statement.trim(),
+            folders_json,
+            allowed_json,
+            price_per_1k_records_cents,
+            self.origin_node_id,
+            prev_hash,
+            timestamp_unix_secs
+        );
+        let entry_hash_blake3 = blake3::hash(canonical_payload.as_bytes()).to_hex().to_string();
+        let signing_key = SigningKey::from_bytes(&self.node_seed);
+        let sig = signing_key.sign(entry_hash_blake3.as_bytes());
+        let ed25519_signature_hex = bytes_to_hex(&sig.to_bytes());
+
+        conn.execute(
+            "INSERT INTO consent_ledger (
+                entry_id, action, opt_in_enabled, user_consent_checked, consent_statement,
+                opt_in_folders_json, allowed_jurisdictions_json, price_per_1k_records_cents, origin_node_id,
+                origin_pubkey_hex, prev_entry_hash_blake3, entry_hash_blake3,
+                ed25519_signature_hex, timestamp_unix_secs, timestamp_iso
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                entry_id,
+                action,
+                i32::from(opt_in_enabled),
+                i32::from(user_consent_checked),
+                consent_statement.trim(),
+                folders_json,
+                allowed_json,
+                price_per_1k_records_cents as i64,
+                self.origin_node_id,
+                self.origin_pubkey_hex,
+                prev_hash,
+                entry_hash_blake3,
+                ed25519_signature_hex,
+                timestamp_unix_secs,
+                timestamp_iso,
+            ],
+        )
+        .map_err(|e| format!("Failed to append consent ledger entry: {e}"))?;
+
+        Ok(ConsentLedgerEntry {
+            entry_id,
+            action: action.to_string(),
+            opt_in_enabled,
+            user_consent_checked,
+            consent_statement: consent_statement.trim().to_string(),
+            opt_in_folders: opt_in_folders.to_vec(),
+            allowed_jurisdictions: allowed_jurisdictions.to_vec(),
+            price_per_1k_records_cents,
+            origin_node_id: self.origin_node_id.clone(),
+            origin_pubkey_hex: self.origin_pubkey_hex.clone(),
+            prev_entry_hash_blake3: prev_hash,
+            entry_hash_blake3,
+            ed25519_signature_hex,
+            timestamp_unix_secs,
+            timestamp_iso,
+        })
+    }
+
+    pub fn list_consent_ledger(&self, limit: usize) -> Vec<ConsentLedgerEntry> {
+        let Ok(conn) = self.connect() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT entry_id, action, opt_in_enabled, user_consent_checked, consent_statement,
+                    opt_in_folders_json, allowed_jurisdictions_json, price_per_1k_records_cents, origin_node_id,
+                    origin_pubkey_hex, prev_entry_hash_blake3, entry_hash_blake3,
+                    ed25519_signature_hex, timestamp_unix_secs, timestamp_iso
+             FROM consent_ledger
+             ORDER BY timestamp_unix_secs DESC, rowid DESC
+             LIMIT ?1",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(params![limit.max(1) as i64], |r| {
+            let folders_str: String = r.get(5).unwrap_or_else(|_| "[]".to_string());
+            let opt_in_folders: Vec<String> = serde_json::from_str(&folders_str)
+                .unwrap_or_default();
+            let allowed_str: String = r.get(6)?;
+            let allowed_jurisdictions: Vec<String> = serde_json::from_str(&allowed_str)
+                .unwrap_or_else(|_| vec!["US".to_string()]);
+            Ok(ConsentLedgerEntry {
+                entry_id: r.get(0)?,
+                action: r.get(1)?,
+                opt_in_enabled: r.get::<_, i32>(2)? != 0,
+                user_consent_checked: r.get::<_, i32>(3)? != 0,
+                consent_statement: r.get(4)?,
+                opt_in_folders,
+                allowed_jurisdictions,
+                price_per_1k_records_cents: r.get::<_, i64>(7)?.max(0) as u64,
+                origin_node_id: r.get(8)?,
+                origin_pubkey_hex: r.get(9)?,
+                prev_entry_hash_blake3: r.get(10)?,
+                entry_hash_blake3: r.get(11)?,
+                ed25519_signature_hex: r.get(12)?,
+                timestamp_unix_secs: r.get(13)?,
+                timestamp_iso: r.get(14)?,
+            })
+        }) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
+    }
+
     pub fn get_config(&self) -> Result<MarketplaceConfigState, String> {
         let conn = self.connect()?;
         let mut map = HashMap::new();
@@ -348,6 +567,20 @@ impl MarketplaceStore {
             .get("opt_in_enabled")
             .map(|v| v.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let user_consent_checked = map
+            .get("user_consent_checked")
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(opt_in_enabled);
+        let consent_statement = map
+            .get("consent_statement")
+            .cloned()
+            .unwrap_or_else(|| {
+                "Opt-Out by Default: No personal or AI training data may be sold unless the user explicitly checks the consent agreement box, selects specific folders, and clicks Opt-In.".to_string()
+            });
+        let opt_in_folders: Vec<String> = map
+            .get("opt_in_folders")
+            .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+            .unwrap_or_default();
         let five_eyes_enabled = map
             .get("five_eyes_enabled")
             .map(|v| v.trim().eq_ignore_ascii_case("true"))
@@ -368,6 +601,9 @@ impl MarketplaceStore {
 
         Ok(MarketplaceConfigState {
             opt_in_enabled,
+            user_consent_checked,
+            consent_statement,
+            opt_in_folders,
             allowed_jurisdictions,
             five_eyes_enabled,
             price_per_1k_records_cents,
@@ -379,8 +615,40 @@ impl MarketplaceStore {
         &self,
         req: OptInConfigRequest,
     ) -> Result<MarketplaceConfigState, String> {
+        if req.opt_in_enabled && req.user_consent_checked == Some(false) {
+            return Err(
+                "Explicit user consent checkbox agreement is required to Opt-In to sell de-identified data (Opt-Out by default)."
+                    .to_string(),
+            );
+        }
+
         let mut current = self.get_config()?;
         current.opt_in_enabled = req.opt_in_enabled;
+        current.user_consent_checked = if req.opt_in_enabled {
+            req.user_consent_checked.unwrap_or(true)
+        } else {
+            false
+        };
+        if let Some(folders) = req.opt_in_folders {
+            let mut cleaned_folders = Vec::new();
+            for f in folders {
+                let trimmed = f.trim().to_string();
+                if !trimmed.is_empty() && !cleaned_folders.contains(&trimmed) {
+                    cleaned_folders.push(trimmed);
+                }
+            }
+            current.opt_in_folders = cleaned_folders;
+        }
+        current.consent_statement = req.consent_statement.unwrap_or_else(|| {
+            if current.opt_in_enabled {
+                format!(
+                    "User explicitly checked the consent agreement box and opted in {} folder(s) to sell de-identified SFT/DPO trajectories through the 3-Engine Airlock (VaultGemma-1B RedactX-v3 + Presidio + GLiNER).",
+                    current.opt_in_folders.len()
+                )
+            } else {
+                "User opted out (default state). Zero personal or AI training data may be sold.".to_string()
+            }
+        });
 
         if let Some(five_eyes) = req.five_eyes_enabled {
             current.five_eyes_enabled = five_eyes;
@@ -433,6 +701,8 @@ impl MarketplaceStore {
         }
 
         let conn = self.connect()?;
+        let folders_json =
+            serde_json::to_string(&current.opt_in_folders).unwrap_or_else(|_| "[]".to_string());
         let allowed_json =
             serde_json::to_string(&current.allowed_jurisdictions).unwrap_or_else(|_| "[\"US\"]".to_string());
         let updates = [
@@ -440,6 +710,12 @@ impl MarketplaceStore {
                 "opt_in_enabled",
                 if current.opt_in_enabled { "true" } else { "false" }.to_string(),
             ),
+            (
+                "user_consent_checked",
+                if current.user_consent_checked { "true" } else { "false" }.to_string(),
+            ),
+            ("consent_statement", current.consent_statement.clone()),
+            ("opt_in_folders", folders_json),
             ("allowed_jurisdictions", allowed_json),
             (
                 "five_eyes_enabled",
@@ -463,6 +739,22 @@ impl MarketplaceStore {
             )
             .map_err(|e| format!("Failed to update {k}: {e}"))?;
         }
+
+        let action = if current.opt_in_enabled {
+            "OPT_IN_AGREED"
+        } else {
+            "OPT_OUT_REVOKED"
+        };
+        let _ = self.append_consent_ledger_entry_with_conn(
+            &conn,
+            action,
+            current.opt_in_enabled,
+            current.user_consent_checked,
+            &current.consent_statement,
+            &current.opt_in_folders,
+            &current.allowed_jurisdictions,
+            current.price_per_1k_records_cents,
+        );
 
         Ok(current)
     }
@@ -873,6 +1165,8 @@ pub async fn marketplace_status_handler(State(state): State<Arc<DaemonState>>) -
         .flatten()
         .map(|(m, _, _)| m);
     let latest_ledger = store.latest_ledger();
+    let all_ledgers = store.all_ledgers();
+    let consent_ledger = store.list_consent_ledger(50);
     let bounties = store.list_bounties(&cfg.allowed_jurisdictions);
     let sovereign_lock_mode = if cfg.five_eyes_enabled {
         "FIVE_EYES_ALLIED"
@@ -884,6 +1178,9 @@ pub async fn marketplace_status_handler(State(state): State<Arc<DaemonState>>) -
         StatusCode::OK,
         Json(serde_json::json!({
             "opt_in_enabled": cfg.opt_in_enabled,
+            "user_consent_checked": cfg.user_consent_checked,
+            "consent_statement": cfg.consent_statement,
+            "opt_in_folders": cfg.opt_in_folders,
             "allowed_jurisdictions": cfg.allowed_jurisdictions,
             "five_eyes_enabled": cfg.five_eyes_enabled,
             "sovereign_lock_mode": sovereign_lock_mode,
@@ -897,6 +1194,8 @@ pub async fn marketplace_status_handler(State(state): State<Arc<DaemonState>>) -
             "approved_batches_count": approved_batches_count,
             "latest_manifest": latest_manifest,
             "latest_ledger": latest_ledger,
+            "all_ledgers": all_ledgers,
+            "consent_ledger": consent_ledger,
             "bounties": bounties,
         })),
     )
@@ -919,18 +1218,25 @@ pub async fn marketplace_opt_in_handler(
         }
     };
     match store.update_config(req) {
-        Ok(cfg) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "updated",
-                "opt_in_enabled": cfg.opt_in_enabled,
-                "allowed_jurisdictions": cfg.allowed_jurisdictions,
-                "five_eyes_enabled": cfg.five_eyes_enabled,
-                "price_per_1k_records_cents": cfg.price_per_1k_records_cents,
-                "authority_pubkey_hex": cfg.authority_pubkey_hex,
-            })),
-        )
-            .into_response(),
+        Ok(cfg) => {
+            let consent_ledger = store.list_consent_ledger(50);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "updated",
+                    "opt_in_enabled": cfg.opt_in_enabled,
+                    "user_consent_checked": cfg.user_consent_checked,
+                    "consent_statement": cfg.consent_statement,
+                    "opt_in_folders": cfg.opt_in_folders,
+                    "allowed_jurisdictions": cfg.allowed_jurisdictions,
+                    "five_eyes_enabled": cfg.five_eyes_enabled,
+                    "price_per_1k_records_cents": cfg.price_per_1k_records_cents,
+                    "authority_pubkey_hex": cfg.authority_pubkey_hex,
+                    "consent_ledger": consent_ledger,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => forbidden_json(e),
     }
 }
