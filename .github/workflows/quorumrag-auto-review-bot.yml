@@ -116,14 +116,10 @@ jobs:
           echo "[PASS] All QuorumRAG security invariants verified."
 
           if [ "${PR_AUTHOR}" = "oyesanyf" ] && [ "${PR_ASSOCIATION}" = "OWNER" ] && [ "${PR_HEAD_REPO}" = "${REPO}" ]; then
-            cat <<EOF > /tmp/quorum_review_body.md
-[PASS] QuorumRAG Solo-Developer Invariant Gate & Review Bot: Verified repository owner (@${PR_AUTHOR}, ${PR_ASSOCIATION}), commit ${PR_HEAD_SHA} (${FILE_COUNT} file(s)), Zero-Touch PATH compliance, zero private keys, and hermetic build scripts.
-EOF
+            printf '%s\n' "[PASS] QuorumRAG Solo-Developer Invariant Gate & Review Bot: Verified repository owner (@${PR_AUTHOR}, ${PR_ASSOCIATION}), commit ${PR_HEAD_SHA} (${FILE_COUNT} file(s)), Zero-Touch PATH compliance, zero private keys, and hermetic build scripts." > /tmp/quorum_review_body.md
             gh pr review "${PR_NUMBER}" --repo "${REPO}" --approve --body-file /tmp/quorum_review_body.md || true
             gh pr merge "${PR_NUMBER}" --repo "${REPO}" --squash || gh pr merge "${PR_NUMBER}" --repo "${REPO}" --auto --squash || true
           else
-            cat <<EOF > /tmp/quorum_manual_review.md
-[INFO] QuorumRAG Invariant Gate passed for @${PR_AUTHOR} (${PR_ASSOCIATION}). Per repository governance policy, only solo-developer PRs by @oyesanyf are auto-approved; all other contributor PRs require manual review and approval by @oyesanyf before merging.
-EOF
+            printf '%s\n' "[INFO] QuorumRAG Invariant Gate passed for @${PR_AUTHOR} (${PR_ASSOCIATION}). Per repository governance policy, only solo-developer PRs by @oyesanyf are auto-approved; all other contributor PRs require manual review and approval by @oyesanyf before merging." > /tmp/quorum_manual_review.md
             gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file /tmp/quorum_manual_review.md || true
           fi
