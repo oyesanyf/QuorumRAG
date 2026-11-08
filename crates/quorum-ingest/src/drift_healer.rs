@@ -271,6 +271,7 @@ impl DriftHealer {
             if !tantivy_only.is_empty() {
                 let mut chunks = self.storage.get_chunks_from_tantivy(&tantivy_only)?;
                 let canonical_dim = self.embedder.dimension();
+                let mut healed_chunks = Vec::new();
                 for chunk in &mut chunks {
                     if chunk.vector.len() != canonical_dim {
                         if let Ok(vec) = self.embedder.embed_text(&chunk.text_content) {
@@ -278,9 +279,13 @@ impl DriftHealer {
                         } else {
                             chunk.vector = vec![0.0; canonical_dim];
                         }
+                        healed_chunks.push(chunk.clone());
                     }
                 }
                 let _ = self.storage.insert_into_lance_only(&chunks).await?;
+                for healed in &healed_chunks {
+                    let _ = self.storage.update_chunk_record(healed).await;
+                }
             }
         }
 

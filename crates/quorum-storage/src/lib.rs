@@ -16,6 +16,7 @@
 
 pub(crate) mod arrow_interop;
 pub mod config;
+pub mod dataset_builder;
 pub mod document_catalog;
 pub mod engine;
 pub mod error;
@@ -24,6 +25,7 @@ pub(crate) mod tantivy_fts;
 pub(crate) mod vector_store;
 
 pub use config::StorageConfig;
+pub use dataset_builder::{DatasetBuilder, DatasetBuilderConfig, RawDatasetCandidate};
 pub use document_catalog::{derive_work_cluster_id, DocumentCatalog, DocumentCatalogEntry};
 pub use engine::{CompactionStats, SearchMode, StorageEngine, StorageSearchQuery};
 pub use error::StorageError;

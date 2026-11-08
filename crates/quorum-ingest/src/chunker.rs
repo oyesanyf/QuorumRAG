@@ -51,6 +51,172 @@ impl TextChunker {
         line_starts.partition_point(|&offset| offset <= byte_offset) as u32
     }
 
+    /// Snaps a candidate chunk start offset to a natural sentence, paragraph, line, or word boundary.
+    ///
+    /// Searches within +/- 60 bytes of `nominal_start` for:
+    /// 1. Paragraph breaks (`\n\n`)
+    /// 2. Sentence terminals (`. `, `! `, `? ` followed by uppercase/whitespace)
+    /// 3. Line breaks (`\n`)
+    /// 4. Fallback: snaps to nearest whitespace boundary; if `nominal_start` falls inside an
+    ///    alphanumeric word, advances forward to the start of the next word so chunks never start mid-word.
+    pub fn snap_to_sentence_boundary(
+        content: &str,
+        nominal_start: usize,
+        min_bound: usize,
+        max_bound: usize,
+    ) -> usize {
+        let total_len = content.len();
+        if total_len == 0 {
+            return 0;
+        }
+
+        // 1. Normalize min_bound and max_bound to valid character boundaries
+        let mut safe_min = min_bound.min(total_len);
+        while !content.is_char_boundary(safe_min) && safe_min < total_len {
+            safe_min += 1;
+        }
+        let mut safe_max = max_bound.min(total_len);
+        while !content.is_char_boundary(safe_max) && safe_max > safe_min {
+            safe_max -= 1;
+        }
+        if safe_min >= safe_max {
+            return safe_max;
+        }
+
+        let cand_start = nominal_start.clamp(safe_min, safe_max);
+
+        // 2. Search window within +/- 60 bytes of cand_start for structural boundaries
+        let mut search_min = cand_start.saturating_sub(60).max(safe_min);
+        let mut search_max = (cand_start + 60).min(safe_max);
+
+        while !content.is_char_boundary(search_min) && search_min < search_max {
+            search_min += 1;
+        }
+        while !content.is_char_boundary(search_max) && search_max > search_min {
+            search_max -= 1;
+        }
+
+        if search_min < search_max {
+            let window = &content[search_min..search_max];
+
+            // 1. Paragraph breaks (\n\n)
+            let mut best_para: Option<(usize, usize)> = None;
+            for (idx, _) in window.match_indices("\n\n") {
+                let mut cand = search_min + idx + 2;
+                while cand < safe_max && content.as_bytes().get(cand).map_or(false, |b| b.is_ascii_whitespace()) {
+                    cand += 1;
+                }
+                if cand >= safe_min && cand <= safe_max && content.is_char_boundary(cand) {
+                    let dist = cand.abs_diff(cand_start);
+                    if best_para.map_or(true, |(_, d)| dist < d) {
+                        best_para = Some((cand, dist));
+                    }
+                }
+            }
+            if let Some((cand, _)) = best_para {
+                return cand;
+            }
+
+            // 2. Sentence terminals (. , ! , ? followed by whitespace or uppercase)
+            let mut best_sent: Option<(usize, usize)> = None;
+            for term in [". ", "! ", "? "] {
+                for (idx, _) in window.match_indices(term) {
+                    let term_pos = search_min + idx;
+                    if term == ". " && term_pos > 0 {
+                        let bytes = content.as_bytes();
+                        if bytes[term_pos - 1].is_ascii_digit() {
+                            continue;
+                        }
+                        if bytes[term_pos - 1].is_ascii_uppercase()
+                            && (term_pos < 2 || !bytes[term_pos - 2].is_ascii_alphanumeric())
+                        {
+                            continue;
+                        }
+                    }
+                    let mut cand = term_pos + 2;
+                    while cand < safe_max && content.as_bytes().get(cand).map_or(false, |b| b.is_ascii_whitespace()) {
+                        cand += 1;
+                    }
+                    if cand >= safe_min && cand <= safe_max && content.is_char_boundary(cand) {
+                        let dist = cand.abs_diff(cand_start);
+                        if best_sent.map_or(true, |(_, d)| dist < d) {
+                            best_sent = Some((cand, dist));
+                        }
+                    }
+                }
+            }
+            if let Some((cand, _)) = best_sent {
+                return cand;
+            }
+
+            // 3. Line breaks (\n)
+            let mut best_line: Option<(usize, usize)> = None;
+            for (idx, _) in window.match_indices('\n') {
+                let mut cand = search_min + idx + 1;
+                while cand < safe_max && (content.as_bytes().get(cand) == Some(&b'\r') || content.as_bytes().get(cand) == Some(&b' ')) {
+                    cand += 1;
+                }
+                if cand >= safe_min && cand <= safe_max && content.is_char_boundary(cand) {
+                    let dist = cand.abs_diff(cand_start);
+                    if best_line.map_or(true, |(_, d)| dist < d) {
+                        best_line = Some((cand, dist));
+                    }
+                }
+            }
+            if let Some((cand, _)) = best_line {
+                return cand;
+            }
+        }
+
+        // 4. Fallback: snap to nearest whitespace / word boundary.
+        // If cand_start falls inside an alphanumeric word, advance forward to the start of the next word.
+        let mut cand = cand_start;
+        while !content.is_char_boundary(cand) && cand < safe_max {
+            cand += 1;
+        }
+
+        let is_inside_word = if cand > 0 && cand < total_len {
+            let prev_alpha = content[..cand].chars().next_back().map_or(false, |c| c.is_alphanumeric());
+            let next_alpha = content[cand..].chars().next().map_or(false, |c| c.is_alphanumeric());
+            prev_alpha && next_alpha
+        } else {
+            false
+        };
+
+        if is_inside_word {
+            // Advance forward past the rest of this word
+            while cand < safe_max && content[cand..].chars().next().map_or(false, |c| !c.is_whitespace()) {
+                cand += content[cand..].chars().next().unwrap().len_utf8();
+            }
+            // Advance forward past whitespace to start of next word
+            while cand < safe_max && content[cand..].chars().next().map_or(false, |c| c.is_whitespace()) {
+                cand += content[cand..].chars().next().unwrap().len_utf8();
+            }
+            if cand >= safe_min && cand < safe_max {
+                return cand;
+            }
+            // If forward advancement reached or exceeded safe_max, snap to safe_max so chunks never start mid-word
+            return safe_max;
+        } else if cand < total_len && content[cand..].chars().next().map_or(false, |c| c.is_whitespace()) {
+            while cand < safe_max && content[cand..].chars().next().map_or(false, |c| c.is_whitespace()) {
+                cand += content[cand..].chars().next().unwrap().len_utf8();
+            }
+            if cand >= safe_min && cand < safe_max {
+                return cand;
+            }
+            return safe_max;
+        }
+
+        let mut final_start = cand.clamp(safe_min, safe_max);
+        while !content.is_char_boundary(final_start) && final_start < safe_max {
+            final_start += 1;
+        }
+        while !content.is_char_boundary(final_start) && final_start > safe_min {
+            final_start -= 1;
+        }
+        final_start
+    }
+
     /// Split arbitrary UTF-8 text into line-aware raw chunks.
     pub fn chunk_text<'a>(&self, content: &'a str) -> Vec<RawTextChunk<'a>> {
         if content.is_empty() {
@@ -88,29 +254,58 @@ impl TextChunker {
 
             // 2. Natural boundary snapping if not at the end of content
             if end_idx < total_len {
-                let mut snap_window_start = end_idx.saturating_sub(self.config.target_chunk_size / 4).max(start_idx);
-                while !content.is_char_boundary(snap_window_start) && snap_window_start < end_idx {
-                    snap_window_start += 1;
-                }
-                let window = &content[snap_window_start..end_idx];
+                if content[end_idx..].trim().is_empty() {
+                    end_idx = total_len;
+                } else {
+                    let mut snap_window_start = end_idx.saturating_sub(self.config.target_chunk_size / 4).max(start_idx);
+                    while !content.is_char_boundary(snap_window_start) && snap_window_start < end_idx {
+                        snap_window_start += 1;
+                    }
+                    let window = &content[snap_window_start..end_idx];
 
-                // Check for paragraph break (\n\n)
-                if let Some(pos) = window.rfind("\n\n") {
-                    let snapped = snap_window_start + pos + 2;
-                    if content.is_char_boundary(snapped) {
-                        end_idx = snapped;
+                    // Check for paragraph break (\n\n)
+                    if let Some(pos) = window.rfind("\n\n") {
+                        let snapped = snap_window_start + pos + 2;
+                        if content.is_char_boundary(snapped) {
+                            end_idx = snapped;
+                        }
+                    } else if let Some(pos) = window.rfind('\n') {
+                        // Check for line break (\n)
+                        let snapped = snap_window_start + pos + 1;
+                        if content.is_char_boundary(snapped) {
+                            end_idx = snapped;
+                        }
+                    } else if let Some(pos) = window.rfind(". ").or_else(|| window.rfind("! ")).or_else(|| window.rfind("? ")) {
+                        // Check for sentence terminal
+                        let snapped = snap_window_start + pos + 2;
+                        if content.is_char_boundary(snapped) {
+                            end_idx = snapped;
+                        }
+                    } else if let Some(pos) = window.rfind(char::is_whitespace) {
+                        // Fallback to whitespace boundary so chunks never terminate mid-word
+                        let snapped = snap_window_start + pos;
+                        if snapped > start_idx && content.is_char_boundary(snapped) {
+                            end_idx = snapped;
+                        }
                     }
-                } else if let Some(pos) = window.rfind('\n') {
-                    // Check for line break (\n)
-                    let snapped = snap_window_start + pos + 1;
-                    if content.is_char_boundary(snapped) {
-                        end_idx = snapped;
-                    }
-                } else if let Some(pos) = window.rfind(". ").or_else(|| window.rfind("! ")).or_else(|| window.rfind("? ")) {
-                    // Check for sentence terminal
-                    let snapped = snap_window_start + pos + 2;
-                    if content.is_char_boundary(snapped) {
-                        end_idx = snapped;
+
+                    // Fallback guarantee: if end_idx still terminates mid-word, snap back to last whitespace
+                    if end_idx < total_len && end_idx > start_idx {
+                        let prev_alpha = content[..end_idx].chars().next_back().map_or(false, |c| c.is_alphanumeric());
+                        let next_alpha = content[end_idx..].chars().next().map_or(false, |c| c.is_alphanumeric());
+                        if prev_alpha && next_alpha {
+                            if let Some(pos) = content[start_idx..end_idx].rfind(char::is_whitespace) {
+                                let snapped = start_idx + pos;
+                                if snapped > start_idx && content.is_char_boundary(snapped) {
+                                    end_idx = snapped;
+                                }
+                            } else if let Some(pos) = content[start_idx..end_idx].rfind(|c: char| !c.is_alphanumeric()) {
+                                let snapped = start_idx + pos + content[start_idx + pos..].chars().next().unwrap().len_utf8();
+                                if snapped > start_idx && snapped < end_idx && content.is_char_boundary(snapped) {
+                                    end_idx = snapped;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -136,20 +331,32 @@ impl TextChunker {
                 break;
             }
 
-            let overlap_step = self.config.chunk_overlap.min(end_idx - start_idx);
-            let mut next_start = end_idx - overlap_step;
+            let min_step = content[start_idx..].chars().next().map_or(1, |c| c.len_utf8());
+            let min_bound = (start_idx + min_step).min(end_idx);
 
-            // Enforce UTF-8 char boundary on next_start
-            while !content.is_char_boundary(next_start) && next_start < end_idx {
-                next_start += 1;
+            let mut next_start = if self.config.chunk_overlap == 0 {
+                // When overlap is 0, advance cleanly past whitespace following end_idx
+                let mut s = end_idx;
+                while s < total_len && content[s..].chars().next().map_or(false, |c| c.is_whitespace()) {
+                    s += content[s..].chars().next().unwrap().len_utf8();
+                }
+                s
+            } else {
+                let overlap_step = self.config.chunk_overlap.min(end_idx - start_idx);
+                let nominal_start = end_idx - overlap_step;
+                Self::snap_to_sentence_boundary(content, nominal_start, min_bound, end_idx)
+            };
+
+            // Ensure next_start advances past whitespace if it landed on whitespace and is not at EOF
+            while next_start < total_len && content[next_start..].chars().next().map_or(false, |c| c.is_whitespace()) {
+                next_start += content[next_start..].chars().next().unwrap().len_utf8();
             }
 
-            // Ensure forward progress
-            if next_start <= start_idx {
-                next_start = end_idx;
-            }
-
-            start_idx = next_start;
+            start_idx = if next_start > start_idx && content.is_char_boundary(next_start) {
+                next_start
+            } else {
+                end_idx
+            };
         }
 
         chunks

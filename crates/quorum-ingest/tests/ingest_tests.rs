@@ -308,6 +308,79 @@ fn test_chunker_multibyte_utf8_char_boundary_safety_and_line_numbers() {
     assert_eq!(empty_chunks.len(), 0);
 }
 
+#[test]
+fn test_line_chunker_boundary_snapping_never_cuts_words() {
+    let config = ChunkerConfig {
+        target_chunk_size: 120,
+        chunk_overlap: 40,
+        min_chunk_size: 20,
+    };
+    let chunker = TextChunker::new(config);
+
+    let sample_text = "Software development in Python and systems architecture requires more than recognizing names. \
+Comprehensive security engineering involves continuous remediation, automated scanning in GitHub Actions, \
+and real-time data engineering pipelines. Furthermore, communications data and connected disclosure policy \
+must protect all participants from accidental privacy exposure.";
+
+    let chunks = chunker.chunk_text(sample_text);
+    assert!(chunks.len() >= 3);
+
+    let broken_start_fragments = [
+        "lopment", "a engineering", "ns Data", "urity", "diation",
+        "anning in GitHub", "ected disclosure", "quires more than",
+    ];
+    let broken_end_fragments = [
+        "Pyt", "Comple", "remed",
+    ];
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        // Assert slice does not begin with known broken start fragments
+        let slice = chunk.text_slice.trim();
+        for &frag in &broken_start_fragments {
+            assert!(!slice.starts_with(frag), "Chunk {i} started with mid-word fragment '{frag}': {slice}");
+        }
+        for &frag in &broken_end_fragments {
+            assert!(!slice.ends_with(frag), "Chunk {i} ended with mid-word fragment '{frag}': {slice}");
+        }
+
+        // Assert chunk start does not bisect an alphanumeric word
+        if chunk.char_start > 0 {
+            let prev_alpha = sample_text[..chunk.char_start]
+                .chars()
+                .next_back()
+                .map_or(false, |c| c.is_alphanumeric());
+            let next_alpha = sample_text[chunk.char_start..]
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_alphanumeric());
+            assert!(
+                !(prev_alpha && next_alpha),
+                "Chunk {i} starts mid-word at char_start={}: {}",
+                chunk.char_start,
+                &sample_text[chunk.char_start.saturating_sub(5)..(chunk.char_start + 10).min(sample_text.len())]
+            );
+        }
+
+        // Assert chunk end does not bisect an alphanumeric word
+        if chunk.char_end < sample_text.len() {
+            let prev_alpha = sample_text[..chunk.char_end]
+                .chars()
+                .next_back()
+                .map_or(false, |c| c.is_alphanumeric());
+            let next_alpha = sample_text[chunk.char_end..]
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_alphanumeric());
+            assert!(
+                !(prev_alpha && next_alpha),
+                "Chunk {i} ends mid-word at char_end={}: {}",
+                chunk.char_end,
+                &sample_text[chunk.char_end.saturating_sub(10)..(chunk.char_end + 5).min(sample_text.len())]
+            );
+        }
+    }
+}
+
 // ============================================================================
 // 5. IMAGE INDEXER TESTS
 // ============================================================================

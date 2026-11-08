@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod agentic;
 pub mod answer_orchestrator;
+pub mod bounty_runner;
 pub mod cache;
 pub mod config;
 pub mod coordinator;
@@ -72,8 +73,12 @@ pub use dlp_mesh::{
 
 pub use marketplace_engine::{
     canonicalize_ip, cidr_contains_ip, contains_trade_secret_or_proprietary_code,
-    decrypt_batch_bytes, encrypt_batch_bytes, is_blocked_foreign_adversary_ip,
-    is_high_risk_datacenter_or_proxy_asn, verify_us_sovereign_buyer_against_domestic_evasion,
-    MarketplaceSanitizer, RawTrajectoryCandidate, BLOCKED_ADVERSARY_JURISDICTIONS,
+    decrypt_batch_bytes, encrypt_batch_bytes, global_vaultgemma_engine,
+    is_blocked_foreign_adversary_ip, is_high_risk_datacenter_or_proxy_asn,
+    verify_us_sovereign_buyer_against_domestic_evasion, DeidPolicyError, DeidVerificationResult,
+    MarketplaceSanitizer, RawTrajectoryCandidate, VaultGemmaDeidPolicy,
+    VaultGemmaDeidPolicyEngine, VaultGemmaPolicyEngine, BLOCKED_ADVERSARY_JURISDICTIONS,
     FOREIGN_ADVERSARY_IPV4_CIDRS, HIGH_RISK_DATACENTER_PROXY_ASNS,
 };
+
+pub use bounty_runner::{BountyMatchResult, BountyRunner};

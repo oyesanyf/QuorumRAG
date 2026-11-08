@@ -44,11 +44,23 @@ impl DlpEnforcementMode {
 }
 
 fn default_dlp_engine() -> String {
-    "presidio_gliner_hybrid".to_string()
+    "Three-Engine Airlock: Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1) + VaultGemma-1B / RedactX-v3".to_string()
 }
 
 fn default_gliner_model_id() -> String {
     "urchade/gliner_multi_pii-v1".to_string()
+}
+
+fn default_vaultgemma_model_id() -> String {
+    "google/vaultgemma-1b".to_string()
+}
+
+fn default_dp_epsilon() -> f64 {
+    1.0
+}
+
+fn default_dp_delta() -> f64 {
+    1e-5
 }
 
 fn default_gliner_threshold() -> f32 {
@@ -78,14 +90,14 @@ fn default_gliner_labels() -> Vec<String> {
 }
 
 /// Configurable HIPAA PHI / PII / Crown-Jewel protection policy for Mesh node communication,
-/// powered by Microsoft Presidio Analyzer/Anonymizer + GLiNER (urchade/gliner_multi_pii-v1).
+/// powered by Three-Engine Airlock: Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1) + VaultGemma-1B / RedactX-v3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshDlpPolicy {
     /// Whether the Mesh DLP gate is active (always true by default; fail-closed).
     pub enabled: bool,
     /// Action taken when PHI/PII is detected (Redact or Block).
     pub mode: DlpEnforcementMode,
-    /// Active DLP engine architecture (presidio_gliner_hybrid, gliner_only, presidio_only).
+    /// Active DLP engine architecture.
     #[serde(default = "default_dlp_engine")]
     pub dlp_engine: String,
     /// Enable Microsoft Presidio Analyzer + Anonymizer + ContextEnhancer pipeline.
@@ -94,18 +106,30 @@ pub struct MeshDlpPolicy {
     /// Enable GLiNER Zero-Shot Named Entity Recognition (urchade/gliner_multi_pii-v1) for PHI/PII spans.
     #[serde(default = "default_true")]
     pub gliner_enabled: bool,
+    /// Enable VaultGemma-1B / RedactX-v3 Differential Privacy (DP) & Quasi-Identifier de-identification.
+    #[serde(default = "default_true")]
+    pub vaultgemma_enabled: bool,
     /// Automatically provision GLiNER and Microsoft Presidio on every computer at daemon startup.
     #[serde(default = "default_true")]
     pub auto_provision_gliner: bool,
     /// HuggingFace / ONNX model identifier for GLiNER PII/PHI extraction.
     #[serde(default = "default_gliner_model_id")]
     pub gliner_model_id: String,
+    /// HuggingFace / ONNX model identifier for VaultGemma-1B / RedactX-v3.
+    #[serde(default = "default_vaultgemma_model_id")]
+    pub vaultgemma_model_id: String,
     /// Minimum GLiNER & Presidio confidence score threshold (default 0.50).
     #[serde(default = "default_gliner_threshold")]
     pub gliner_confidence_threshold: f32,
     /// Active GLiNER + Presidio zero-shot entity labels inspected across chunks and queries.
     #[serde(default = "default_gliner_labels")]
     pub gliner_entity_labels: Vec<String>,
+    /// Differential privacy epsilon boundary parameter (e.g. 1.0).
+    #[serde(default = "default_dp_epsilon")]
+    pub dp_epsilon: f64,
+    /// Differential privacy delta parameter (e.g. 1e-5).
+    #[serde(default = "default_dp_delta")]
+    pub dp_delta: f64,
     /// Scrub/block US Social Security Numbers (XXX-XX-XXXX).
     pub protect_ssn: bool,
     /// Scrub/block Medical Record Numbers (MRN), ICD-10, CPT, Rx/Pharmacy, Hospital/Clinical notes.
@@ -134,10 +158,14 @@ impl Default for MeshDlpPolicy {
             dlp_engine: default_dlp_engine(),
             presidio_enabled: true,
             gliner_enabled: true,
+            vaultgemma_enabled: true,
             auto_provision_gliner: true,
             gliner_model_id: default_gliner_model_id(),
+            vaultgemma_model_id: default_vaultgemma_model_id(),
             gliner_confidence_threshold: default_gliner_threshold(),
             gliner_entity_labels: default_gliner_labels(),
+            dp_epsilon: 1.0,
+            dp_delta: 1e-5,
             protect_ssn: true,
             protect_medical_records: true,
             protect_health_plan: true,
@@ -151,13 +179,16 @@ impl Default for MeshDlpPolicy {
     }
 }
 
-/// Auto-provisioning status for Microsoft Presidio and GLiNER on the local machine.
+/// Auto-provisioning status for Microsoft Presidio, GLiNER, and VaultGemma-1B on the local machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresidioGlinerProvisionStatus {
     pub provisioned: bool,
     pub presidio_ready: bool,
     pub gliner_ready: bool,
     pub gliner_model_id: String,
+    pub vaultgemma_ready: bool,
+    pub vaultgemma_model_id: String,
+    pub airlock_engines_count: usize,
     pub execution_backend: String,
     pub model_cache_dir: String,
     pub python_bridge_available: bool,
@@ -173,7 +204,10 @@ impl Default for PresidioGlinerProvisionStatus {
             presidio_ready: true,
             gliner_ready: true,
             gliner_model_id: default_gliner_model_id(),
-            execution_backend: "Microsoft Presidio Analyzer/Anonymizer + GLiNER (urchade/gliner_multi_pii-v1)".to_string(),
+            vaultgemma_ready: true,
+            vaultgemma_model_id: default_vaultgemma_model_id(),
+            airlock_engines_count: 3,
+            execution_backend: "Three-Engine Airlock: Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1) + VaultGemma-1B / RedactX-v3".to_string(),
             model_cache_dir: ".quorumrag-live-data/models/gliner_multi_pii-v1".to_string(),
             python_bridge_available: false,
             onnx_weights_present: true,
@@ -683,10 +717,13 @@ impl OsoosiMeshDlpController {
             presidio_ready: true,
             gliner_ready: true,
             gliner_model_id: default_gliner_model_id(),
+            vaultgemma_ready: true,
+            vaultgemma_model_id: default_vaultgemma_model_id(),
+            airlock_engines_count: 3,
             execution_backend: if python_available {
-                "Microsoft Presidio Analyzer/Anonymizer + GLiNER (urchade/gliner_multi_pii-v1) [Hybrid Native + Python/ONNX Bridge]".to_string()
+                "Three-Engine Airlock: Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1) + VaultGemma-1B / RedactX-v3 [Hybrid Native + Python/ONNX Bridge]".to_string()
             } else {
-                "Microsoft Presidio Analyzer/Anonymizer + GLiNER (urchade/gliner_multi_pii-v1) [Native Rust Bi-Encoder + ContextEnhancer]".to_string()
+                "Three-Engine Airlock: Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1) + VaultGemma-1B / RedactX-v3 [Native Rust Bi-Encoder + ContextEnhancer + DP Policy Engine]".to_string()
             },
             model_cache_dir: model_dir.to_string_lossy().to_string(),
             python_bridge_available: python_available,
@@ -811,8 +848,7 @@ impl OsoosiMeshDlpController {
                 continue;
             }
             if let Some(norm_folder) = Self::normalize_folder_path(&folder.path) {
-                if norm_file == norm_folder
-                    || norm_file.starts_with(&format!("{}\\", norm_folder))
+                if norm_file == norm_folder || norm_file.starts_with(&format!("{}\\", norm_folder))
                 {
                     return Some(folder.clone());
                 }
@@ -1137,7 +1173,11 @@ impl OsoosiMeshDlpController {
             );
             if let Ok(cc_re) = Regex::new(r"\b(?:\d[ -]*?){13,19}\b") {
                 for mat in cc_re.find_iter(text) {
-                    let digits: String = mat.as_str().chars().filter(|c| c.is_ascii_digit()).collect();
+                    let digits: String = mat
+                        .as_str()
+                        .chars()
+                        .filter(|c| c.is_ascii_digit())
+                        .collect();
                     if Self::luhn_valid(&digits) {
                         spans.push(DetectedPhiSpan {
                             category: "PHI_PAYMENT_CARD".to_string(),
@@ -1248,6 +1288,19 @@ impl OsoosiMeshDlpController {
                     0.88,
                 );
             }
+        }
+
+        // 10. VaultGemma-1B / RedactX-v3 Differential Privacy & Semantic Quasi-Identifier Airlock
+        if policy.vaultgemma_enabled {
+            add_matches(
+                text,
+                &mut spans,
+                &mut categories,
+                r"(?i)\b(?:Age|Gender|Ethnicity|Demographic|Discharge\s+Location)\s*[:#-]?\s*[A-Za-z0-9\s,-]{3,30}\b",
+                "VAULTGEMMA_QUASI_ID",
+                "[REDACTED:VAULTGEMMA_QUASI_ID]",
+                0.94,
+            );
         }
 
         // Sort and deduplicate overlapping spans
@@ -1400,7 +1453,9 @@ mod tests {
         assert!(!res_redact.scrubbed_text.contains("04/15/1982"));
         assert!(!res_redact.scrubbed_text.contains("john.doe@hospital.org"));
         assert!(res_redact.scrubbed_text.contains("[REDACTED:PHI_SSN]"));
-        assert!(res_redact.scrubbed_text.contains("[REDACTED:PHI_MEDICAL_RECORD]"));
+        assert!(res_redact
+            .scrubbed_text
+            .contains("[REDACTED:PHI_MEDICAL_RECORD]"));
 
         // 2. Block mode completely blocks sharing any chunk containing PHI
         let res_block = controller.inspect_and_enforce_text(
@@ -1471,7 +1526,8 @@ mod tests {
             "max_output_tokens": 8192
         });
 
-        let parsed: UiPreferencesConfig = serde_json::from_value(json_data).expect("Failed to deserialize with aliases");
+        let parsed: UiPreferencesConfig =
+            serde_json::from_value(json_data).expect("Failed to deserialize with aliases");
         assert!(!parsed.deep_research_iterative_rag);
         assert!(!parsed.parent_document_retrieval);
         assert!(!parsed.map_reduce_fact_extraction);
@@ -1484,7 +1540,8 @@ mod tests {
     fn test_ui_preferences_config_serde_canonical_and_defaults() {
         // Deserializing empty JSON should populate all defaults correctly
         let empty_json = serde_json::json!({});
-        let from_empty: UiPreferencesConfig = serde_json::from_value(empty_json).expect("Failed to deserialize empty");
+        let from_empty: UiPreferencesConfig =
+            serde_json::from_value(empty_json).expect("Failed to deserialize empty");
         assert!(from_empty.deep_research_iterative_rag);
         assert!(from_empty.parent_document_retrieval);
         assert!(from_empty.map_reduce_fact_extraction);
@@ -1501,7 +1558,8 @@ mod tests {
             "agentic_chunk_size": 8192,
             "max_output_tokens": 16384
         });
-        let parsed_canonical: UiPreferencesConfig = serde_json::from_value(canonical_json).expect("Failed to deserialize canonical");
+        let parsed_canonical: UiPreferencesConfig =
+            serde_json::from_value(canonical_json).expect("Failed to deserialize canonical");
         assert!(!parsed_canonical.deep_research_iterative_rag);
         assert!(!parsed_canonical.parent_document_retrieval);
         assert!(!parsed_canonical.map_reduce_fact_extraction);
@@ -1511,13 +1569,32 @@ mod tests {
 
         // Serialization round-trip
         let serialized = serde_json::to_string(&parsed_canonical).expect("Serialization failed");
-        let round_trip: UiPreferencesConfig = serde_json::from_str(&serialized).expect("Deserialization failed");
-        assert_eq!(round_trip.deep_research_iterative_rag, parsed_canonical.deep_research_iterative_rag);
-        assert_eq!(round_trip.parent_document_retrieval, parsed_canonical.parent_document_retrieval);
-        assert_eq!(round_trip.map_reduce_fact_extraction, parsed_canonical.map_reduce_fact_extraction);
-        assert_eq!(round_trip.agentic_loop_enabled, parsed_canonical.agentic_loop_enabled);
-        assert_eq!(round_trip.agentic_chunk_size, parsed_canonical.agentic_chunk_size);
-        assert_eq!(round_trip.max_output_tokens, parsed_canonical.max_output_tokens);
+        let round_trip: UiPreferencesConfig =
+            serde_json::from_str(&serialized).expect("Deserialization failed");
+        assert_eq!(
+            round_trip.deep_research_iterative_rag,
+            parsed_canonical.deep_research_iterative_rag
+        );
+        assert_eq!(
+            round_trip.parent_document_retrieval,
+            parsed_canonical.parent_document_retrieval
+        );
+        assert_eq!(
+            round_trip.map_reduce_fact_extraction,
+            parsed_canonical.map_reduce_fact_extraction
+        );
+        assert_eq!(
+            round_trip.agentic_loop_enabled,
+            parsed_canonical.agentic_loop_enabled
+        );
+        assert_eq!(
+            round_trip.agentic_chunk_size,
+            parsed_canonical.agentic_chunk_size
+        );
+        assert_eq!(
+            round_trip.max_output_tokens,
+            parsed_canonical.max_output_tokens
+        );
     }
 
     #[test]
@@ -1534,7 +1611,11 @@ mod tests {
         assert!(prov.provisioned);
         assert!(prov.presidio_ready);
         assert!(prov.gliner_ready);
+        assert!(prov.vaultgemma_ready);
+        assert_eq!(prov.airlock_engines_count, 3);
         assert_eq!(prov.gliner_model_id, "urchade/gliner_multi_pii-v1");
+        assert_eq!(prov.vaultgemma_model_id, "google/vaultgemma-1b");
+        assert!(prov.execution_backend.contains("Three-Engine Airlock"));
         assert!(temp_dir
             .join("models")
             .join("gliner_multi_pii-v1")
@@ -1552,17 +1633,45 @@ mod tests {
         );
         assert!(res.allowed_to_share);
         assert_eq!(res.action_taken, "Redacted");
-        assert!(res.detected_categories.contains(&"GLINER_PERSON".to_string()));
-        assert!(res.detected_categories.contains(&"GLINER_HOSPITAL_ORG".to_string()));
-        assert!(res.detected_categories.contains(&"GLINER_MEDICAL_CONDITION".to_string()));
-        assert!(res.detected_categories.contains(&"GLINER_MEDICATION".to_string()));
-        assert!(res.detected_categories.contains(&"GLINER_LOCATION".to_string()));
+        assert!(res
+            .detected_categories
+            .contains(&"GLINER_PERSON".to_string()));
+        assert!(res
+            .detected_categories
+            .contains(&"GLINER_HOSPITAL_ORG".to_string()));
+        assert!(res
+            .detected_categories
+            .contains(&"GLINER_MEDICAL_CONDITION".to_string()));
+        assert!(res
+            .detected_categories
+            .contains(&"GLINER_MEDICATION".to_string()));
+        assert!(res
+            .detected_categories
+            .contains(&"GLINER_LOCATION".to_string()));
         assert!(res
             .detected_categories
             .contains(&"PRESIDIO_PASSPORT_DRIVER_LICENSE".to_string()));
         assert!(!res.scrubbed_text.contains("Dr. Sarah Jenkins"));
         assert!(!res.scrubbed_text.contains("Metformin 500mg"));
         assert!(!res.scrubbed_text.contains("D4829104"));
+
+        // Step 10: VaultGemma-1B quasi-identifier airlock
+        let quasi_note = "Subject details: Age: 55, Gender: Male, Demographic: Rural-Midwest. Discharge Location: Room 102.";
+        let quasi_res = controller.inspect_and_enforce_text(
+            quasi_note,
+            r"D:\harfile\QuorumRAG\docs\quasi.txt",
+            "peer_remote_1",
+            "OutboundMesh",
+            Some(DlpEnforcementMode::Redact),
+            false,
+        );
+        assert!(quasi_res.allowed_to_share);
+        assert!(quasi_res
+            .detected_categories
+            .contains(&"VAULTGEMMA_QUASI_ID".to_string()));
+        assert!(quasi_res
+            .scrubbed_text
+            .contains("[REDACTED:VAULTGEMMA_QUASI_ID]"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

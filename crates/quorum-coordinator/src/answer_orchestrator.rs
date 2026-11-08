@@ -307,6 +307,61 @@ fn is_mostly_upper(s: &str) -> bool {
     !letters.is_empty() && letters.iter().filter(|c| c.is_uppercase()).count() * 3 > letters.len() * 2
 }
 
+/// Returns true if an address candidate represents a government agency headquarters,
+/// form filing lockbox, or administrative boilerplate address rather than a subject's personal/business address.
+pub fn is_government_agency_or_boilerplate_address(addr: &str, surrounding: &str) -> bool {
+    let a_low = addr.to_ascii_lowercase();
+    let c_low = surrounding.to_ascii_lowercase();
+
+    // 1. Known Federal Agency / USCIS / DHS / Government Headquarters Addresses
+    const KNOWN_AGENCY_ADDRESSES: &[&str] = &[
+        "111 massachusetts",
+        "20 massachusetts",
+        "5900 capital gateway",
+        "5107 leesburg pike",
+        "200 constitution ave",
+        "400 7th st",
+        "1600 pennsylvania",
+        "p.o. box 805887",
+        "p.o. box 660867",
+        "p.o. box 21281",
+        "p.o. box 4008",
+        "2501 s. state highway 121",
+        "131 s. dearborn",
+        "1820 e. skyharbor",
+    ];
+    for &known in KNOWN_AGENCY_ADDRESSES {
+        if a_low.contains(known) {
+            return true;
+        }
+    }
+
+    // 2. Washington DC Agency ZIP codes (20529: USCIS/DHS, 20530: DOJ, 20210: DOL, 20588: FDA/HHS)
+    if a_low.contains("20529") || a_low.contains("20530") || a_low.contains("20210") || a_low.contains("20588") {
+        return true;
+    }
+
+    // 3. Surrounding Contextual Indicators (Form Instructions & Filing Lockboxes)
+    let is_form_context = c_low.contains("uscis")
+        || c_low.contains("department of homeland security")
+        || c_low.contains("citizenship and immigration")
+        || c_low.contains("form g-28")
+        || c_low.contains("form i-")
+        || c_low.contains("instructions for form")
+        || c_low.contains("filing address")
+        || c_low.contains("lockbox")
+        || c_low.contains("mail your application")
+        || c_low.contains("submit to:")
+        || c_low.contains("omb no.")
+        || c_low.contains("administrative appeals office");
+
+    if is_form_context && (a_low.contains("washington") || a_low.contains("d.c.") || a_low.contains("p.o. box") || a_low.contains("20529")) {
+        return true;
+    }
+
+    false
+}
+
 /// Extract grounded facts from the retrieved excerpts. `texts[i]` is cited as `[i + 1]`.
 pub fn extract_grounded_facts(subject: Option<&str>, texts: &[(String, String, String)]) -> Vec<GroundedFact> {
     let r = rules();
@@ -331,7 +386,14 @@ pub fn extract_grounded_facts(subject: Option<&str>, texts: &[(String, String, S
             candidates.push(("Other parties", format!("{} ({})", name, &cap[2])));
         }
         for m in r.address.find_iter(text) {
-            candidates.push(("Addresses", m.as_str().to_string()));
+            let matched_addr = m.as_str();
+            let window_start = m.start().saturating_sub(150);
+            let window_end = (m.end() + 150).min(text.len());
+            let surrounding = &text[window_start..window_end];
+
+            if !is_government_agency_or_boilerplate_address(matched_addr, surrounding) {
+                candidates.push(("Addresses", matched_addr.to_string()));
+            }
         }
         for m in r.phone.find_iter(text) {
             candidates.push(("Phone", m.as_str().to_string()));
@@ -598,5 +660,45 @@ mod tests {
         let installed = vec!["gemma4:26b".to_string(), "glm4:9b".to_string(), "qwen2.5:7b".to_string(), "moondream:latest".to_string()];
         assert_eq!(fast_fallback_models(&installed, "gemma4:26b"), vec!["qwen2.5:7b".to_string(), "glm4:9b".to_string()]);
         assert_eq!(fast_fallback_models(&installed, "qwen2.5:7b"), vec!["glm4:9b".to_string()]);
+    }
+
+    #[test]
+    fn test_government_agency_and_boilerplate_address_filtering() {
+        let texts = vec![
+            (
+                "g28_chunk".to_string(),
+                "Form_G28_Instructions.pdf".to_string(),
+                "Department of Homeland Security USCIS Form G-28 Notice of Entry of Appearance as Attorney. \
+Submit completed form to: 111 Massachusetts Avenue, NW, Washington, DC 20529. OMB No. 1615-0105.".to_string(),
+            ),
+            (
+                "lease_chunk".to_string(),
+                "Residential_Lease.docx".to_string(),
+                "Tenant agrees to reside at 2913 Castiglione St, New Orleans, LA 70119 for the term of twelve months.".to_string(),
+            ),
+        ];
+
+        let facts = extract_grounded_facts(Some("Femi Oyesanya"), &texts);
+        let addresses: Vec<&str> = facts
+            .iter()
+            .filter(|f| f.class == "Addresses")
+            .map(|f| f.value.as_str())
+            .collect();
+
+        // Must NOT contain the USCIS Washington DC headquarters address
+        assert!(
+            !addresses.iter().any(|a| a.contains("111 Massachusetts")),
+            "Government agency address leaked: {addresses:?}"
+        );
+        assert!(
+            !addresses.iter().any(|a| a.contains("20529")),
+            "Government agency ZIP leaked: {addresses:?}"
+        );
+
+        // MUST contain the genuine residential address
+        assert!(
+            addresses.iter().any(|a| a.contains("2913 Castiglione St")),
+            "Genuine residential address missing: {addresses:?}"
+        );
     }
 }
