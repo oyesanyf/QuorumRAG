@@ -157,6 +157,11 @@
               <div id="top-index-bar" style="width:0%; height:100%; background:linear-gradient(90deg, #2563eb, #10a37f); transition:width 0.4s ease;"></div>
             </div>
           </div>
+          <button id="btn-open-marketplace" class="btn-recache-header" title="Opt-In Sovereign AI Training Data Marketplace (Disabled by Default — US 28 CFR Part 202 Lock)" onclick="if(window.openMarketplaceModal) window.openMarketplaceModal();" style="display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
+            <span>🛡️</span>
+            <span>AI Data Marketplace</span>
+            <span id="marketplace-top-pill" style="font-size:10px; padding:1px 6px; border-radius:999px; background:rgba(239,68,68,0.18); color:#f87171; font-weight:700;">OFF</span>
+          </button>
           <button id="btn-top-settings" class="btn-recache-header" title="Open Settings (Ctrl+,)">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             <span>Settings</span>
@@ -346,6 +351,10 @@
           <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
           <span class="nav-item-label">DLP &amp; PHI Protection</span>
         </button>
+        <button class="chatgpt-nav-item" data-tab="marketplace" onclick="if(window.openMarketplaceModal) window.openMarketplaceModal();">
+          <span class="nav-item-icon">💎</span>
+          <span class="nav-item-label">AI Data Marketplace (Opt-In)</span>
+        </button>
         <button class="chatgpt-nav-item" data-tab="notifications">
           <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></span>
           <span class="nav-item-label">Notifications</span>
@@ -429,6 +438,219 @@
       </div>
     </form>
   </dialog>
+
+  <!-- OPT-IN SOVEREIGN AI TRAINING DATA MARKETPLACE MODAL (DISABLED BY DEFAULT) -->
+  <div id="modal-marketplace" class="modal-backdrop hidden" role="dialog" aria-label="Opt-In Sovereign AI Training Data Marketplace">
+    <div class="modal-card" style="max-width:860px; width:94%; max-height:88vh; overflow-y:auto;">
+      <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between;">
+        <div>
+          <h3 style="margin:0;">🛡️ Sovereign AI Training Data Marketplace &amp; Contribution Ledger</h3>
+          <div style="font-size:12px; opacity:0.75; margin-top:3px;">
+            Disabled by Default (<code>opt_in_enabled: false</code>) · 7-Layer Anti-Exfiltration &amp; DOJ 28 CFR Part 202 Domestic-Evasion Guard
+          </div>
+        </div>
+        <button class="btn-close-modal" id="btn-close-marketplace" onclick="document.getElementById('modal-marketplace').classList.add('hidden')">&times;</button>
+      </div>
+      <div class="modal-body" style="display:flex; flex-direction:column; gap:14px;">
+        <!-- 1. Master Opt-In & Sovereign Jurisdiction Lock -->
+        <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:12px 14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;">
+            <label style="display:flex; align-items:center; gap:8px; font-weight:600; cursor:pointer;">
+              <input type="checkbox" id="marketplace-opt-in-toggle" onchange="window.updateMarketplaceOptIn()">
+              <span>Enable Opt-In AI Training Data Marketplace (Default: OFF)</span>
+            </label>
+            <span id="marketplace-status-badge" style="font-size:11px; font-weight:700; padding:3px 9px; border-radius:999px; background:rgba(239,68,68,0.2); color:#f87171;">
+              DISABLED BY DEFAULT (403 Fail-Closed)
+            </span>
+          </div>
+          <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-top:10px; font-size:12.5px;">
+            <label>
+              <strong>Sovereign Lock Policy:</strong>
+              <select id="marketplace-jurisdiction-select" onchange="window.updateMarketplaceOptIn()" style="margin-left:6px; padding:4px 8px; border-radius:6px; background:#111318; color:#fff; border:1px solid rgba(255,255,255,0.2);">
+                <option value="US_ONLY" selected>US Only (DOJ 28 CFR Part 202 Sovereign Lock)</option>
+                <option value="FIVE_EYES">Five Eyes Allied (US, CA, GB, AU, NZ)</option>
+              </select>
+            </label>
+            <label>
+              <strong>Floor Price (Cents / 1k SFT-DPO Records):</strong>
+              <input type="number" id="marketplace-price-cents" value="5000" min="100" step="100" onchange="window.updateMarketplaceOptIn()" style="width:95px; margin-left:6px; padding:4px 8px; border-radius:6px; background:#111318; color:#fff; border:1px solid rgba(255,255,255,0.2);">
+            </label>
+          </div>
+          <div style="margin-top:10px; font-size:11.5px; color:#9ca3af; line-height:1.45;">
+            <strong>Active 7-Layer Sovereign &amp; Domestic-Evasion Protections:</strong>
+            (1) Zero raw files + Semantic Trade-Secret Filter (<code>&lt;= 15</code> code lines, 0 RFC1918 IPs, 0 high-entropy secrets) ·
+            (2) Hard-block <code>CN, HK, MO, RU, IR, KP, BY, CU, VE</code> + US-PoP Chinese Cloud &amp; Anonymous VPS/VPN ASNs (<code>AS4134, AS45102, AS132203, AS14061, AS20473, AS9009</code>) ·
+            (3) FOCI/UBO &amp; DOJ 28 CFR Part 202 Non-Covered Person + LEI/DUNS ·
+            (4) Certificate-Pinned Corporate Egress CIDRs (<code>authorized_egress_cidrs</code>) ·
+            (5) Hardware TPM 2.0 / HSM Cluster Key Binding (<code>bound_tpm_pubkey_blake3</code>) ·
+            (6) Anti-Scraping Zero-Canary Public Previews + Commit-and-Reveal <code>EscrowReceiptToken</code> ·
+            (7) Per-Buyer Cryptographic Canary Watermarking.
+          </div>
+        </div>
+
+        <!-- 2. HITL Sanitization, Trade-Secret Gate & Batch Sealing -->
+        <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:10px; padding:12px 14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+            <strong>1. Local Privacy Scrubber (Presidio + GLiNER) &amp; Verbatim Citation Grounding (10,000 bps)</strong>
+            <div style="display:flex; gap:8px;">
+              <button type="button" id="btn-marketplace-harvest" class="btn-primary" onclick="window.harvestMarketplaceBatch()" style="padding:6px 12px; font-size:12px;">
+                Harvest &amp; Sanitize Preview
+              </button>
+              <button type="button" id="btn-marketplace-approve" class="btn-primary" onclick="window.approveMarketplaceBatch()" style="padding:6px 12px; font-size:12px; background:#10a37f; border-color:#10a37f;">
+                Approve &amp; Seal Batch (HITL)
+              </button>
+            </div>
+          </div>
+          <div id="marketplace-manifest-box" style="font-size:12px; font-family:monospace; background:rgba(0,0,0,0.35); padding:10px; border-radius:8px; white-space:pre-wrap; max-height:170px; overflow-y:auto;">
+            Marketplace is disabled by default. Enable Opt-In above to harvest and review sanitized SFT/DPO trajectories.
+          </div>
+        </div>
+
+        <!-- 3. Federated Swarm Pool ContributionLedger & Active US Bounties -->
+        <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:10px; padding:12px 14px;">
+          <strong>2. Federated Swarm Pool <code>ContributionLedger</code> (BLAKE3 Deduplication &amp; Basis-Point Revenue Split)</strong>
+          <table class="report-table" style="width:100%; margin-top:8px; font-size:12px;">
+            <thead>
+              <tr>
+                <th style="text-align:left;">Peer Node ID (<code>origin_node_id</code>)</th>
+                <th style="text-align:right;">Unique BLAKE3 Records</th>
+                <th style="text-align:right;">Duplicates Dropped</th>
+                <th style="text-align:right;">Verified Tokens</th>
+                <th style="text-align:right;">Share (bps / %)</th>
+                <th style="text-align:right;">Est. Payout</th>
+              </tr>
+            </thead>
+            <tbody id="marketplace-ledger-tbody">
+              <tr><td colspan="6" style="opacity:0.7;">No sealed pool ledger yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.refreshMarketplaceStatus = async function() {
+      try {
+        const res = await fetch('/api/v1/marketplace/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        const toggle = document.getElementById('marketplace-opt-in-toggle');
+        const badge = document.getElementById('marketplace-status-badge');
+        const topPill = document.getElementById('marketplace-top-pill');
+        const jurSelect = document.getElementById('marketplace-jurisdiction-select');
+        const priceInput = document.getElementById('marketplace-price-cents');
+        if (toggle) toggle.checked = !!data.opt_in_enabled;
+        if (jurSelect) jurSelect.value = data.five_eyes_enabled ? 'FIVE_EYES' : 'US_ONLY';
+        if (priceInput && data.price_per_1k_records_cents) priceInput.value = data.price_per_1k_records_cents;
+
+        if (data.opt_in_enabled) {
+          if (badge) {
+            badge.textContent = 'OPT-IN ACTIVE (' + (data.allowed_jurisdictions || ['US']).join(', ') + ' SOVEREIGN LOCK)';
+            badge.style.background = 'rgba(16,163,127,0.2)';
+            badge.style.color = '#10a37f';
+          }
+          if (topPill) {
+            topPill.textContent = 'US LOCK';
+            topPill.style.background = 'rgba(16,163,127,0.2)';
+            topPill.style.color = '#10a37f';
+          }
+        } else {
+          if (badge) {
+            badge.textContent = 'DISABLED BY DEFAULT (403 Fail-Closed)';
+            badge.style.background = 'rgba(239,68,68,0.2)';
+            badge.style.color = '#f87171';
+          }
+          if (topPill) {
+            topPill.textContent = 'OFF';
+            topPill.style.background = 'rgba(239,68,68,0.18)';
+            topPill.style.color = '#f87171';
+          }
+        }
+
+        const manifestBox = document.getElementById('marketplace-manifest-box');
+        if (manifestBox && data.latest_manifest) {
+          const m = data.latest_manifest;
+          manifestBox.textContent =
+            'Batch ID: ' + m.batch_id + '\n' +
+            'Origin Node: ' + m.origin_node_id + ' (Ed25519 Signed)\n' +
+            'SFT Records: ' + m.sft_record_count + ' | DPO Pairs: ' + m.dpo_record_count + ' | Verified Tokens: ' + m.total_tokens + '\n' +
+            'BLAKE3 Merkle Root: ' + m.merkle_root_blake3 + '\n' +
+            'Sanitized Canary Sample[0]: ' + (m.canary_sample && m.canary_sample[0] ? m.canary_sample[0].chosen_response : 'None');
+        }
+
+        const tbody = document.getElementById('marketplace-ledger-tbody');
+        if (tbody && data.latest_ledger && data.latest_ledger.peer_shares) {
+          const shares = Object.values(data.latest_ledger.peer_shares);
+          if (shares.length > 0) {
+            tbody.innerHTML = shares.map(s =>
+              '<tr>' +
+              '<td><code>' + s.origin_node_id + '</code></td>' +
+              '<td style="text-align:right;">' + s.unique_records_accepted + '</td>' +
+              '<td style="text-align:right;">' + s.duplicate_records_dropped + '</td>' +
+              '<td style="text-align:right;">' + s.verified_tokens_accepted + '</td>' +
+              '<td style="text-align:right;">' + s.revenue_share_bps + ' bps (' + (s.revenue_share_bps / 100).toFixed(2) + '%)</td>' +
+              '<td style="text-align:right;">$' + (s.estimated_payout_cents / 100).toFixed(2) + '</td>' +
+              '</tr>'
+            ).join('');
+          }
+        }
+      } catch (_) {}
+    };
+
+    window.openMarketplaceModal = function() {
+      const m = document.getElementById('modal-marketplace');
+      if (m) m.classList.remove('hidden');
+      window.refreshMarketplaceStatus();
+    };
+
+    window.updateMarketplaceOptIn = async function() {
+      const toggle = document.getElementById('marketplace-opt-in-toggle');
+      const jurSelect = document.getElementById('marketplace-jurisdiction-select');
+      const priceInput = document.getElementById('marketplace-price-cents');
+      const fiveEyes = jurSelect && jurSelect.value === 'FIVE_EYES';
+      await fetch('/api/v1/marketplace/opt-in', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          opt_in_enabled: !!(toggle && toggle.checked),
+          five_eyes_enabled: fiveEyes,
+          price_per_1k_records_cents: Number(priceInput && priceInput.value ? priceInput.value : 5000)
+        })
+      });
+      await window.refreshMarketplaceStatus();
+    };
+
+    window.harvestMarketplaceBatch = async function() {
+      const box = document.getElementById('marketplace-manifest-box');
+      const res = await fetch('/api/v1/marketplace/harvest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (box) box.textContent = 'Blocked (' + res.status + '): ' + (data.error || JSON.stringify(data));
+        return;
+      }
+      await window.refreshMarketplaceStatus();
+    };
+
+    window.approveMarketplaceBatch = async function() {
+      const box = document.getElementById('marketplace-manifest-box');
+      const res = await fetch('/api/v1/marketplace/approve-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (box) box.textContent = 'Blocked (' + res.status + '): ' + (data.error || JSON.stringify(data));
+        return;
+      }
+      await window.refreshMarketplaceStatus();
+    };
+  </script>
 
   <script src="/assets/app.js?v=20261105b"></script>
 </body>

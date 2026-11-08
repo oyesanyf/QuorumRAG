@@ -9,6 +9,7 @@ description = "Gemma 768d embedding contract, BLAKE3 derivation, constant-time h
 [dependencies]
 quorum-types = { workspace = true }
 blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
 subtle = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

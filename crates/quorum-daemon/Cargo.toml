@@ -20,6 +20,9 @@ quorum-ingest = { workspace = true }
 quorum-network = { workspace = true }
 quorum-coordinator = { workspace = true }
 quorum-ui = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+subtle = { workspace = true }
 
 # Axum Web Server & Networking
 axum = { version = "0.7", features = ["macros", "tokio"] }
@@ -65,3 +68,7 @@ path = "../../tests/multi_node_p2p_search_tests.rs"
 [[test]]
 name = "retrieval_performance_tests"
 path = "../../tests/retrieval_performance_tests.rs"
+
+[[test]]
+name = "marketplace_sovereign_escrow_tests"
+path = "tests/marketplace_sovereign_escrow_tests.rs"
