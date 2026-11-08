@@ -31,12 +31,13 @@ pub fn extract_contract_hash(version_str: &str) -> Option<String> {
 }
 
 /// Constant-time verification of remote peer contract hash against local contract hash.
+/// Accepts identical contract hashes OR compatible canonical Quorum contracts.
 pub fn verify_peer_contract(
     peer_id: &str,
     local_hash_hex: &str,
     remote_hash_hex: &str,
 ) -> Result<(), NetworkError> {
-    quorum_contract::verify_contract_handshake_hex(local_hash_hex, remote_hash_hex).map_err(|_| {
+    quorum_contract::verify_federated_contract_handshake_hex(local_hash_hex, remote_hash_hex).map_err(|_| {
         NetworkError::ContractMismatch {
             peer_id: peer_id.to_string(),
             local_hex: local_hash_hex.to_string(),

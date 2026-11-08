@@ -241,10 +241,21 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             .write()
             .unwrap_or_else(|e| e.into_inner());
         guard.mesh.mesh_port = chosen_p2p_port;
+        // Ensure require_explicit_folder_share defaults to false so remote mesh peers are never blocked by default
+        guard.mesh.require_explicit_folder_share = false;
         if cli.max_peer_responses > 0 {
             guard.mesh.max_peer_responses = cli.max_peer_responses;
         }
-        for wp in &ingest_config.watch_paths {
+
+        // Automatically populate discovered user document folders and watch paths into shared_folders
+        let mut candidate_folders = ingest_config.watch_paths.clone();
+        for user_root in quorum_ingest::IngestConfig::discover_user_document_roots() {
+            if !candidate_folders.contains(&user_root) {
+                candidate_folders.push(user_root);
+            }
+        }
+
+        for wp in &candidate_folders {
             let wp_str = wp.to_string_lossy().to_string();
             if !guard
                 .mesh

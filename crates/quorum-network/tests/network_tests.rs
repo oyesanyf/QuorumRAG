@@ -136,3 +136,49 @@ async fn test_contract_mismatch_disconnects_peer() {
     let _ = handle_a.shutdown().await;
     let _ = handle_b.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_cross_engine_canonical_contract_handshake_connects() {
+    use quorum_contract::EmbeddingContract;
+
+    // Node A uses DeterministicOffline
+    let mut config_a = NetworkConfig::new_localhost();
+    config_a.contract_hash_hex = EmbeddingContract::canonical_deterministic_offline().derive_contract_hash_hex();
+    let (_jh_a, handle_a) = start_network_node(config_a, None).await.unwrap();
+
+    // Node B uses OllamaEmbedding (different engine mode, but both canonical 768d Quorum contracts)
+    let mut config_b = NetworkConfig::new_localhost();
+    config_b.contract_hash_hex = EmbeddingContract::canonical_ollama_embeddinggemma().derive_contract_hash_hex();
+    let (_jh_b, handle_b) = start_network_node(config_b, None).await.unwrap();
+
+    let addrs_b = handle_b.listen_addresses().await.unwrap();
+    let tcp_addr = addrs_b
+        .iter()
+        .find(|a| a.to_string().contains("/tcp/"))
+        .cloned()
+        .unwrap();
+
+    let mut events_a = handle_a.subscribe_events();
+    handle_a.dial(tcp_addr).await.expect("Dial succeeds");
+
+    // Must NOT reject each other
+    let mut rejected = false;
+    for _ in 0..10 {
+        tokio::select! {
+            Ok(ev) = events_a.recv() => {
+                if let NetworkEvent::PeerRejected { peer_id, .. } = ev {
+                    if peer_id == handle_b.local_peer_id() {
+                        rejected = true;
+                        break;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+
+    assert!(!rejected, "Nodes running different canonical Quorum contracts must NOT reject each other");
+
+    let _ = handle_a.shutdown().await;
+    let _ = handle_b.shutdown().await;
+}

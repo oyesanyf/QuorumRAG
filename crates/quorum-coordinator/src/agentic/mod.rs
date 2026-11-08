@@ -303,6 +303,7 @@ impl AgenticStateGraphRunner {
                                     final_state: AgenticStateName::Complete,
                                     model_name: graph_state.selected_model_tag.clone(),
                                     responder_peer_id,
+                                    peer_diagnostics: graph_state.peer_diagnostics.clone(),
                                 })
                                 .await;
                         }
@@ -379,6 +380,7 @@ impl AgenticStateGraphRunner {
                                 local_count,
                                 remote_count,
                                 latency_ms: latency,
+                                peer_diagnostics: graph_state.peer_diagnostics.clone(),
                             })
                             .await;
 
@@ -586,6 +588,7 @@ impl AgenticStateGraphRunner {
                                 final_state: AgenticStateName::Complete,
                                 model_name: graph_state.selected_model_tag.clone(),
                                 responder_peer_id,
+                                peer_diagnostics: graph_state.peer_diagnostics.clone(),
                             })
                             .await;
                     }

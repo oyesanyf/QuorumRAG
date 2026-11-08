@@ -307,6 +307,7 @@ fn test_web_boundary_query_result_to_citations_empty() {
         sources_cited: Vec::new(),
         cache_hit: false,
         cache_epoch: 0,
+        peer_diagnostics: None,
     };
 
     assert!(empty_qr.chunks.is_empty());

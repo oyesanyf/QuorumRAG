@@ -337,6 +337,7 @@ pub struct ScatterGatherEngine {
     pub config: CoordinatorConfig,
     pub secret_seed: [u8; 32],
     pub sender_peer_id: String,
+    pub last_peer_diagnostics: Arc<RwLock<Option<quorum_types::FederatedPeerDiagnostics>>>,
 }
 
 impl ScatterGatherEngine {
@@ -355,7 +356,18 @@ impl ScatterGatherEngine {
             config,
             secret_seed,
             sender_peer_id,
+            last_peer_diagnostics: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Retrieves the most recent federated peer diagnostics from the latest scatter-gather query.
+    pub async fn last_diagnostics(&self) -> Option<quorum_types::FederatedPeerDiagnostics> {
+        self.last_peer_diagnostics.read().await.clone()
+    }
+
+    /// Stores the active federated peer diagnostics for telemetry and sources reporting.
+    pub async fn set_last_diagnostics(&self, diag: quorum_types::FederatedPeerDiagnostics) {
+        *self.last_peer_diagnostics.write().await = Some(diag);
     }
 
     /// Dispatches parallel queries across local storage and remote peers with optional cached vector hits
@@ -460,9 +472,9 @@ impl ScatterGatherEngine {
                     let dispatcher = Arc::clone(&self.mesh_dispatcher);
                     tokio::spawn(async move {
                         dispatcher
-                            .query_peers(&req, timeout_dur)
+                            .query_peers_with_diagnostics(&req, timeout_dur)
                             .await
-                            .unwrap_or_default()
+                            .unwrap_or_else(|_| (Vec::new(), quorum_types::FederatedPeerDiagnostics::default()))
                     })
                 })
         } else {
@@ -545,14 +557,22 @@ impl ScatterGatherEngine {
                         candidate_limit,
                         exclude_chunk_ids,
                     )
-                    .await
+                        .await
             };
             (results.clone(), results)
         };
 
-        let remote_responses = match remote_handle {
-            Some(jh) => jh.await.unwrap_or_default(),
-            None => Vec::new(),
+        let (remote_responses, mut diagnostics) = match remote_handle {
+            Some(jh) => jh
+                .await
+                .unwrap_or_else(|_| (Vec::new(), quorum_types::FederatedPeerDiagnostics::default())),
+            None => {
+                let mut d = quorum_types::FederatedPeerDiagnostics::default();
+                if !p2p_enabled {
+                    d.summary_reason = Some("P2P mesh retrieval is disabled in settings".to_string());
+                }
+                (Vec::new(), d)
+            }
         };
 
         // 3. Ingest candidate chunks into volatile memory containers after inbound PHI/PII DLP gate
@@ -620,7 +640,7 @@ impl ScatterGatherEngine {
         // We also preserve the remote peer's `ScoredChunk` entries so the UI Sources panel and citations
         // display BOTH `(local)` AND `(Peer: 12D3KooW...)` when a document exists across 2+ computers.
         for (peer_id, peer_chunks) in remote_lists_snapshot {
-            if !peer_id.starts_with("12D3KooW") {
+            if peer_id.is_empty() || peer_id == "local" {
                 continue;
             }
             for (rank, dto) in peer_chunks.into_iter().enumerate() {
@@ -692,6 +712,34 @@ impl ScatterGatherEngine {
         if !exclude_set.is_empty() {
             fused.retain(|c| !exclude_set.contains(c.chunk.chunk_id.as_str()));
         }
+
+        let remote_chunks_count = fused
+            .iter()
+            .filter(|c| !c.source_peer.is_empty() && c.source_peer != "local")
+            .count();
+
+        for outcome in &mut diagnostics.peer_outcomes {
+            outcome.cited_chunk_count = fused
+                .iter()
+                .filter(|c| c.source_peer == outcome.peer_id)
+                .count();
+        }
+
+        if remote_chunks_count == 0 {
+            if p2p_enabled {
+                let mesh_port = {
+                    let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
+                    s.mesh.mesh_port
+                };
+                let timeout_dur_ms = self.config.timeout_ms;
+                diagnostics.compute_summary_reason(mesh_port, timeout_dur_ms);
+            }
+        } else {
+            diagnostics.summary_reason = None;
+        }
+
+        *self.last_peer_diagnostics.write().await = Some(diagnostics.clone());
+        crate::offline_engine::DeterministicOfflineSynthesisEngine::set_active_peer_diagnostics(diagnostics);
 
         let duration_ms = start.elapsed().as_millis() as u64;
         (fused, volatile_chunks, duration_ms, new_cached_vector)

@@ -100,6 +100,7 @@ impl QueryCoordinator {
                 sources_cited: cached.citations.clone(),
                 cache_hit: true,
                 cache_epoch: epoch,
+                peer_diagnostics: None,
             });
         }
 
@@ -143,6 +144,8 @@ impl QueryCoordinator {
             None,
         );
 
+        let peer_diagnostics = self.engine.last_diagnostics().await;
+
         Ok(QueryResult {
             chunks,
             synthesis_prompt,
@@ -150,6 +153,7 @@ impl QueryCoordinator {
             sources_cited,
             cache_hit: false,
             cache_epoch: epoch,
+            peer_diagnostics,
         })
     }
 
@@ -222,6 +226,7 @@ impl QueryCoordinator {
             sources_cited: final_state.citations,
             cache_hit: was_cached,
             cache_epoch: epoch,
+            peer_diagnostics: final_state.peer_diagnostics,
         })
     }
 

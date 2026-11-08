@@ -1296,6 +1296,13 @@ function secureRandomIndex(n) {
       if (telemetryModelInfo) {
         telemetryModelInfo.textContent = `Retrieved ${data.retrieved_count || 0} chunks (${data.local_count || 0} local, ${data.remote_count || 0} mesh) in ${data.latency_ms || 0}ms`;
       }
+      if (citationsEl) {
+        const diag = (data && data.peer_diagnostics) || (event && event.data && event.data.peer_diagnostics);
+        if (diag) {
+          citationsEl._peerDiagnostics = diag;
+          refreshSourcesNodeIdRow(citationsEl);
+        }
+      }
     } else if (type === 'RelevanceGraded' || type === 'relevance_graded') {
       setCompletedStep('step-retrieve');
       setActiveStep('step-grade');
@@ -1337,8 +1344,14 @@ function secureRandomIndex(n) {
         citationsEl._pendingCitations.push(cit);
       }
     } else if (type === 'ExecutionFinished' || type === 'execution_finished' || type === 'done') {
-      if (citationsEl && data && data.responder_peer_id) {
-        citationsEl._responderPeerId = String(data.responder_peer_id).trim();
+      if (citationsEl) {
+        if (data && data.responder_peer_id) {
+          citationsEl._responderPeerId = String(data.responder_peer_id).trim();
+        }
+        const diag = (data && data.peer_diagnostics) || (event && event.data && event.data.peer_diagnostics);
+        if (diag) {
+          citationsEl._peerDiagnostics = diag;
+        }
         refreshSourcesNodeIdRow(citationsEl);
       }
       markTelemetryComplete();
@@ -1808,16 +1821,34 @@ function secureRandomIndex(n) {
     const peerCount = distinctPeers.size;
     const meshContributorsCount = isExternalResponder ? peerCount : (peerCount > 1 ? peerCount - 1 : 0);
 
+    let peerDiagHtml = '';
+    if (meshContributorsCount === 0) {
+      const diag = citationsEl._peerDiagnostics;
+      const meshPort = (cachedSettingsData && cachedSettingsData.mesh && cachedSettingsData.mesh.mesh_port) || 3032;
+      const reason = (diag && diag.summary_reason)
+        ? diag.summary_reason
+        : `0 peers connected on P2P port ${meshPort} (no mDNS or bootstrap peers online)`;
+      peerDiagHtml = `
+        <div class="sources-peer-diagnostic-row" style="margin-top:4px; font-size:12px; color:var(--text-muted, #9ca3af);">
+          <span>📡 Remote Peers:</span>
+          <span class="sources-peer-diagnostic-reason" style="color:#f59e0b; margin-left:4px;">No data from remote peers — Reason: ${escapeHtml(reason)}</span>
+        </div>
+      `;
+    }
+
     nodeRow.innerHTML = `
-      <span style="font-weight:600; color:var(--text-secondary, #d1d5db);">Responding Node ID:</span>
-      <button type="button" class="sources-responder-peer-pill" title="Click to copy responding Node ID">
-        <span>🌐</span> <strong>${escapeHtml(responderId)}</strong>
-      </button>
-      ${meshContributorsCount > 0 ? `
-        <span class="sources-federated-tag" style="font-size:11px; opacity:0.85; color:var(--text-muted); background:rgba(255,255,255,0.06); padding:2px 6px; border-radius:4px;">
-          (+ ${meshContributorsCount} Mesh Peer${meshContributorsCount > 1 ? 's' : ''})
-        </span>
-      ` : ''}
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+        <span style="font-weight:600; color:var(--text-secondary, #d1d5db);">Responding Node ID:</span>
+        <button type="button" class="sources-responder-peer-pill" title="Click to copy responding Node ID">
+          <span>🌐</span> <strong>${escapeHtml(responderId)}</strong>
+        </button>
+        ${meshContributorsCount > 0 ? `
+          <span class="sources-federated-tag" style="font-size:11px; opacity:0.85; color:var(--text-muted); background:rgba(255,255,255,0.06); padding:2px 6px; border-radius:4px;">
+            (+ ${meshContributorsCount} Mesh Peer${meshContributorsCount > 1 ? 's' : ''})
+          </span>
+        ` : ''}
+      </div>
+      ${peerDiagHtml}
     `;
 
     const btn = nodeRow.querySelector('.sources-responder-peer-pill');
@@ -4887,7 +4918,7 @@ function secureRandomIndex(n) {
               <label for="sw-explicit-folders" class="settings-row-label">Require Explicit Folder Approval for Mesh Sharing (Fail-Closed)</label>
               <div class="settings-row-desc">Block remote peers from accessing any file outside the folders listed below (${dlpStats.total_blocked_unshared_folder_chunks || 0} unshared folder chunks blocked).</div>
             </div>
-            <input id="sw-explicit-folders" type="checkbox" class="quorum-switch" ${mesh.require_explicit_folder_share !== false ? 'checked' : ''} data-change-action="mesh-config" data-config-key="require_explicit_folder_share">
+            <input id="sw-explicit-folders" type="checkbox" class="quorum-switch" ${mesh.require_explicit_folder_share === true ? 'checked' : ''} data-change-action="mesh-config" data-config-key="require_explicit_folder_share">
           </div>
 
           <div style="margin-bottom:14px;">${foldersListHtml}</div>
@@ -5855,7 +5886,7 @@ function secureRandomIndex(n) {
               <label for="sw-dc-explicit" class="settings-row-label">Only Share Explicitly Approved Folders with Mesh</label>
               <div class="settings-row-desc">Prevent any folder not in your Shared Folders allowlist from being accessed over P2P.</div>
             </div>
-            <input id="sw-dc-explicit" type="checkbox" class="quorum-switch" ${mesh.require_explicit_folder_share !== false ? 'checked' : ''} data-change-action="mesh-config" data-config-key="require_explicit_folder_share">
+            <input id="sw-dc-explicit" type="checkbox" class="quorum-switch" ${mesh.require_explicit_folder_share === true ? 'checked' : ''} data-change-action="mesh-config" data-config-key="require_explicit_folder_share">
           </div>
           <div class="settings-row">
             <div class="settings-row-info">

@@ -267,7 +267,7 @@ async fn test_empirical_contract_differentiation_and_wire_handshake_rejection() 
     let verify_hex_res = verify_contract_handshake_hex(&hex_offline, &hex_gemma);
     assert!(matches!(verify_hex_res, Err(ContractError::ContractMismatch { .. })));
 
-    // 5. Live wire libp2p test: DeterministicOffline node dials GemmaCandle node
+    // 5. Live wire libp2p test: foreign/incompatible contract node dials GemmaCandle node
     let mut config_gemma = NetworkConfig::new_localhost();
     config_gemma.contract_hash_hex = hex_gemma.clone();
     let (_jh_gemma, handle_gemma) = start_network_node(config_gemma, None).await.unwrap();
@@ -279,24 +279,25 @@ async fn test_empirical_contract_differentiation_and_wire_handshake_rejection() 
         .cloned()
         .expect("Gemma node must have TCP listen address");
 
-    let mut config_offline = NetworkConfig::new_localhost();
-    config_offline.contract_hash_hex = hex_offline.clone();
-    let (_jh_offline, handle_offline) = start_network_node(config_offline, None).await.unwrap();
+    let foreign_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string();
+    let mut config_foreign = NetworkConfig::new_localhost();
+    config_foreign.contract_hash_hex = foreign_hex.clone();
+    let (_jh_foreign, handle_foreign) = start_network_node(config_foreign, None).await.unwrap();
 
-    let mut events_offline = handle_offline.subscribe_events();
+    let mut events_foreign = handle_foreign.subscribe_events();
 
-    // DeterministicOffline node dials GemmaCandle node
-    handle_offline.dial(tcp_gemma.clone()).await.unwrap();
+    // Foreign node dials GemmaCandle node
+    handle_foreign.dial(tcp_gemma.clone()).await.unwrap();
 
     // Verify rejection is received on the wire
-    let mut offline_rejected = false;
+    let mut foreign_rejected = false;
     for _ in 0..20 {
         tokio::select! {
-            Ok(ev) = events_offline.recv() => {
+            Ok(ev) = events_foreign.recv() => {
                 if let NetworkEvent::PeerRejected { peer_id, reason } = ev {
                     if peer_id == handle_gemma.local_peer_id() {
                         assert!(reason.contains("contract hash mismatch"));
-                        offline_rejected = true;
+                        foreign_rejected = true;
                         break;
                     }
                 }
@@ -304,31 +305,31 @@ async fn test_empirical_contract_differentiation_and_wire_handshake_rejection() 
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
-    assert!(offline_rejected, "Offline node must be rejected by Gemma node on contract mismatch");
+    assert!(foreign_rejected, "Foreign node must be rejected by Gemma node on contract mismatch");
 
     // Verify connection was torn down
     tokio::time::sleep(Duration::from_millis(150)).await;
     let peers_gemma = handle_gemma.connected_peers().await.unwrap();
     assert!(
-        !peers_gemma.contains(&handle_offline.local_peer_id()),
-        "Gemma node must NOT maintain connection with mismatched Offline node"
+        !peers_gemma.contains(&handle_foreign.local_peer_id()),
+        "Gemma node must NOT maintain connection with foreign node"
     );
 
-    // 6. Verify identical contract succeeds on the wire
-    let mut config_gemma_peer = NetworkConfig::new_localhost();
-    config_gemma_peer.contract_hash_hex = hex_gemma.clone();
-    let (_jh_peer, handle_peer) = start_network_node(config_gemma_peer, None).await.unwrap();
+    // 6. Verify cross-engine canonical contract succeeds on the wire (DeterministicOffline <-> GemmaCandle)
+    let mut config_offline = NetworkConfig::new_localhost();
+    config_offline.contract_hash_hex = hex_offline.clone();
+    let (_jh_offline, handle_offline) = start_network_node(config_offline, None).await.unwrap();
 
-    handle_peer.dial(tcp_gemma).await.unwrap();
+    handle_offline.dial(tcp_gemma).await.unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let peers_gemma_final = handle_gemma.connected_peers().await.unwrap();
     assert!(
-        peers_gemma_final.contains(&handle_peer.local_peer_id()),
-        "Compatible Gemma peer must be accepted and connected"
+        peers_gemma_final.contains(&handle_offline.local_peer_id()),
+        "Compatible federated peer (DeterministicOffline) must be accepted and connected to GemmaCandle node"
     );
 
     let _ = handle_gemma.shutdown().await;
+    let _ = handle_foreign.shutdown().await;
     let _ = handle_offline.shutdown().await;
-    let _ = handle_peer.shutdown().await;
 }

@@ -13,3 +13,15 @@ __pycache__/
 *.py[cod]
 /logs/
 /raptor_out/
+
+# Root scaffolding and agent tracking files
+/ORIGINAL_REQUEST.md
+/pr_body*.md
+/TEST_READY.md
+/DEAD_ENDS.md
+/BRIEFING.md
+/progress.md
+/GATE_STATUS.md
+/SCOPE.md
+/PROJECT.md
+/TEST_INFRA.md

@@ -4,38 +4,223 @@
 [![Installers](https://github.com/oyesanyf/QuorumRAG/actions/workflows/quorumrag-release.yml/badge.svg)](https://github.com/oyesanyf/QuorumRAG/actions/workflows/quorumrag-release.yml)
 [![RAPTOR Security Audit](https://github.com/oyesanyf/QuorumRAG/actions/workflows/raptor-security.yml/badge.svg)](https://github.com/oyesanyf/QuorumRAG/actions/workflows/raptor-security.yml)
 
-Local-first, peer-to-peer agentic Retrieval-Augmented Generation (RAG) and Recursive Language Model (RLM) daemon with an embedded ChatGPT-style Web UI and an **Opt-In Sovereign AI Training Data Marketplace** (strictly disabled by default: `opt_in_enabled = false`).
+Production-grade, local-first, peer-to-peer Retrieval-Augmented Generation (RAG) and Recursive Language Model (RLM) daemon with an embedded ChatGPT-style Web UI, co-located hybrid vector/full-text search, and cryptographic privacy enforcement.
 
-- **Hybrid Search & Deep Parent-Window RLM**: LanceDB dense vectors + Tantivy BM25 full-text search with `0..10000` byte parent-document window expansion and cross-node document-family deduplication.
-- **Multimodal Ingestion**: Documents (PDF, DOCX, XLSX, PPTX, TXT, MD), images (local Ollama vision captioning), and audio, with magic-byte exclusion of executables/binaries (`.exe`, `.dll`, ELF, Mach-O).
-- **100% Verbatim Citation Grounding**: LLM synthesis and deterministic LangExtract fallback verify `slice_text.contains(&verbatim_quote)` on every citation.
-- **Ed25519-Authenticated `libp2p` Mesh**: Cryptographically signed scatter-gather retrieval with Microsoft Presidio + GLiNER (`urchade/gliner_multi_pii-v1`) HIPAA PHI/PII Data Loss Prevention (DLP).
-- **Opt-In Sovereign AI Training Data Marketplace & `ContributionLedger`**: Enables subscribers who explicitly opt in to monetize sanitized, citation-grounded SFT and DPO reasoning trajectories with verified U.S. / allied AI labs while enforcing a multi-layer anti-exfiltration and domestic-evasion guard (`SovereignJurisdictionGuard`).
+- **Hybrid Search Engine**: LanceDB dense vector embeddings paired with co-located Tantivy BM25 full-text indexing, evaluated via Reciprocal Rank Fusion (RRF) and parent-document window expansion.
+- **Multimodal Ingestion**: Documents (PDF, DOCX, XLSX, PPTX, TXT, MD), images (local Ollama vision captioning), and audio, with magic-byte exclusion of binaries and executables (`.exe`, `.dll`, ELF, Mach-O).
+- **100% Verbatim Citation Grounding**: LLM synthesis and deterministic offline synthesis verify `slice_text.contains(&verbatim_quote)` on every cited excerpt.
+- **Ed25519-Authenticated `libp2p` Mesh**: Cryptographically signed scatter-gather retrieval across private LAN/WAN peers with Microsoft Presidio + GLiNER (`urchade/gliner_multi_pii-v1`) HIPAA PHI/PII Data Loss Prevention (DLP).
+- **Structured Peer Query Diagnostics**: Real-time reporting of connected swarm nodes, queried peers, and per-peer outcomes (status, chunk count, cited count, timeout, policy blocks) rendered directly in the Web UI.
+- **Zero-Stub Production Architecture**: Single self-contained binary daemon that automatically binds open ports, manages local indexes, and launches the browser interface.
+
+---
 
 ## Contents
 
-- [Sovereign AI Training Data Marketplace & Multi-Layer Guard](#sovereign-ai-training-data-marketplace--multi-layer-guard)
-  - [Architecture Overview](#architecture-overview)
-  - [4-Stage Sovereign Marketplace & Revenue-Sharing Pipeline](#4-stage-sovereign-marketplace--revenue-sharing-pipeline)
-  - [Five-Layer Sovereign Guard + Domestic U.S. Evasion Hardening](#five-layer-sovereign-guard--domestic-us-evasion-hardening)
-  - [Code Inspection Map & One-Command Verification](#code-inspection-map--one-command-verification)
-- [Install](#install)
-- [Build from source](#build-from-source)
-- [Workspace layout](#workspace-layout)
-- [Repository map](#repository-map)
+- [Quickstart & Install](#quickstart--install)
+- [Architecture & Data Flow](#architecture--data-flow)
+- [CLI Reference](#cli-reference)
+- [Build from Source](#build-from-source)
+- [Workspace Layout](#workspace-layout)
+- [Repository Map](#repository-map)
+- [Opt-In Sovereign AI Training Data Marketplace (Experimental)](#opt-in-sovereign-ai-training-data-marketplace-experimental)
 - [Documentation](#documentation)
 
 ---
 
-## Sovereign AI Training Data Marketplace & Multi-Layer Guard
+## Quickstart & Install
+
+Download pre-built packages from [Releases](https://github.com/oyesanyf/QuorumRAG/releases). Every package installs QuorumRAG as an always-on background service and opens `http://127.0.0.1:3031/` in your browser:
+
+| OS | Package | Service Name |
+|---|---|---|
+| Windows | `QuorumRAG-<ver>-x86_64.msi` (or portable `.zip`) | `QuorumRAGDaemon` |
+| Debian / Ubuntu | `quorumrag_<ver>_<arch>.deb` | `quorumrag.service` |
+| RHEL / Fedora / SUSE | `quorumrag-<ver>-1.<arch>.rpm` | `quorumrag.service` |
+| macOS | `QuorumRAG-<ver>-macos-universal.pkg` | `dev.quorumrag.daemon` |
+| Docker | `ghcr.io/oyesanyf/quorumrag:latest` | Container daemon |
+
+### Docker Container
+
+```bash
+docker run -d --name quorumrag --network host \
+  -v quorumrag-data:/var/lib/quorumrag \
+  ghcr.io/oyesanyf/quorumrag:latest
+
+# Web UI: http://127.0.0.1:3031/
+```
+
+### Running the Daemon Locally
+
+If running from binary or cargo:
+
+```bash
+# Start daemon with default fixed-drive indexing and browser launch
+quorumrag --host 0.0.0.0 --port 3031 --p2p-port 3032 --data-dir ./data
+
+# Or headless without auto-opening browser
+quorumrag --no-browser --data-dir ./data
+```
+
+Uninstalling stops the service and deletes installed files. See [docs/INSTALL.md](docs/INSTALL.md) for silent-install switches, data paths, purge options, and code-signing notes.
+
+---
+
+## Architecture & Data Flow
+
+QuorumRAG coordinates embedded local storage, ingestion watchers, language model synthesis, and decentralized swarm peers:
+
+```
+[User / Browser]
+       │
+       ▼ (HTTP / SSE / WebSocket)
+[quorum-ui / Axum Web Server] (Embedded HTML/CSS/JS, SSE Streaming, Citations)
+       │
+       ▼
+[quorum-coordinator] ─── (400ms scatter-gather) ───┐
+       │                                            ▼
+       ├─────────────────────────┐          [quorum-network] (rust-libp2p Swarm)
+       ▼                         ▼                  │ (QUIC/TCP/Noise/Yamux/mDNS/CBOR)
+[quorum-storage]          [quorum-contract]         ▼
+(LanceDB + Tantivy FTS)   (Gemma 768d Offline)   [Remote Peer Swarm Nodes]
+  - Arrow Encapsulated     - Deterministic B3       - Ed25519 Access Tier Pre-filter
+  - SQL Pre-filtering        contract hash          - ZeroizeOnDrop Remote Chunks
+  - Scheduled Compaction   - Constant-time gating   - Reciprocal Rank Fusion (RRF)
+       ▲
+       │ (Micro-batched writes)
+[quorum-ingest]
+  - Google Magika Content-Type Sniffing
+  - Level-1 BLAKE3 Mtime Catalog
+  - Level-2 BLAKE3 Chunk Hash Cache
+  - Multimodal Vision / Audio Extraction
+```
+
+### Core Invariants
+
+1. **Deterministic Offline Fallback**: If no local Ollama or cloud LLM engine is running, `DeterministicOfflineSynthesisEngine` synthesizes cohesive biographical and technical answers with full citation links.
+2. **Volatile Memory Protection**: Remote chunks ingested from the P2P mesh implement `ZeroizeOnDrop` to prevent cross-peer retention in process memory.
+3. **Fail-Closed Access Tiers**: Document chunks and search queries enforce Ed25519-signed `AccessTier` gates (`Tier0Public`, `Tier1Internal`, `Tier2Confidential`, `Tier3Restricted`).
+
+---
+
+## CLI Reference
+
+```
+Usage: quorumrag [OPTIONS] [COMMAND]
+
+Commands:
+  reindex    Run standalone reindex worker process on designated directories
+  fix-drift  Run standalone drift healing process repairing all 5 drift types
+  recache    Invalidate, synchronize, and pre-warm BLAKE3 query and embedding caches
+  watch-p2p  Run dedicated out-of-process P2P Mesh Watcher & Self-Healing Supervisor
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -p, --port <PORT>
+          Port to bind the web server and UI on [default: 3030]
+      --host <HOST>
+          Host interface to bind on [default: 0.0.0.0]
+      --data-dir <DATA_DIR>
+          Root directory for LanceDB and Tantivy persistent data [default: ./data]
+      --watch-dir <WATCH_DIR>
+          Directory to index and watch for changes (defaults to all fixed physical drives)
+      --no-browser
+          Do not auto-open the default browser upon server startup
+      --p2p-port <P2P_PORT>
+          Port for libp2p P2P swarm (TCP & QUIC) [default: 3031]
+      --local-only
+          Run in local-only mode (disable remote peer networking)
+      --no-p2p-watcher
+          Disable spawning the dedicated out-of-process P2P watcher child process
+      --model-family <MODEL_FAMILY>
+          Default synthesis model family [default: AutoFusion]
+      --max-peer-responses <MAX_PEER_RESPONSES>
+          Maximum number of remote peer responses to collect/fuse per query [default: 8]
+      --service
+          Run under the OS Service Control Manager (file logging to <data-dir>/logs/)
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
+### CLI Subcommands
+
+- **`quorumrag reindex --path <DIR> [--full] [--force-reembed] [--batch-size 64]`**:
+  Executes an offline reindex pass using Level-1 mtime and Level-2 BLAKE3 caching.
+- **`quorumrag fix-drift [--dry-run] [--drift-type <TYPE>]`**:
+  Audits and heals storage drift across Merkle state, hybrid index desync, vector contracts, ACL policies, and compaction.
+- **`quorumrag recache [--clear] [--warm]`**:
+  Pre-warms hot vector queries or flushes the embedding cache epoch.
+- **`quorumrag watch-p2p [--daemon-url <URL>] [--interval-secs 10] [--heal-service] [--once]`**:
+  Monitors mesh connectivity and automatically restarts the local service daemon on stalls.
+
+---
+
+## Build from Source
+
+Prerequisites: Rust stable toolchain (`1.78+`), CMake, and LLVM/Clang for LanceDB C++ dependencies.
+
+```bash
+# Build release daemon
+cargo build --release -p quorum-daemon --bin quorumrag
+
+# Run release executable
+./target/release/quorumrag --host 0.0.0.0 --port 3031 --p2p-port 3032 --data-dir ./data
+```
+
+### Package Generation
+
+- **Windows MSI**: `powershell -ExecutionPolicy Bypass -File scripts/package.ps1`
+- **Linux DEB / RPM**: `packaging/linux/build_packages.sh`
+- **macOS Universal PKG**: `packaging/macos/build_packages.sh`
+
+---
+
+## Workspace Layout
+
+| Crate | Purpose |
+|---|---|
+| `quorum-daemon` | HTTP API, embedded Web UI, SQLite chat history, Windows service host (`quorumrag` binary) |
+| `quorum-coordinator` | Agentic RLM retrieval, answer synthesis, Reciprocal Rank Fusion, Presidio/GLiNER DLP, and `SovereignJurisdictionGuard` |
+| `quorum-ingest` | Filesystem discovery, Magika MIME detection, chunking, and multimodal extraction |
+| `quorum-storage` | LanceDB vector store and Tantivy BM25 full-text index |
+| `quorum-network` | Ed25519-authenticated `libp2p` peer mesh (TCP, QUIC, Noise, Yamux, mDNS) |
+| `quorum-contract` | Shared data contracts, BLAKE3 Merkle trees, embedding schemas, and marketplace models |
+| `quorum-types` | Core domain types, DocumentChunk, ScoredChunk, AccessTier, and FederatedPeerDiagnostics |
+| `quorum-ui` | Embedded HTML, CSS, JavaScript frontend assets and Axum static routes |
+
+---
+
+## Repository Map
+
+| Path | What is there |
+|---|---|
+| [`crates/`](crates) | Rust workspace crates (see [Workspace layout](#workspace-layout)) |
+| [`crates/quorum-daemon/src/`](crates/quorum-daemon/src) | HTTP handlers, CLI router, shutdown signals, Windows service harness (`win_service.rs`) |
+| [`crates/quorum-coordinator/src/`](crates/quorum-coordinator/src) | Answer orchestrator, offline engine, scatter-gather, DLP mesh, and sovereign marketplace engine |
+| [`crates/quorum-ui/assets/`](crates/quorum-ui/assets) | Embedded responsive ChatGPT-style Web UI (`index.html`, `app.js`, `styles.css`) |
+| [`crates/quorum-network/src/`](crates/quorum-network/src) | Libp2p Swarm, Noise authentication, Ed25519 request signing, and peer discovery |
+| [`crates/quorum-storage/src/`](crates/quorum-storage/src) | Embedded LanceDB vector tables and Tantivy full-text search indexes |
+| [`crates/quorum-ingest/src/`](crates/quorum-ingest/src) | Google Magika content detector, multithreaded crawler, and document chunkers |
+| [`packaging/windows/`](packaging/windows) | Launcher scripts, browser launcher, and complete-uninstall utilities for MSI |
+| [`packaging/linux/`](packaging/linux) | deb/rpm builders, systemd unit file (`quorumrag.service`), and control helper |
+| [`packaging/macos/`](packaging/macos) | pkg/dmg builders, LaunchDaemon plist, install and uninstall scripts |
+| [`wix/QuorumRAG.wxs`](wix/QuorumRAG.wxs) | WiX v5 MSI definition (auto-start service, browser launch, clean removal) |
+| [`scripts/`](scripts) | Packaging pipeline (`package.ps1`), solo PR ship script, and nightly RAPTOR security audit |
+| [`.github/workflows/`](.github/workflows) | Multi-platform CI, release builders, PR invariant gate, and RAPTOR security scans |
+| [`docs/`](docs) | Detailed guides for installation, multimodal ingestion, and sovereign data marketplace |
+| [`AGENTS.md`](AGENTS.md) | Boundary and solo-developer shipping invariants for automated agents |
+
+---
+
+## Opt-In Sovereign AI Training Data Marketplace (Experimental)
 
 > [!IMPORTANT]
 > **Strictly Disabled by Default (`opt_in_enabled = false`) & `["US"]`-Only Default Sovereign Lock**:
 > Every marketplace endpoint (`/api/v1/marketplace/harvest`, `/approve-batch`, `/preview`, `/unlock`, `/download`, `/bounties`, `/pool-merge`, `/ledger`) ships **OFF by default** and returns `403 Forbidden` unless the local node owner explicitly turns on **Opt-In AI Training Data Marketplace** in Settings and clicks **Approve & Seal Batch (HITL)**. Out of the box, `allowed_jurisdictions` defaults strictly to `["US"]` (`US_ONLY_DOJ_28_CFR_PART_202`).
 
-### Architecture Overview
-
-Frontier AI labs do not buy raw, unverified PDFs or hard-drive dumps due to copyright exposure and PII/PHI liability. They purchase **de-identified, domain-specific SFT (Supervised Fine-Tuning) and DPO (Direct Preference Optimization) reasoning trajectories** that prove how an agentic model solves multi-step problems with 100% verbatim substring grounding.
+The Sovereign AI Training Data Marketplace allows opted-in subscribers to monetize sanitized, citation-grounded SFT and DPO reasoning trajectories with verified domestic AI labs while enforcing a multi-layer anti-exfiltration and domestic-evasion guard (`SovereignJurisdictionGuard`).
 
 ```mermaid
 flowchart TD
@@ -58,45 +243,28 @@ flowchart TD
     D -->|"POST /api/v1/marketplace/download"| L2 --> L3 --> L4 --> L5 --> DL["Stream Buyer-Watermarked .jsonl + Credit Federated ContributionLedger"]
 ```
 
-### 4-Stage Sovereign Marketplace & Revenue-Sharing Pipeline
+### 4-Stage Sovereign Pipeline
 
-1. **Stage 1 -- Local Privacy Scrubbing, Trade-Secret Filtering & Quality Attestation ([`MarketplaceSanitizer`](crates/quorum-coordinator/src/marketplace_engine.rs))**:
-   - **Automated PII/PHI De-Identification**: Runs `OsoosiMeshDlpController` (Microsoft Presidio Analyzer/Anonymizer + GLiNER `urchade/gliner_multi_pii-v1`) plus deterministic regex scrubbers to strip personal names, emails, phone numbers, SSNs, client identifiers, and Windows/POSIX local file paths (`[REDACTED:PERSON]`, `[REDACTED:EMAIL]`, `[REDACTED:PHONE]`, `[REDACTED:SSN]`, `[REDACTED:LOCAL_PATH]`).
-   - **Zero Raw Files & Semantic Trade-Secret Filter (`contains_trade_secret_or_proprietary_code`)**: Raw PDFs, Word documents, and spreadsheets are never exported. Only abstracted RLM reasoning traces (`prompt`, `rlm_trajectory`, `chosen_response`, `rejected_response`) are packaged, and any trajectory containing `> 15` lines of source code, RFC1918/ULA internal IP addresses, `.internal`/`.corp`/`.lan` hostnames, PEM keys, or high-entropy secrets is deterministically rejected before batch sealing.
-   - **Cryptographic Quality Attestation (`SanitizedTrainingRecord`)**: Requires `grounding_score_bps == 10_000` (100.00% of citations verified via `slice_text.contains(verbatim_quote)`) and `>= 64` tokens. Each record is hashed with `blake3` (`blake3_record_hash`) and signed with the node's `Ed25519` private key (`origin_node_id`).
-2. **Stage 2 -- Zero-Knowledge Data Catalog Manifests ([`DataCatalogManifest`](crates/quorum-contract/src/marketplace.rs))**:
-   - Generates an `Ed25519`-signed manifest containing domain tags, SFT/DPO record counts, total verified token volume, and the binary `blake3` Merkle tree root (`compute_blake3_merkle_root`) over all record hashes in the batch.
-   - **Anti-Scraping Tiered Previews**: Unauthenticated calls to `GET /api/v1/marketplace/preview` return aggregate counts and `merkle_root_blake3` **only** (`canary_sample: []`). Viewing up to `5` canary sample lines requires a valid `BuyerJurisdictionCertificate`, is rate-limited per buyer and `/24` (or `/48` IPv6) subnet (`429 Too Many Requests`), and embeds a requester-specific watermark into every canary line.
-3. **Stage 3 -- Commit-and-Reveal Cryptographic Escrow ([`EscrowReceiptToken`](crates/quorum-contract/src/marketplace.rs)) & Active Data Bounties ([`DataBountySpec`](crates/quorum-contract/src/marketplace.rs))**:
-   - Approved `.jsonl` batches are encrypted at rest in `<data_dir>/marketplace_ledger.db` using a keyed BLAKE3 XOF stream cipher + 256-bit keyed MAC (`encrypt_batch_bytes` / `decrypt_batch_bytes`).
-   - Verified buyers unlock batches via `POST /api/v1/marketplace/unlock`, which validates all sovereign guard layers and seals an `EscrowReceiptToken` with a 256-bit keyed BLAKE3 MAC verified in constant time (`subtle::ConstantTimeEq`) on `/api/v1/marketplace/download`.
-4. **Stage 4 -- Federated Swarm Pool & Revenue-Sharing Ledger ([`ContributionLedger`](crates/quorum-contract/src/marketplace.rs))**:
-   - Individual nodes can pool sanitized trajectories across the `libp2p` mesh (`POST /api/v1/marketplace/pool-merge`) to fulfill enterprise-scale training contracts (e.g., 50,000+ SFT/DPO trajectories).
-   - `ContributionLedger::merge_and_deduplicate_mesh_records` deduplicates pooled records across peers by canonical `blake3_record_hash`, tracks each peer's unique accepted records and dropped duplicates, and computes exact basis-point (`10,000 bps` = `100.00%`) revenue splits and cent payouts per `origin_node_id`.
+1. **Stage 1 -- Local Privacy Scrubbing, Trade-Secret Filtering & Quality Attestation**:
+   Automated PII/PHI de-identification via Presidio Analyzer and GLiNER, zero raw file leakage, semantic code filters (rejects trajectories with `> 15` code lines or high-entropy secrets), and 10,000 bps (100.00%) citation grounding verification.
+2. **Stage 2 -- Zero-Knowledge Data Catalog Manifests**:
+   Signed Ed25519 manifests containing record counts, verified token volume, and binary BLAKE3 Merkle roots. Tiered anti-scraping prevents mass harvesting.
+3. **Stage 3 -- Commit-and-Reveal Cryptographic Escrow**:
+   Batches are encrypted at rest with a keyed BLAKE3 stream cipher in `marketplace_ledger.db`. Unlocking requires verified certificates and constant-time token MAC validation.
+4. **Stage 4 -- Federated Swarm Pool & Revenue Splits**:
+   Peer nodes pool sanitized records across the libp2p mesh (`POST /api/v1/marketplace/pool-merge`), deduplicate canonical record hashes, and compute exact basis-point revenue allocations via `ContributionLedger`.
 
-### Five-Layer Sovereign Guard + Domestic U.S. Evasion Hardening
+### Five-Layer Sovereign Guard Matrix
 
-To prevent both direct foreign scraping and **domestic U.S. evasion** (where a foreign adversary rents an AWS/DigitalOcean VM in `us-east`, uses a U.S. residential proxy, or registers a Delaware LLC majority-owned by an overseas parent company in violation of the U.S. DOJ Bulk Sensitive Data Rule, **28 CFR Part 202**), `SovereignJurisdictionGuard` enforces the following defense-in-depth controls before a single byte of `.jsonl` data is previewed or unlocked:
-
-| Guard Layer | Threat Vector Blocked | Cryptographic / Network Enforcement in Code |
+| Guard Layer | Threat Vector Blocked | Technical Enforcement |
 |---|---|---|
-| **Layer 1: Zero Raw Documents, HITL Opt-In & Semantic Trade-Secret Filter** | Accidental background harvesting, PII/PHI leakage, or exfiltration of proprietary source code / internal network topology | `opt_in_enabled = false` default (`403 Forbidden`); `MarketplaceSanitizer` scrubs PII/PHI/paths via Presidio + GLiNER and blocks trajectories with `> 15` code lines, RFC1918/ULA IPs, `.internal`/`.corp` FQDNs, or high-entropy secrets ([`marketplace_engine.rs`](crates/quorum-coordinator/src/marketplace_engine.rs)). |
-| **Layer 2: Foreign GeoIP + Chinese Cloud U.S.-PoP & Anonymous VPS/VPN ASN Firewall** | Direct connections from `CN`, `HK`, `MO`, `RU`, `IR`, `KP`, `BY`, `CU`, `VE` **and** domestic U.S. Points of Presence (PoPs) of Chinese clouds/telecoms or rented anonymous VPS/VPNs | Hard-blocks foreign adversary CIDRs (`FOREIGN_ADVERSARY_IPV4_CIDRS`) and `HIGH_RISK_DATACENTER_PROXY_ASNS`: China Telecom/CTAmericas (`AS4134`, `AS4809`), China Unicom (`AS4837`), China Mobile (`AS9808`), Alibaba Cloud US/Intl (`AS37963`, `AS45102`), Tencent Cloud US/Intl (`AS45090`, `AS132203`), Huawei (`AS55990`, `AS136907`), Baidu (`AS38365`), CERNET (`AS4538`), plus DigitalOcean (`AS14061`), Vultr/Choopa (`AS20473`), Linode (`AS63949`), OVH (`AS16276`), Hetzner (`AS24940`), M247 VPN (`AS9009`), and Datacamp/CDN77 (`AS60068`). |
-| **Layer 3: Ed25519 `BuyerJurisdictionCertificate` + FOCI/UBO & DOJ 28 CFR Part 202 Attestation** | Delaware shell LLCs or U.S. subsidiaries controlled by foreign adversary parents (*Covered Persons* under 28 CFR Part 202) | Requires authority-signed `Ed25519` `BuyerJurisdictionCertificate` with verified `lei_or_duns_id`, `incorporation_country_iso` in `allowed_jurisdictions` (default `["US"]`), `foci_ubo_verified_clean == true` (`0%` adversary ownership/board control), `doj_part202_non_covered_person == true`, and `non_redistribution_covenant_accepted == true` ([`marketplace.rs`](crates/quorum-contract/src/marketplace.rs)). |
-| **Layer 4: Certificate-Pinned Corporate Egress CIDRs & Hardware TPM 2.0 Cluster Binding** | Attackers renting unvetted U.S. EC2/residential proxy IPs or forwarding a valid U.S. API receipt to an overseas training cluster | Every `BuyerJurisdictionCertificate` cryptographically pins the buyer's static corporate IPv4/IPv6 `authorized_egress_cidrs` (`cidr_contains_ip` checks `caller_ip` and every `X-Forwarded-For` / `CF-Connecting-IP` / `X-Real-IP` hop) and binds `bound_tpm_pubkey_blake3` verified in constant time (`subtle::ConstantTimeEq`) against `X-Quorum-TPM-Pubkey-Blake3`. |
-| **Layer 5: Tiered Anti-Scraping Previews, Commit-and-Reveal Escrow & Per-Buyer Canary Watermarking** | Reconstructing datasets by scraping 5-line previews across rotates IPs, or reselling unlocked `.jsonl` batches to third parties | Unauthenticated `/api/v1/marketplace/preview` returns `canary_sample: []` (aggregate counts + `merkle_root_blake3` only); cert-authenticated previews are rate-limited and watermarked; `/api/v1/marketplace/download` verifies `EscrowReceiptToken` keyed BLAKE3 MAC in constant time and embeds deterministic `compute_buyer_watermark_hex` watermarks into every record for leak attribution. |
+| **Layer 1: Zero Raw Documents & Semantic Filter** | Accidental data harvesting, PII/PHI leakage, proprietary code | `opt_in_enabled = false` default (`403 Forbidden`); Presidio + GLiNER scrubbers; trade secret rejection filter ([`marketplace_engine.rs`](crates/quorum-coordinator/src/marketplace_engine.rs)). |
+| **Layer 2: GeoIP + ASN Proxy Firewall** | Adversary connections (`CN`, `HK`, `MO`, `RU`, `IR`, `KP`, etc.) and datacenter VPN proxies | Blocks foreign adversary CIDRs and `HIGH_RISK_DATACENTER_PROXY_ASNS` (Alibaba Cloud, Tencent Cloud, Huawei, China Telecom, DigitalOcean, Vultr, Linode, OVH, Hetzner, etc.). |
+| **Layer 3: Buyer Jurisdiction Certificate & FOCI/UBO** | Shell companies or adversary-controlled subsidiaries | Requires authority-signed `Ed25519` `BuyerJurisdictionCertificate` with non-covered-person attestation (DOJ 28 CFR Part 202) and verified LEI/DUNS identifier. |
+| **Layer 4: Pinned Egress CIDRs & TPM 2.0 Binding** | Proxy forwarding and cluster credential relaying | Validates caller IP against pinned corporate CIDRs and matches hardware `bound_tpm_pubkey_blake3` via constant-time comparison. |
+| **Layer 5: Escrow Receipts & Canary Watermarking** | Dataset reconstruction and unauthorized redistribution | Rate-limited previews; commit-and-reveal escrow tokens; deterministic buyer watermarking (`compute_buyer_watermark_hex`) for leak attribution. |
 
-### Code Inspection Map & One-Command Verification
-
-| Component | Source File | Key Types & Functions |
-|---|---|---|
-| **Marketplace Contracts, Merkle Root & `ContributionLedger`** | [`crates/quorum-contract/src/marketplace.rs`](crates/quorum-contract/src/marketplace.rs) | `BuyerJurisdictionCertificate`, `EscrowReceiptToken`, `SanitizedTrainingRecord`, `DataCatalogManifest`, `ContributionLedger::merge_and_deduplicate_mesh_records`, `compute_blake3_merkle_root`, `compute_buyer_watermark_hex` |
-| **7-Layer Domestic-Evasion Guard & Sanitizer** | [`crates/quorum-coordinator/src/marketplace_engine.rs`](crates/quorum-coordinator/src/marketplace_engine.rs) | `verify_us_sovereign_buyer_against_domestic_evasion`, `HIGH_RISK_DATACENTER_PROXY_ASNS`, `cidr_contains_ip`, `contains_trade_secret_or_proprietary_code`, `MarketplaceSanitizer::sanitize_and_sign_record`, `encrypt_batch_bytes`, `decrypt_batch_bytes` |
-| **SQLite Ledger Store & Axum HTTP Routes** | [`crates/quorum-daemon/src/handlers/marketplace.rs`](crates/quorum-daemon/src/handlers/marketplace.rs) | `MarketplaceStore`, `/api/v1/marketplace/status`, `/opt-in`, `/harvest`, `/approve-batch`, `/preview`, `/unlock`, `/download`, `/pool-merge`, `/ledger`, `/bounties` |
-| **Embedded Web UI Marketplace Modal** | [`crates/quorum-ui/assets/index.html`](crates/quorum-ui/assets/index.html) | `#modal-marketplace`, `#marketplace-opt-in-toggle` (default `OFF`), `#marketplace-jurisdiction-select` (default `US_ONLY`), `#marketplace-ledger-tbody` |
-| **End-to-End Integration Test Suite (6 Tests)** | [`crates/quorum-daemon/tests/marketplace_sovereign_escrow_tests.rs`](crates/quorum-daemon/tests/marketplace_sovereign_escrow_tests.rs) | `test_1_disabled_by_default_invariant` through `test_6_domestic_us_proxy_and_shell_company_evasion_invariant` |
-
-Run all Marketplace unit and end-to-end security invariant tests locally:
+Run marketplace security verification tests:
 
 ```bash
 cargo test -p quorum-contract -p quorum-coordinator --lib marketplace
@@ -105,76 +273,9 @@ cargo test -p quorum-daemon --test marketplace_sovereign_escrow_tests
 
 ---
 
-## Install
-
-Download a package from [Releases](https://github.com/oyesanyf/QuorumRAG/releases). Every package installs QuorumRAG as an always-on background service and opens http://127.0.0.1:3031/ in your browser:
-
-| OS | Package |
-|---|---|
-| Windows | `QuorumRAG-<ver>-x86_64.msi` (service `QuorumRAGDaemon`) or the portable `.zip` |
-| Debian / Ubuntu | `quorumrag_<ver>_<arch>.deb` (`quorumrag.service`) |
-| RHEL / Fedora / SUSE | `quorumrag-<ver>-1.<arch>.rpm` (`quorumrag.service`) |
-| macOS | `QuorumRAG-<ver>-macos-universal.pkg` (LaunchDaemon `dev.quorumrag.daemon`) |
-| Docker (linux/amd64, linux/arm64) | `ghcr.io/oyesanyf/quorumrag:latest` from [GitHub Packages](https://github.com/oyesanyf/QuorumRAG/pkgs/container/quorumrag) |
-
-Container:
-
-```bash
-docker run -d --name quorumrag --network host \
-  -v quorumrag-data:/var/lib/quorumrag \
-  ghcr.io/oyesanyf/quorumrag:latest
-# Web UI: http://127.0.0.1:3031/   (remove with: docker rm -f quorumrag && docker volume rm quorumrag-data)
-```
-
-Uninstalling stops the service and deletes it completely. See [docs/INSTALL.md](docs/INSTALL.md) for silent-install options, data locations, purge options and code-signing notes.
-
-## Build from source
-
-```bash
-cargo build --release -p quorum-daemon --bin quorumrag
-./target/release/quorumrag --host 0.0.0.0 --port 3031 --p2p-port 3032 --data-dir ./data
-```
-
-Windows installers: `powershell -ExecutionPolicy Bypass -File scripts/package.ps1`.
-Linux and macOS packages: `packaging/linux/build_packages.sh` and `packaging/macos/build_packages.sh`.
-
-## Workspace layout
-
-| Crate | Purpose |
-|---|---|
-| `quorum-daemon` | HTTP API, embedded Web UI, SQLite Marketplace & Chat stores, Windows service entry point (`quorumrag` binary) |
-| `quorum-coordinator` | Agentic RLM retrieval, answer synthesis, `SovereignJurisdictionGuard`, `MarketplaceSanitizer`, and Presidio/GLiNER DLP |
-| `quorum-ingest` | Parallel filesystem discovery, parsing, authorship metadata, and multimodal extraction |
-| `quorum-storage` | LanceDB vector store and Tantivy BM25 full-text index |
-| `quorum-network` | Ed25519-authenticated `libp2p` peer mesh |
-| `quorum-contract` | Shared embedding, RLM, `DataCatalogManifest`, `BuyerJurisdictionCertificate`, `EscrowReceiptToken`, and `ContributionLedger` contracts |
-
-## Repository map
-
-| Path | What is there |
-|---|---|
-| [`crates/`](crates) | Rust workspace crates (see [Workspace layout](#workspace-layout)) |
-| [`crates/quorum-contract/src/marketplace.rs`](crates/quorum-contract/src/marketplace.rs) | Sovereign Marketplace schemas, Ed25519 certificate/manifest signing, BLAKE3 Merkle trees, and `ContributionLedger` |
-| [`crates/quorum-coordinator/src/marketplace_engine.rs`](crates/quorum-coordinator/src/marketplace_engine.rs) | `SovereignJurisdictionGuard`, domestic-evasion CIDR/ASN/FOCI/Part-202/TPM checks, trade-secret filter, and `MarketplaceSanitizer` |
-| [`crates/quorum-daemon/src/handlers/marketplace.rs`](crates/quorum-daemon/src/handlers/marketplace.rs) | SQLite `MarketplaceStore` and `/api/v1/marketplace/*` handlers |
-| [`crates/quorum-daemon/tests/marketplace_sovereign_escrow_tests.rs`](crates/quorum-daemon/tests/marketplace_sovereign_escrow_tests.rs) | End-to-end integration tests for disabled-by-default, foreign & domestic evasion blocking, PII/trade-secret scrubbing, escrow, and revenue splits |
-| [`crates/quorum-daemon/src/`](crates/quorum-daemon/src) | HTTP handlers, CLI, shutdown, Windows service (`win_service.rs`) |
-| [`crates/quorum-coordinator/src/`](crates/quorum-coordinator/src) | Agentic retrieval, `answer_orchestrator.rs`, LangExtract grounding, Presidio/GLiNER DLP |
-| [`crates/quorum-ui/assets/`](crates/quorum-ui/assets) | Embedded Web UI |
-| [`packaging/windows/`](packaging/windows) | Launcher, open-UI and complete-uninstall scripts for the MSI and ZIP |
-| [`packaging/linux/`](packaging/linux) | deb/rpm/tarball builder, `quorumrag.service`, `quorumrag-ctl` helper |
-| [`packaging/macos/`](packaging/macos) | pkg/dmg/tarball builder, LaunchDaemon plist, install/uninstall |
-| [`wix/QuorumRAG.wxs`](wix/QuorumRAG.wxs) | WiX v5 MSI definition (auto-start service, browser launch, full removal) |
-| [`scripts/`](scripts) | `package.ps1` (Windows build), signing, release and PR shipping |
-| [`.github/workflows/`](.github/workflows) | Cross-platform installer + release pipeline, PR invariant gate, RAPTOR security scan |
-| [`tests/`](tests) | Workspace and end-to-end regression tests |
-| [`policy/`](policy) | Witness / supply-chain policy templates |
-| [`docs/`](docs) | Install, multimodal, and Sovereign Marketplace documentation |
-
 ## Documentation
 
-- [docs/SOVEREIGN_MARKETPLACE.md](docs/SOVEREIGN_MARKETPLACE.md): Sovereign AI Training Data Marketplace, 5-Layer + Domestic-Evasion Guard (`SovereignJurisdictionGuard`), Commit-and-Reveal Escrow, and Federated `ContributionLedger`
-- [docs/INSTALL.md](docs/INSTALL.md): service install, silent options, uninstall and purge on every OS, code signing
-- [docs/MULTIMODAL.md](docs/MULTIMODAL.md): image/audio/document ingestion, answer orchestration, exports
-- [PROJECT.md](PROJECT.md): feature matrix and milestones
-- [AGENTS.md](AGENTS.md): rules for automated agents working on this repository
+- [docs/INSTALL.md](docs/INSTALL.md): Service installation, silent unattended flags, uninstall, purge, and code-signing details.
+- [docs/MULTIMODAL.md](docs/MULTIMODAL.md): Image, audio, and document ingestion, OCR extraction, and multimodal synthesis.
+- [docs/SOVEREIGN_MARKETPLACE.md](docs/SOVEREIGN_MARKETPLACE.md): Comprehensive reference for Sovereign Marketplace, Escrow, and 5-Layer Jurisdiction Guard.
+- [AGENTS.md](AGENTS.md): Strict solo-developer shipping workflow, repository boundary rules, and RAPTOR security gates.

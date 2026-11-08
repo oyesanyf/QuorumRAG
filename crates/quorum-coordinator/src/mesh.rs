@@ -1,5 +1,6 @@
 use crate::error::CoordinatorError;
 use chrono::Utc;
+use quorum_contract::EmbeddingGenerator;
 use quorum_network::NetworkSwarmHandle;
 use quorum_types::{CandidateChunkDto, FederatedQueryRequest, FederatedQueryResponse};
 use serde::{Deserialize, Serialize};
@@ -117,6 +118,22 @@ pub trait MeshQueryDispatcher: Send + Sync {
         timeout: Duration,
     ) -> Result<Vec<FederatedQueryResponse>, CoordinatorError>;
 
+    async fn query_peers_with_diagnostics(
+        &self,
+        request: &FederatedQueryRequest,
+        timeout: Duration,
+    ) -> Result<(Vec<FederatedQueryResponse>, quorum_types::FederatedPeerDiagnostics), CoordinatorError> {
+        let responses = self.query_peers(request, timeout).await?;
+        let diagnostics = quorum_types::FederatedPeerDiagnostics {
+            connected_peers_count: self.peer_count(),
+            connected_peer_ids: Vec::new(),
+            queried_peers_count: responses.len(),
+            peer_outcomes: Vec::new(),
+            summary_reason: None,
+        };
+        Ok((responses, diagnostics))
+    }
+
     fn peer_count(&self) -> usize;
 }
 
@@ -165,23 +182,47 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
         request: &FederatedQueryRequest,
         timeout: Duration,
     ) -> Result<Vec<FederatedQueryResponse>, CoordinatorError> {
+        let (responses, _) = self.query_peers_with_diagnostics(request, timeout).await?;
+        Ok(responses)
+    }
+
+    async fn query_peers_with_diagnostics(
+        &self,
+        request: &FederatedQueryRequest,
+        timeout: Duration,
+    ) -> Result<(Vec<FederatedQueryResponse>, quorum_types::FederatedPeerDiagnostics), CoordinatorError> {
         let peers = self.peers.read().await.clone();
+        let connected_peers_count = peers.len();
+        let connected_peer_ids: Vec<String> = peers.iter().map(|p| p.peer_id.clone()).collect();
+        let mut diagnostics = quorum_types::FederatedPeerDiagnostics::new(
+            connected_peers_count,
+            connected_peer_ids.clone(),
+        );
+
+        let mesh_port = {
+            let controller = crate::dlp_mesh::global_mesh_dlp_controller();
+            let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
+            s.mesh.mesh_port
+        };
+
         if peers.is_empty() {
-            return Ok(Vec::new());
+            diagnostics.compute_summary_reason(mesh_port, timeout.as_millis() as u64);
+            return Ok((Vec::new(), diagnostics));
         }
+
+        diagnostics.queried_peers_count = peers.len();
 
         use futures::stream::{FuturesUnordered, StreamExt};
 
+        let mut pending_ids: std::collections::HashSet<String> = connected_peer_ids.into_iter().collect();
         let mut futures = FuturesUnordered::new();
         for peer in peers {
             let req = request.clone();
             futures.push(tokio::spawn(async move {
+                let start = std::time::Instant::now();
                 let chunks = peer.handle_query(0).await;
-                FederatedQueryResponse {
-                    query_id: req.query_id,
-                    responder_peer_id: peer.peer_id,
-                    chunks,
-                }
+                let latency_ms = start.elapsed().as_millis() as u64;
+                (peer.peer_id, req.query_id, chunks, latency_ms)
             }));
         }
 
@@ -198,8 +239,27 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
         let mut responses = Vec::new();
         let _ = tokio::time::timeout(timeout, async {
             while let Some(res) = futures.next().await {
-                if let Ok(resp) = res {
-                    responses.push(resp);
+                if let Ok((peer_id, query_id, chunks, latency_ms)) = res {
+                    pending_ids.remove(&peer_id);
+                    let chunks_count = chunks.len();
+                    let status = if chunks_count > 0 {
+                        quorum_types::PeerQueryStatus::Connected
+                    } else {
+                        quorum_types::PeerQueryStatus::ZeroMatchingChunks
+                    };
+                    diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
+                        peer_id: peer_id.clone(),
+                        status,
+                        matching_chunk_count: chunks_count,
+                        cited_chunk_count: 0,
+                        latency_ms,
+                        error_message: None,
+                    });
+                    responses.push(FederatedQueryResponse {
+                        query_id,
+                        responder_peer_id: peer_id,
+                        chunks,
+                    });
                     if responses.len() >= max_peer_responses {
                         break;
                     }
@@ -208,11 +268,24 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
         })
         .await;
 
-        Ok(responses)
+        for stalled_peer in pending_ids {
+            diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
+                peer_id: stalled_peer,
+                status: quorum_types::PeerQueryStatus::TimedOut,
+                matching_chunk_count: 0,
+                cited_chunk_count: 0,
+                latency_ms: timeout.as_millis() as u64,
+                error_message: Some(format!("Timed out after {}ms", timeout.as_millis())),
+            });
+        }
+
+        diagnostics.compute_summary_reason(mesh_port, timeout.as_millis() as u64);
+
+        Ok((responses, diagnostics))
     }
 
     fn peer_count(&self) -> usize {
-        0
+        self.peers.try_read().map(|p| p.len()).unwrap_or(0)
     }
 }
 
@@ -239,6 +312,15 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
         request: &FederatedQueryRequest,
         timeout: Duration,
     ) -> Result<Vec<FederatedQueryResponse>, CoordinatorError> {
+        let (responses, _) = self.query_peers_with_diagnostics(request, timeout).await?;
+        Ok(responses)
+    }
+
+    async fn query_peers_with_diagnostics(
+        &self,
+        request: &FederatedQueryRequest,
+        timeout: Duration,
+    ) -> Result<(Vec<FederatedQueryResponse>, quorum_types::FederatedPeerDiagnostics), CoordinatorError> {
         let mut peers = self
             .handle
             .connected_peers()
@@ -283,9 +365,23 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             }
         }
 
+        let mesh_port = {
+            let controller = crate::dlp_mesh::global_mesh_dlp_controller();
+            let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
+            s.mesh.mesh_port
+        };
+
+        let mut diagnostics = quorum_types::FederatedPeerDiagnostics::new(
+            peers.len(),
+            peers.iter().map(|p| p.to_string()).collect(),
+        );
+
         if peers.is_empty() {
-            return Ok(Vec::new());
+            diagnostics.compute_summary_reason(mesh_port, timeout.as_millis() as u64);
+            return Ok((Vec::new(), diagnostics));
         }
+
+        diagnostics.queried_peers_count = peers.len();
 
         use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -335,6 +431,19 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                     pending_peer_ids.remove(&peer_str);
                     let chunks_len = resp.chunks.len();
                     registry.record_success(&peer_str, rtt_ms, chunks_len);
+                    let status = if chunks_len > 0 {
+                        quorum_types::PeerQueryStatus::Connected
+                    } else {
+                        quorum_types::PeerQueryStatus::ZeroMatchingChunks
+                    };
+                    diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
+                        peer_id: peer_str.clone(),
+                        status,
+                        matching_chunk_count: chunks_len,
+                        cited_chunk_count: 0,
+                        latency_ms: rtt_ms as u64,
+                        error_message: None,
+                    });
                     tracing::info!(
                         peer = %peer_str,
                         rtt_ms = format!("{:.1}", rtt_ms),
@@ -359,7 +468,24 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                 }
                 Ok(Some(Ok((peer_str, Err(err), rtt_ms)))) => {
                     pending_peer_ids.remove(&peer_str);
-                    registry.record_failure(&peer_str, err.to_string());
+                    let err_str = err.to_string();
+                    registry.record_failure(&peer_str, err_str.clone());
+                    let status = if err_str.to_ascii_lowercase().contains("policy")
+                        || err_str.to_ascii_lowercase().contains("dlp")
+                        || err_str.to_ascii_lowercase().contains("folder")
+                    {
+                        quorum_types::PeerQueryStatus::BlockedByPolicy
+                    } else {
+                        quorum_types::PeerQueryStatus::NetworkError
+                    };
+                    diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
+                        peer_id: peer_str.clone(),
+                        status,
+                        matching_chunk_count: 0,
+                        cited_chunk_count: 0,
+                        latency_ms: rtt_ms as u64,
+                        error_message: Some(err_str.clone()),
+                    });
                     tracing::warn!(
                         peer = %peer_str,
                         rtt_ms = format!("{:.1}", rtt_ms),
@@ -380,12 +506,20 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
 
         // Any peers still pending when the primary deadline expired (not merely shortened straggler grace)
         // are recorded as timed-out so the P2P Watcher can proactively probe & heal zombie streams.
-        if !pending_peer_ids.is_empty() && tokio::time::Instant::now() >= primary_deadline {
+        if !pending_peer_ids.is_empty() {
             for stalled_peer in &pending_peer_ids {
                 registry.record_failure(
                     stalled_peer,
                     format!("Timed out after {}ms", timeout.as_millis()),
                 );
+                diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
+                    peer_id: stalled_peer.clone(),
+                    status: quorum_types::PeerQueryStatus::TimedOut,
+                    matching_chunk_count: 0,
+                    cited_chunk_count: 0,
+                    latency_ms: timeout.as_millis() as u64,
+                    error_message: Some(format!("Timed out after {}ms", timeout.as_millis())),
+                });
                 tracing::warn!(
                     peer = %stalled_peer,
                     timeout_ms = timeout.as_millis() as u64,
@@ -394,7 +528,9 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             }
         }
 
-        Ok(responses)
+        diagnostics.compute_summary_reason(mesh_port, timeout.as_millis() as u64);
+
+        Ok((responses, diagnostics))
     }
 
     fn peer_count(&self) -> usize {
@@ -426,6 +562,7 @@ impl MeshQueryDispatcher for LocalOnlyDispatcher {
 pub struct OsoosiMeshInboundHandler {
     pub local_storage: Arc<dyn crate::scatter_gather::StorageSearcher>,
     pub local_peer_id: String,
+    pub embedder: Option<Arc<dyn quorum_contract::EmbeddingGenerator>>,
 }
 
 impl OsoosiMeshInboundHandler {
@@ -436,6 +573,27 @@ impl OsoosiMeshInboundHandler {
         Self {
             local_storage,
             local_peer_id: local_peer_id.into(),
+            embedder: None,
+        }
+    }
+
+    pub fn with_embedder(
+        mut self,
+        embedder: Arc<dyn quorum_contract::EmbeddingGenerator>,
+    ) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    pub fn new_with_embedder(
+        local_storage: Arc<dyn crate::scatter_gather::StorageSearcher>,
+        local_peer_id: impl Into<String>,
+        embedder: Arc<dyn quorum_contract::EmbeddingGenerator>,
+    ) -> Self {
+        Self {
+            local_storage,
+            local_peer_id: local_peer_id.into(),
+            embedder: Some(embedder),
         }
     }
 }
@@ -549,10 +707,27 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             };
         }
 
+        // Re-embed query in local embedding space if local embedder is available or incoming vector is unpopulated
+        let query_embedding = if let Some(ref embedder) = self.embedder {
+            match embedder.embed_text(&req.query_text) {
+                Ok(vec) if vec.len() == 768 => vec,
+                Ok(_) => req.embedding.clone(),
+                Err(err) => {
+                    tracing::warn!("Failed to re-embed mesh query text locally: {}; falling back to req.embedding", err);
+                    req.embedding.clone()
+                }
+            }
+        } else if req.embedding.iter().all(|&f| f == 0.0) {
+            let offline = quorum_contract::DeterministicOfflineEngine::new();
+            offline.embed_text(&req.query_text).unwrap_or_else(|_| req.embedding.clone())
+        } else {
+            req.embedding.clone()
+        };
+
         let (mut scored, text_scored) = tokio::join!(
             self.local_storage.search_hybrid(
                 &req.query_text,
-                &req.embedding,
+                &query_embedding,
                 effective_tier,
                 req.top_k.clamp(16, 32),
             ),
@@ -565,6 +740,34 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
         for hit in text_scored {
             if seen_ids.insert(hit.chunk.chunk_id.clone()) {
                 scored.push(hit);
+            }
+        }
+
+        // Preserve multimodal chunks matching key query content terms
+        let query_words: Vec<&str> = req
+            .query_text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 4)
+            .collect();
+        if !query_words.is_empty() && !scored.iter().any(|c| {
+            let p = c.chunk.file_path.to_ascii_lowercase();
+            p.ends_with(".png") || p.ends_with(".jpg") || p.ends_with(".jpeg")
+        }) {
+            for word in &query_words {
+                let media_hits = self.local_storage.search_text(word, effective_tier, 8).await;
+                for hit in media_hits {
+                    let path_l = hit.chunk.file_path.to_ascii_lowercase();
+                    if (path_l.ends_with(".png")
+                        || path_l.ends_with(".jpg")
+                        || path_l.ends_with(".jpeg")
+                        || path_l.ends_with(".gif")
+                        || path_l.ends_with(".webp")
+                        || hit.chunk.text_content.starts_with("[Image Document:"))
+                        && seen_ids.insert(hit.chunk.chunk_id.clone())
+                    {
+                        scored.push(hit);
+                    }
+                }
             }
         }
 

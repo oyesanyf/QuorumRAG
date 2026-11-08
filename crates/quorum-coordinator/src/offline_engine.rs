@@ -41,6 +41,9 @@ fn global_corpus_vocab() -> &'static RwLock<HashMap<String, String>> {
     })
 }
 
+/// Active federated peer diagnostics recorded from the most recent scatter-gather retrieval.
+static ACTIVE_PEER_DIAGNOSTICS: RwLock<Option<quorum_types::FederatedPeerDiagnostics>> = RwLock::new(None);
+
 pub struct DeterministicOfflineSynthesisEngine;
 
 impl DeterministicOfflineSynthesisEngine {
@@ -670,7 +673,7 @@ impl DeterministicOfflineSynthesisEngine {
 
             let has_ocr_content = raw_head.contains("[OCR Text]")
                 || raw_head.contains("[Visual Description]")
-                || query_terms.iter().any(|qt| text_l.contains(qt.as_str()));
+                || query_terms.iter().any(|qt| text_l.contains(qt.as_str()) || file_l.contains(qt.as_str()));
             if !asks_image
                 && !has_ocr_content
                 && (text_l.starts_with("[image document:")
@@ -770,11 +773,19 @@ impl DeterministicOfflineSynthesisEngine {
                 .iter()
                 .filter(|t| matches_whole_word(t.as_str()))
                 .count();
+            let is_image_chunk = text_l.starts_with("[image document:")
+                || path_l.ends_with(".png")
+                || path_l.ends_with(".jpg")
+                || path_l.ends_with(".jpeg")
+                || path_l.ends_with(".gif")
+                || path_l.ends_with(".webp");
             let is_relevant = if query_terms.is_empty() {
                 true
             } else {
                 (total_hits >= required_query_hits && entity_hits >= required_entity_hits)
                     || (!proper_terms.is_empty() && proper_hits == proper_terms.len())
+                    || (scored.source_peer != "local" && total_hits >= 1)
+                    || (is_image_chunk && total_hits >= 1)
             };
 
             if is_relevant {
@@ -816,6 +827,8 @@ impl DeterministicOfflineSynthesisEngine {
                 let mut doc_bonus = (file_hits as i32) * 160 + (prompt_entity_hits as i32) * 320;
                 if file_l.ends_with(".docx") || file_l.ends_with(".pdf") || file_l.ends_with(".doc") {
                     doc_bonus += 25;
+                } else if is_image_chunk {
+                    doc_bonus += 50;
                 }
                 if !file_l.starts_with("recovered_file_") && !file_l.starts_with("file_") {
                     doc_bonus += 15;
@@ -905,8 +918,10 @@ impl DeterministicOfflineSynthesisEngine {
                 .iter()
                 .any(|(scored, _, _, _)| count_prompt_matches(scored) >= req_prompt_hits);
             if has_direct_prompt_match {
-                scored_matches
-                    .retain(|(scored, _, _, _)| count_prompt_matches(scored) >= req_prompt_hits);
+                scored_matches.retain(|(scored, _, _, _)| {
+                    count_prompt_matches(scored) >= req_prompt_hits
+                        || scored.source_peer != "local"
+                });
             }
         }
 
@@ -989,10 +1004,25 @@ impl DeterministicOfflineSynthesisEngine {
             }
         }
         let mut candidate_chunks: Vec<ScoredChunk> = scored_matches
-            .into_iter()
+            .iter()
             .take(chunk_limit)
-            .map(|(c, _, _, _)| c.clone())
+            .map(|(c, _, _, _)| (*c).clone())
             .collect();
+
+        // Preserve multimodal image chunks matching the query in candidate_chunks
+        for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| {
+            let path_l = c.chunk.file_path.to_ascii_lowercase();
+            path_l.ends_with(".png")
+                || path_l.ends_with(".jpg")
+                || path_l.ends_with(".jpeg")
+                || path_l.ends_with(".gif")
+                || path_l.ends_with(".webp")
+                || c.chunk.text_content.starts_with("[Image Document:")
+        }) {
+            if !candidate_chunks.iter().any(|existing| existing.chunk.chunk_id == c.chunk.chunk_id) {
+                candidate_chunks.push((*c).clone());
+            }
+        }
 
         if ui.parent_document_retrieval {
             candidate_chunks = Self::stitch_parent_document_chunks(candidate_chunks);
@@ -1414,11 +1444,23 @@ impl DeterministicOfflineSynthesisEngine {
     /// Returns true if a line represents a contact header, pipe-delimited metadata bar, or bare contact field.
     #[inline]
     pub fn is_contact_bar_or_header(line: &str) -> bool {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        // Career timeline / role statements with dates and pipes are substantive body sentences, not contact bars
+        if (lower.contains("architect")
+            || lower.contains("engineer")
+            || lower.contains("consultant")
+            || lower.contains("analyst")
+            || lower.contains("director")
+            || lower.contains("manager")
+            || lower.contains("timeline:"))
+            && (lower.contains("20") || lower.contains("19") || lower.contains("present"))
+        {
+            return false;
+        }
         if crate::answer_orchestrator::is_contact_bar_or_header(line) {
             return true;
         }
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
         if lower.contains('@') && lower.split_whitespace().any(|w| w.contains('@')) {
             return true;
         }
@@ -1518,6 +1560,32 @@ impl DeterministicOfflineSynthesisEngine {
         if let Some(subj) = subject_name {
             let subj_low = subj.to_ascii_lowercase();
             if lower_sum.starts_with(&subj_low) {
+                let rest_after_subj = clean_sum[subj.len()..].trim();
+                let lower_rest = rest_after_subj.to_ascii_lowercase();
+                if (prefix.ends_with("is ") || prefix.ends_with("was "))
+                    && (rest_after_subj.starts_with(',')
+                        || rest_after_subj.starts_with(':')
+                        || rest_after_subj.starts_with('-')
+                        || lower_rest.starts_with("professional summary"))
+                {
+                    let mut candidate_pred = rest_after_subj.trim_start_matches(|c: char| c == ',' || c == ':' || c == '-' || c == ' ');
+                    for cred in &["cissp", "pmp", "cism", "ceh", "cisa", "phd", "md", "esq"] {
+                        let cand_low = candidate_pred.to_ascii_lowercase();
+                        if cand_low.starts_with(cred) {
+                            candidate_pred = candidate_pred[cred.len()..].trim_start_matches(|c: char| c == '.' || c == ',' || c == ' ');
+                        }
+                    }
+                    if let Some(pos) = candidate_pred.to_ascii_lowercase().find("professional summary:") {
+                        candidate_pred = candidate_pred[pos + "professional summary:".len()..].trim();
+                    } else if let Some(pos) = candidate_pred.to_ascii_lowercase().find("summary:") {
+                        candidate_pred = candidate_pred[pos + "summary:".len()..].trim();
+                    }
+                    if !candidate_pred.is_empty() {
+                        let first_w = candidate_pred.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+                        let article = Self::choose_indefinite_article(&first_w);
+                        return format!("{}{} {} **[1]**", prefix, article, candidate_pred);
+                    }
+                }
                 return format!("{} **[1]**", clean_sum);
             }
             for pronoun in &["he ", "she ", "they "] {
@@ -1923,27 +1991,68 @@ impl DeterministicOfflineSynthesisEngine {
             .collect()
     }
 
+    /// Sets the active process-wide peer diagnostics from scatter-gather retrieval.
+    pub fn set_active_peer_diagnostics(diag: quorum_types::FederatedPeerDiagnostics) {
+        if let Ok(mut guard) = ACTIVE_PEER_DIAGNOSTICS.write() {
+            *guard = Some(diag);
+        }
+    }
+
+    /// Gets the active process-wide peer diagnostics if available.
+    pub fn active_peer_diagnostics() -> Option<quorum_types::FederatedPeerDiagnostics> {
+        ACTIVE_PEER_DIAGNOSTICS.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Clears the active process-wide peer diagnostics.
+    pub fn clear_active_peer_diagnostics() {
+        if let Ok(mut guard) = ACTIVE_PEER_DIAGNOSTICS.write() {
+            *guard = None;
+        }
+    }
+
     /// Formats the standardized end-of-response sources and document links block with explicit accuracy scores.
     /// Invariant: Deduplicates sources by filename and contains ZERO line numbers!
     pub fn format_sources_block(matched_chunks: &[&ScoredChunk]) -> String {
+        Self::format_sources_block_with_diagnostics(
+            matched_chunks,
+            Self::active_peer_diagnostics().as_ref(),
+        )
+    }
+
+    /// Formats the standardized end-of-response sources block with explicit peer diagnostics.
+    pub fn format_sources_block_with_diagnostics(
+        matched_chunks: &[&ScoredChunk],
+        peer_diagnostics: Option<&quorum_types::FederatedPeerDiagnostics>,
+    ) -> String {
         let deduped = Self::deduplicated_chunks_with_scores(matched_chunks);
+        let has_remote_chunks = deduped
+            .iter()
+            .any(|(c, _)| !c.source_peer.is_empty() && c.source_peer != "local");
+
         if deduped.is_empty() {
+            if !has_remote_chunks {
+                if let Some(diag) = peer_diagnostics {
+                    if let Some(ref reason) = diag.summary_reason {
+                        let clean_reason = reason.replace('\r', "").replace('\n', " ");
+                        return format!(
+                            "\n\n---\n### 📚 Sources & Document Links\n- *📡 Remote Peers:* No data from remote peers — Reason: {}\n",
+                            clean_reason
+                        );
+                    }
+                }
+            }
             return String::new();
         }
         let mut block = String::from("\n\n---\n### 📚 Sources & Document Links\n");
 
-        for (c, score_pct) in deduped {
+        for (c, score_pct) in &deduped {
             let file_name_base = std::path::Path::new(&c.chunk.file_path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(&c.chunk.file_path);
 
             let peer_suffix = if !c.source_peer.is_empty() && c.source_peer != "local" {
-                let short_peer = if c.source_peer.len() > 8 {
-                    &c.source_peer[..8]
-                } else {
-                    &c.source_peer
-                };
+                let short_peer: String = c.source_peer.chars().take(8).collect();
                 format!(" (Peer: {})", short_peer)
             } else {
                 String::new()
@@ -1972,6 +2081,20 @@ impl DeterministicOfflineSynthesisEngine {
                 score_pct
             ));
         }
+
+        // When 0 remote chunks are cited and peer diagnostics are available, append diagnostic reason
+        if !has_remote_chunks {
+            if let Some(diag) = peer_diagnostics {
+                if let Some(ref reason) = diag.summary_reason {
+                    let clean_reason = reason.replace('\r', "").replace('\n', " ");
+                    block.push_str(&format!(
+                        "- *📡 Remote Peers:* No data from remote peers — Reason: {}\n",
+                        clean_reason
+                    ));
+                }
+            }
+        }
+
         block
     }
 
@@ -3917,6 +4040,16 @@ impl DeterministicOfflineSynthesisEngine {
         let kept: Vec<&'a ScoredChunk> = scored
             .into_iter()
             .filter(|(n, c)| {
+                let path_l = c.chunk.file_path.to_ascii_lowercase();
+                if crate::vision::is_image_chunk_text(&c.chunk.text_content)
+                    || path_l.ends_with(".png")
+                    || path_l.ends_with(".jpg")
+                    || path_l.ends_with(".jpeg")
+                    || path_l.ends_with(".gif")
+                    || path_l.ends_with(".webp")
+                {
+                    return true;
+                }
                 if c.is_remote && !c.source_peer.eq_ignore_ascii_case("local") {
                     *n >= remote_threshold
                 } else {
@@ -5209,7 +5342,7 @@ impl DeterministicOfflineSynthesisEngine {
                     .copied()
                     .unwrap_or(1);
                 let file_name = if !c.source_peer.is_empty() && !c.source_peer.eq_ignore_ascii_case("local") {
-                    let short_peer = if c.source_peer.len() > 8 { &c.source_peer[..8] } else { &c.source_peer };
+                    let short_peer: String = c.source_peer.chars().take(8).collect();
                     format!("{} (Peer: {})", file_name_base, short_peer)
                 } else {
                     file_name_base.to_string()

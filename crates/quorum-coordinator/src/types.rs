@@ -92,6 +92,7 @@ pub struct AgenticGraphState {
     pub extracted_questions: Vec<String>,
     pub extracted_entities: Vec<crate::langextract::Extraction>,
     pub seen_chunk_ids: std::collections::HashSet<String>,
+    pub peer_diagnostics: Option<quorum_types::FederatedPeerDiagnostics>,
 }
 
 impl AgenticGraphState {
@@ -122,6 +123,7 @@ impl AgenticGraphState {
             extracted_questions: Vec::new(),
             extracted_entities: Vec::new(),
             seen_chunk_ids: std::collections::HashSet::new(),
+            peer_diagnostics: None,
         }
     }
 
