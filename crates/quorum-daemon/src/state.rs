@@ -406,6 +406,7 @@ pub struct ChatSessionRegistry {
     sessions: Arc<RwLock<HashMap<String, ChatSessionData>>>,
     history_db: Arc<RwLock<Option<Arc<crate::chat_history_db::ChatHistoryStore>>>>,
     pub(crate) p2p_watcher_runtime: Arc<RwLock<Option<Arc<crate::p2p_watcher::P2pWatcherRuntime>>>>,
+    pub(crate) marketplace_db: Arc<RwLock<Option<Arc<crate::handlers::marketplace::MarketplaceStore>>>>,
 }
 
 impl ChatSessionRegistry {
@@ -414,6 +415,7 @@ impl ChatSessionRegistry {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             history_db: Arc::new(RwLock::new(None)),
             p2p_watcher_runtime: Arc::new(RwLock::new(None)),
+            marketplace_db: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -533,6 +535,34 @@ impl DaemonState {
         let opened = Arc::new(
             crate::chat_history_db::ChatHistoryStore::open(&db_path)
                 .map_err(|e| format!("Failed to open {}: {e}", db_path.display()))?,
+        );
+        *wguard = Some(Arc::clone(&opened));
+        Ok(opened)
+    }
+
+    /// Returns the persistent SQLite `MarketplaceStore` backed by `<data_dir>/marketplace_ledger.db`.
+    pub fn marketplace_store(&self) -> Result<Arc<crate::handlers::marketplace::MarketplaceStore>, String> {
+        if let Ok(guard) = self.sessions.marketplace_db.read() {
+            if let Some(ref existing) = *guard {
+                return Ok(Arc::clone(existing));
+            }
+        }
+        let mut wguard = self
+            .sessions
+            .marketplace_db
+            .write()
+            .map_err(|e| format!("Marketplace DB lock poisoned: {e}"))?;
+        if let Some(ref existing) = *wguard {
+            return Ok(Arc::clone(existing));
+        }
+        let db_path = self.data_dir.join("marketplace_ledger.db");
+        let opened = Arc::new(
+            crate::handlers::marketplace::MarketplaceStore::open(
+                &db_path,
+                self.coordinator.engine.secret_seed,
+                self.coordinator.engine.sender_peer_id.clone(),
+            )
+            .map_err(|e| format!("Failed to open {}: {e}", db_path.display()))?,
         );
         *wguard = Some(Arc::clone(&opened));
         Ok(opened)

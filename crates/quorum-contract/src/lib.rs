@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
+pub mod marketplace;
 pub mod rlm;
+pub use marketplace::*;
 pub use quorum_types::{DocumentFormat, IngestedParentDocument, RegexMatchSpan};
 pub use rlm::*;
 

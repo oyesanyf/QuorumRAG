@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::handlers::{cache, chat, drift, export, health, history, langextract, media, mesh, reindex, settings};
+use crate::handlers::{cache, chat, drift, export, health, history, langextract, marketplace, media, mesh, reindex, settings};
 use crate::state::DaemonState;
 
 /// Constructs the complete Axum 0.7 web server Router.
@@ -95,6 +95,20 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         // Google LangExtract Endpoints
         .route("/api/langextract", post(langextract::extract_handler))
         .route("/api/langextract/visualize", post(langextract::visualize_handler))
+
+        // Opt-In Sovereign AI Training Data Marketplace Endpoints (Disabled by Default)
+        .route("/api/v1/marketplace/status", get(marketplace::marketplace_status_handler))
+        .route("/api/v1/marketplace/opt-in", post(marketplace::marketplace_opt_in_handler))
+        .route("/api/v1/marketplace/harvest", post(marketplace::marketplace_harvest_handler))
+        .route("/api/v1/marketplace/approve-batch", post(marketplace::marketplace_approve_batch_handler))
+        .route("/api/v1/marketplace/preview", get(marketplace::marketplace_preview_handler).post(marketplace::marketplace_preview_handler))
+        .route("/api/v1/marketplace/unlock", post(marketplace::marketplace_unlock_handler))
+        .route("/api/v1/marketplace/issue-receipt", post(marketplace::marketplace_unlock_handler))
+        .route("/api/v1/marketplace/download", get(marketplace::marketplace_download_handler).post(marketplace::marketplace_download_handler))
+        .route("/api/v1/marketplace/pool-merge", post(marketplace::marketplace_pool_merge_handler))
+        .route("/api/v1/marketplace/ledger", get(marketplace::marketplace_ledger_handler))
+        .route("/api/v1/marketplace/bounties", get(marketplace::marketplace_bounties_handler))
+        .route("/api/v1/marketplace/bounties/submit", post(marketplace::marketplace_bounty_submit_handler))
 
         // Health & Models Telemetry
         .route("/api/health", get(health::health_handler))
