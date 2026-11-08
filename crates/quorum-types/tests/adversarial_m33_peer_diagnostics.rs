@@ -104,6 +104,7 @@ fn test_peer_diagnostics_extreme_scaling_10k_peers() {
         queried_peers_count: num_peers,
         peer_outcomes: outcomes,
         summary_reason: None,
+        contributing_peer_ids: Vec::new(),
     };
 
     // Stress test compute_summary_reason with 10k items
@@ -185,6 +186,7 @@ fn test_peer_diagnostics_summary_reason_priority_hierarchy_oracle() {
             },
         ],
         summary_reason: None,
+        contributing_peer_ids: Vec::new(),
     };
     diag.compute_summary_reason(3032, 3500);
     assert_eq!(
@@ -277,6 +279,7 @@ fn test_logical_anomaly_connected_peers_with_zero_queried() {
         queried_peers_count: 0,
         peer_outcomes: Vec::new(),
         summary_reason: None,
+        contributing_peer_ids: Vec::new(),
     };
     diag.compute_summary_reason(3032, 3500);
 

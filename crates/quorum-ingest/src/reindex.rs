@@ -5,6 +5,7 @@
 //! Provides asynchronous background task management, cooperative cancellation, and live telemetry.
 
 use chrono::{DateTime, Utc};
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -538,6 +539,21 @@ impl ReindexWorker {
         progress: Arc<RwLock<Option<ReindexProgress>>>,
         cancel_flag: Arc<AtomicBool>,
     ) -> Result<(), IngestError> {
+        // RAII guard to ensure bulk indexing is restored when this reindex pass terminates
+        struct BulkIndexReset;
+        impl Drop for BulkIndexReset {
+            fn drop(&mut self) {
+                crate::image_indexer::ImageIndexer::set_bulk_indexing(false);
+            }
+        }
+        crate::image_indexer::ImageIndexer::set_bulk_indexing(true);
+        let _bulk_reset = BulkIndexReset;
+
+        // Hydrate deduplication state from SQLite document catalog before processing candidates
+        if let Err(e) = dedup.hydrate_from_catalog(&storage) {
+            warn!("Failed to hydrate dedup catalog from document_catalog.db: {}", e);
+        }
+
         let storage_path = storage.config().storage_path.clone();
         if !config.excluded_paths.iter().any(|p| p == &storage_path) {
             config.excluded_paths.push(storage_path);
@@ -616,36 +632,49 @@ impl ReindexWorker {
             }
         }
 
-        let mut batch_chunks: Vec<DocumentChunk> = Vec::with_capacity(options.batch_size);
-        let mut batch_parents: Vec<(quorum_types::IngestedParentDocument, u8)> = Vec::new();
+        let catalog_path = config
+            .dedup_catalog_path
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| storage.config().storage_path.join("dedup_catalog.json"));
 
-        for candidate in all_candidates {
+        let concurrency = if options.num_threads > 0 {
+            options.num_threads.clamp(1, 64)
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() * 2).clamp(8, 32))
+                .unwrap_or(16)
+        };
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+
+        let mut batch_chunks: Vec<DocumentChunk> = Vec::with_capacity(options.batch_size.max(64));
+        let mut batch_parents: Vec<(quorum_types::IngestedParentDocument, u8)> = Vec::with_capacity(options.batch_size.max(64));
+
+        let mut futures = FuturesUnordered::new();
+        let mut candidate_iter = all_candidates.into_iter();
+
+        loop {
             if cancel_flag.load(Ordering::SeqCst) {
                 return Err(IngestError::Cancelled);
             }
 
-                // Cooperative multitasking yield point
-                tokio::task::yield_now().await;
+            // Fill concurrency slots up to capacity
+            while futures.len() < concurrency {
+                let Some(candidate) = candidate_iter.next() else { break };
 
-                {
-                    let mut lock = progress.write().await;
-                    if let Some(ref mut p) = *lock {
-                        p.files_scanned += 1;
-                        p.bytes_processed += candidate.size_bytes;
-                    }
-                }
-
-                let path = &candidate.path;
-                let access_tier = config.resolve_access_tier(path);
+                let path = candidate.path.clone();
+                let access_tier = config.resolve_access_tier(&path);
 
                 // Level-1 Evaluation: skip unmodified unless full_rebuild is forced
                 if !options.full_rebuild {
-                    if let Ok(action) = dedup.evaluate_file(path, candidate.mtime_secs, candidate.size_bytes) {
+                    if let Ok(action) = dedup.evaluate_file(&path, candidate.mtime_secs, candidate.size_bytes) {
                         match action {
                             DedupAction::Unchanged { .. } => {
                                 let mut lock = progress.write().await;
                                 if let Some(ref mut p) = *lock {
+                                    p.files_scanned += 1;
                                     p.files_skipped_unmodified += 1;
+                                    p.bytes_processed += candidate.size_bytes;
                                 }
                                 continue;
                             }
@@ -660,7 +689,9 @@ impl ReindexWorker {
                                 });
                                 let mut lock = progress.write().await;
                                 if let Some(ref mut p) = *lock {
+                                    p.files_scanned += 1;
                                     p.files_indexed += 1;
+                                    p.bytes_processed += candidate.size_bytes;
                                 }
                                 continue;
                             }
@@ -671,194 +702,70 @@ impl ReindexWorker {
                     }
                 }
 
-                // File is new, modified, or full rebuild was requested
-                match candidate.kind {
-                    CandidateKind::Text { .. } => {
-                        let content = match DocumentExtractor::extract_text(path, &candidate.file_identity) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!("Failed to read file '{}': {}", path.display(), e);
-                                let mut lock = progress.write().await;
-                                if let Some(ref mut p) = *lock {
-                                    p.files_failed += 1;
-                                }
-                                continue;
+                let permit = semaphore.clone().acquire_owned().await.map_err(|_| IngestError::Cancelled)?;
+                let embedder_c = Arc::clone(&embedder);
+                let dedup_c = Arc::clone(&dedup);
+                let chunker_c = chunker.clone();
+                let force_reembed = options.force_reembed;
+
+                futures.push(tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    crate::throttling::set_background_thread_priority();
+                    let outcome = process_candidate_sync(
+                        candidate,
+                        access_tier,
+                        force_reembed,
+                        embedder_c,
+                        dedup_c,
+                        chunker_c,
+                    );
+                    crate::throttling::end_background_thread_priority();
+                    outcome
+                }));
+            }
+
+            if futures.is_empty() {
+                break;
+            }
+
+            // Await next completed candidate
+            if let Some(join_res) = futures.next().await {
+                match join_res {
+                    Ok(outcome) => match outcome {
+                        CandidateOutcome::Processed {
+                            chunks,
+                            parent_doc,
+                            catalog_entry,
+                            size_bytes,
+                            chunks_reused,
+                            chunks_new,
+                        } => {
+                            dedup.register_entry(catalog_entry);
+                            if let Some(parent) = parent_doc {
+                                batch_parents.push(parent);
                             }
-                        };
+                            batch_chunks.extend(chunks);
 
-                        let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
-                        let mut file_chunk_hashes = Vec::new();
-
-                        let raw_chunks = chunker.chunk_text(&content);
-                        let path_str = path.to_string_lossy().to_string();
-                        let header = crate::chunker::build_contextual_header(path, &content);
-
-                        for raw in raw_chunks {
-                            if raw.chunk_index > 0 && raw.chunk_index % 8 == 0 {
-                                tokio::task::yield_now().await;
-                            }
-
-                            let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-                            let chunk_content = crate::chunker::prepend_contextual_header(&header, raw.text_slice);
-                            let chunk_b3 = DocumentChunk::compute_blake3_hash(&chunk_content);
-                            file_chunk_hashes.push(raw_b3.clone());
-
-                            // Level-2 Evaluation: reuse cached vector if available
-                            let vector = if !options.force_reembed {
-                                if let Some(existing_vec) = dedup.cache().get(&raw_b3) {
-                                    let mut lock = progress.write().await;
-                                    if let Some(ref mut p) = *lock {
-                                        p.chunks_reused_from_cache += 1;
-                                    }
-                                    existing_vec
-                                } else {
-                                    let vec = embedder
-                                        .embed_text(raw.text_slice)
-                                        .unwrap_or_else(|_| vec![0.0; embedder.dimension()]);
-                                    dedup.cache().insert(raw_b3.clone(), vec.clone());
-                                    let mut lock = progress.write().await;
-                                    if let Some(ref mut p) = *lock {
-                                        p.chunks_newly_embedded += 1;
-                                    }
-                                    vec
-                                }
-                            } else {
-                                let vec = embedder
-                                    .embed_text(&chunk_content)
-                                    .unwrap_or_else(|_| vec![0.0; embedder.dimension()]);
-                                dedup.cache().insert(chunk_b3.clone(), vec.clone());
-                                let mut lock = progress.write().await;
-                                if let Some(ref mut p) = *lock {
-                                    p.chunks_newly_embedded += 1;
-                                }
-                                vec
-                            };
-
-                            let chunk_id = format!("{}:{}", file_b3, raw.chunk_index);
-                            let metadata_json = serde_json::json!({
-                                "char_start": raw.char_start,
-                                "char_end": raw.char_end,
-                                "chunk_index": raw.chunk_index,
-                                "contract_hash": embedder.contract().derive_contract_hash_hex(),
-                            })
-                            .to_string();
-
-                            if let Ok(doc_chunk) = DocumentChunk::new(
-                                chunk_id,
-                                file_b3.clone(),
-                                &path_str,
-                                raw.line_start,
-                                raw.line_end,
-                                access_tier,
-                                vector,
-                                &chunk_content,
-                                Some(metadata_json),
-                            ) {
-                                batch_chunks.push(doc_chunk);
-                            }
-                        }
-
-                        if !content.is_empty() {
-                            let parent_doc = DocumentExtractor::build_ingested_parent_document(
-                                path,
-                                &file_b3,
-                                &file_b3,
-                                &content,
-                                candidate.mtime_secs,
-                                candidate.size_bytes,
-                                None,
-                            );
-                            batch_parents.push((parent_doc, access_tier));
-                        }
-
-                        // Register in Level-1 catalog
-                        dedup.register_entry(FileCatalogEntry {
-                            file_path: path.clone(),
-                            file_blake3: file_b3,
-                            mtime_secs: candidate.mtime_secs,
-                            size_bytes: candidate.size_bytes,
-                            chunk_hashes: file_chunk_hashes,
-                        });
-                    }
-                    CandidateKind::Image { .. } => {
-                        let bytes = match std::fs::read(path) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!("Failed to read image file '{}': {}", path.display(), e);
-                                let mut lock = progress.write().await;
-                                if let Some(ref mut p) = *lock {
-                                    p.files_failed += 1;
-                                }
-                                continue;
-                            }
-                        };
-
-                        if let Ok(doc_chunk) = ImageIndexer::index_image(
-                            path,
-                            &bytes,
-                            &candidate.file_identity,
-                            access_tier,
-                            embedder.as_ref(),
-                        ) {
-                            let file_b3 = doc_chunk.document_id.clone();
-                            let parent_doc = DocumentExtractor::build_ingested_parent_document(
-                                path,
-                                &file_b3,
-                                &file_b3,
-                                &doc_chunk.text_content,
-                                candidate.mtime_secs,
-                                candidate.size_bytes,
-                                Some(quorum_types::DocumentFormat::ImageFile),
-                            );
-                            batch_parents.push((parent_doc, access_tier));
-                            dedup.register_entry(FileCatalogEntry {
-                                file_path: path.clone(),
-                                file_blake3: file_b3,
-                                mtime_secs: candidate.mtime_secs,
-                                size_bytes: candidate.size_bytes,
-                                chunk_hashes: vec![doc_chunk.blake3_hash.clone()],
-                            });
-                            batch_chunks.push(doc_chunk);
                             let mut lock = progress.write().await;
                             if let Some(ref mut p) = *lock {
-                                p.chunks_newly_embedded += 1;
+                                p.files_scanned += 1;
+                                p.files_indexed += 1;
+                                p.bytes_processed += size_bytes;
+                                p.chunks_reused_from_cache += chunks_reused;
+                                p.chunks_newly_embedded += chunks_new;
                             }
                         }
-                    }
-                    CandidateKind::Audio { .. } => {
-                        let bytes = match std::fs::read(path) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!("Failed to read audio file '{}': {}", path.display(), e);
-                                let mut lock = progress.write().await;
-                                if let Some(ref mut p) = *lock {
-                                    p.files_failed += 1;
-                                }
-                                continue;
-                            }
-                        };
-
-                        if let Ok(doc_chunk) = AudioIndexer::index_audio(
-                            path,
-                            &bytes,
-                            &candidate.file_identity,
-                            access_tier,
-                            embedder.as_ref(),
-                        ) {
-                            let file_b3 = doc_chunk.document_id.clone();
-                            dedup.register_entry(FileCatalogEntry {
-                                file_path: path.clone(),
-                                file_blake3: file_b3,
-                                mtime_secs: candidate.mtime_secs,
-                                size_bytes: candidate.size_bytes,
-                                chunk_hashes: vec![doc_chunk.blake3_hash.clone()],
-                            });
-                            batch_chunks.push(doc_chunk);
+                        CandidateOutcome::Failed { path, error } => {
+                            warn!("Failed to process '{}': {}", path.display(), error);
                             let mut lock = progress.write().await;
                             if let Some(ref mut p) = *lock {
-                                p.chunks_newly_embedded += 1;
+                                p.files_scanned += 1;
+                                p.files_failed += 1;
                             }
                         }
+                    },
+                    Err(e) => {
+                        warn!("Blocking reindex worker task failed: {}", e);
                     }
                 }
 
@@ -870,6 +777,7 @@ impl ReindexWorker {
                         for (pdoc, ptier) in batch_parents.drain(..) {
                             let _ = storage.upsert_parent_document(&pdoc, ptier);
                         }
+                        let _ = dedup.save_catalog_to_file(&catalog_path);
                         let _ = storage.bump_index_epoch("reindex_micro_batch");
                     } else {
                         batch_parents.clear();
@@ -877,27 +785,25 @@ impl ReindexWorker {
                     batch_chunks.clear();
                     tokio::task::yield_now().await;
                 }
-
-                let mut lock = progress.write().await;
-                if let Some(ref mut p) = *lock {
-                    p.files_indexed += 1;
-                }
             }
+        }
 
-            // Flush remaining micro-batch
-            if !batch_chunks.is_empty() && !options.dry_run {
-                Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
-                let _ = storage.insert_chunks(&batch_chunks).await?;
-                for (pdoc, ptier) in batch_parents.drain(..) {
-                    let _ = storage.upsert_parent_document(&pdoc, ptier);
-                }
-                let _ = storage.bump_index_epoch("reindex_final_flush");
-                batch_chunks.clear();
-            } else if !batch_parents.is_empty() && !options.dry_run {
-                for (pdoc, ptier) in batch_parents.drain(..) {
-                    let _ = storage.upsert_parent_document(&pdoc, ptier);
-                }
+        // Flush remaining micro-batch
+        if !batch_chunks.is_empty() && !options.dry_run {
+            Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
+            let _ = storage.insert_chunks(&batch_chunks).await?;
+            for (pdoc, ptier) in batch_parents.drain(..) {
+                let _ = storage.upsert_parent_document(&pdoc, ptier);
             }
+            let _ = dedup.save_catalog_to_file(&catalog_path);
+            let _ = storage.bump_index_epoch("reindex_final_flush");
+            batch_chunks.clear();
+        } else if !batch_parents.is_empty() && !options.dry_run {
+            for (pdoc, ptier) in batch_parents.drain(..) {
+                let _ = storage.upsert_parent_document(&pdoc, ptier);
+            }
+            let _ = dedup.save_catalog_to_file(&catalog_path);
+        }
 
         // Compaction phase if full rebuild
         if options.full_rebuild && !options.dry_run {
@@ -1077,6 +983,237 @@ impl ReindexWorker {
             raw_targets.to_vec()
         } else {
             expanded
+        }
+    }
+}
+
+/// Internal candidate outcome from multithreaded processing task.
+enum CandidateOutcome {
+    Processed {
+        chunks: Vec<DocumentChunk>,
+        parent_doc: Option<(quorum_types::IngestedParentDocument, u8)>,
+        catalog_entry: FileCatalogEntry,
+        size_bytes: u64,
+        chunks_reused: usize,
+        chunks_new: usize,
+    },
+    Failed {
+        path: std::path::PathBuf,
+        error: String,
+    },
+}
+
+fn process_candidate_sync(
+    candidate: DiscoveredCandidate,
+    access_tier: u8,
+    force_reembed: bool,
+    embedder: Arc<dyn EmbeddingGenerator>,
+    dedup: Arc<TwoLevelDedupEngine>,
+    chunker: TextChunker,
+) -> CandidateOutcome {
+    let path = &candidate.path;
+    match candidate.kind {
+        CandidateKind::Text { .. } => {
+            let content = match DocumentExtractor::extract_text(path, &candidate.file_identity) {
+                Ok(c) => c,
+                Err(e) => {
+                    return CandidateOutcome::Failed {
+                        path: path.clone(),
+                        error: format!("Failed to read file: {}", e),
+                    };
+                }
+            };
+
+            let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
+            let raw_chunks = chunker.chunk_text(&content);
+            let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
+            let path_str = path.to_string_lossy().to_string();
+            let header = crate::chunker::build_contextual_header(path, &content);
+
+            let mut chunks = Vec::with_capacity(raw_chunks.len());
+            let mut chunks_reused = 0;
+            let mut chunks_new = 0;
+
+            for raw in raw_chunks {
+                let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
+                let chunk_content = crate::chunker::prepend_contextual_header(&header, raw.text_slice);
+                let chunk_b3 = DocumentChunk::compute_blake3_hash(&chunk_content);
+                file_chunk_hashes.push(raw_b3.clone());
+
+                let vector = if !force_reembed {
+                    if let Some(existing_vec) = dedup.cache().get(&raw_b3) {
+                        chunks_reused += 1;
+                        existing_vec
+                    } else {
+                        let vec = embedder
+                            .embed_text(raw.text_slice)
+                            .unwrap_or_else(|_| vec![0.0; embedder.dimension()]);
+                        dedup.cache().insert(raw_b3.clone(), vec.clone());
+                        chunks_new += 1;
+                        vec
+                    }
+                } else {
+                    let vec = embedder
+                        .embed_text(&chunk_content)
+                        .unwrap_or_else(|_| vec![0.0; embedder.dimension()]);
+                    dedup.cache().insert(chunk_b3.clone(), vec.clone());
+                    chunks_new += 1;
+                    vec
+                };
+
+                let chunk_id = format!("{}:{}", file_b3, raw.chunk_index);
+                let metadata_json = serde_json::json!({
+                    "char_start": raw.char_start,
+                    "char_end": raw.char_end,
+                    "chunk_index": raw.chunk_index,
+                    "contract_hash": embedder.contract().derive_contract_hash_hex(),
+                })
+                .to_string();
+
+                if let Ok(doc_chunk) = DocumentChunk::new(
+                    chunk_id,
+                    file_b3.clone(),
+                    &path_str,
+                    raw.line_start,
+                    raw.line_end,
+                    access_tier,
+                    vector,
+                    &chunk_content,
+                    Some(metadata_json),
+                ) {
+                    chunks.push(doc_chunk);
+                }
+            }
+
+            let parent_doc = if !content.is_empty() {
+                Some((
+                    DocumentExtractor::build_ingested_parent_document(
+                        path,
+                        &file_b3,
+                        &file_b3,
+                        &content,
+                        candidate.mtime_secs,
+                        candidate.size_bytes,
+                        None,
+                    ),
+                    access_tier,
+                ))
+            } else {
+                None
+            };
+
+            let catalog_entry = FileCatalogEntry {
+                file_path: path.clone(),
+                file_blake3: file_b3,
+                mtime_secs: candidate.mtime_secs,
+                size_bytes: candidate.size_bytes,
+                chunk_hashes: file_chunk_hashes,
+            };
+
+            CandidateOutcome::Processed {
+                chunks,
+                parent_doc,
+                catalog_entry,
+                size_bytes: candidate.size_bytes,
+                chunks_reused,
+                chunks_new,
+            }
+        }
+        CandidateKind::Image { .. } => {
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    return CandidateOutcome::Failed {
+                        path: path.clone(),
+                        error: format!("Failed to read image file: {}", e),
+                    };
+                }
+            };
+
+            match ImageIndexer::index_image(
+                path,
+                &bytes,
+                &candidate.file_identity,
+                access_tier,
+                embedder.as_ref(),
+            ) {
+                Ok(doc_chunk) => {
+                    let file_b3 = doc_chunk.document_id.clone();
+                    let parent_doc = Some((
+                        DocumentExtractor::build_ingested_parent_document(
+                            path,
+                            &file_b3,
+                            &file_b3,
+                            &doc_chunk.text_content,
+                            candidate.mtime_secs,
+                            candidate.size_bytes,
+                            Some(quorum_types::DocumentFormat::ImageFile),
+                        ),
+                        access_tier,
+                    ));
+                    let catalog_entry = FileCatalogEntry {
+                        file_path: path.clone(),
+                        file_blake3: file_b3,
+                        mtime_secs: candidate.mtime_secs,
+                        size_bytes: candidate.size_bytes,
+                        chunk_hashes: vec![doc_chunk.blake3_hash.clone()],
+                    };
+                    CandidateOutcome::Processed {
+                        chunks: vec![doc_chunk],
+                        parent_doc,
+                        catalog_entry,
+                        size_bytes: candidate.size_bytes,
+                        chunks_reused: 0,
+                        chunks_new: 1,
+                    }
+                }
+                Err(e) => CandidateOutcome::Failed {
+                    path: path.clone(),
+                    error: format!("Failed to index image: {}", e),
+                },
+            }
+        }
+        CandidateKind::Audio { .. } => {
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    return CandidateOutcome::Failed {
+                        path: path.clone(),
+                        error: format!("Failed to read audio file: {}", e),
+                    };
+                }
+            };
+
+            match AudioIndexer::index_audio(
+                path,
+                &bytes,
+                &candidate.file_identity,
+                access_tier,
+                embedder.as_ref(),
+            ) {
+                Ok(doc_chunk) => {
+                    let file_b3 = doc_chunk.document_id.clone();
+                    let catalog_entry = FileCatalogEntry {
+                        file_path: path.clone(),
+                        file_blake3: file_b3,
+                        mtime_secs: candidate.mtime_secs,
+                        size_bytes: candidate.size_bytes,
+                        chunk_hashes: vec![doc_chunk.blake3_hash.clone()],
+                    };
+                    CandidateOutcome::Processed {
+                        chunks: vec![doc_chunk],
+                        parent_doc: None,
+                        catalog_entry,
+                        size_bytes: candidate.size_bytes,
+                        chunks_reused: 0,
+                        chunks_new: 1,
+                    }
+                }
+                Err(e) => CandidateOutcome::Failed {
+                    path: path.clone(),
+                    error: format!("Failed to index audio: {}", e),
+                },
+            }
         }
     }
 }

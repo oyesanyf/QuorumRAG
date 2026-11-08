@@ -371,3 +371,43 @@ fn test_rlm_verbatim_grounding_with_synthetic_headers() {
         "Byte range must slice verbatim quote in raw parent text"
     );
 }
+
+#[test]
+fn test_identity_profile_query_filters_uscis_form_g28_boilerplate_from_citations() {
+    let resume_chunk = make_test_chunk(
+        "chunk_resume_0",
+        "C:/Users/oyesanyf/Documents/Femi_Oyesanya_Resume_2026.docx",
+        REALISTIC_RESUME_TEXT,
+        Some(0),
+        Some(REALISTIC_RESUME_TEXT.len()),
+    );
+
+    let g28_text = "USCIS Form G-28 Notice of Entry of Appearance as Attorney or Accredited Representative. Department of Homeland Security. OMB No. 1615-0105. In re: Femi Oyesanya. Part 1. Information About Attorney.";
+    let g28_chunk = make_test_chunk(
+        "chunk_g28_0",
+        "C:/Users/oyesanyf/Downloads/Form_G-28_USCIS.pdf",
+        g28_text,
+        None,
+        None,
+    );
+
+    let chunks = vec![resume_chunk, g28_chunk];
+    let (body, citations) = DeterministicOfflineSynthesisEngine::synthesize(
+        "who is Femi Oyesanya",
+        &chunks,
+        "offline",
+    );
+
+    assert!(
+        citations.iter().any(|c| c.file_path.contains("Resume")),
+        "Resume document must be cited in citations"
+    );
+    assert!(
+        !citations.iter().any(|c| c.file_path.contains("G-28") || c.file_path.contains("g28") || c.file_path.contains("G28")),
+        "Form G-28 must be filtered from citations when resume is present"
+    );
+    assert!(
+        !body.contains("Form_G-28"),
+        "Sources block in synthesized body must omit Form G-28"
+    );
+}

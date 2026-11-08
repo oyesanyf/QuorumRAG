@@ -481,6 +481,19 @@ impl StorageEngine {
         self.vector_store.has_chunk_hash(blake3_hash).await
     }
 
+    /// Checks if a chunk's ID already exists in storage (Tantivy BM25 inverted index fast path, falling back to LanceDB).
+    pub async fn has_chunk_id(&self, chunk_id: &str) -> Result<bool, StorageError> {
+        if self.fts_index.has_chunk_id(chunk_id)? {
+            return Ok(true);
+        }
+        self.vector_store.has_chunk_id(chunk_id).await
+    }
+
+    /// Lists all file identities stored in the SQLite Document Catalog for fast startup hydration.
+    pub fn list_catalog_file_identities(&self) -> Result<Vec<crate::document_catalog::CatalogFileIdentity>, StorageError> {
+        self.catalog.list_all_file_identities()
+    }
+
     /// Deletes all chunks matching the specified source `file_path`.
     pub async fn delete_by_file_path(&self, file_path: &str) -> Result<usize, StorageError> {
         let lance_deleted = self.vector_store.delete_by_file_path(file_path).await?;

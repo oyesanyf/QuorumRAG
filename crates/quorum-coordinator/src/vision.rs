@@ -116,8 +116,8 @@ pub fn describe_image_file(addr: &SocketAddr, host_port: &str, model: &str, path
     );
 
     let mut stream = TcpStream::connect_timeout(addr, Duration::from_millis(800)).ok()?;
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(90)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(2000)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(2500)));
     stream.write_all(request.as_bytes()).ok()?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).ok()?;

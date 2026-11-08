@@ -26,7 +26,7 @@ pub(crate) mod vector_store;
 
 pub use config::StorageConfig;
 pub use dataset_builder::{DatasetBuilder, DatasetBuilderConfig, RawDatasetCandidate};
-pub use document_catalog::{derive_work_cluster_id, DocumentCatalog, DocumentCatalogEntry};
+pub use document_catalog::{derive_work_cluster_id, CatalogFileIdentity, DocumentCatalog, DocumentCatalogEntry};
 pub use engine::{CompactionStats, SearchMode, StorageEngine, StorageSearchQuery};
 pub use error::StorageError;
 pub use tantivy_fts::DistinctWorkHit;

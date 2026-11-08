@@ -34,7 +34,7 @@ pub use document_extractor::DocumentExtractor;
 pub use drift_healer::{DriftHealer, DriftReport};
 pub use engine::IngestEngine;
 pub use error::IngestError;
-pub use image_indexer::{ImageIndexer, ImageMetadata};
+pub use image_indexer::{ImageIndexer, ImageMetadata, OcrOutcome};
 pub use reindex::{ReindexPhase, ReindexProgress, ReindexWorker};
 pub use reverse_geocoder::{resolve_location, GeoLocation};
 pub use throttling::{end_background_thread_priority, set_background_thread_priority};

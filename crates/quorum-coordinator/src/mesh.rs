@@ -130,6 +130,7 @@ pub trait MeshQueryDispatcher: Send + Sync {
             queried_peers_count: responses.len(),
             peer_outcomes: Vec::new(),
             summary_reason: None,
+            contributing_peer_ids: Vec::new(),
         };
         Ok((responses, diagnostics))
     }
@@ -237,9 +238,21 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
         };
 
         let mut responses = Vec::new();
-        let _ = tokio::time::timeout(timeout, async {
-            while let Some(res) = futures.next().await {
-                if let Ok((peer_id, query_id, chunks, latency_ms)) = res {
+        let primary_deadline = tokio::time::Instant::now() + timeout;
+        let mut active_deadline = primary_deadline;
+        let mut got_non_empty = false;
+
+        loop {
+            if futures.is_empty() {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= active_deadline {
+                break;
+            }
+            let remaining = active_deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, futures.next()).await {
+                Ok(Some(Ok((peer_id, query_id, chunks, latency_ms)))) => {
                     pending_ids.remove(&peer_id);
                     let chunks_count = chunks.len();
                     let status = if chunks_count > 0 {
@@ -260,13 +273,25 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
                         responder_peer_id: peer_id,
                         chunks,
                     });
-                    if responses.len() >= max_peer_responses {
+                    if responses.len() >= max_peer_responses || pending_ids.is_empty() {
                         break;
                     }
+                    let max_straggler_grace = if chunks_count > 0 {
+                        got_non_empty = true;
+                        Duration::from_millis(120)
+                    } else if !got_non_empty {
+                        Duration::from_millis(200)
+                    } else {
+                        Duration::from_millis(120)
+                    };
+                    let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
+                    if straggler_deadline < active_deadline {
+                        active_deadline = straggler_deadline;
+                    }
                 }
+                _ => break,
             }
-        })
-        .await;
+        }
 
         for stalled_peer in pending_ids {
             diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
@@ -328,7 +353,7 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             .map_err(|e| CoordinatorError::Network(e.to_string()))?;
 
         // If no peers are currently connected (e.g., idle TCP drop or remote node restarted),
-        // proactively dial configured bootstrap_peers from OshoosiClaw Mesh settings and wait briefly,
+        // proactively dial configured bootstrap_peers and known peers from p2p_known_peers.json on mesh port,
         // subject to a 10-second cooldown so offline peers do not inject 450ms sleep per sub-query.
         if peers.is_empty() {
             let now_ms = std::time::SystemTime::now()
@@ -341,13 +366,46 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             if now_ms.saturating_sub(last_dial) >= 10_000 {
                 self.last_bootstrap_dial_ms
                     .store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                let bootstrap_addrs = {
+                let (bootstrap_addrs, mesh_port) = {
                     let controller = crate::dlp_mesh::global_mesh_dlp_controller();
                     let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
-                    s.mesh.bootstrap_peers.clone()
+                    (s.mesh.bootstrap_peers.clone(), s.mesh.mesh_port)
                 };
-                if !bootstrap_addrs.is_empty() {
-                    for addr_str in &bootstrap_addrs {
+                let mut dial_targets: Vec<String> = bootstrap_addrs;
+
+                // Discover and dial known peers from p2p_known_peers.json on mesh_port (default 3032)
+                let controller = crate::dlp_mesh::global_mesh_dlp_controller();
+                let known_peers_path = controller
+                    .settings_file_path
+                    .read()
+                    .ok()
+                    .and_then(|p| p.as_ref().and_then(|f| f.parent().map(|d| d.join("p2p_known_peers.json"))));
+
+                if let Some(path) = known_peers_path {
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                            if let Some(multiaddrs) = val.get("multiaddrs").and_then(|m| m.as_array()) {
+                                for ma in multiaddrs {
+                                    if let Some(s) = ma.as_str() {
+                                        let s = s.trim();
+                                        if !s.contains("/4001")
+                                            && (s.contains(&format!("/tcp/{}", mesh_port))
+                                                || s.contains(&format!("/udp/{}", mesh_port))
+                                                || s.contains("/tcp/3032"))
+                                        {
+                                            dial_targets.push(s.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                dial_targets.retain(|a| !a.contains("/4001"));
+
+                if !dial_targets.is_empty() {
+                    for addr_str in &dial_targets {
                         if let Ok(addr) = addr_str.trim().parse::<quorum_network::Multiaddr>() {
                             let _ = self.handle.dial(addr).await;
                         }
@@ -362,6 +420,30 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                         }
                     }
                 }
+            }
+        }
+
+        // Filter out non-QuorumRAG IPFS peers on port 4001 before dispatching candidate queries
+        let connected_addrs = self.handle.connected_peer_addresses();
+        peers.retain(|peer| {
+            if let Some(addr) = connected_addrs.get(peer) {
+                let s = addr.to_string();
+                !s.contains("/tcp/4001") && !s.contains("/udp/4001") && !s.ends_with(":4001")
+            } else {
+                true
+            }
+        });
+
+        // Filter out known dead peers (>=3 consecutive failures) when healthy peers exist
+        let registry = global_peer_health_registry();
+        if peers.len() > 1 {
+            let has_healthy = peers.iter().any(|p| {
+                registry.get(&p.to_string()).map_or(true, |s| s.consecutive_failures < 3)
+            });
+            if has_healthy {
+                peers.retain(|p| {
+                    registry.get(&p.to_string()).map_or(true, |s| s.consecutive_failures < 3)
+                });
             }
         }
 
@@ -382,6 +464,7 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
         }
 
         diagnostics.queried_peers_count = peers.len();
+        let total_queried = peers.len();
 
         use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -411,7 +494,6 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             }
         };
 
-        let registry = global_peer_health_registry();
         let primary_deadline = tokio::time::Instant::now() + timeout;
         let mut active_deadline = primary_deadline;
         let mut got_non_empty_peer = false;
@@ -450,20 +532,28 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                         chunks = chunks_len,
                         "Received federated P2P mesh response"
                     );
-                    if chunks_len > 0 && !got_non_empty_peer {
-                        got_non_empty_peer = true;
-                        // Two-stage deadline: once at least one peer has delivered real chunks,
-                        // give slower straggler peers a bounded 950ms grace window so dead/stalled
-                        // sockets never penalize responsive LAN peers.
-                        let grace_deadline =
-                            tokio::time::Instant::now() + Duration::from_millis(950);
-                        if grace_deadline < active_deadline {
-                            active_deadline = grace_deadline;
-                        }
-                    }
                     responses.push(resp);
-                    if responses.len() >= max_peer_responses {
+
+                    // EARLY RESOLUTION LAW:
+                    // 1. If all queried peers have responded or max responses reached, break immediately.
+                    if responses.len() >= total_queried || responses.len() >= max_peer_responses || pending_peer_ids.is_empty() {
                         break;
+                    }
+
+                    // 2. Once responses have arrived, do NOT wait out 5,000ms!
+                    // If we have received matching chunks, clamp straggler grace to 120ms max.
+                    // If chunks == 0, clamp straggler grace to 200ms max.
+                    let max_straggler_grace = if chunks_len > 0 {
+                        got_non_empty_peer = true;
+                        Duration::from_millis(120)
+                    } else if !got_non_empty_peer {
+                        Duration::from_millis(200)
+                    } else {
+                        Duration::from_millis(120)
+                    };
+                    let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
+                    if straggler_deadline < active_deadline {
+                        active_deadline = straggler_deadline;
                     }
                 }
                 Ok(Some(Ok((peer_str, Err(err), rtt_ms)))) => {
@@ -492,6 +582,9 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                         error = %err,
                         "Federated P2P mesh query to peer failed"
                     );
+                    if pending_peer_ids.is_empty() || (!responses.is_empty() && responses.len() >= max_peer_responses) {
+                        break;
+                    }
                 }
                 Ok(Some(Err(join_err))) => {
                     tracing::warn!("Swarm query task join error: {}", join_err);

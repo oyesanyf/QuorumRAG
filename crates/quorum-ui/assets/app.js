@@ -755,6 +755,12 @@ function secureRandomIndex(n) {
 
     bodyEl._rawMarkdown = '';
     bodyEl.innerHTML = '';
+    citationsEl._queryInFlight = true;
+    citationsEl._retrievedRemoteCount = 0;
+    citationsEl._remoteCount = 0;
+    citationsEl._retrievedLocalCount = 0;
+    citationsEl._contributingPeerIds = new Set();
+    citationsEl._peerDiagnostics = null;
     citationsEl._pendingCitations = [];
     citationsEl._seenFiles = new Set();
     citationsEl._hasSourcesHeading = false;
@@ -913,6 +919,8 @@ function secureRandomIndex(n) {
         }
       }
       linkInlineCitations(bodyEl, citationsEl);
+      citationsEl._queryInFlight = false;
+      refreshSourcesNodeIdRow(citationsEl);
       // 3. Render browser-style Response Action Toolbar (Copy, Regenerate, Read Aloud, Helpful/Not Helpful)
       if (actionsEl) {
         renderResponseActionsBar(actionsEl, bodyEl, citationsEl, headerEl, text, turnHistorySnapshot);
@@ -954,6 +962,12 @@ function secureRandomIndex(n) {
     const { bodyEl, citationsEl, headerEl, actionsEl } = createAssistantMessage();
     bodyEl._rawMarkdown = '';
     bodyEl.innerHTML = '';
+    citationsEl._queryInFlight = true;
+    citationsEl._retrievedRemoteCount = 0;
+    citationsEl._remoteCount = 0;
+    citationsEl._retrievedLocalCount = 0;
+    citationsEl._contributingPeerIds = new Set();
+    citationsEl._peerDiagnostics = null;
     citationsEl._pendingCitations = [];
     citationsEl._seenFiles = new Set();
     citationsEl._hasSourcesHeading = false;
@@ -1059,6 +1073,8 @@ function secureRandomIndex(n) {
         }
       }
       linkInlineCitations(bodyEl, citationsEl);
+      citationsEl._queryInFlight = false;
+      refreshSourcesNodeIdRow(citationsEl);
 
       if (actionsEl) {
         const turnHistorySnapshot = conversationHistoryTurns.slice(-14);
@@ -1297,11 +1313,38 @@ function secureRandomIndex(n) {
         telemetryModelInfo.textContent = `Retrieved ${data.retrieved_count || 0} chunks (${data.local_count || 0} local, ${data.remote_count || 0} mesh) in ${data.latency_ms || 0}ms`;
       }
       if (citationsEl) {
+        citationsEl._retrievedRemoteCount = Number(data.remote_count || 0);
+        citationsEl._remoteCount = citationsEl._retrievedRemoteCount;
+        citationsEl._retrievedLocalCount = Number(data.local_count || 0);
+        if (!citationsEl._contributingPeerIds) {
+          citationsEl._contributingPeerIds = new Set();
+        }
+        if (Array.isArray(data.contributing_peer_ids)) {
+          for (const pid of data.contributing_peer_ids) {
+            if (pid && String(pid).toLowerCase() !== 'local') {
+              citationsEl._contributingPeerIds.add(String(pid).trim());
+            }
+          }
+        }
         const diag = (data && data.peer_diagnostics) || (event && event.data && event.data.peer_diagnostics);
         if (diag) {
+          if (Array.isArray(diag.contributing_peer_ids)) {
+            for (const pid of diag.contributing_peer_ids) {
+              if (pid && String(pid).toLowerCase() !== 'local') {
+                citationsEl._contributingPeerIds.add(String(pid).trim());
+              }
+            }
+          }
+          if (Array.isArray(diag.peer_outcomes)) {
+            for (const outcome of diag.peer_outcomes) {
+              if (outcome && outcome.matching_chunk_count > 0 && outcome.peer_id && String(outcome.peer_id).toLowerCase() !== 'local') {
+                citationsEl._contributingPeerIds.add(String(outcome.peer_id).trim());
+              }
+            }
+          }
           citationsEl._peerDiagnostics = diag;
-          refreshSourcesNodeIdRow(citationsEl);
         }
+        refreshSourcesNodeIdRow(citationsEl);
       }
     } else if (type === 'RelevanceGraded' || type === 'relevance_graded') {
       setCompletedStep('step-retrieve');
@@ -1345,11 +1388,28 @@ function secureRandomIndex(n) {
       }
     } else if (type === 'ExecutionFinished' || type === 'execution_finished' || type === 'done') {
       if (citationsEl) {
+        citationsEl._queryInFlight = false;
         if (data && data.responder_peer_id) {
           citationsEl._responderPeerId = String(data.responder_peer_id).trim();
         }
+        if (Array.isArray(data && data.contributing_peer_ids)) {
+          if (!citationsEl._contributingPeerIds) citationsEl._contributingPeerIds = new Set();
+          for (const pid of data.contributing_peer_ids) {
+            if (pid && String(pid).toLowerCase() !== 'local') {
+              citationsEl._contributingPeerIds.add(String(pid).trim());
+            }
+          }
+        }
         const diag = (data && data.peer_diagnostics) || (event && event.data && event.data.peer_diagnostics);
         if (diag) {
+          if (Array.isArray(diag.contributing_peer_ids)) {
+            if (!citationsEl._contributingPeerIds) citationsEl._contributingPeerIds = new Set();
+            for (const pid of diag.contributing_peer_ids) {
+              if (pid && String(pid).toLowerCase() !== 'local') {
+                citationsEl._contributingPeerIds.add(String(pid).trim());
+              }
+            }
+          }
           citationsEl._peerDiagnostics = diag;
         }
         refreshSourcesNodeIdRow(citationsEl);
@@ -1786,6 +1846,16 @@ function secureRandomIndex(n) {
     const pendingList = Array.isArray(citationsEl._pendingCitations) ? citationsEl._pendingCitations : [];
     const records = Array.isArray(citationsEl._records) ? citationsEl._records : [];
     const distinctPeers = new Set();
+
+    if (citationsEl._contributingPeerIds && typeof citationsEl._contributingPeerIds.forEach === 'function') {
+      citationsEl._contributingPeerIds.forEach(pid => {
+        const s = String(pid || '').trim();
+        if (s && s.toLowerCase() !== 'local') {
+          distinctPeers.add(s);
+        }
+      });
+    }
+
     for (const item of pendingList) {
       const isExt = Boolean(item && item.is_external_node);
       const pid = String((item && (item.node_id || item.peer_id || item.source_peer)) || '').trim();
@@ -1818,16 +1888,30 @@ function secureRandomIndex(n) {
     }
 
     const isExternalResponder = responderId !== localNodeId && responderId !== 'local-sovereign-node';
-    const peerCount = distinctPeers.size;
-    const meshContributorsCount = isExternalResponder ? peerCount : (peerCount > 1 ? peerCount - 1 : 0);
+    const meshPeerIds = Array.from(distinctPeers).filter(pid =>
+      pid && pid.toLowerCase() !== 'local' && pid !== localNodeId && pid !== 'local-sovereign-node'
+    );
+    const meshContributorsCount = meshPeerIds.length;
+    const retrievedRemoteCount = Number(citationsEl._retrievedRemoteCount || citationsEl._remoteCount || 0);
+    const hasRemoteChunks = (meshContributorsCount > 0) || (retrievedRemoteCount > 0);
+    const queryInFlight = Boolean(citationsEl._queryInFlight || isGenerating);
 
     let peerDiagHtml = '';
-    if (meshContributorsCount === 0) {
+    // Never render "No data from remote peers" banner while query is in flight OR when remote chunks match or contributors exist!
+    if (!queryInFlight && !hasRemoteChunks && meshContributorsCount === 0) {
       const diag = citationsEl._peerDiagnostics;
       const meshPort = (cachedSettingsData && cachedSettingsData.mesh && cachedSettingsData.mesh.mesh_port) || 3032;
-      const reason = (diag && diag.summary_reason)
-        ? diag.summary_reason
-        : `0 peers connected on P2P port ${meshPort} (no mDNS or bootstrap peers online)`;
+      const connectedCount = (diag && typeof diag.connected_peers_count === 'number') ? diag.connected_peers_count : 0;
+      let reason = (diag && diag.summary_reason) ? diag.summary_reason : null;
+      if (!reason) {
+        if (connectedCount > 0) {
+          reason = `${connectedCount} peer${connectedCount > 1 ? 's' : ''} connected on P2P port ${meshPort}, but no matching chunks returned`;
+        } else {
+          reason = `0 peers connected on P2P port ${meshPort} (no mDNS or bootstrap peers online)`;
+        }
+      } else if (connectedCount > 0 && reason.startsWith('0 peers connected')) {
+        reason = `${connectedCount} peer${connectedCount > 1 ? 's' : ''} connected on P2P port ${meshPort}, but no matching chunks returned`;
+      }
       peerDiagHtml = `
         <div class="sources-peer-diagnostic-row" style="margin-top:4px; font-size:12px; color:var(--text-muted, #9ca3af);">
           <span>📡 Remote Peers:</span>
@@ -1835,6 +1919,10 @@ function secureRandomIndex(n) {
         </div>
       `;
     }
+
+    const meshPeersLabel = meshPeerIds.length > 0
+      ? ` (+ ${meshContributorsCount} Mesh Peer${meshContributorsCount > 1 ? 's' : ''}: ${meshPeerIds.map(p => escapeHtml(p.length > 12 ? p.slice(0, 10) + '…' : p)).join(', ')})`
+      : (meshContributorsCount > 0 ? ` (+ ${meshContributorsCount} Mesh Peer${meshContributorsCount > 1 ? 's' : ''})` : '');
 
     nodeRow.innerHTML = `
       <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
@@ -1844,7 +1932,7 @@ function secureRandomIndex(n) {
         </button>
         ${meshContributorsCount > 0 ? `
           <span class="sources-federated-tag" style="font-size:11px; opacity:0.85; color:var(--text-muted); background:rgba(255,255,255,0.06); padding:2px 6px; border-radius:4px;">
-            (+ ${meshContributorsCount} Mesh Peer${meshContributorsCount > 1 ? 's' : ''})
+            ${meshPeersLabel}
           </span>
         ` : ''}
       </div>

@@ -76,7 +76,11 @@ impl GradeRelevanceNode {
             .len();
 
         let is_author_query = crate::offline_engine::DeterministicOfflineSynthesisEngine::is_authorship_query(&state.original_prompt);
-        let satisfactory = !is_empty && max_score >= effective_threshold && (!is_author_query || distinct_docs >= 2);
+        let satisfactory = !is_empty
+            && max_score >= effective_threshold
+            && (!is_author_query
+                || distinct_docs >= 2
+                || (distinct_docs >= 1 && (max_score >= 0.70 || has_content_match)));
         let will_rewrite = !satisfactory && state.hop_count < state.max_hops;
 
         let reasoning = if is_empty {
@@ -218,5 +222,26 @@ mod tests {
             !will_rewrite,
             "Must not rewrite when hop_count reached max_hops"
         );
+    }
+
+    #[test]
+    fn test_grade_relevance_single_doc_author_query_passes_hop_0() {
+        let grader = GradeRelevanceNode::default();
+        let mut state = AgenticGraphState::new(
+            "What did Femi Oyesanya write?",
+            crate::types::SynthesisModelFamily::AutoFusion,
+            3,
+        );
+        state.hop_count = 0;
+        state.retrieved_chunks = vec![make_test_chunk(
+            "c1",
+            "African_Churches_and_Gang_Violence.docx",
+            "African Churches and Gang Violence by Femi Oyesanya investigates youth intervention programs.",
+            0.88,
+        )];
+        let (grade, will_rewrite) = grader.execute(&mut state);
+        assert!(grade.satisfactory, "Single-document author query with verified content must be satisfactory");
+        assert!(grade.is_relevant);
+        assert!(!will_rewrite, "Hop 0 must not rewrite when author document is verified");
     }
 }
