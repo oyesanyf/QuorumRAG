@@ -36,6 +36,16 @@ pub struct DocumentCatalogEntry {
     pub created_at: i64,
 }
 
+/// Compact identity representation of an indexed document for fast deduplication hydration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogFileIdentity {
+    pub file_path: String,
+    pub document_id: String,
+    pub mtime_secs: i64,
+    pub size_bytes: u64,
+    pub chunk_count: usize,
+}
+
 /// Normalizes file stems and collapses near-duplicate revisions and drafts into a canonical `work_cluster_id`.
 ///
 /// Strips revision patterns such as `_v\d+`, `_final`, `_corrected`, `_rewritten`, `_typesetting`,
@@ -350,6 +360,12 @@ impl DocumentCatalog {
                 metadata_json,
             ],
         )?;
+
+        let _ = conn.execute(
+            "UPDATE document_catalog SET mtime_secs = ?1, size_bytes = ?2 WHERE file_path = ?3",
+            params![doc.modified_unix_secs, doc.byte_len as i64, doc.source_path],
+        );
+
         Ok(())
     }
 
@@ -543,6 +559,40 @@ impl DocumentCatalog {
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![like_pattern, max_tier, limit as i64], Self::row_to_entry)?;
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r?);
+        }
+        Ok(entries)
+    }
+
+    /// Lists all file identities stored in the document catalog without limit or clustering.
+    pub fn list_all_file_identities(&self) -> Result<Vec<CatalogFileIdentity>, StorageError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT 
+                d.file_path, 
+                d.document_id, 
+                CASE WHEN d.mtime_secs > 0 THEN d.mtime_secs ELSE COALESCE(p.modified_unix_secs, 0) END,
+                CASE WHEN d.size_bytes > 0 THEN d.size_bytes ELSE COALESCE(p.byte_len, 0) END,
+                d.chunk_count 
+             FROM document_catalog d
+             LEFT JOIN parent_documents p ON d.file_path = p.file_path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let file_path: String = row.get(0)?;
+            let document_id: String = row.get(1)?;
+            let mtime_secs: i64 = row.get(2)?;
+            let size_bytes: i64 = row.get(3)?;
+            let chunk_count: i64 = row.get(4)?;
+            Ok(CatalogFileIdentity {
+                file_path,
+                document_id,
+                mtime_secs,
+                size_bytes: size_bytes.max(0) as u64,
+                chunk_count: chunk_count.max(0) as usize,
+            })
+        })?;
         let mut entries = Vec::new();
         for r in rows {
             entries.push(r?);
@@ -769,5 +819,10 @@ mod tests {
         // Delete entry1
         catalog.delete_by_file_path("D:/docs/RedactX_v1.pdf").unwrap();
         assert_eq!(catalog.count_documents().unwrap(), 2);
+
+        let identities = catalog.list_all_file_identities().unwrap();
+        assert_eq!(identities.len(), 2);
+        assert!(identities.iter().any(|id| id.file_path == "D:/docs/RedactX_v2_final.pdf" && id.size_bytes == 52000 && id.chunk_count == 6));
+        assert!(identities.iter().any(|id| id.file_path == "D:/docs/QuorumRAG_Arch.pdf" && id.size_bytes == 40000 && id.chunk_count == 4));
     }
 }

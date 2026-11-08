@@ -585,14 +585,20 @@ impl ScatterGatherEngine {
             }
         };
 
-        let mut volatile_chunks = Vec::new();
-        let mut remote_lists = Vec::new();
-        for resp in remote_responses {
-            if remote_lists.len() >= max_peer_responses {
+        let dlp_concurrency = std::thread::available_parallelism()
+            .map(|n| (n.get() * 2).clamp(8, 32))
+            .unwrap_or(16);
+        let dlp_sem = Arc::new(tokio::sync::Semaphore::new(dlp_concurrency));
+
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let mut dlp_tasks = FuturesUnordered::new();
+        for (resp_idx, resp) in remote_responses.into_iter().enumerate() {
+            if resp_idx >= max_peer_responses {
                 break;
             }
-            let mut clean_peer_chunks = Vec::new();
-            for mut chunk in resp.chunks {
+            let peer_id = resp.responder_peer_id;
+            for (chunk_idx, mut chunk) in resp.chunks.into_iter().enumerate() {
                 if exclude_set.contains(chunk.chunk_id.as_str()) {
                     continue;
                 }
@@ -602,29 +608,61 @@ impl ScatterGatherEngine {
                         "Rejecting malformed remote chunk line_start {} > line_end {} from peer {}",
                         chunk.line_start,
                         chunk.line_end,
-                        resp.responder_peer_id
+                        peer_id
                     );
                     continue;
                 }
                 chunk.access_tier = chunk.access_tier.min(access_tier);
 
-                let dlp_res = controller.inspect_and_enforce_text(
-                    &chunk.content,
-                    &chunk.file_path,
-                    &resp.responder_peer_id,
-                    "InboundMesh",
-                    None,
-                    false,
-                );
-                if dlp_res.allowed_to_share {
-                    chunk.content = dlp_res.scrubbed_text;
-                    volatile_chunks.push(chunk.to_volatile_remote_chunk(&resp.responder_peer_id));
-                    clean_peer_chunks.push(chunk);
+                let c_ctrl = Arc::clone(&controller);
+                let p_id = peer_id.clone();
+                let sem = Arc::clone(&dlp_sem);
+                dlp_tasks.push(tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await.ok();
+                    let dlp_res = c_ctrl.inspect_and_enforce_text(
+                        &chunk.content,
+                        &chunk.file_path,
+                        &p_id,
+                        "InboundMesh",
+                        None,
+                        false,
+                    );
+                    (resp_idx, chunk_idx, p_id, chunk, dlp_res)
+                }));
+            }
+        }
+
+        let mut inspected_items = Vec::new();
+        while let Some(res) = dlp_tasks.next().await {
+            if let Ok(item) = res {
+                inspected_items.push(item);
+            }
+        }
+        inspected_items.sort_by_key(|(resp_idx, chunk_idx, _, _, _)| (*resp_idx, *chunk_idx));
+
+        let mut volatile_chunks = Vec::with_capacity(inspected_items.len());
+        let mut remote_lists = Vec::new();
+        let mut current_resp_idx = usize::MAX;
+        let mut current_peer = String::new();
+        let mut current_list = Vec::new();
+
+        for (resp_idx, _, peer_id, mut chunk, dlp_res) in inspected_items {
+            if dlp_res.allowed_to_share {
+                chunk.content = dlp_res.scrubbed_text;
+                volatile_chunks.push(chunk.to_volatile_remote_chunk(&peer_id));
+                if resp_idx != current_resp_idx {
+                    if !current_list.is_empty() {
+                        remote_lists.push((current_peer, current_list));
+                        current_list = Vec::new();
+                    }
+                    current_resp_idx = resp_idx;
+                    current_peer = peer_id;
                 }
+                current_list.push(chunk);
             }
-            if !clean_peer_chunks.is_empty() {
-                remote_lists.push((resp.responder_peer_id.clone(), clean_peer_chunks));
-            }
+        }
+        if !current_list.is_empty() {
+            remote_lists.push((current_peer, current_list));
         }
 
         // 4. Reciprocal Rank Fusion preserving responder_peer_id
@@ -639,7 +677,7 @@ impl ScatterGatherEngine {
         // `RrfCombiner` boosts the local chunk's score by 1.25x (consensus boost) and deduplicates by BLAKE3 hash.
         // We also preserve the remote peer's `ScoredChunk` entries so the UI Sources panel and citations
         // display BOTH `(local)` AND `(Peer: 12D3KooW...)` when a document exists across 2+ computers.
-        for (peer_id, peer_chunks) in remote_lists_snapshot {
+        for (peer_id, peer_chunks) in remote_lists_snapshot.clone() {
             if peer_id.is_empty() || peer_id == "local" {
                 continue;
             }
@@ -718,12 +756,44 @@ impl ScatterGatherEngine {
             .filter(|c| !c.source_peer.is_empty() && c.source_peer != "local")
             .count();
 
+        // Ensure peer_outcomes is populated for all responding peers
+        for (peer_id, chunks) in &remote_lists_snapshot {
+            if let Some(outcome) = diagnostics.peer_outcomes.iter_mut().find(|o| o.peer_id == *peer_id) {
+                if !chunks.is_empty() {
+                    outcome.matching_chunk_count = chunks.len();
+                    outcome.status = quorum_types::PeerQueryStatus::Connected;
+                }
+            } else {
+                diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
+                    peer_id: peer_id.clone(),
+                    status: if !chunks.is_empty() {
+                        quorum_types::PeerQueryStatus::Connected
+                    } else {
+                        quorum_types::PeerQueryStatus::ZeroMatchingChunks
+                    },
+                    matching_chunk_count: chunks.len(),
+                    cited_chunk_count: 0,
+                    latency_ms: 0,
+                    error_message: None,
+                });
+            }
+        }
+
         for outcome in &mut diagnostics.peer_outcomes {
             outcome.cited_chunk_count = fused
                 .iter()
                 .filter(|c| c.source_peer == outcome.peer_id)
                 .count();
         }
+
+        let mut contributing_peer_ids: Vec<String> = fused
+            .iter()
+            .filter(|c| !c.source_peer.is_empty() && c.source_peer != "local")
+            .map(|c| c.source_peer.clone())
+            .collect();
+        contributing_peer_ids.sort();
+        contributing_peer_ids.dedup();
+        diagnostics.contributing_peer_ids = contributing_peer_ids;
 
         if remote_chunks_count == 0 {
             if p2p_enabled {
@@ -819,58 +889,79 @@ impl ScatterGatherEngine {
 
         let mut volatile = Vec::new();
         if let Some(responses) = peer_responses_opt {
-            let mut peer_count = 0;
-            for resp in responses {
-                if peer_count >= max_peer_responses {
+            let dlp_concurrency = std::thread::available_parallelism()
+                .map(|n| (n.get() * 2).clamp(8, 32))
+                .unwrap_or(16);
+            let dlp_sem = Arc::new(tokio::sync::Semaphore::new(dlp_concurrency));
+
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let mut dlp_tasks = FuturesUnordered::new();
+
+            for (resp_idx, resp) in responses.into_iter().enumerate() {
+                if resp_idx >= max_peer_responses {
                     break;
                 }
-                let mut peer_added = false;
-                for mut chunk in resp.chunks {
+                let peer_id = resp.responder_peer_id;
+                for (chunk_idx, mut chunk) in resp.chunks.into_iter().enumerate() {
                     if chunk.line_start > chunk.line_end {
                         continue;
                     }
                     chunk.access_tier = chunk.access_tier.min(access_tier);
-                    let dlp_res = controller.inspect_and_enforce_text(
-                        &chunk.content,
-                        &chunk.file_path,
-                        &resp.responder_peer_id,
-                        "InboundMesh",
-                        None,
-                        false,
-                    );
-                    if dlp_res.allowed_to_share {
-                        chunk.content = dlp_res.scrubbed_text.clone();
-                        volatile.push(chunk.to_volatile_remote_chunk(&resp.responder_peer_id));
-                        let derived_doc_id = chunk
-                            .chunk_id
-                            .rsplit_once(':')
-                            .map(|(d, _)| d.to_string())
-                            .unwrap_or_else(|| format!("remote:{}", chunk.file_path));
-                        let doc_chunk = quorum_types::DocumentChunk {
-                            chunk_id: chunk.chunk_id,
-                            document_id: derived_doc_id,
-                            file_path: chunk.file_path,
-                            line_start: chunk.line_start,
-                            line_end: chunk.line_end,
-                            blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(
-                                &dlp_res.scrubbed_text,
-                            ),
-                            access_tier: chunk.access_tier,
-                            vector: vec![0.0; 768],
-                            text_content: dlp_res.scrubbed_text,
-                            metadata_json: "{}".to_string(),
-                        };
-                        results.push(ScoredChunk::new(
-                            doc_chunk,
-                            chunk.score,
-                            resp.responder_peer_id.clone(),
-                            true,
-                        ));
-                        peer_added = true;
-                    }
+                    let c_ctrl = Arc::clone(&controller);
+                    let p_id = peer_id.clone();
+                    let sem = Arc::clone(&dlp_sem);
+                    dlp_tasks.push(tokio::spawn(async move {
+                        let _permit = sem.acquire_owned().await.ok();
+                        let dlp_res = c_ctrl.inspect_and_enforce_text(
+                            &chunk.content,
+                            &chunk.file_path,
+                            &p_id,
+                            "InboundMesh",
+                            None,
+                            false,
+                        );
+                        (resp_idx, chunk_idx, p_id, chunk, dlp_res)
+                    }));
                 }
-                if peer_added {
-                    peer_count += 1;
+            }
+
+            let mut evaluated = Vec::new();
+            while let Some(res) = dlp_tasks.next().await {
+                if let Ok(item) = res {
+                    evaluated.push(item);
+                }
+            }
+            evaluated.sort_by_key(|(r_idx, c_idx, _, _, _)| (*r_idx, *c_idx));
+
+            for (_, _, peer_id, mut chunk, dlp_res) in evaluated {
+                if dlp_res.allowed_to_share {
+                    chunk.content = dlp_res.scrubbed_text.clone();
+                    volatile.push(chunk.to_volatile_remote_chunk(&peer_id));
+                    let derived_doc_id = chunk
+                        .chunk_id
+                        .rsplit_once(':')
+                        .map(|(d, _)| d.to_string())
+                        .unwrap_or_else(|| format!("remote:{}", chunk.file_path));
+                    let doc_chunk = quorum_types::DocumentChunk {
+                        chunk_id: chunk.chunk_id,
+                        document_id: derived_doc_id,
+                        file_path: chunk.file_path,
+                        line_start: chunk.line_start,
+                        line_end: chunk.line_end,
+                        blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(
+                            &dlp_res.scrubbed_text,
+                        ),
+                        access_tier: chunk.access_tier,
+                        vector: vec![0.0; 768],
+                        text_content: dlp_res.scrubbed_text,
+                        metadata_json: "{}".to_string(),
+                    };
+                    results.push(ScoredChunk::new(
+                        doc_chunk,
+                        chunk.score,
+                        peer_id,
+                        true,
+                    ));
                 }
             }
         }

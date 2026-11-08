@@ -521,4 +521,39 @@ impl TwoLevelDedupEngine {
 
         Ok(chunk_count)
     }
+
+    /// Hydrates Level-1 deduplication state directly from SQLite `document_catalog.db`.
+    /// Does NOT scan LanceDB vectors into memory, completing in milliseconds.
+    pub fn hydrate_from_catalog(
+        &self,
+        storage: &quorum_storage::StorageEngine,
+    ) -> Result<usize, crate::error::IngestError> {
+        let identities = storage.list_catalog_file_identities()?;
+        if identities.is_empty() {
+            return Ok(0);
+        }
+
+        let mut catalog = self.catalog.write().map_err(|_| {
+            std::io::Error::other("Level 1 dedup catalog lock poisoned")
+        })?;
+
+        let mut count = 0;
+        for ident in identities {
+            let path = PathBuf::from(&ident.file_path);
+            if catalog.get_file_entry(&path).is_some() {
+                continue;
+            }
+
+            catalog.register_entry(FileCatalogEntry {
+                file_path: path,
+                file_blake3: ident.document_id,
+                mtime_secs: ident.mtime_secs,
+                size_bytes: ident.size_bytes,
+                chunk_hashes: Vec::new(),
+            });
+            count += 1;
+        }
+
+        Ok(count)
+    }
 }

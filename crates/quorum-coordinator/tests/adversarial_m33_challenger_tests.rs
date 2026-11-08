@@ -298,6 +298,7 @@ fn test_adversarial_extreme_scale_formatting_performance() {
         queried_peers_count: num_peers,
         peer_outcomes: outcomes,
         summary_reason: Some("Peer peer_00000 returned 0 matching chunks for this query".to_string()),
+        contributing_peer_ids: Vec::new(),
     };
 
     let chunk_local = ScoredChunk::new(

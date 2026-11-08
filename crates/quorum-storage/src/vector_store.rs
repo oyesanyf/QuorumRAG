@@ -157,6 +157,17 @@ impl VectorStore {
         Ok(count > 0)
     }
 
+    /// Checks if a chunk_id exists in LanceDB table via row count.
+    pub(crate) async fn has_chunk_id(&self, chunk_id: &str) -> Result<bool, StorageError> {
+        let table = self.table.read().await;
+        let escaped = chunk_id.replace('\'', "''");
+        let count = table
+            .count_rows(Some(format!("chunk_id = '{}'", escaped)))
+            .await
+            .map_err(|e| StorageError::Lance(format!("Count rows error: {}", e)))?;
+        Ok(count > 0)
+    }
+
     /// Deletes all chunks associated with `file_path`.
     pub(crate) async fn delete_by_file_path(&self, file_path: &str) -> Result<usize, StorageError> {
         let table = self.table.read().await;

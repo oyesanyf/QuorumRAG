@@ -259,7 +259,9 @@ impl P2pWatcherRuntime {
 pub fn load_known_peers_from_dir(data_dir: &Path) -> PersistedKnownPeers {
     let path = data_dir.join("p2p_known_peers.json");
     if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(parsed) = serde_json::from_str::<PersistedKnownPeers>(&raw) {
+        if let Ok(mut parsed) = serde_json::from_str::<PersistedKnownPeers>(&raw) {
+            parsed.multiaddrs.retain(|a| is_dialable_lan_or_wan_multiaddr(a));
+            parsed.peer_map.retain(|_, a| is_dialable_lan_or_wan_multiaddr(a));
             return parsed;
         }
     }
@@ -276,8 +278,11 @@ pub fn strip_p2p_suffix(addr: &str) -> String {
     }
 }
 
-/// Validates that a multiaddr points to a dialable private LAN or routable host (rejecting loopback/unspecified/ephemeral).
+/// Validates that a multiaddr points to a dialable private LAN or routable host (rejecting loopback/unspecified/ephemeral and port 4001).
 pub fn is_dialable_lan_or_wan_multiaddr(addr: &str) -> bool {
+    if addr.contains("/tcp/4001") || addr.contains("/udp/4001") || addr.ends_with(":4001") {
+        return false;
+    }
     if let Some(rest) = addr.strip_prefix("/ip4/") {
         let mut parts = rest.split('/');
         let Some(ip_str) = parts.next() else {
@@ -294,13 +299,16 @@ pub fn is_dialable_lan_or_wan_multiaddr(addr: &str) -> bool {
             return false;
         }
         if let (Some(proto), Some(port_str)) = (parts.next(), parts.next()) {
-            if (proto == "tcp" || proto == "udp") && port_str.parse::<u16>().unwrap_or(0) > 0 {
+            let port = port_str.parse::<u16>().unwrap_or(0);
+            if (proto == "tcp" || proto == "udp") && port > 0 && port != 4001 {
                 return true;
             }
         }
         false
+    } else if addr.starts_with("/dns4/") || addr.starts_with("/dns/") {
+        !addr.contains("/4001") && !addr.ends_with(":4001")
     } else {
-        addr.starts_with("/dns4/") || addr.starts_with("/dns/")
+        false
     }
 }
 
@@ -479,9 +487,14 @@ pub async fn run_in_daemon_canary_probe(state: &Arc<DaemonState>) -> Vec<PeerCan
 
     let mut join_set = tokio::task::JoinSet::new();
     for peer in connected {
+        let ma_str = addr_map.get(&peer).map(|m| m.to_string());
+        if let Some(ref ma) = ma_str {
+            if ma.contains("/tcp/4001") || ma.contains("/udp/4001") || ma.ends_with(":4001") {
+                continue;
+            }
+        }
         let h = handle.clone();
         let r = req.clone();
-        let ma_str = addr_map.get(&peer).map(|m| m.to_string());
         join_set.spawn(async move {
             let started = Instant::now();
             let outcome = tokio::time::timeout(Duration::from_secs(4), h.send_query(peer, r)).await;
@@ -654,6 +667,8 @@ pub async fn run_in_daemon_mesh_heal(state: &Arc<DaemonState>, req: HealMeshRequ
         .values()
         .map(|m| strip_p2p_suffix(&m.to_string()))
         .collect();
+
+    dial_targets.retain(|t| !t.contains("/4001") && !t.ends_with(":4001"));
 
     let mut dialed_count = 0usize;
     for target in dial_targets {
@@ -1203,6 +1218,9 @@ mod tests {
             Some("10.0.0.165:3032".to_string())
         );
         assert!(is_dialable_lan_or_wan_multiaddr("/ip4/10.0.0.165/tcp/3032"));
+        assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/10.0.0.165/tcp/4001"));
+        assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/10.0.0.165/udp/4001"));
+        assert!(!is_dialable_lan_or_wan_multiaddr("/dns4/ipfs.io/tcp/4001"));
         assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/127.0.0.1/tcp/3032"));
         assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/10.0.0.255/tcp/3032"));
     }

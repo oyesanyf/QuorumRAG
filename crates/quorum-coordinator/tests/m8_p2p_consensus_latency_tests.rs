@@ -389,3 +389,52 @@ fn test_pubkey_to_peer_id_derivation() {
     let derived = derive_peer_id_from_pubkey(&ed_kp.public().to_bytes()).unwrap();
     assert_eq!(derived, expected_peer_id);
 }
+
+#[tokio::test]
+async fn test_mesh_early_resolution_single_peer_latency() {
+    use quorum_coordinator::mesh::{MockMeshDispatcher, MockRemotePeer, MeshQueryDispatcher};
+    use std::time::{Duration, Instant};
+
+    let dispatcher = MockMeshDispatcher::new();
+    let peer = MockRemotePeer {
+        peer_id: "peer_quick_1".to_string(),
+        latency: Duration::from_millis(15),
+        max_access_tier: 0,
+        candidate_chunks: vec![CandidateChunkDto {
+            chunk_id: "remote_chunk_1".to_string(),
+            file_path: "remote/doc.txt".to_string(),
+            line_start: 1,
+            line_end: 10,
+            content: "Remote test content".to_string(),
+            score: 0.85,
+            access_tier: 0,
+        }],
+    };
+    dispatcher.add_peer(peer).await;
+
+    let req = FederatedQueryRequest {
+        query_id: Uuid::new_v4(),
+        sender_peer_id: "local_sender".to_string(),
+        sender_pubkey: [0u8; 32],
+        query_text: "test query".to_string(),
+        embedding: vec![0.1; 768],
+        top_k: 5,
+        timestamp: Utc::now().timestamp(),
+        signature: [0u8; 64],
+    };
+
+    let start = Instant::now();
+    let (responses, diag) = dispatcher
+        .query_peers_with_diagnostics(&req, Duration::from_millis(5000))
+        .await
+        .expect("Query must succeed");
+
+    let elapsed = start.elapsed();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(diag.peer_outcomes.len(), 1);
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "Single-peer query must resolve immediately upon response without waiting for 5000ms deadline; took: {:?}",
+        elapsed
+    );
+}

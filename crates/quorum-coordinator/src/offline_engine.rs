@@ -1974,14 +1974,42 @@ impl DeterministicOfflineSynthesisEngine {
     fn deduplicated_chunks_with_scores<'a>(
         matched_chunks: &[&'a ScoredChunk],
     ) -> Vec<(&'a ScoredChunk, u32)> {
-        let all_explicit_unit = !matched_chunks.is_empty()
-            && matched_chunks.iter().all(|c| (0.85..=1.0).contains(&c.score));
+        let has_resume_or_bio = matched_chunks.iter().any(|c| {
+            let p = c.chunk.file_path.to_ascii_lowercase();
+            let t = c.chunk.text_content.to_ascii_lowercase();
+            p.contains("resume")
+                || p.contains("cv")
+                || p.contains("bio")
+                || t.contains("professional summary")
+                || t.contains("work experience")
+                || t.contains("career summary")
+                || t.contains("curriculum vitae")
+                || t.contains("employment history")
+        });
+
+        let filtered_chunks: Vec<&'a ScoredChunk> = if has_resume_or_bio {
+            let without_bp: Vec<&'a ScoredChunk> = matched_chunks
+                .iter()
+                .copied()
+                .filter(|c| !Self::is_g28_or_administrative_boilerplate(&c.chunk.file_path, &c.chunk.text_content))
+                .collect();
+            if without_bp.is_empty() {
+                matched_chunks.to_vec()
+            } else {
+                without_bp
+            }
+        } else {
+            matched_chunks.to_vec()
+        };
+
+        let all_explicit_unit = !filtered_chunks.is_empty()
+            && filtered_chunks.iter().all(|c| (0.85..=1.0).contains(&c.score));
 
         let mut families: Vec<(String, String)> = Vec::new();
         let mut family_chunks: std::collections::HashMap<(String, String), Vec<&'a ScoredChunk>> =
             std::collections::HashMap::new();
 
-        for &c in matched_chunks {
+        for &c in &filtered_chunks {
             let family_key = (
                 c.source_peer.to_ascii_lowercase(),
                 Self::derive_document_family_key(&c.chunk.file_path),
@@ -2171,6 +2199,67 @@ impl DeterministicOfflineSynthesisEngine {
             || t.contains("different paper")
             || t.contains("different research")
             || t.contains("different article")
+    }
+
+    /// Detects whether a document chunk represents USCIS Form G-28, DHS notices, or administrative immigration boilerplate.
+    pub fn is_g28_or_administrative_boilerplate(file_path: &str, text: &str) -> bool {
+        let path_l = file_path.to_ascii_lowercase();
+        let text_l = text.to_ascii_lowercase();
+        path_l.contains("g-28")
+            || path_l.contains("g28")
+            || path_l.contains("i-130")
+            || path_l.contains("i130")
+            || path_l.contains("dhs")
+            || path_l.contains("uscis")
+            || text_l.contains("form g-28")
+            || text_l.contains("notice of entry of appearance")
+            || text_l.contains("department of homeland security")
+            || text_l.contains("omb no. 1615-")
+            || text_l.contains("111 massachusetts avenue")
+            || text_l.contains("instructions for notice of entry")
+            || text_l.contains("part 1. information about attorney")
+            || text_l.contains("part 2. eligibility information")
+            || text_l.contains("part 3. notice of appearance as attorney")
+            || text_l.contains("united states citizenship and immigration services")
+    }
+
+    /// Detects whether a query asks for a person's profile, career, employment, role, or background.
+    pub fn is_profile_or_role_query(prompt: &str) -> bool {
+        let q = prompt.to_ascii_lowercase();
+        q.contains("what does")
+            || q.contains("who is")
+            || q.contains("resume")
+            || q.contains("work")
+            || q.contains("job")
+            || q.contains("role")
+            || q.contains("skill")
+            || q.contains("profession")
+            || q.contains("experience")
+            || q.contains("career")
+            || q.contains("background")
+            || q.contains("about")
+            || q.contains("profile")
+    }
+
+    /// Verifies whether an Ollama model is currently loaded and warm in `/api/ps` to prevent VRAM swap stalls.
+    pub fn is_model_warm_in_ollama(addr: &std::net::SocketAddr, host_port: &str, model_name: &str) -> bool {
+        let mut ps_stream = match std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_millis(180)) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let _ = ps_stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+        let _ = ps_stream.set_write_timeout(Some(std::time::Duration::from_millis(180)));
+        use std::io::{Read, Write};
+        let req = format!("GET /api/ps HTTP/1.0\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+        if ps_stream.write_all(req.as_bytes()).is_err() {
+            return false;
+        }
+        let mut ps_resp = String::new();
+        if ps_stream.read_to_string(&mut ps_resp).is_err() {
+            return false;
+        }
+        let model_prefix = model_name.split(':').next().unwrap_or(model_name);
+        ps_resp.to_ascii_lowercase().contains(&model_prefix.to_ascii_lowercase())
     }
 
     /// Detects whether a query string specifically asks for publications, research papers, or articles authored by a subject.
@@ -5537,6 +5626,27 @@ impl DeterministicOfflineSynthesisEngine {
         // never reach the model. Always keeps at least the top excerpt.
         let mut pruned_chunks: Vec<&ScoredChunk> =
             Self::dedup_near_identical_excerpts(Self::prune_weak_excerpts(prompt, matched_chunks));
+
+        let asks_profile_or_role = Self::is_profile_or_role_query(prompt);
+        let asks_author_works = Self::is_authorship_query(prompt);
+        let has_resume_or_bio = pruned_chunks.iter().any(|c| {
+            let p = c.chunk.file_path.to_ascii_lowercase();
+            let t = c.chunk.text_content.to_ascii_lowercase();
+            p.contains("resume")
+                || p.contains("cv")
+                || p.contains("bio")
+                || t.contains("professional summary")
+                || t.contains("work experience")
+                || t.contains("career summary")
+                || t.contains("curriculum vitae")
+                || t.contains("employment history")
+        });
+
+        if (asks_profile_or_role || asks_author_works) && has_resume_or_bio {
+            pruned_chunks.retain(|c| {
+                !Self::is_g28_or_administrative_boilerplate(&c.chunk.file_path, &c.chunk.text_content)
+            });
+        }
         // For typed questions (where/when/how much/phone), excerpts holding the requested kind of fact go first
         // (stable sort keeps relevance order among equals), so a small model sees the answer in excerpt [1].
         if !Self::answer_type_cue_terms(prompt).is_empty() {
@@ -5614,51 +5724,63 @@ impl DeterministicOfflineSynthesisEngine {
         }
 
         // Query-time multimodal inspection: let a local vision model look at the actual pixels of the top
-        // cited local image files, so answers describe what images show rather than only their metadata.
+        // cited local image files ONLY if the query explicitly asks about images/photos and the vision model is already warm.
+        let prompt_lower = prompt.to_ascii_lowercase();
+        let asks_image = prompt_lower.contains("image")
+            || prompt_lower.contains("photo")
+            || prompt_lower.contains("picture")
+            || prompt_lower.contains("screenshot");
+
         let mut vision_notes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let image_targets: Vec<&ScoredChunk> = active_excerpts
-            .iter()
-            .copied()
-            .filter(|c| {
-                crate::vision::is_image_chunk_text(&c.chunk.text_content)
-                    && (c.source_peer.is_empty() || c.source_peer.eq_ignore_ascii_case("local"))
-                    && std::path::Path::new(&c.chunk.file_path).is_file()
-            })
-            .take(3)
-            .collect();
-        if !image_targets.is_empty() {
-            if let Some(vision_model) = crate::vision::pick_vision_model(&installed_models) {
-                let question = clean_prompt_for_prefix.to_string();
-                let results: Vec<(String, Option<String>)> = std::thread::scope(|s| {
-                    let handles: Vec<_> = image_targets
-                        .iter()
-                        .map(|c| {
-                            let vm = vision_model.clone();
-                            let path = c.chunk.file_path.clone();
-                            let id = c.chunk.chunk_id.clone();
-                            let q = question.clone();
-                            s.spawn(move || {
-                                let d = crate::vision::describe_image_file(&addr, host_port, &vm, std::path::Path::new(&path), &q);
-                                (id, d)
-                            })
-                        })
-                        .collect();
-                    handles.into_iter().filter_map(|h| h.join().ok()).collect()
-                });
-                for (id, desc) in results {
-                    if let Some(d) = desc {
-                        vision_notes.insert(id, d);
+        if asks_image {
+            let image_targets: Vec<&ScoredChunk> = active_excerpts
+                .iter()
+                .copied()
+                .filter(|c| {
+                    crate::vision::is_image_chunk_text(&c.chunk.text_content)
+                        && (c.source_peer.is_empty() || c.source_peer.eq_ignore_ascii_case("local"))
+                        && std::path::Path::new(&c.chunk.file_path).is_file()
+                })
+                .take(3)
+                .collect();
+            if !image_targets.is_empty() {
+                if let Some(vision_model) = crate::vision::pick_vision_model(&installed_models) {
+                    if Self::is_model_warm_in_ollama(&addr, host_port, &vision_model) {
+                        let question = clean_prompt_for_prefix.to_string();
+                        let results: Vec<(String, Option<String>)> = std::thread::scope(|s| {
+                            let handles: Vec<_> = image_targets
+                                .iter()
+                                .map(|c| {
+                                    let vm = vision_model.clone();
+                                    let path = c.chunk.file_path.clone();
+                                    let id = c.chunk.chunk_id.clone();
+                                    let q = question.clone();
+                                    s.spawn(move || {
+                                        let d = crate::vision::describe_image_file(&addr, host_port, &vm, std::path::Path::new(&path), &q);
+                                        (id, d)
+                                    })
+                                })
+                                .collect();
+                            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                        });
+                        for (id, desc) in results {
+                            if let Some(d) = desc {
+                                vision_notes.insert(id, d);
+                            }
+                        }
+                        tracing::info!(
+                            vision_model = %vision_model,
+                            images = image_targets.len(),
+                            described = vision_notes.len(),
+                            "Query-time multimodal image inspection complete"
+                        );
+                    } else {
+                        tracing::debug!(vision_model = %vision_model, "Skipping cold vision model to prevent synthesis stall");
                     }
+                } else if Self::model_fits_free_memory("moondream", &hw) {
+                    // No vision model installed: fetch the small one in the background for next time.
+                    let _ = Self::trigger_background_ollama_pull("moondream");
                 }
-                tracing::info!(
-                    vision_model = %vision_model,
-                    images = image_targets.len(),
-                    described = vision_notes.len(),
-                    "Query-time multimodal image inspection complete"
-                );
-            } else if Self::model_fits_free_memory("moondream", &hw) {
-                // No vision model installed: fetch the small one in the background for next time.
-                let _ = Self::trigger_background_ollama_pull("moondream");
             }
         }
 
@@ -6101,6 +6223,11 @@ impl DeterministicOfflineSynthesisEngine {
                     {
                         compacted_chunks.push(rc);
                     }
+                }
+                if (asks_profile_or_role || asks_author_works) && has_resume_or_bio {
+                    compacted_chunks.retain(|c| {
+                        !Self::is_g28_or_administrative_boilerplate(&c.chunk.file_path, &c.chunk.text_content)
+                    });
                 }
                 let sources_block = Self::format_sources_block(&compacted_chunks);
                 let final_with_sources = format!("{}{}", compacted_prose.trim(), sources_block);

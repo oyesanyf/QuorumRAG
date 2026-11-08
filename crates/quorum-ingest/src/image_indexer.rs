@@ -71,11 +71,33 @@ fn default_true() -> bool {
     true
 }
 
+/// Result of executing optical character recognition against an image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OcrOutcome {
+    /// Recognition succeeded and extracted non-empty text.
+    Text(String),
+    /// Recognition succeeded, the image was decoded cleanly, and 0 words/text were found.
+    ZeroWords,
+    /// Recognition or decoding failed completely.
+    Failed,
+}
+
+static BULK_INDEXING_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Image Indexing Engine handling all Magika-classified images.
 pub struct ImageIndexer;
 
 impl ImageIndexer {
+    /// Sets whether bulk indexing is active. When true, synchronous Ollama vision is disabled.
+    pub fn set_bulk_indexing(active: bool) {
+        BULK_INDEXING_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Returns whether bulk indexing is currently active.
+    pub fn is_bulk_indexing() -> bool {
+        BULK_INDEXING_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Verify whether a classified file is an image that should route to this extractor.
     pub fn is_supported_image(identity: &FileIdentity) -> bool {
         identity.category == FileCategory::Image
@@ -211,25 +233,31 @@ impl ImageIndexer {
             "png" | "jpeg" | "jpg" | "webp" | "gif" | "bmp" | "tiff"
         ) || identity.mime_type.starts_with("image/")
         {
-            if let Some(ocr) = Self::run_native_windows_ocr(bytes) {
-                let trimmed = ocr.trim();
-                if !trimmed.is_empty() {
-                    ocr_text = Some(trimmed.to_string());
+            let outcome = Self::run_native_windows_ocr_outcome(bytes);
+            match outcome {
+                OcrOutcome::Text(text) => {
+                    ocr_text = Some(text);
                 }
-            }
-            #[cfg(windows)]
-            if ocr_text.is_none() {
-                if let Some(ocr) = Self::run_powershell_winrt_ocr(path) {
-                    let trimmed = ocr.trim();
-                    if !trimmed.is_empty() {
-                        ocr_text = Some(trimmed.to_string());
+                OcrOutcome::ZeroWords => {
+                    // In-process WinRT OCR succeeded and found 0 words. Clean exit!
+                    // NEVER spawn cold PowerShell process for zero-word images!
+                }
+                OcrOutcome::Failed => {
+                    #[cfg(windows)]
+                    if let Some(ocr) = Self::run_powershell_winrt_ocr(path) {
+                        let trimmed = ocr.trim();
+                        if !trimmed.is_empty() {
+                            ocr_text = Some(trimmed.to_string());
+                        }
                     }
                 }
             }
-            if let Some(vis) = Self::extract_vision_description(bytes) {
-                let trimmed = vis.trim();
-                if !trimmed.is_empty() {
-                    visual_description = Some(trimmed.to_string());
+            if !Self::is_bulk_indexing() {
+                if let Some(vis) = Self::extract_vision_description(bytes) {
+                    let trimmed = vis.trim();
+                    if !trimmed.is_empty() {
+                        visual_description = Some(trimmed.to_string());
+                    }
                 }
             }
         }
@@ -649,17 +677,18 @@ impl ImageIndexer {
     }
 
     /// Native Windows OCR using Windows.Media.Ocr.OcrEngine with Session 0 language fallback.
+    /// Distinguishes in-process zero-word images from OCR failures so cold PowerShell processes are never spawned.
     #[cfg(windows)]
-    pub fn run_native_windows_ocr(bytes: &[u8]) -> Option<String> {
+    pub fn run_native_windows_ocr_outcome(bytes: &[u8]) -> OcrOutcome {
         use windows::Graphics::Imaging::BitmapDecoder;
         use windows::Media::Ocr::OcrEngine;
         use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 
         if bytes.len() < 16 {
-            return None;
+            return OcrOutcome::Failed;
         }
 
-        let run_ocr = || -> windows::core::Result<Option<String>> {
+        let run_ocr = || -> windows::core::Result<OcrOutcome> {
             let stream = InMemoryRandomAccessStream::new()?;
             let writer = DataWriter::CreateDataWriter(&stream)?;
             writer.WriteBytes(bytes)?;
@@ -681,7 +710,7 @@ impl ImageIndexer {
             });
 
             let Some(engine) = engine else {
-                return Ok(None);
+                return Ok(OcrOutcome::Failed);
             };
 
             let result = engine.RecognizeAsync(&bitmap)?.get()?;
@@ -689,13 +718,26 @@ impl ImageIndexer {
             let normalized = Self::normalize_ocr_text(&text);
             let trimmed = normalized.trim();
             if trimmed.is_empty() {
-                Ok(None)
+                Ok(OcrOutcome::ZeroWords)
             } else {
-                Ok(Some(trimmed.to_string()))
+                Ok(OcrOutcome::Text(trimmed.to_string()))
             }
         };
 
-        run_ocr().ok().flatten()
+        run_ocr().unwrap_or(OcrOutcome::Failed)
+    }
+
+    #[cfg(not(windows))]
+    pub fn run_native_windows_ocr_outcome(_bytes: &[u8]) -> OcrOutcome {
+        OcrOutcome::Failed
+    }
+
+    /// Convenience wrapper returning Option<String> for non-empty recognized text.
+    pub fn run_native_windows_ocr(bytes: &[u8]) -> Option<String> {
+        match Self::run_native_windows_ocr_outcome(bytes) {
+            OcrOutcome::Text(t) => Some(t),
+            _ => None,
+        }
     }
 
     /// Normalizes typographic dashes (em-dash, en-dash, minus, non-breaking hyphen)
@@ -879,7 +921,17 @@ if ($engine) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(text[body_at..].trim()) {
             if let Some(arr) = val.get("models").and_then(|m| m.as_array()) {
                 for item in arr {
+                    // Exclude heavy models >= 20GB to prevent OOM and multi-minute hangs
+                    if let Some(size) = item.get("size").and_then(|s| s.as_u64()) {
+                        if size >= 20 * 1024 * 1024 * 1024 {
+                            continue;
+                        }
+                    }
                     if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                        let lower = name.to_ascii_lowercase();
+                        if lower.contains(":70b") || lower.contains(":32b") || lower.contains(":90b") {
+                            continue;
+                        }
                         installed_names.push(name.to_string());
                     }
                 }

@@ -294,7 +294,7 @@ fn test_summary_reason_boundary_conditions() {
     diag_empty_outcomes.compute_summary_reason(3032, 1000);
     assert_eq!(
         diag_empty_outcomes.summary_reason,
-        Some("0 peers connected on P2P port 3032 (no mDNS or bootstrap peers online)".to_string())
+        Some("2 peers connected on P2P port 3032, but 0 responses received".to_string())
     );
 }
 

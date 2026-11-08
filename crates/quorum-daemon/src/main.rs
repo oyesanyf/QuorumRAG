@@ -152,31 +152,44 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     let storage_bg = Arc::clone(&storage);
     let catalog_path_bg = catalog_path.clone();
     tokio::spawn(async move {
-        let chunk_count = storage_bg.count().await.unwrap_or(0);
         let catalog_is_empty = dedup_bg.catalog().read().map(|c| c.is_empty()).unwrap_or(true);
-        if catalog_is_empty && chunk_count > 0 && chunk_count <= 5_000 {
-            match dedup_bg.hydrate_from_storage(&storage_bg).await {
-                Ok(chunks) => {
+        if catalog_is_empty {
+            match dedup_bg.hydrate_from_catalog(&storage_bg) {
+                Ok(count) if count > 0 => {
                     info!(
-                        chunks,
+                        count,
                         tracked_files = dedup_bg.catalog().read().map(|c| c.len()).unwrap_or(0),
-                        "Startup deduplication hydration completed from LanceDB storage"
+                        "Startup deduplication hydration completed from SQLite document catalog"
                     );
                     let _ = dedup_bg.save_catalog_to_file(&catalog_path_bg);
+                }
+                Ok(_) => {
+                    // SQLite catalog had 0 entries; fallback to LanceDB if <= 5,000 chunks
+                    let chunk_count = storage_bg.count().await.unwrap_or(0);
+                    if chunk_count > 0 && chunk_count <= 5_000 {
+                        match dedup_bg.hydrate_from_storage(&storage_bg).await {
+                            Ok(chunks) => {
+                                info!(
+                                    chunks,
+                                    tracked_files = dedup_bg.catalog().read().map(|c| c.len()).unwrap_or(0),
+                                    "Startup deduplication hydration completed from LanceDB storage"
+                                );
+                                let _ = dedup_bg.save_catalog_to_file(&catalog_path_bg);
+                            }
+                            Err(e) => {
+                                error!("Startup deduplication hydration warning: {}", e);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("Startup deduplication hydration warning: {}", e);
                 }
             }
-        } else if !catalog_is_empty {
+        } else {
             info!(
                 tracked_files = dedup_bg.catalog().read().map(|c| c.len()).unwrap_or(0),
                 "Persistent dedup catalog active with 0-disk-read fast path"
-            );
-        } else {
-            info!(
-                chunk_count,
-                "Pre-existing high-capacity LanceDB index active; skipping monolithic in-memory chunk hydration on daemon startup"
             );
         }
     });
@@ -203,12 +216,49 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             drives = ?physical_drives,
             "No --watch-dir specified; defaulting to discovered user document roots + fixed physical drives"
         );
-        let mut default_paths = user_roots;
+        let mut default_paths = Vec::new();
+
+        // 1. Data physical drives (D:\, E:\, etc. before C:\)
+        for d in &physical_drives {
+            let s = d.to_string_lossy().to_ascii_uppercase();
+            if !s.starts_with("C:") && !default_paths.contains(d) {
+                default_paths.push(d.clone());
+            }
+        }
+
+        // 2. Documents, Desktop, Downloads
+        for sub in ["documents", "desktop", "downloads"] {
+            for root in &user_roots {
+                let name = root.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+                if name == sub && !default_paths.contains(root) {
+                    default_paths.push(root.clone());
+                }
+            }
+        }
+
+        // 3. User document roots other than Pictures
+        for root in &user_roots {
+            let name = root.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            if name != "pictures" && !default_paths.contains(root) {
+                default_paths.push(root.clone());
+            }
+        }
+
+        // 4. Pictures roots
+        for root in &user_roots {
+            let name = root.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            if name == "pictures" && !default_paths.contains(root) {
+                default_paths.push(root.clone());
+            }
+        }
+
+        // 5. Remaining physical drives (C:\)
         for d in physical_drives {
             if !default_paths.contains(&d) {
                 default_paths.push(d);
             }
         }
+
         ingest_config.watch_paths = default_paths;
     }
 
@@ -590,8 +640,18 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             );
         }
 
-        // Pass 0: Priority fast pass over user document & screenshot folders (Pictures, Desktop, Downloads, Documents)
-        let priority_user_roots = quorum_ingest::IngestConfig::discover_user_document_roots();
+        // Pass 0: Priority fast pass over user document & screenshot folders (Documents, Desktop, Downloads before Pictures)
+        let mut priority_user_roots = quorum_ingest::IngestConfig::discover_user_document_roots();
+        priority_user_roots.sort_by_key(|r| {
+            let name = r.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            match name.as_str() {
+                "documents" => 0,
+                "desktop" => 1,
+                "downloads" => 2,
+                "pictures" => 10,
+                _ => 5,
+            }
+        });
         if !priority_user_roots.is_empty() {
             let fast_opts = quorum_ingest::ReindexOptions {
                 target_paths: priority_user_roots,

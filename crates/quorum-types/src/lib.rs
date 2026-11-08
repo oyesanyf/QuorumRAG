@@ -734,6 +734,8 @@ pub struct FederatedPeerDiagnostics {
     pub queried_peers_count: usize,
     pub peer_outcomes: Vec<PeerQueryOutcome>,
     pub summary_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributing_peer_ids: Vec<String>,
 }
 
 impl FederatedPeerDiagnostics {
@@ -744,6 +746,7 @@ impl FederatedPeerDiagnostics {
             queried_peers_count: 0,
             peer_outcomes: Vec::new(),
             summary_reason: None,
+            contributing_peer_ids: Vec::new(),
         }
     }
 
@@ -763,10 +766,19 @@ impl FederatedPeerDiagnostics {
         }
 
         if self.peer_outcomes.is_empty() {
-            self.summary_reason = Some(format!(
-                "0 peers connected on P2P port {} (no mDNS or bootstrap peers online)",
-                p2p_port
-            ));
+            if self.connected_peers_count > 0 {
+                self.summary_reason = Some(format!(
+                    "{} peer{} connected on P2P port {}, but 0 responses received",
+                    self.connected_peers_count,
+                    if self.connected_peers_count > 1 { "s" } else { "" },
+                    p2p_port
+                ));
+            } else {
+                self.summary_reason = Some(format!(
+                    "0 peers connected on P2P port {} (no mDNS or bootstrap peers online)",
+                    p2p_port
+                ));
+            }
             return;
         }
 
@@ -1224,6 +1236,7 @@ mod tests {
                 error_message: None,
             }],
             summary_reason: None,
+            contributing_peer_ids: Vec::new(),
         };
         diag_zero_chunks.compute_summary_reason(3032, 5000);
         assert_eq!(
@@ -1244,6 +1257,7 @@ mod tests {
                 error_message: Some("Timed out after 5000ms".to_string()),
             }],
             summary_reason: None,
+            contributing_peer_ids: Vec::new(),
         };
         diag_timeout.compute_summary_reason(3032, 5000);
         assert_eq!(
@@ -1264,11 +1278,26 @@ mod tests {
                 error_message: Some("blocked by policy".to_string()),
             }],
             summary_reason: None,
+            contributing_peer_ids: Vec::new(),
         };
         diag_policy.compute_summary_reason(3032, 5000);
         assert_eq!(
             diag_policy.summary_reason.as_deref(),
             Some("Peer 12D3KooWPeer3 blocked by shared-folder / DLP policy")
+        );
+
+        let mut diag_connected_no_outcomes = FederatedPeerDiagnostics {
+            connected_peers_count: 2,
+            connected_peer_ids: vec!["peer_a".to_string(), "peer_b".to_string()],
+            queried_peers_count: 2,
+            peer_outcomes: Vec::new(),
+            summary_reason: None,
+            contributing_peer_ids: Vec::new(),
+        };
+        diag_connected_no_outcomes.compute_summary_reason(3032, 5000);
+        assert_eq!(
+            diag_connected_no_outcomes.summary_reason.as_deref(),
+            Some("2 peers connected on P2P port 3032, but 0 responses received")
         );
 
         // Verify QueryResult roundtrip serialization with peer_diagnostics

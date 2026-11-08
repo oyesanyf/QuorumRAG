@@ -358,7 +358,27 @@ impl RetrieveMeshNode {
                             .any(|e| hay.contains(&e.to_ascii_lowercase()))
                     }
                 }));
-        if !has_entity_matched_remote {
+
+        let local_chunks_satisfy_query = {
+            let local_chunks: Vec<&ScoredChunk> = chunks.iter().filter(|c| !c.is_remote).collect();
+            if local_chunks.is_empty() {
+                false
+            } else {
+                let max_score = local_chunks.iter().map(|c| c.score).fold(0.0f32, f32::max);
+                let has_match = prelim_entities.is_empty() || local_chunks.iter().any(|c| {
+                    let hay = format!(
+                        "{} {}",
+                        c.chunk.file_path.to_ascii_lowercase(),
+                        c.chunk.text_content.to_ascii_lowercase()
+                    );
+                    prelim_entities.iter().any(|e| hay.contains(&e.to_ascii_lowercase()))
+                });
+                (local_chunks.len() >= 3 && has_match) || max_score >= 0.70 || (max_score >= 0.015 && has_match)
+            }
+        };
+
+        let peer_count = engine.mesh_dispatcher.peer_count();
+        if !local_chunks_satisfy_query && !has_entity_matched_remote && peer_count > 0 {
             if let Some(ref entity_q) = entity_kw_query_opt {
                 if !entity_q.eq_ignore_ascii_case(&state.current_query) {
                     let (fb_hits, fb_vol) = engine
@@ -588,6 +608,15 @@ impl RetrieveMeshNode {
                 || query_lower.contains("photo")
                 || query_lower.contains("picture")
                 || query_lower.contains("screenshot");
+
+            let has_resume_or_bio = chunks.iter().any(|c| {
+                let path_l = c.chunk.file_path.to_ascii_lowercase();
+                let text_l = c.chunk.text_content.to_ascii_lowercase();
+                path_l.contains("resume") || path_l.contains("cv") || path_l.contains("bio")
+                    || text_l.contains("professional summary") || text_l.contains("work experience")
+                    || text_l.contains("career summary") || text_l.contains("curriculum vitae")
+                    || text_l.contains("cissp-certified") || text_l.contains("employment history")
+            });
 
             // Precompute query term forms and proper term forms once upfront to eliminate inner-loop format! allocations
             struct QueryTermInfo {
@@ -839,11 +868,15 @@ impl RetrieveMeshNode {
                     }
                 }
 
-                // Authorship / Publication Intent: boost research articles and heavily penalize government legal forms
+                // Authorship / Profile Intent: heavily penalize government legal forms and boilerplate
+                let is_g28 = crate::offline_engine::DeterministicOfflineSynthesisEngine::is_g28_or_administrative_boilerplate(
+                    &c.chunk.file_path,
+                    &c.chunk.text_content,
+                );
+                if (asks_author_works || (asks_profile_or_role && has_resume_or_bio)) && is_g28 {
+                    intent_bonus -= 500;
+                }
                 if asks_author_works {
-                    if file_name_l.contains("g-28") || file_name_l.contains("g28") || file_name_l.contains("i-130") || file_name_l.contains("i130") || path_l.contains("dhs") || text_l.contains("notice of entry of appearance as attorney") {
-                        intent_bonus -= 200;
-                    }
                     if file_name_l.contains("paper") || file_name_l.contains("article") || file_name_l.contains("manuscript") || text_l.contains("abstract") || text_l.contains("introduction") || text_l.contains("methodology") || text_l.contains("references") {
                         intent_bonus += 120;
                     }
@@ -942,13 +975,11 @@ impl RetrieveMeshNode {
             }
 
             // Precompute criteria upfront into static structs for all candidates
-            let mut paired: Vec<(ScoredChunk, ChunkScoreCriteria)> = chunks
-                .into_iter()
-                .map(|c| {
-                    let crit = precompute_criteria(&c);
-                    (c, crit)
-                })
-                .collect();
+            let mut paired: Vec<(ScoredChunk, ChunkScoreCriteria)> = Vec::with_capacity(chunks.len());
+            for c in chunks {
+                let crit = precompute_criteria(&c);
+                paired.push((c, crit));
+            }
 
             let any_lexical_match = paired.iter().any(|(_, crit)| crit.weighted_hits > 0);
             let any_proper_match = !proper_terms.is_empty()
