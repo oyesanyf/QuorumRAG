@@ -160,7 +160,12 @@ def try_gpg_sign_artifacts(deploy_root: Path, artifacts: list[Path], sums_path: 
 
 
 def collect_canonical_artifacts(root: Path, version: str) -> list[Path]:
+    v_clean = version.lstrip("v")
     expected_patterns = [
+        f"deploy/windows/QuorumRAG-{v_clean}-x86_64.msi",
+        f"deploy/windows/QuorumRAG-{v_clean}-windows-x86_64.zip",
+        f"dist/QuorumRAG-{v_clean}-x86_64.msi",
+        f"dist/QuorumRAG-windows-x86_64.zip",
         f"deploy/windows/QuorumRAG-{version}-x86_64.msi",
         f"deploy/windows/QuorumRAG-{version}-windows-x86_64.zip",
         f"deploy/linux/quorumrag_{version}_amd64.deb",
