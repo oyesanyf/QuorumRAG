@@ -13,7 +13,7 @@ pub struct CoordinatorConfig {
 impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
-            timeout_ms: 400,
+            timeout_ms: 5000,
             max_drift_secs: 60,
             rrf_k: 60.0,
             default_top_k: 10,

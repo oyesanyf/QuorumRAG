@@ -1652,6 +1652,23 @@ input[type="checkbox"][switch]:focus-visible {
   border-color: rgba(16, 163, 127, 0.6);
 }
 
+.sources-peer-diagnostic-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted, #9ca3af);
+  line-height: 1.4;
+}
+
+.sources-peer-diagnostic-reason {
+  color: #f59e0b;
+  font-weight: 500;
+}
+
 .citation-node-id-subline {
   font-size: 10.5px;
   color: var(--text-muted);

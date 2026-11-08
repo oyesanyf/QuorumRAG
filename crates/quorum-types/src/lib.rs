@@ -662,18 +662,22 @@ impl VolatileRemoteChunk {
 }
 
 /// High-level result produced by the query coordinator.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct QueryResult {
     /// Fused, deduplicated, and ranked scored chunks.
+    #[serde(default)]
     pub chunks: Vec<ScoredChunk>,
 
     /// Augmented prompt formatted for downstream synthesis.
+    #[serde(default)]
     pub synthesis_prompt: String,
 
     /// Execution time in milliseconds for the complete scatter-gather operation.
+    #[serde(default)]
     pub execution_time_ms: u64,
 
     /// Extracted citations for all referenced sources.
+    #[serde(default)]
     pub sources_cited: Vec<Citation>,
 
     /// Flag indicating whether this result was served directly from the BLAKE3 QueryCache.
@@ -683,6 +687,162 @@ pub struct QueryResult {
     /// The index/cache epoch at the time of retrieval.
     #[serde(default)]
     pub cache_epoch: u64,
+
+    /// Structured peer query diagnostics for federated retrieval observability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_diagnostics: Option<FederatedPeerDiagnostics>,
+}
+
+/// Status of an individual remote peer query during scatter-gather.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerQueryStatus {
+    Connected,
+    ZeroMatchingChunks,
+    TimedOut,
+    BlockedByPolicy,
+    NetworkError,
+}
+
+impl PeerQueryStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::ZeroMatchingChunks => "zero_matching_chunks",
+            Self::TimedOut => "timed_out",
+            Self::BlockedByPolicy => "blocked_by_policy",
+            Self::NetworkError => "network_error",
+        }
+    }
+}
+
+/// Structured outcome for a single peer involved in a federated query.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerQueryOutcome {
+    pub peer_id: String,
+    pub status: PeerQueryStatus,
+    pub matching_chunk_count: usize,
+    pub cited_chunk_count: usize,
+    pub latency_ms: u64,
+    pub error_message: Option<String>,
+}
+
+/// Structured diagnostics for all connected and queried remote peers across a federated query.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct FederatedPeerDiagnostics {
+    pub connected_peers_count: usize,
+    pub connected_peer_ids: Vec<String>,
+    pub queried_peers_count: usize,
+    pub peer_outcomes: Vec<PeerQueryOutcome>,
+    pub summary_reason: Option<String>,
+}
+
+impl FederatedPeerDiagnostics {
+    pub fn new(connected_count: usize, connected_ids: Vec<String>) -> Self {
+        Self {
+            connected_peers_count: connected_count,
+            connected_peer_ids: connected_ids,
+            queried_peers_count: 0,
+            peer_outcomes: Vec::new(),
+            summary_reason: None,
+        }
+    }
+
+    /// Computes a deterministic human-readable summary reason when 0 remote peer chunks appear in the answer.
+    pub fn compute_summary_reason(&mut self, p2p_port: u16, default_timeout_ms: u64) {
+        if self.connected_peers_count == 0 {
+            self.summary_reason = Some(format!(
+                "0 peers connected on P2P port {} (no mDNS or bootstrap peers online)",
+                p2p_port
+            ));
+            return;
+        }
+
+        if self.queried_peers_count == 0 {
+            self.summary_reason = Some("P2P mesh query skipped (0 remote peers queried)".to_string());
+            return;
+        }
+
+        if self.peer_outcomes.is_empty() {
+            self.summary_reason = Some(format!(
+                "0 peers connected on P2P port {} (no mDNS or bootstrap peers online)",
+                p2p_port
+            ));
+            return;
+        }
+
+        // Priority 1: Blocked by shared-folder or DLP policy
+        let blocked = self
+            .peer_outcomes
+            .iter()
+            .find(|o| o.status == PeerQueryStatus::BlockedByPolicy);
+        if let Some(b) = blocked {
+            self.summary_reason = Some(format!(
+                "Peer {} blocked by shared-folder / DLP policy",
+                b.peer_id
+            ));
+            return;
+        }
+
+        // Priority 2: Timed out
+        let timed_out = self
+            .peer_outcomes
+            .iter()
+            .find(|o| o.status == PeerQueryStatus::TimedOut);
+        if let Some(t) = timed_out {
+            let timeout_ms = if t.latency_ms > 0 {
+                t.latency_ms
+            } else {
+                default_timeout_ms
+            };
+            self.summary_reason = Some(format!(
+                "Peer {} timed out after {}ms",
+                t.peer_id, timeout_ms
+            ));
+            return;
+        }
+
+        // Priority 3: Zero matching chunks
+        let zero_chunks = self
+            .peer_outcomes
+            .iter()
+            .find(|o| o.status == PeerQueryStatus::ZeroMatchingChunks);
+        if let Some(z) = zero_chunks {
+            self.summary_reason = Some(format!(
+                "Peer {} returned 0 matching chunks for this query",
+                z.peer_id
+            ));
+            return;
+        }
+
+        // Priority 4: Network error
+        let net_err = self
+            .peer_outcomes
+            .iter()
+            .find(|o| o.status == PeerQueryStatus::NetworkError);
+        if let Some(n) = net_err {
+            let err = n
+                .error_message
+                .as_deref()
+                .unwrap_or("network error communicating with peer");
+            self.summary_reason = Some(format!("Peer {} network error: {}", n.peer_id, err));
+            return;
+        }
+
+        // Priority 5: Connected peer returned chunks that were un-cited
+        if let Some(c) = self
+            .peer_outcomes
+            .iter()
+            .find(|o| o.status == PeerQueryStatus::Connected && o.matching_chunk_count > 0 && o.cited_chunk_count == 0)
+        {
+            self.summary_reason = Some(format!(
+                "Peer {} returned {} chunks (0 cited)",
+                c.peer_id, c.matching_chunk_count
+            ));
+            return;
+        }
+
+        self.summary_reason = Some("No data returned from remote peers".to_string());
+    }
 }
 
 /// Live telemetry metrics for multi-layer query and embedding caching.
@@ -1042,5 +1202,87 @@ mod tests {
         let recache_json = serde_json::to_string(&recache).unwrap();
         let recache_de: RecacheResponse = serde_json::from_str(&recache_json).unwrap();
         assert_eq!(recache, recache_de);
+
+        // Test FederatedPeerDiagnostics summary reason computations
+        let mut diag0 = FederatedPeerDiagnostics::new(0, vec![]);
+        diag0.compute_summary_reason(3032, 5000);
+        assert_eq!(
+            diag0.summary_reason.as_deref(),
+            Some("0 peers connected on P2P port 3032 (no mDNS or bootstrap peers online)")
+        );
+
+        let mut diag_zero_chunks = FederatedPeerDiagnostics {
+            connected_peers_count: 1,
+            connected_peer_ids: vec!["12D3KooWPeer1".to_string()],
+            queried_peers_count: 1,
+            peer_outcomes: vec![PeerQueryOutcome {
+                peer_id: "12D3KooWPeer1".to_string(),
+                status: PeerQueryStatus::ZeroMatchingChunks,
+                matching_chunk_count: 0,
+                cited_chunk_count: 0,
+                latency_ms: 45,
+                error_message: None,
+            }],
+            summary_reason: None,
+        };
+        diag_zero_chunks.compute_summary_reason(3032, 5000);
+        assert_eq!(
+            diag_zero_chunks.summary_reason.as_deref(),
+            Some("Peer 12D3KooWPeer1 returned 0 matching chunks for this query")
+        );
+
+        let mut diag_timeout = FederatedPeerDiagnostics {
+            connected_peers_count: 1,
+            connected_peer_ids: vec!["12D3KooWPeer2".to_string()],
+            queried_peers_count: 1,
+            peer_outcomes: vec![PeerQueryOutcome {
+                peer_id: "12D3KooWPeer2".to_string(),
+                status: PeerQueryStatus::TimedOut,
+                matching_chunk_count: 0,
+                cited_chunk_count: 0,
+                latency_ms: 5000,
+                error_message: Some("Timed out after 5000ms".to_string()),
+            }],
+            summary_reason: None,
+        };
+        diag_timeout.compute_summary_reason(3032, 5000);
+        assert_eq!(
+            diag_timeout.summary_reason.as_deref(),
+            Some("Peer 12D3KooWPeer2 timed out after 5000ms")
+        );
+
+        let mut diag_policy = FederatedPeerDiagnostics {
+            connected_peers_count: 1,
+            connected_peer_ids: vec!["12D3KooWPeer3".to_string()],
+            queried_peers_count: 1,
+            peer_outcomes: vec![PeerQueryOutcome {
+                peer_id: "12D3KooWPeer3".to_string(),
+                status: PeerQueryStatus::BlockedByPolicy,
+                matching_chunk_count: 0,
+                cited_chunk_count: 0,
+                latency_ms: 12,
+                error_message: Some("blocked by policy".to_string()),
+            }],
+            summary_reason: None,
+        };
+        diag_policy.compute_summary_reason(3032, 5000);
+        assert_eq!(
+            diag_policy.summary_reason.as_deref(),
+            Some("Peer 12D3KooWPeer3 blocked by shared-folder / DLP policy")
+        );
+
+        // Verify QueryResult roundtrip serialization with peer_diagnostics
+        let qr_with_diag = QueryResult {
+            chunks: Vec::new(),
+            synthesis_prompt: "test".to_string(),
+            execution_time_ms: 10,
+            sources_cited: Vec::new(),
+            cache_hit: false,
+            cache_epoch: 1,
+            peer_diagnostics: Some(diag_zero_chunks.clone()),
+        };
+        let qr_json = serde_json::to_string(&qr_with_diag).unwrap();
+        let qr_deserialized: QueryResult = serde_json::from_str(&qr_json).unwrap();
+        assert_eq!(qr_with_diag, qr_deserialized);
     }
 }

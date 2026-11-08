@@ -43,6 +43,8 @@ pub enum AgenticTelemetryEvent {
         local_count: usize,
         remote_count: usize,
         latency_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_diagnostics: Option<quorum_types::FederatedPeerDiagnostics>,
     },
     /// Relevance grading outcome
     #[serde(rename = "relevance_graded")]
@@ -95,6 +97,8 @@ pub enum AgenticTelemetryEvent {
         model_name: String,
         #[serde(default)]
         responder_peer_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_diagnostics: Option<quorum_types::FederatedPeerDiagnostics>,
     },
     /// Fail-closed error reporting
     #[serde(rename = "execution_error")]

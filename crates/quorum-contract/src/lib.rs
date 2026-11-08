@@ -191,6 +191,58 @@ pub fn verify_contract_handshake_hex(
     verify_contract_handshake(&local, &remote)
 }
 
+/// Check if a 32-byte contract hash matches any canonical Quorum 768d contract
+/// (`DeterministicOffline`, `GemmaCandle`, or `OllamaEmbedding`).
+pub fn is_canonical_quorum_contract_hash(hash: &[u8; 32]) -> bool {
+    let canonical = [
+        EmbeddingContract::canonical_deterministic_offline().derive_contract_hash(),
+        EmbeddingContract::canonical_gemma_300m().derive_contract_hash(),
+        EmbeddingContract::canonical_ollama_embeddinggemma().derive_contract_hash(),
+    ];
+    canonical.iter().any(|c| bool::from(hash.ct_eq(c)))
+}
+
+/// Check if a 64-char hex contract hash matches any canonical Quorum 768d contract.
+pub fn is_canonical_quorum_contract_hex(hex: &str) -> bool {
+    match parse_hex_32(hex) {
+        Ok(hash) => is_canonical_quorum_contract_hash(&hash),
+        Err(_) => false,
+    }
+}
+
+/// Verify federated peer contract handshake using constant-time comparison.
+///
+/// Accepts:
+/// 1. Identical hashes, OR
+/// 2. Any pairing where both local and remote hashes represent recognized canonical Quorum contracts.
+///
+/// Fails closed with `ContractMismatch` if remote contract is unknown/non-canonical.
+pub fn verify_federated_contract_handshake(
+    local_hash: &[u8; 32],
+    remote_hash: &[u8; 32],
+) -> Result<(), ContractError> {
+    if bool::from(local_hash.ct_eq(remote_hash)) {
+        return Ok(());
+    }
+    if is_canonical_quorum_contract_hash(local_hash) && is_canonical_quorum_contract_hash(remote_hash) {
+        return Ok(());
+    }
+    Err(ContractError::ContractMismatch {
+        local_hex: format_hex(local_hash),
+        remote_hex: format_hex(remote_hash),
+    })
+}
+
+/// Verify federated peer contract handshake given hex string representations.
+pub fn verify_federated_contract_handshake_hex(
+    local_hex: &str,
+    remote_hex: &str,
+) -> Result<(), ContractError> {
+    let local = parse_hex_32(local_hex)?;
+    let remote = parse_hex_32(remote_hex)?;
+    verify_federated_contract_handshake(&local, &remote)
+}
+
 /// Abstract embedding generator interface.
 pub trait EmbeddingGenerator: Send + Sync {
     /// Return the active embedding contract governing this generator.
@@ -843,5 +895,49 @@ mod tests {
         assert_eq!(vec.len(), 768);
         let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_canonical_quorum_contract_recognition() {
+        let offline = EmbeddingContract::canonical_deterministic_offline();
+        let gemma = EmbeddingContract::canonical_gemma_300m();
+        let ollama = EmbeddingContract::canonical_ollama_embeddinggemma();
+
+        assert!(is_canonical_quorum_contract_hash(&offline.derive_contract_hash()));
+        assert!(is_canonical_quorum_contract_hash(&gemma.derive_contract_hash()));
+        assert!(is_canonical_quorum_contract_hash(&ollama.derive_contract_hash()));
+
+        assert!(is_canonical_quorum_contract_hex(&offline.derive_contract_hash_hex()));
+        assert!(is_canonical_quorum_contract_hex(&gemma.derive_contract_hash_hex()));
+        assert!(is_canonical_quorum_contract_hex(&ollama.derive_contract_hash_hex()));
+
+        // Non-canonical / foreign hash must be rejected
+        let foreign_hash = [0x55u8; 32];
+        assert!(!is_canonical_quorum_contract_hash(&foreign_hash));
+        assert!(!is_canonical_quorum_contract_hex("5555555555555555555555555555555555555555555555555555555555555555"));
+        assert!(!is_canonical_quorum_contract_hex("invalid_hex"));
+    }
+
+    #[test]
+    fn test_federated_contract_handshake_cross_engine_compatibility() {
+        let offline_hex = EmbeddingContract::canonical_deterministic_offline().derive_contract_hash_hex();
+        let gemma_hex = EmbeddingContract::canonical_gemma_300m().derive_contract_hash_hex();
+        let ollama_hex = EmbeddingContract::canonical_ollama_embeddinggemma().derive_contract_hash_hex();
+
+        // 1. Identical handshakes pass
+        assert!(verify_federated_contract_handshake_hex(&offline_hex, &offline_hex).is_ok());
+        assert!(verify_federated_contract_handshake_hex(&gemma_hex, &gemma_hex).is_ok());
+        assert!(verify_federated_contract_handshake_hex(&ollama_hex, &ollama_hex).is_ok());
+
+        // 2. Cross-engine canonical pairings pass
+        assert!(verify_federated_contract_handshake_hex(&offline_hex, &gemma_hex).is_ok());
+        assert!(verify_federated_contract_handshake_hex(&gemma_hex, &offline_hex).is_ok());
+        assert!(verify_federated_contract_handshake_hex(&offline_hex, &ollama_hex).is_ok());
+        assert!(verify_federated_contract_handshake_hex(&ollama_hex, &gemma_hex).is_ok());
+
+        // 3. Foreign / arbitrary contract fails closed
+        let foreign_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(verify_federated_contract_handshake_hex(&offline_hex, foreign_hex).is_err());
+        assert!(verify_federated_contract_handshake_hex(foreign_hex, &gemma_hex).is_err());
     }
 }

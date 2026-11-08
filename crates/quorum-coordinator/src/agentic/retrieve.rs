@@ -381,6 +381,7 @@ impl RetrieveMeshNode {
             }
         }
         tracing::info!(chunks = chunks.len(), volatile = volatile.len(), "Finished concurrent execute_query and supplemental federated queries");
+        state.peer_diagnostics = engine.last_diagnostics().await;
 
         if !new_vector_hits.is_empty() && state.cached_vector_hits.is_empty() {
             state.cached_vector_hits = new_vector_hits;

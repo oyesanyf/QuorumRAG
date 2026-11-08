@@ -123,8 +123,89 @@ impl RrfCombiner {
                 .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
         });
 
-        // 5. Truncate to top_k
-        fused.truncate(top_k);
-        fused
+        // 5. Guaranteed federated peer diversity slots and interleaving
+        let (local_chunks, remote_chunks): (Vec<ScoredChunk>, Vec<ScoredChunk>) =
+            fused.into_iter().partition(|c| c.source_peer == "local");
+
+        if remote_chunks.is_empty() {
+            let mut res = local_chunks;
+            res.truncate(top_k);
+            return res;
+        }
+
+        if local_chunks.is_empty() {
+            let mut res = remote_chunks;
+            res.truncate(top_k);
+            return res;
+        }
+
+        let target_len = top_k.min(local_chunks.len() + remote_chunks.len());
+        let guaranteed_remote_slots = remote_chunks
+            .len()
+            .min(std::cmp::max(2, top_k / 3))
+            .min(target_len);
+
+        // Count how many remote chunks naturally fall into top target_len by score
+        let natural_remote_count = {
+            let mut count = 0;
+            let mut loc_idx = 0;
+            let mut rem_idx = 0;
+            for _ in 0..target_len {
+                match (local_chunks.get(loc_idx), remote_chunks.get(rem_idx)) {
+                    (Some(loc), Some(rem)) => {
+                        if rem.score >= loc.score {
+                            count += 1;
+                            rem_idx += 1;
+                        } else {
+                            loc_idx += 1;
+                        }
+                    }
+                    (None, Some(_)) => {
+                        count += 1;
+                        rem_idx += 1;
+                    }
+                    (Some(_), None) => {
+                        loc_idx += 1;
+                    }
+                    (None, None) => break,
+                }
+            }
+            count
+        };
+
+        let num_remote = natural_remote_count
+            .max(guaranteed_remote_slots)
+            .min(remote_chunks.len())
+            .min(target_len);
+        let num_local = target_len - num_remote;
+
+        let max_consecutive_local = ((num_local + num_remote) / (num_remote + 1)).max(1);
+        let mut local_iter = local_chunks.into_iter().take(num_local).peekable();
+        let mut remote_iter = remote_chunks.into_iter().take(num_remote).peekable();
+        let mut result = Vec::with_capacity(target_len);
+        let mut consecutive_local = 0;
+
+        while result.len() < target_len {
+            match (local_iter.peek(), remote_iter.peek()) {
+                (Some(loc), Some(rem)) => {
+                    if rem.score >= loc.score || consecutive_local >= max_consecutive_local {
+                        result.push(remote_iter.next().unwrap());
+                        consecutive_local = 0;
+                    } else {
+                        result.push(local_iter.next().unwrap());
+                        consecutive_local += 1;
+                    }
+                }
+                (Some(_), None) => {
+                    result.push(local_iter.next().unwrap());
+                }
+                (None, Some(_)) => {
+                    result.push(remote_iter.next().unwrap());
+                }
+                (None, None) => break,
+            }
+        }
+
+        result
     }
 }
