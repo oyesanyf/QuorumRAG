@@ -301,6 +301,196 @@ impl DeterministicOfflineSynthesisEngine {
         out
     }
 
+    /// Deterministically packs retrieved chunks into a strict byte/token context window budget:
+    /// 1. Deduplicates overlapping byte spans (`start_byte..end_byte`) within the same document
+    ///    and duplicate normalized text blocks across chunks.
+    /// 2. Preserves rank ordering and parent-document metadata (`doc_title`, `doc_author`, `doc_revision`, `header_hierarchy`).
+    /// 3. Enforces `max_context_bytes` without mid-sentence or mid-codepoint truncation.
+    pub fn pack_context_window(chunks: &[ScoredChunk], max_context_bytes: usize) -> Vec<ScoredChunk> {
+        let budget = max_context_bytes.max(256);
+        let mut packed: Vec<ScoredChunk> = Vec::with_capacity(chunks.len());
+        let mut seen_spans: Vec<(String, usize, usize)> = Vec::new();
+        let mut seen_text_prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut used_bytes = 0usize;
+
+        for scored in chunks {
+            if used_bytes >= budget {
+                break;
+            }
+            let doc_key = if !scored.chunk.document_id.is_empty() {
+                scored.chunk.document_id.clone()
+            } else {
+                scored.chunk.file_path.clone()
+            };
+            let (s_byte, e_byte) = serde_json::from_str::<serde_json::Value>(&scored.chunk.metadata_json)
+                .ok()
+                .and_then(|v| {
+                    let sb = v
+                        .get("start_byte")
+                        .or_else(|| v.get("char_start"))
+                        .and_then(|x| x.as_u64())? as usize;
+                    let eb = v
+                        .get("end_byte")
+                        .or_else(|| v.get("char_end"))
+                        .and_then(|x| x.as_u64())? as usize;
+                    Some((sb, eb))
+                })
+                .unwrap_or((
+                    scored.chunk.line_start as usize,
+                    scored.chunk.line_end as usize,
+                ));
+
+            // Check if this byte/line span is already >80% covered by a higher-ranked chunk from the same document
+            if e_byte > s_byte {
+                let span_len = e_byte - s_byte;
+                let already_covered = seen_spans.iter().any(|(d, ps, pe)| {
+                    if d != &doc_key || *pe <= *ps {
+                        return false;
+                    }
+                    let overlap_start = s_byte.max(*ps);
+                    let overlap_end = e_byte.min(*pe);
+                    if overlap_end > overlap_start {
+                        let overlap = overlap_end - overlap_start;
+                        overlap * 100 / span_len >= 80
+                    } else {
+                        false
+                    }
+                });
+                if already_covered {
+                    continue;
+                }
+            }
+
+            let cleaned = Self::clean_chunk_text(&scored.chunk.text_content);
+            let norm_key: String = cleaned
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+                .chars()
+                .take(160)
+                .collect();
+            if norm_key.len() >= 32 && !seen_text_prefixes.insert(norm_key) {
+                continue;
+            }
+
+            let remaining = budget.saturating_sub(used_bytes);
+            if remaining < 64 {
+                break;
+            }
+
+            let mut item = scored.clone();
+            if item.chunk.text_content.len() > remaining {
+                // Truncate safely on a UTF-8 and sentence/word boundary
+                let mut cut = remaining;
+                while cut > 0 && !item.chunk.text_content.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                let candidate = &item.chunk.text_content[..cut];
+                let bounded = if let Some(p) = candidate.rfind(['.', '!', '?', '\n']) {
+                    if p >= candidate.len() / 2 {
+                        &candidate[..=p]
+                    } else if let Some(ws) = candidate.rfind(char::is_whitespace) {
+                        &candidate[..ws]
+                    } else {
+                        candidate
+                    }
+                } else if let Some(ws) = candidate.rfind(char::is_whitespace) {
+                    &candidate[..ws]
+                } else {
+                    candidate
+                };
+                let trimmed = bounded.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                used_bytes += trimmed.len();
+                item.chunk.text_content = trimmed.to_string();
+            } else {
+                used_bytes += item.chunk.text_content.len();
+            }
+
+            if e_byte > s_byte {
+                seen_spans.push((doc_key, s_byte, e_byte));
+            }
+            packed.push(item);
+        }
+
+        packed
+    }
+
+    /// Formats a context-window-packed synthesis prompt with parent-document metadata
+    /// (`doc_title`, `doc_author`, `doc_revision`, `header_hierarchy`) and numbered source citations.
+    pub fn build_synthesis_prompt_packed(
+        prompt: &str,
+        chunks: &[ScoredChunk],
+        max_context_bytes: usize,
+    ) -> String {
+        let packed = Self::pack_context_window(chunks, max_context_bytes);
+        let mut out = String::new();
+        out.push_str("### User Query:\n");
+        out.push_str(prompt);
+        out.push_str("\n\n### Grounded Source Documents:\n");
+
+        if packed.is_empty() {
+            out.push_str("No relevant documents found.\n");
+        } else {
+            for (i, scored) in packed.iter().enumerate() {
+                let cleaned = Self::clean_chunk_text(&scored.chunk.text_content);
+                let mut meta_suffix = String::new();
+                if !scored.chunk.metadata_json.is_empty() {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&scored.chunk.metadata_json) {
+                        let title = val.get("doc_title").and_then(|v| v.as_str()).unwrap_or("");
+                        let author = val.get("doc_author").and_then(|v| v.as_str()).unwrap_or("");
+                        let rev = val.get("doc_revision").and_then(|v| v.as_str()).unwrap_or("");
+                        let section = val
+                            .get("section_hierarchy")
+                            .or_else(|| val.get("header_hierarchy"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" > ")
+                            })
+                            .or_else(|| {
+                                val.get("section_path")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        if !title.is_empty() {
+                            meta_suffix.push_str(&format!(", Title: \"{}\"", title));
+                        }
+                        if !author.is_empty() {
+                            meta_suffix.push_str(&format!(", Author: {}", author));
+                        }
+                        if !rev.is_empty() {
+                            meta_suffix.push_str(&format!(", Revision: {}", rev));
+                        }
+                        if !section.is_empty() {
+                            meta_suffix.push_str(&format!(", Section: {}", section));
+                        }
+                    }
+                }
+                out.push_str(&format!(
+                    "[{}] Source: {} (Lines {}-{}, Score: {:.3}, Peer: {}{})\n{}\n\n",
+                    i + 1,
+                    scored.chunk.file_path,
+                    scored.chunk.line_start,
+                    scored.chunk.line_end,
+                    scored.score,
+                    scored.source_peer,
+                    meta_suffix,
+                    cleaned.trim()
+                ));
+            }
+        }
+
+        out.push_str("### Instructions:\nAnswer the query accurately based strictly on the provided documents. Include citation markers [1], [2], etc.\n");
+        out
+    }
+
     /// Generates a synthesis response from prompt and retrieved chunks (single-turn convenience wrapper).
     pub fn synthesize(prompt: &str, chunks: &[ScoredChunk], model_tag: &str) -> (String, Vec<Citation>) {
         Self::synthesize_with_history(prompt, prompt, &[], chunks, model_tag, None)

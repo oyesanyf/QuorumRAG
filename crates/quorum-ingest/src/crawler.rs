@@ -91,12 +91,30 @@ impl AtomicCrawlerStats {
 pub struct FilesystemCrawler {
     config: IngestConfig,
     router: ClassifierRouter,
+    io_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl FilesystemCrawler {
     pub fn new(config: IngestConfig) -> Self {
         let router = ClassifierRouter::new(config.clone());
-        Self { config, router }
+        let io_permits = if config.crawler_threads > 0 {
+            (config.crawler_threads * 2).clamp(4, 64)
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() * 2).clamp(8, 32))
+                .unwrap_or(16)
+        };
+        let io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_permits));
+        Self {
+            config,
+            router,
+            io_semaphore,
+        }
+    }
+
+    /// Returns the adaptive I/O semaphore gating concurrent filesystem header reads.
+    pub fn io_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.io_semaphore
     }
 
     /// Asynchronously initiates parallel traversal over all configured watch paths.
@@ -146,12 +164,16 @@ impl FilesystemCrawler {
         let walker = self.build_walker(root);
         let router = self.router.clone();
 
+        let io_sem = Arc::clone(&self.io_semaphore);
         walker.run(move || {
+            crate::throttling::set_background_thread_priority();
             let tx = tx.clone();
             let router = router.clone();
             let stats = Arc::clone(&stats);
+            let io_sem = Arc::clone(&io_sem);
 
             Box::new(move |entry_result| {
+                let _io_permit = io_sem.try_acquire().ok();
                 if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
                     if tx.send(candidate).is_err() {
                         return WalkState::Quit;
@@ -209,12 +231,16 @@ impl FilesystemCrawler {
         let walker = builder.build_parallel();
         let router = self.router.clone();
 
+        let io_sem = Arc::clone(&self.io_semaphore);
         walker.run(move || {
+            crate::throttling::set_background_thread_priority();
             let tx = tx.clone();
             let router = router.clone();
             let stats = Arc::clone(&stats);
+            let io_sem = Arc::clone(&io_sem);
 
             Box::new(move |entry_result| {
+                let _io_permit = io_sem.try_acquire().ok();
                 if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
                     if tx.send(candidate).is_err() {
                         return WalkState::Quit;
@@ -254,14 +280,16 @@ impl FilesystemCrawler {
                 let io_sem = Arc::clone(&io_semaphore);
 
                 walker.run(move || {
+                    crate::throttling::set_background_thread_priority();
                     let tx = tx_clone.clone();
                     let router = router.clone();
                     let stats = Arc::clone(&stats_clone);
-                    let io_permit = io_sem.clone().try_acquire_owned().ok();
+                    let io_sem = Arc::clone(&io_sem);
 
                     Box::new(move |entry_result| {
-                        let _permit_guard = &io_permit;
+                        let _permit_guard = io_sem.try_acquire().ok();
                         if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
+                            drop(_permit_guard);
                             if tx.blocking_send(candidate).is_err() {
                                 return WalkState::Quit;
                             }
@@ -421,13 +449,19 @@ impl FilesystemCrawler {
         let tx_channel = tx.clone();
         let stats_ref = Arc::clone(stats);
 
+        let io_sem = Arc::clone(&self.io_semaphore);
+
         walker.run(move || {
+            crate::throttling::set_background_thread_priority();
             let tx = tx_channel.clone();
             let router = router.clone();
             let stats = Arc::clone(&stats_ref);
+            let io_sem = Arc::clone(&io_sem);
 
             Box::new(move |entry_result| {
+                let _permit_guard = io_sem.try_acquire().ok();
                 if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
+                    drop(_permit_guard);
                     if tx.blocking_send(candidate).is_err() {
                         return WalkState::Quit;
                     }

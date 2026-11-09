@@ -364,6 +364,7 @@ impl ReindexWorker {
                 continue;
             }
 
+            let resolved_meta = crate::chunker::resolve_document_metadata(file_path, &content);
             let header = crate::chunker::build_contextual_header(file_path, &content);
             let contract_hash = self.embedder.contract().derive_contract_hash_hex();
             let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
@@ -397,6 +398,9 @@ impl ReindexWorker {
                     "contract_hash": contract_hash,
                     "parent_doc_id": file_b3.clone(),
                     "parent_chunk_id": format!("{}:p{}", file_b3, raw.parent_chunk_index),
+                    "doc_title": resolved_meta.title,
+                    "doc_author": resolved_meta.author,
+                    "doc_revision": resolved_meta.revision,
                     "heading_path": raw.section_path,
                     "section_path": raw.section_path,
                     "section_title": raw.section_title,
@@ -1101,6 +1105,7 @@ fn process_candidate_sync(
             let raw_chunks = chunker.chunk_text_structure_aware(&content);
             let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
             let path_str = path.to_string_lossy().to_string();
+            let resolved_meta = crate::chunker::resolve_document_metadata(path, &content);
             let header = crate::chunker::build_contextual_header(path, &content);
 
             let mut chunks = Vec::with_capacity(raw_chunks.len());
@@ -1146,6 +1151,9 @@ fn process_candidate_sync(
                     "contract_hash": embedder.contract().derive_contract_hash_hex(),
                     "parent_doc_id": file_b3.clone(),
                     "parent_chunk_id": format!("{}:p{}", file_b3, raw.parent_chunk_index),
+                    "doc_title": resolved_meta.title,
+                    "doc_author": resolved_meta.author,
+                    "doc_revision": resolved_meta.revision,
                     "heading_path": raw.section_path,
                     "section_path": raw.section_path,
                     "section_title": raw.section_title,

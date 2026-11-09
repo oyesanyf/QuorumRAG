@@ -53,8 +53,8 @@ pub use mesh::{
 pub use model_router::AutoFusionRouter;
 pub use offline_engine::DeterministicOfflineSynthesisEngine;
 pub use rlm_orchestrator::{
-    execute_rlm_tools_concurrent, RlmDepthAwareSemaphore, RlmOrchestrator, RlmParentSliceCache,
-    RlmToolInvocation, RlmToolOutput, RlmWorkspaceState,
+    execute_rlm_subqueries_unordered, execute_rlm_tools_concurrent, RlmDepthAwareSemaphore,
+    RlmOrchestrator, RlmParentSliceCache, RlmToolInvocation, RlmToolOutput, RlmWorkspaceState,
 };
 pub use scatter_gather::{FederatedQueryCoordinator, ScatterGatherEngine, StorageSearcher};
 pub use telemetry::AgenticTelemetryEvent;

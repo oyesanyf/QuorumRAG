@@ -652,6 +652,7 @@ impl TextChunker {
         let mut document_chunks = Vec::with_capacity(structure_chunks.len());
 
         let path_str = path.to_string_lossy().to_string();
+        let resolved_meta = resolve_document_metadata(path, content);
         let header = build_contextual_header(path, content);
 
         for raw in structure_chunks {
@@ -666,6 +667,9 @@ impl TextChunker {
                 "chunk_index": raw.chunk_index,
                 "parent_doc_id": file_blake3,
                 "parent_chunk_id": format!("{}:p{}", file_blake3, raw.parent_chunk_index),
+                "doc_title": resolved_meta.title,
+                "doc_author": resolved_meta.author,
+                "doc_revision": resolved_meta.revision,
                 "heading_path": raw.section_path,
                 "section_path": raw.section_path,
                 "section_title": raw.section_title,
@@ -694,13 +698,25 @@ impl TextChunker {
     }
 }
 
-/// Derives document metadata and builds the contextual header:
-/// `[Document: "{doc_title}" | Author: {doc_authors} | Kind: {doc_kind} | File: {file_name}]`
-pub fn build_contextual_header(path: &Path, content: &str) -> String {
+/// Resolved parent-document metadata propagated across all child chunks.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedDocumentMetadata {
+    pub title: String,
+    pub author: String,
+    pub revision: Option<String>,
+    pub kind: String,
+    pub file_name: String,
+}
+
+/// Deterministically resolves parent-document metadata (`title`, `author`, `revision`, `kind`)
+/// from document headers, `[PDF Metadata]` / `[Document Metadata]` banners, OpenXML core properties,
+/// and filename fallbacks.
+pub fn resolve_document_metadata(path: &Path, content: &str) -> ResolvedDocumentMetadata {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("document");
+        .unwrap_or("document")
+        .to_string();
 
     let ext = path
         .extension()
@@ -708,17 +724,94 @@ pub fn build_contextual_header(path: &Path, content: &str) -> String {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // 1. Title derivation
     let mut doc_title = String::new();
-    for line in content.lines().take(20) {
-        let trimmed = line.trim();
-        if let Some(t) = trimmed.strip_prefix("Title: ") {
-            if !t.trim().is_empty() {
+    let mut doc_authors = String::new();
+    let mut doc_revision: Option<String> = None;
+
+    // 0. If this is an OpenXML / ODF document on disk, inspect core properties first
+    if matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp") && path.exists() {
+        if let Ok(bytes) = std::fs::read(path) {
+            let props = crate::document_extractor::DocumentExtractor::extract_openxml_core_props(&bytes);
+            if let Some(t) = props.get("doc_title").filter(|s| !s.trim().is_empty()) {
                 doc_title = t.trim().to_string();
-                break;
+            }
+            if let Some(a) = props.get("doc_author").filter(|s| !s.trim().is_empty()) {
+                doc_authors = a.trim().to_string();
+            }
+            if let Some(r) = props.get("doc_revision").filter(|s| !s.trim().is_empty()) {
+                doc_revision = Some(r.trim().to_string());
             }
         }
     }
+
+    let mut preview_end = content.len().min(2048);
+    while !content.is_char_boundary(preview_end) && preview_end > 0 {
+        preview_end -= 1;
+    }
+    let header_preview = &content[..preview_end];
+
+    // 1. Parse structured metadata banners and header key-values within the first 2KB
+    for line in header_preview.lines().take(25) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix("[PDF Metadata]")
+            .or_else(|| trimmed.strip_prefix("[Document Metadata]"))
+        {
+            for seg in rest.split('|') {
+                if let Some((k, v)) = seg.split_once(':') {
+                    let key_l = k.trim().to_ascii_lowercase();
+                    let val = v.trim();
+                    if val.is_empty() {
+                        continue;
+                    }
+                    match key_l.as_str() {
+                        "title" if doc_title.is_empty() => doc_title = val.to_string(),
+                        "author" | "creator" if doc_authors.is_empty() => doc_authors = val.to_string(),
+                        "revision" | "version" | "rev" if doc_revision.is_none() => {
+                            doc_revision = Some(val.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            continue;
+        }
+
+        if doc_title.is_empty() {
+            if let Some(t) = trimmed.strip_prefix("Title:").or_else(|| trimmed.strip_prefix("title:")) {
+                if !t.trim().is_empty() {
+                    doc_title = t.trim().to_string();
+                }
+            }
+        }
+        if doc_authors.is_empty() {
+            if let Some(a) = trimmed
+                .strip_prefix("Author:")
+                .or_else(|| trimmed.strip_prefix("Authors:"))
+                .or_else(|| trimmed.strip_prefix("By:"))
+            {
+                if !a.trim().is_empty() && a.trim().len() < 120 {
+                    doc_authors = a.trim().to_string();
+                }
+            } else if let Some(a) = trimmed.strip_prefix("by ") {
+                if !a.trim().is_empty() && a.trim().len() < 80 {
+                    doc_authors = a.trim().to_string();
+                }
+            }
+        }
+        if doc_revision.is_none() {
+            if let Some(r) = trimmed
+                .strip_prefix("Revision:")
+                .or_else(|| trimmed.strip_prefix("Version:"))
+                .or_else(|| trimmed.strip_prefix("Rev:"))
+            {
+                if !r.trim().is_empty() && r.trim().len() < 64 {
+                    doc_revision = Some(r.trim().to_string());
+                }
+            }
+        }
+    }
+
     if doc_title.is_empty() {
         let stem = path
             .file_stem()
@@ -726,35 +819,10 @@ pub fn build_contextual_header(path: &Path, content: &str) -> String {
             .unwrap_or("Untitled Document");
         doc_title = stem.replace(['_', '-'], " ").trim().to_string();
     }
-
-    // 2. Author derivation (strictly within first 2KB before Abstract/Introduction)
-    let mut doc_authors = "Unknown".to_string();
-    let mut preview_end = content.len().min(2048);
-    while !content.is_char_boundary(preview_end) && preview_end > 0 {
-        preview_end -= 1;
-    }
-    let header_preview = &content[..preview_end];
-    for line in header_preview.lines() {
-        let trimmed = line.trim();
-        if let Some(a) = trimmed.strip_prefix("Author: ") {
-            if !a.trim().is_empty() {
-                doc_authors = a.trim().to_string();
-                break;
-            }
-        } else if let Some(a) = trimmed.strip_prefix("by ") {
-            if !a.trim().is_empty() && a.len() < 80 {
-                doc_authors = a.trim().to_string();
-                break;
-            }
-        } else if let Some(a) = trimmed.strip_prefix("By: ") {
-            if !a.trim().is_empty() && a.len() < 80 {
-                doc_authors = a.trim().to_string();
-                break;
-            }
-        }
+    if doc_authors.is_empty() {
+        doc_authors = "Unknown".to_string();
     }
 
-    // 3. Kind derivation
     let doc_kind = match ext.as_str() {
         "pdf" | "docx" | "doc" | "odt" | "rtf" | "tex" | "html" | "htm" => {
             let lower_preview = header_preview.to_ascii_lowercase();
@@ -776,10 +844,31 @@ pub fn build_contextual_header(path: &Path, content: &str) -> String {
         _ => "general_doc".to_string(),
     };
 
-    format!(
-        "[Document: \"{}\" | Author: {} | Kind: {} | File: {}]",
-        doc_title, doc_authors, doc_kind, file_name
-    )
+    ResolvedDocumentMetadata {
+        title: doc_title,
+        author: doc_authors,
+        revision: doc_revision,
+        kind: doc_kind,
+        file_name,
+    }
+}
+
+/// Derives document metadata and builds the contextual header:
+/// `[Document: "{doc_title}" | Author: {doc_authors} | Kind: {doc_kind} | File: {file_name}]`
+/// (with `| Rev: {revision}` included when a revision is present).
+pub fn build_contextual_header(path: &Path, content: &str) -> String {
+    let meta = resolve_document_metadata(path, content);
+    if let Some(ref rev) = meta.revision {
+        format!(
+            "[Document: \"{}\" | Author: {} | Rev: {} | Kind: {} | File: {}]",
+            meta.title, meta.author, rev, meta.kind, meta.file_name
+        )
+    } else {
+        format!(
+            "[Document: \"{}\" | Author: {} | Kind: {} | File: {}]",
+            meta.title, meta.author, meta.kind, meta.file_name
+        )
+    }
 }
 
 /// Prepends the contextual header to raw slice if not already present.
