@@ -75,18 +75,16 @@ impl Level1DedupCatalog {
         Ok(catalog)
     }
 
-    /// Persist catalog atomically to a JSON file on disk.
+    /// Persist catalog atomically to a JSON file on disk using in-memory serialization
+    /// and a single buffered OS write (avoiding millions of unbuffered WriteFile syscalls).
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
         let temp_path = path.with_extension("tmp");
-        {
-            let f = File::create(&temp_path)?;
-            serde_json::to_writer_pretty(f, self)
-                .map_err(io::Error::other)?;
-        }
+        std::fs::write(&temp_path, &bytes)?;
         if let Err(e) = std::fs::rename(&temp_path, path) {
             if path.exists() {
                 let _ = std::fs::remove_file(path);
@@ -96,6 +94,64 @@ impl Level1DedupCatalog {
             }
         }
         Ok(())
+    }
+
+    /// Zero-I/O fast path check: returns `Some(DedupAction::Unchanged)` if `(path, mtime, size)` match.
+    pub fn check_unchanged_fast(
+        &self,
+        path: &Path,
+        current_mtime: i64,
+        current_size: u64,
+    ) -> Option<DedupAction> {
+        let existing_hash = self.path_to_hash.get(path)?;
+        let entry = self.entries.get(existing_hash)?;
+        if entry.mtime_secs == current_mtime && entry.size_bytes == current_size {
+            Some(DedupAction::Unchanged {
+                file_blake3: existing_hash.clone(),
+                chunk_hashes: entry.chunk_hashes.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Evaluates a pre-hashed file against the catalog without performing disk I/O under the lock.
+    pub fn evaluate_prehashed_file(
+        &mut self,
+        path: &Path,
+        current_mtime: i64,
+        current_size: u64,
+        file_b3: String,
+    ) -> DedupAction {
+        if let Some(entry) = self.entries.get_mut(&file_b3) {
+            if entry.file_path != path {
+                let old_path = entry.file_path.clone();
+                let chunk_hashes = entry.chunk_hashes.clone();
+                self.path_to_hash.remove(&old_path);
+                self.path_to_hash.insert(path.to_path_buf(), file_b3.clone());
+                entry.file_path = path.to_path_buf();
+                entry.mtime_secs = current_mtime;
+                entry.size_bytes = current_size;
+                return DedupAction::MovedOrRenamed {
+                    old_path,
+                    new_path: path.to_path_buf(),
+                    file_blake3: file_b3,
+                    chunk_hashes,
+                };
+            } else {
+                entry.mtime_secs = current_mtime;
+                entry.size_bytes = current_size;
+                return DedupAction::Unchanged {
+                    file_blake3: file_b3,
+                    chunk_hashes: entry.chunk_hashes.clone(),
+                };
+            }
+        }
+        let is_new = !self.path_to_hash.contains_key(path);
+        DedupAction::ModifiedOrNew {
+            file_blake3: file_b3,
+            is_new,
+        }
     }
 
     /// Compute 64-char lowercase hex BLAKE3 hash of a file via streaming reader.
@@ -381,17 +437,32 @@ impl TwoLevelDedupEngine {
         &self.cache
     }
 
-    /// Evaluates a file against the Level-1 catalog.
+    /// Zero-I/O metadata fast-path check under a read lock.
+    pub fn check_unchanged_fast(
+        &self,
+        path: &Path,
+        current_mtime: i64,
+        current_size: u64,
+    ) -> Option<DedupAction> {
+        let catalog = self.catalog.read().ok()?;
+        catalog.check_unchanged_fast(path, current_mtime, current_size)
+    }
+
+    /// Evaluates a file against the Level-1 catalog without holding the catalog lock during BLAKE3 disk I/O.
     pub fn evaluate_file(
         &self,
         path: &Path,
         current_mtime: i64,
         current_size: u64,
     ) -> io::Result<DedupAction> {
+        if let Some(unchanged) = self.check_unchanged_fast(path, current_mtime, current_size) {
+            return Ok(unchanged);
+        }
+        let file_b3 = Level1DedupCatalog::hash_file_stream(path)?;
         let mut catalog = self.catalog.write().map_err(|_| {
             io::Error::other("Level 1 catalog lock poisoned")
         })?;
-        catalog.evaluate_file(path, current_mtime, current_size)
+        Ok(catalog.evaluate_prehashed_file(path, current_mtime, current_size, file_b3))
     }
 
     /// Registers a newly indexed file into the Level-1 catalog.
@@ -427,12 +498,30 @@ impl TwoLevelDedupEngine {
         Ok(())
     }
 
-    /// Persists the Level-1 File Catalog atomically to a JSON file on disk.
+    /// Persists the Level-1 File Catalog atomically to a JSON file on disk,
+    /// releasing the catalog read lock before performing the OS disk write.
     pub fn save_catalog_to_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let catalog = self.catalog.read().map_err(|_| {
-            io::Error::other("Level 1 catalog lock poisoned")
-        })?;
-        catalog.save_to_file(path)
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = {
+            let catalog = self.catalog.read().map_err(|_| {
+                io::Error::other("Level 1 catalog lock poisoned")
+            })?;
+            serde_json::to_vec(&*catalog).map_err(io::Error::other)?
+        };
+        let temp_path = path.with_extension("tmp");
+        std::fs::write(&temp_path, &bytes)?;
+        if let Err(e) = std::fs::rename(&temp_path, path) {
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+                std::fs::rename(&temp_path, path)?;
+            } else {
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// Hydrates deduplication state (both Level-1 File Catalog and Level-2 Chunk Cache)
