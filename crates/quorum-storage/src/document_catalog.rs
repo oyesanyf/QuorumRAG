@@ -636,6 +636,19 @@ impl DocumentCatalog {
             let doc_kind = extract_kind_from_chunk(&primary.text_content, &file_path);
             let summary_excerpt = primary.text_content.chars().take(400).collect::<String>();
 
+            let (mtime_secs, size_bytes) = if let Ok(meta) = std::fs::metadata(path_obj) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0i64);
+                let size = meta.len() as i64;
+                (mtime, size)
+            } else {
+                (0i64, 0i64)
+            };
+
             tx.execute(
                 "INSERT INTO document_catalog (
                     file_path, document_id, work_cluster_id, doc_title, doc_authors, doc_kind,
@@ -656,8 +669,8 @@ impl DocumentCatalog {
                     normalized_stem,
                     "metadata",
                     primary.access_tier,
-                    0i64,
-                    0i64,
+                    mtime_secs,
+                    size_bytes,
                     file_chunks.len() as i64,
                     summary_excerpt,
                     chrono::Utc::now().timestamp(),

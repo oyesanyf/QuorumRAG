@@ -148,51 +148,46 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    let dedup_bg = Arc::clone(&dedup);
-    let storage_bg = Arc::clone(&storage);
-    let catalog_path_bg = catalog_path.clone();
-    tokio::spawn(async move {
-        let catalog_is_empty = dedup_bg.catalog().read().map(|c| c.is_empty()).unwrap_or(true);
-        if catalog_is_empty {
-            match dedup_bg.hydrate_from_catalog(&storage_bg) {
-                Ok(count) if count > 0 => {
-                    info!(
-                        count,
-                        tracked_files = dedup_bg.catalog().read().map(|c| c.len()).unwrap_or(0),
-                        "Startup deduplication hydration completed from SQLite document catalog"
-                    );
-                    let _ = dedup_bg.save_catalog_to_file(&catalog_path_bg);
-                }
-                Ok(_) => {
-                    // SQLite catalog had 0 entries; fallback to LanceDB if <= 5,000 chunks
-                    let chunk_count = storage_bg.count().await.unwrap_or(0);
-                    if chunk_count > 0 && chunk_count <= 5_000 {
-                        match dedup_bg.hydrate_from_storage(&storage_bg).await {
-                            Ok(chunks) => {
-                                info!(
-                                    chunks,
-                                    tracked_files = dedup_bg.catalog().read().map(|c| c.len()).unwrap_or(0),
-                                    "Startup deduplication hydration completed from LanceDB storage"
-                                );
-                                let _ = dedup_bg.save_catalog_to_file(&catalog_path_bg);
-                            }
-                            Err(e) => {
-                                error!("Startup deduplication hydration warning: {}", e);
-                            }
+    let catalog_is_empty = dedup.catalog().read().map(|c| c.is_empty()).unwrap_or(true);
+    if catalog_is_empty {
+        match dedup.hydrate_from_catalog(&storage) {
+            Ok(count) if count > 0 => {
+                info!(
+                    count,
+                    tracked_files = dedup.catalog().read().map(|c| c.len()).unwrap_or(0),
+                    "Startup deduplication hydration completed synchronously from SQLite document catalog"
+                );
+                let _ = dedup.save_catalog_to_file(&catalog_path);
+            }
+            Ok(_) => {
+                // SQLite catalog had 0 entries; fallback to LanceDB if <= 50,000 chunks
+                let chunk_count = storage.count().await.unwrap_or(0);
+                if chunk_count > 0 && chunk_count <= 50_000 {
+                    match dedup.hydrate_from_storage(&storage).await {
+                        Ok(chunks) => {
+                            info!(
+                                chunks,
+                                tracked_files = dedup.catalog().read().map(|c| c.len()).unwrap_or(0),
+                                "Startup deduplication hydration completed synchronously from LanceDB storage"
+                            );
+                            let _ = dedup.save_catalog_to_file(&catalog_path);
+                        }
+                        Err(e) => {
+                            error!("Startup deduplication hydration warning: {}", e);
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Startup deduplication hydration warning: {}", e);
-                }
             }
-        } else {
-            info!(
-                tracked_files = dedup_bg.catalog().read().map(|c| c.len()).unwrap_or(0),
-                "Persistent dedup catalog active with 0-disk-read fast path"
-            );
+            Err(e) => {
+                error!("Startup deduplication hydration warning: {}", e);
+            }
         }
-    });
+    } else {
+        info!(
+            tracked_files = dedup.catalog().read().map(|c| c.len()).unwrap_or(0),
+            "Persistent dedup catalog active with 0-disk-read fast path"
+        );
+    }
 
     // 2. Ingest Config & Workers (defaults to discovered user roots + fixed physical drives when --watch-dir is omitted)
     let mut ingest_config = quorum_ingest::IngestConfig::default();

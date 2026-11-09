@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use crate::classifier_router::{CandidateKind, ClassifierRouter, FilterDecision};
 use crate::chunker::TextChunker;
 use crate::config::{ChunkerConfig, DriftFixOptions, IngestConfig, ReindexOptions};
-use crate::dedup::{DedupAction, FileCatalogEntry, TwoLevelDedupEngine};
+use crate::dedup::{DedupAction, FileCatalogEntry, Level1DedupCatalog, TwoLevelDedupEngine};
 use crate::document_extractor::DocumentExtractor;
 use crate::drift_healer::DriftHealer;
 use crate::audio_indexer::AudioIndexer;
@@ -115,7 +115,7 @@ impl IngestEngine {
         };
 
         // Level-1 Evaluation
-        match self.dedup.evaluate_file(path, mtime_secs, size_bytes)? {
+        let precomputed_file_b3 = match self.dedup.evaluate_file(path, mtime_secs, size_bytes)? {
             DedupAction::Unchanged { .. } => {
                 return Ok(Some(Vec::new()));
             }
@@ -130,10 +130,10 @@ impl IngestEngine {
                 });
                 return Ok(Some(Vec::new()));
             }
-            DedupAction::ModifiedOrNew { .. } => {
-                // Proceed to chunking and embedding
+            DedupAction::ModifiedOrNew { file_blake3, .. } => {
+                Some(file_blake3)
             }
-        }
+        };
 
         let access_tier = self.config.resolve_access_tier(path);
         let path_str = path.to_string_lossy().to_string();
@@ -145,7 +145,11 @@ impl IngestEngine {
                     return Ok(Some(Vec::new()));
                 }
 
-                let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
+                let file_b3 = match precomputed_file_b3 {
+                    Some(b3) => b3,
+                    None => Level1DedupCatalog::hash_file_stream(path)
+                        .unwrap_or_else(|_| blake3::hash(content.as_bytes()).to_hex().to_string()),
+                };
                 let raw_chunks = self.chunker.chunk_text_structure_aware(&content);
 
                 let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
