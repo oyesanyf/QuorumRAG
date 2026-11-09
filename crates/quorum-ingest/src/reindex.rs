@@ -17,7 +17,7 @@ use crate::classifier_router::CandidateKind;
 use crate::chunker::TextChunker;
 use crate::config::{ChunkerConfig, IngestConfig, ReindexOptions};
 use crate::crawler::{DiscoveredCandidate, FilesystemCrawler};
-use crate::dedup::{DedupAction, FileCatalogEntry, TwoLevelDedupEngine};
+use crate::dedup::{DedupAction, FileCatalogEntry, Level1DedupCatalog, TwoLevelDedupEngine};
 use crate::document_extractor::DocumentExtractor;
 use crate::audio_indexer::AudioIndexer;
 use crate::error::IngestError;
@@ -357,7 +357,8 @@ impl ReindexWorker {
             }
 
             let access_tier = self.config.resolve_access_tier(file_path);
-            let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
+            let file_b3 = Level1DedupCatalog::hash_file_stream(file_path)
+                .unwrap_or_else(|_| blake3::hash(content.as_bytes()).to_hex().to_string());
             let raw_chunks = chunker.chunk_text_structure_aware(&content);
             if raw_chunks.is_empty() {
                 continue;
@@ -661,6 +662,7 @@ impl ReindexWorker {
                 let access_tier = config.resolve_access_tier(&path);
 
                 // Level-1 Evaluation: skip unmodified unless full_rebuild is forced
+                let mut precomputed_file_b3 = None;
                 if !options.full_rebuild {
                     if let Ok(action) = dedup.evaluate_file(&path, candidate.mtime_secs, candidate.size_bytes) {
                         match action {
@@ -670,6 +672,10 @@ impl ReindexWorker {
                                     p.files_scanned += 1;
                                     p.files_skipped_unmodified += 1;
                                     p.bytes_processed += candidate.size_bytes;
+                                }
+                                if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                                    let _ = dedup.save_catalog_to_file(&catalog_path);
+                                    last_catalog_save = std::time::Instant::now();
                                 }
                                 continue;
                             }
@@ -688,9 +694,14 @@ impl ReindexWorker {
                                     p.files_indexed += 1;
                                     p.bytes_processed += candidate.size_bytes;
                                 }
+                                if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                                    let _ = dedup.save_catalog_to_file(&catalog_path);
+                                    last_catalog_save = std::time::Instant::now();
+                                }
                                 continue;
                             }
-                            DedupAction::ModifiedOrNew { .. } => {
+                            DedupAction::ModifiedOrNew { file_blake3, .. } => {
+                                precomputed_file_b3 = Some(file_blake3);
                                 // Proceed to chunking and vectorization
                             }
                         }
@@ -714,6 +725,7 @@ impl ReindexWorker {
                         embedder_c,
                         dedup_c,
                         chunker_c,
+                        precomputed_file_b3,
                     )
                 }));
             }
@@ -722,78 +734,103 @@ impl ReindexWorker {
                 break;
             }
 
-            // Await next completed candidate
-            if let Some(join_res) = futures.next().await {
-                match join_res {
-                    Ok(outcome) => match outcome {
-                        CandidateOutcome::AlreadyIndexedInFts {
-                            catalog_entry,
-                            size_bytes,
-                        } => {
-                            dedup.register_entry(catalog_entry);
-                            let mut lock = progress.write().await;
-                            if let Some(ref mut p) = *lock {
-                                p.files_scanned += 1;
-                                p.files_skipped_unmodified += 1;
-                                p.bytes_processed += size_bytes;
+            // Await next completed candidate with 45s timeout to prevent thread-pool deadlocks
+            match tokio::time::timeout(std::time::Duration::from_secs(45), futures.next()).await {
+                Ok(Some(join_res)) => {
+                    match join_res {
+                        Ok(outcome) => match outcome {
+                            CandidateOutcome::AlreadyIndexedInFts {
+                                catalog_entry,
+                                size_bytes,
+                            } => {
+                                dedup.register_entry(catalog_entry);
+                                let mut lock = progress.write().await;
+                                if let Some(ref mut p) = *lock {
+                                    p.files_scanned += 1;
+                                    p.files_skipped_unmodified += 1;
+                                    p.bytes_processed += size_bytes;
+                                }
                             }
-                        }
-                        CandidateOutcome::Processed {
-                            chunks,
-                            parent_doc,
-                            catalog_entry,
-                            size_bytes,
-                            chunks_reused,
-                            chunks_new,
-                        } => {
-                            dedup.register_entry(catalog_entry);
-                            if let Some(parent) = parent_doc {
-                                batch_parents.push(parent);
-                            }
-                            batch_chunks.extend(chunks);
+                            CandidateOutcome::Processed {
+                                chunks,
+                                parent_doc,
+                                catalog_entry,
+                                size_bytes,
+                                chunks_reused,
+                                chunks_new,
+                            } => {
+                                dedup.register_entry(catalog_entry);
+                                if let Some(parent) = parent_doc {
+                                    batch_parents.push(parent);
+                                }
+                                batch_chunks.extend(chunks);
 
-                            let mut lock = progress.write().await;
-                            if let Some(ref mut p) = *lock {
-                                p.files_scanned += 1;
-                                p.files_indexed += 1;
-                                p.bytes_processed += size_bytes;
-                                p.chunks_reused_from_cache += chunks_reused;
-                                p.chunks_newly_embedded += chunks_new;
+                                let mut lock = progress.write().await;
+                                if let Some(ref mut p) = *lock {
+                                    p.files_scanned += 1;
+                                    p.files_indexed += 1;
+                                    p.bytes_processed += size_bytes;
+                                    p.chunks_reused_from_cache += chunks_reused;
+                                    p.chunks_newly_embedded += chunks_new;
+                                }
                             }
-                        }
-                        CandidateOutcome::Failed { path, error } => {
-                            warn!("Failed to process '{}': {}", path.display(), error);
+                            CandidateOutcome::Failed { path, error } => {
+                                warn!("Failed to process '{}': {}", path.display(), error);
+                                let mut lock = progress.write().await;
+                                if let Some(ref mut p) = *lock {
+                                    p.files_scanned += 1;
+                                    p.files_failed += 1;
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Blocking reindex worker task failed: {}", e);
                             let mut lock = progress.write().await;
                             if let Some(ref mut p) = *lock {
                                 p.files_scanned += 1;
                                 p.files_failed += 1;
                             }
                         }
-                    },
-                    Err(e) => {
-                        warn!("Blocking reindex worker task failed: {}", e);
                     }
-                }
 
-                // If micro-batch is full, flush to storage
-                if batch_chunks.len() >= options.batch_size {
-                    if !options.dry_run {
-                        let _commit_permit = permit_tiers.acquire_storage_commit().await?;
-                        Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
-                        let _ = storage.insert_chunks(&batch_chunks).await?;
-                        for (pdoc, ptier) in batch_parents.drain(..) {
-                            let _ = storage.upsert_parent_document(&pdoc, ptier);
-                        }
-                        if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                    if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                        let _ = dedup.save_catalog_to_file(&catalog_path);
+                        last_catalog_save = std::time::Instant::now();
+                    }
+
+                    // If micro-batch is full, flush to storage
+                    if batch_chunks.len() >= options.batch_size {
+                        if !options.dry_run {
+                            let _commit_permit = permit_tiers.acquire_storage_commit().await?;
+                            Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
+                            let _ = storage.insert_chunks(&batch_chunks).await?;
+                            for (pdoc, ptier) in batch_parents.drain(..) {
+                                let _ = storage.upsert_parent_document(&pdoc, ptier);
+                            }
                             let _ = dedup.save_catalog_to_file(&catalog_path);
                             last_catalog_save = std::time::Instant::now();
+                            let _ = storage.bump_index_epoch("reindex_micro_batch");
+                        } else {
+                            batch_parents.clear();
                         }
-                        let _ = storage.bump_index_epoch("reindex_micro_batch");
-                    } else {
-                        batch_parents.clear();
+                        batch_chunks.clear();
+                        tokio::task::yield_now().await;
                     }
-                    batch_chunks.clear();
-                    tokio::task::yield_now().await;
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(_) => {
+                    warn!("Candidate extraction task timed out after 45s; continuing pipeline");
+                    let mut lock = progress.write().await;
+                    if let Some(ref mut p) = *lock {
+                        p.files_scanned += 1;
+                        p.files_failed += 1;
+                    }
+                    if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                        let _ = dedup.save_catalog_to_file(&catalog_path);
+                        last_catalog_save = std::time::Instant::now();
+                    }
                 }
             }
         }
@@ -857,6 +894,8 @@ impl ReindexWorker {
                     "Auto-saved Level-1 dedup catalog to disk after reindex pass"
                 );
             }
+        } else if !options.dry_run {
+            let _ = dedup.save_catalog_to_file(&catalog_path);
         }
 
         Ok(())
@@ -1027,6 +1066,7 @@ fn process_candidate_sync(
     embedder: Arc<dyn EmbeddingGenerator>,
     dedup: Arc<TwoLevelDedupEngine>,
     chunker: TextChunker,
+    precomputed_file_b3: Option<String>,
 ) -> CandidateOutcome {
     let path = &candidate.path;
     match candidate.kind {
@@ -1041,7 +1081,11 @@ fn process_candidate_sync(
                 }
             };
 
-            let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
+            let file_b3 = match precomputed_file_b3 {
+                Some(b3) => b3,
+                None => Level1DedupCatalog::hash_file_stream(path)
+                    .unwrap_or_else(|_| blake3::hash(content.as_bytes()).to_hex().to_string()),
+            };
             if !force_reembed && storage.has_chunk_id_in_fts(&format!("{}:0", file_b3)) {
                 return CandidateOutcome::AlreadyIndexedInFts {
                     catalog_entry: FileCatalogEntry {
@@ -1171,8 +1215,11 @@ fn process_candidate_sync(
                 }
             };
 
-            let img_b3 = blake3::hash(&bytes).to_hex().to_string();
-            if !force_reembed && storage.has_chunk_id_in_fts(&format!("{}:image:0", img_b3)) {
+            let img_b3 = match precomputed_file_b3 {
+                Some(b3) => b3,
+                None => blake3::hash(&bytes).to_hex().to_string(),
+            };
+            if !force_reembed && (storage.has_chunk_id_in_fts(&format!("{}:img:0", img_b3)) || storage.has_chunk_id_in_fts(&format!("{}:image:0", img_b3))) {
                 return CandidateOutcome::AlreadyIndexedInFts {
                     catalog_entry: FileCatalogEntry {
                         file_path: path.clone(),

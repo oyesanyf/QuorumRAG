@@ -1453,6 +1453,67 @@ impl DocumentExtractor {
         lines.join("\n")
     }
 
+    /// Executes a child process with bounded wall-clock timeout and concurrent stdout/stderr draining
+    /// to prevent thread pool deadlocks and pipe buffer stalls.
+    fn run_command_with_timeout(
+        mut cmd: Command,
+        timeout: std::time::Duration,
+    ) -> io::Result<std::process::Output> {
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn()?;
+
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = stdout_handle {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = stderr_handle {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let start = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_millis(50);
+
+        let status = loop {
+            match child.try_wait()? {
+                Some(status) => break status,
+                None => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.join();
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("Subprocess timed out after {:?}", timeout),
+                        ));
+                    }
+                    std::thread::sleep(poll_interval);
+                }
+            }
+        };
+
+        let stdout = stdout_thread.join().unwrap_or_default();
+        let stderr = stderr_thread.join().unwrap_or_default();
+
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
     /// Extracts metadata and text layer using pypdf via discovered python subprocess.
     fn extract_pdf_via_pypdf(path: &Path) -> io::Result<(String, String)> {
         let Some(python_bin) = Self::resolve_python_binary() else {
@@ -1490,11 +1551,9 @@ impl DocumentExtractor {
         ]
         .join("\n");
 
-        let output = Command::new(python_bin)
-            .arg("-c")
-            .arg(script)
-            .arg(path.as_os_str())
-            .output()?;
+        let mut cmd = Command::new(python_bin);
+        cmd.arg("-c").arg(script).arg(path.as_os_str());
+        let output = Self::run_command_with_timeout(cmd, std::time::Duration::from_secs(30))?;
 
         if !output.status.success() {
             return Err(io::Error::other(format!(
@@ -1559,12 +1618,12 @@ impl DocumentExtractor {
         ]
         .join("\n");
 
-        let output = Command::new(python_bin)
-            .arg("-c")
+        let mut cmd = Command::new(python_bin);
+        cmd.arg("-c")
             .arg(script)
             .arg(path.as_os_str())
-            .arg(temp_dir_path.as_os_str())
-            .output()?;
+            .arg(temp_dir_path.as_os_str());
+        let output = Self::run_command_with_timeout(cmd, std::time::Duration::from_secs(30))?;
 
         if !output.status.success() {
             return Err(io::Error::other(format!(
@@ -1718,12 +1777,11 @@ impl DocumentExtractor {
             ]
             .join("\n");
 
-            if let Ok(output) = Command::new(python_bin)
-                .arg("-c")
+            let mut cmd = Command::new(python_bin);
+            cmd.arg("-c")
                 .arg(script)
-                .arg(path.as_os_str())
-                .output()
-            {
+                .arg(path.as_os_str());
+            if let Ok(output) = Self::run_command_with_timeout(cmd, std::time::Duration::from_secs(30)) {
                 if output.status.success() {
                     let extracted = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !extracted.is_empty() {

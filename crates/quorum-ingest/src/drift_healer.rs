@@ -23,7 +23,7 @@ use crate::classifier_router::{CandidateKind, ClassifierRouter, FilterDecision};
 use crate::chunker::TextChunker;
 use crate::config::{ChunkerConfig, DriftFixOptions, DriftType, IngestConfig};
 use crate::crawler::FilesystemCrawler;
-use crate::dedup::{FileCatalogEntry, TwoLevelDedupEngine};
+use crate::dedup::{FileCatalogEntry, Level1DedupCatalog, TwoLevelDedupEngine};
 use crate::audio_indexer::AudioIndexer;
 use crate::error::IngestError;
 use crate::image_indexer::ImageIndexer;
@@ -422,7 +422,8 @@ impl DriftHealer {
                 match kind {
                     CandidateKind::Text { .. } => {
                         let content = crate::document_extractor::DocumentExtractor::extract_text(path, &identity)?;
-                        let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
+                        let file_b3 = Level1DedupCatalog::hash_file_stream(path)
+                            .unwrap_or_else(|_| blake3::hash(content.as_bytes()).to_hex().to_string());
                         let chunker = TextChunker::new(ChunkerConfig::default());
                         let raw_chunks = chunker.chunk_text_structure_aware(&content);
 

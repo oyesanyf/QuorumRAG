@@ -61,6 +61,41 @@ pub struct Level1DedupCatalog {
     path_to_hash: HashMap<PathBuf, String>,
 }
 
+/// Atomically persists a serialized JSON byte payload to disk using a unique temporary file
+/// and exponential retry backoff on rename to prevent Windows ERROR_SHARING_VIOLATION collisions.
+fn atomic_write_json_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let unique_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), unique_id));
+    std::fs::write(&temp_path, bytes)?;
+
+    let mut renamed = false;
+    for attempt in 0..5 {
+        if std::fs::rename(&temp_path, path).is_ok() {
+            renamed = true;
+            break;
+        }
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+            if std::fs::rename(&temp_path, path).is_ok() {
+                renamed = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15 * (1 << attempt)));
+    }
+    if !renamed {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(io::Error::other("Failed to rename temporary dedup catalog after 5 attempts"));
+    }
+    Ok(())
+}
+
 impl Level1DedupCatalog {
     pub fn new() -> Self {
         Self::default()
@@ -78,22 +113,8 @@ impl Level1DedupCatalog {
     /// Persist catalog atomically to a JSON file on disk using in-memory serialization
     /// and a single buffered OS write (avoiding millions of unbuffered WriteFile syscalls).
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
-        let temp_path = path.with_extension("tmp");
-        std::fs::write(&temp_path, &bytes)?;
-        if let Err(e) = std::fs::rename(&temp_path, path) {
-            if path.exists() {
-                let _ = std::fs::remove_file(path);
-                std::fs::rename(&temp_path, path)?;
-            } else {
-                return Err(e);
-            }
-        }
-        Ok(())
+        atomic_write_json_file(path.as_ref(), &bytes)
     }
 
     /// Zero-I/O fast path check: returns `Some(DedupAction::Unchanged)` if `(path, mtime, size)` match.
@@ -501,27 +522,13 @@ impl TwoLevelDedupEngine {
     /// Persists the Level-1 File Catalog atomically to a JSON file on disk,
     /// releasing the catalog read lock before performing the OS disk write.
     pub fn save_catalog_to_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let bytes = {
             let catalog = self.catalog.read().map_err(|_| {
                 io::Error::other("Level 1 catalog lock poisoned")
             })?;
             serde_json::to_vec(&*catalog).map_err(io::Error::other)?
         };
-        let temp_path = path.with_extension("tmp");
-        std::fs::write(&temp_path, &bytes)?;
-        if let Err(e) = std::fs::rename(&temp_path, path) {
-            if path.exists() {
-                let _ = std::fs::remove_file(path);
-                std::fs::rename(&temp_path, path)?;
-            } else {
-                return Err(e);
-            }
-        }
-        Ok(())
+        atomic_write_json_file(path.as_ref(), &bytes)
     }
 
     /// Hydrates deduplication state (both Level-1 File Catalog and Level-2 Chunk Cache)
