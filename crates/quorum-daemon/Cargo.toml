@@ -76,3 +76,8 @@ path = "../../tests/retrieval_performance_tests.rs"
 [[test]]
 name = "marketplace_sovereign_escrow_tests"
 path = "tests/marketplace_sovereign_escrow_tests.rs"
+
+[[test]]
+name = "concurrency_stress_tests"
+path = "tests/concurrency_stress_tests.rs"
+

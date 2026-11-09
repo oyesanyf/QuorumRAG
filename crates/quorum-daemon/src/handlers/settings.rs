@@ -507,7 +507,7 @@ pub async fn manage_shared_folders_handler(
     .into_response()
 }
 
-/// GET /api/mesh/browse-folders?path=... - Lists real directories on physical drives so the user can pick folders to share with Mesh.
+/// GET /api/fs/browse-folders?path=... (and /api/mesh/browse-folders) - Lists real directories on physical drives and quick-access user folders.
 pub async fn browse_folders_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -532,10 +532,15 @@ pub async fn browse_folders_handler(
         })
     };
 
+    let drives_raw = quorum_ingest::IngestConfig::discover_physical_drives();
+    let physical_drives: Vec<String> = drives_raw
+        .iter()
+        .map(|d| d.to_string_lossy().to_string())
+        .collect();
+
     let requested_path = params.get("path").map(|s| s.trim()).unwrap_or("");
     if requested_path.is_empty() {
-        let drives = quorum_ingest::IngestConfig::discover_physical_drives();
-        let entries: Vec<serde_json::Value> = drives
+        let mut entries: Vec<serde_json::Value> = drives_raw
             .into_iter()
             .map(|d| {
                 let s = d.to_string_lossy().to_string();
@@ -543,62 +548,186 @@ pub async fn browse_folders_handler(
                     "name": s,
                     "path": s,
                     "is_drive": true,
+                    "is_quick_access": false,
                     "is_shared": is_shared_fn(&s)
                 })
             })
             .collect();
+
+        // Add user quick-access folders (Desktop, Documents, Downloads, Pictures)
+        let home_opt = std::env::var("USERPROFILE").ok().or_else(|| std::env::var("HOME").ok());
+        if let Some(home) = home_opt {
+            let quick_folders = [
+                ("Desktop", "Desktop"),
+                ("Documents", "Documents"),
+                ("Downloads", "Downloads"),
+                ("Pictures", "Pictures"),
+            ];
+            for (label, sub) in quick_folders {
+                let p = Path::new(&home).join(sub);
+                if p.is_dir() {
+                    let s = p.to_string_lossy().to_string();
+                    entries.push(serde_json::json!({
+                        "name": label,
+                        "path": s,
+                        "is_drive": false,
+                        "is_quick_access": true,
+                        "is_shared": is_shared_fn(&s)
+                    }));
+                }
+            }
+        }
+
         return Json(serde_json::json!({
             "status": "ok",
             "current_path": "",
             "parent_path": "",
+            "drives": physical_drives,
             "directories": entries
         }));
     }
 
     let dir_path = Path::new(requested_path);
-    let parent_path = dir_path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let is_drive_root = physical_drives.iter().any(|d| {
+        let d_trimmed = d.trim_end_matches(['\\', '/']);
+        let req_trimmed = requested_path.trim_end_matches(['\\', '/']);
+        d_trimmed.eq_ignore_ascii_case(req_trimmed)
+    });
 
-    let mut dirs = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(dir_path) {
-        for entry in read_dir.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with('$')
-                        || name.eq_ignore_ascii_case("System Volume Information")
-                        || name.eq_ignore_ascii_case("target")
-                        || name.eq_ignore_ascii_case("node_modules")
-                        || name.eq_ignore_ascii_case(".git")
-                    {
-                        continue;
+    let parent_path = if is_drive_root {
+        String::new()
+    } else {
+        dir_path
+            .parent()
+            .map(|p| {
+                let s = p.to_string_lossy().to_string();
+                if s.len() == 2 && s.ends_with(':') {
+                    format!("{}\\", s)
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_default()
+    };
+
+    let dir_path_buf = dir_path.to_path_buf();
+    let shared_folders_clone = shared_folders.clone();
+    let dirs: Vec<serde_json::Value> = tokio::task::spawn_blocking(move || {
+        let is_shared = |candidate: &str| -> bool {
+            let Some(norm_c) = quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(candidate) else {
+                return false;
+            };
+            shared_folders_clone.iter().any(|f| {
+                f.enabled
+                    && quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(&f.path)
+                        .as_deref()
+                        == Some(norm_c.as_str())
+            })
+        };
+
+        let mut dirs = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(&dir_path_buf) {
+            for entry in read_dir.flatten() {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with('$')
+                            || name.eq_ignore_ascii_case("System Volume Information")
+                            || name.eq_ignore_ascii_case("target")
+                            || name.eq_ignore_ascii_case("node_modules")
+                            || name.eq_ignore_ascii_case(".git")
+                        {
+                            continue;
+                        }
+                        let full = entry.path().to_string_lossy().to_string();
+                        dirs.push(serde_json::json!({
+                            "name": name,
+                            "path": full,
+                            "is_drive": false,
+                            "is_quick_access": false,
+                            "is_shared": is_shared(&full)
+                        }));
                     }
-                    let full = entry.path().to_string_lossy().to_string();
-                    dirs.push(serde_json::json!({
-                        "name": name,
-                        "path": full,
-                        "is_drive": false,
-                        "is_shared": is_shared_fn(&full)
-                    }));
                 }
             }
         }
-    }
-    dirs.sort_by(|a, b| {
-        let na = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let nb = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        na.to_ascii_lowercase().cmp(&nb.to_ascii_lowercase())
-    });
-    dirs.truncate(120);
+        dirs.sort_by(|a, b| {
+            let na = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let nb = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            na.to_ascii_lowercase().cmp(&nb.to_ascii_lowercase())
+        });
+        dirs.truncate(150);
+        dirs
+    })
+    .await
+    .unwrap_or_default();
 
     Json(serde_json::json!({
         "status": "ok",
         "current_path": requested_path,
         "parent_path": parent_path,
+        "drives": physical_drives,
         "directories": dirs
     }))
+}
+
+/// POST /api/fs/pick-folder - Triggers native operating system folder selection dialog.
+pub async fn pick_folder_dialog_handler() -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(|| {
+        #[cfg(windows)]
+        {
+            use std::process::Command;
+            use std::os::windows::process::CommandExt;
+
+            let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = "Select a folder for QuorumRAG"
+$dialog.ShowNewFolderButton = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::Out.Write($dialog.SelectedPath)
+}
+"#;
+            // 0x08000000 = CREATE_NO_WINDOW
+            let output = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .creation_flags(0x08000000)
+                .output();
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(path)
+                    }
+                }
+                _ => None,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    })
+    .await
+    .unwrap_or(None);
+
+    match result {
+        Some(path) => Json(serde_json::json!({
+            "status": "ok",
+            "path": path,
+            "cancelled": false
+        }))
+        .into_response(),
+        None => Json(serde_json::json!({
+            "status": "cancelled",
+            "path": "",
+            "cancelled": true
+        }))
+        .into_response(),
+    }
 }
 
 /// GET /api/dlp/status - Returns HIPAA PHI/PII DLP policy and live audit telemetry.

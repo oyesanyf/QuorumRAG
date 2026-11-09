@@ -10,3 +10,4 @@ pub mod mesh;
 pub mod reindex;
 pub mod settings;
 pub mod marketplace;
+pub mod synthetic_gate;

@@ -22,6 +22,111 @@ pub struct RawTextChunk<'a> {
     pub chunk_index: usize,
 }
 
+/// Header item in the active section hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SectionHeader {
+    pub level: u8,
+    pub title: String,
+    pub line_number: u32,
+    pub byte_offset: usize,
+}
+
+/// Active hierarchical section breadcrumb tracker.
+#[derive(Debug, Clone, Default)]
+pub struct SectionHierarchyStack {
+    headers: Vec<SectionHeader>,
+}
+
+impl SectionHierarchyStack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, level: u8, title: String, line_number: u32, byte_offset: usize) {
+        self.headers.retain(|h| h.level < level);
+        self.headers.push(SectionHeader {
+            level,
+            title,
+            line_number,
+            byte_offset,
+        });
+    }
+
+    pub fn breadcrumb_string(&self) -> String {
+        self.headers
+            .iter()
+            .map(|h| h.title.as_str())
+            .collect::<Vec<_>>()
+            .join(" > ")
+    }
+
+    pub fn hierarchy_titles(&self) -> Vec<String> {
+        self.headers.iter().map(|h| h.title.clone()).collect()
+    }
+
+    pub fn current_level(&self) -> u8 {
+        self.headers.last().map(|h| h.level).unwrap_or(0)
+    }
+
+    pub fn current_title(&self) -> String {
+        self.headers.last().map(|h| h.title.clone()).unwrap_or_default()
+    }
+}
+
+/// Structure-aware raw chunk with parent-child linkage and heading hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructureAwareRawChunk<'a> {
+    pub text_slice: &'a str,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub char_start: usize,
+    pub char_end: usize,
+    pub chunk_index: usize,
+    pub parent_chunk_index: usize,
+    pub section_path: String,
+    pub section_title: String,
+    pub section_hierarchy: Vec<String>,
+    pub section_level: u8,
+}
+
+/// Parses a heading line into a `SectionHeader` if it conforms to Markdown or Section heading styles.
+pub fn parse_section_header_line(line: &str, line_num: u32, byte_offset: usize) -> Option<SectionHeader> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Markdown headers: # Title, ## Subtitle, etc.
+    if trimmed.starts_with('#') {
+        let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+        if hashes <= 6 {
+            let title = trimmed[hashes..].trim().to_string();
+            if !title.is_empty() {
+                return Some(SectionHeader {
+                    level: hashes as u8,
+                    title,
+                    line_number: line_num,
+                    byte_offset,
+                });
+            }
+        }
+    }
+
+    // Explicit Section prefixes: "Section 1.2: Architecture" or "Chapter 3: Storage"
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("section ") || lower.starts_with("chapter ") {
+        let title = trimmed.to_string();
+        return Some(SectionHeader {
+            level: 2,
+            title,
+            line_number: line_num,
+            byte_offset,
+        });
+    }
+
+    None
+}
+
 /// Line-aware text chunker with newline prefix indexing and boundary snapping.
 #[derive(Debug, Clone)]
 pub struct TextChunker {
@@ -362,6 +467,175 @@ impl TextChunker {
         chunks
     }
 
+    /// Slices content into structure-aware child chunks linked to containing parent chunks,
+    /// tracking active section headers line by line.
+    ///
+    /// Section header boundaries demarcate discrete chunks even when text is shorter than
+    /// `target_chunk_size`. If a section exceeds `target_chunk_size`, it is sub-chunked
+    /// while preserving the active section's breadcrumb hierarchy.
+    pub fn chunk_text_structure_aware<'a>(&self, content: &'a str) -> Vec<StructureAwareRawChunk<'a>> {
+        if content.is_empty() {
+            return Vec::new();
+        }
+
+        let line_starts = Self::build_line_starts(content);
+        let mut header_events = Vec::new();
+        for (line_idx, &start_byte) in line_starts.iter().enumerate() {
+            let next_byte = if line_idx + 1 < line_starts.len() {
+                line_starts[line_idx + 1]
+            } else {
+                content.len()
+            };
+            if start_byte < next_byte && content.is_char_boundary(start_byte) && content.is_char_boundary(next_byte) {
+                let line_str = &content[start_byte..next_byte];
+                if let Some(header) = parse_section_header_line(line_str, (line_idx + 1) as u32, start_byte) {
+                    header_events.push(header);
+                }
+            }
+        }
+
+        let parent_window_chunks = 4;
+
+        // If there are no structural section headers, fallback to standard sliding-window chunking
+        if header_events.is_empty() {
+            let raw_chunks = self.chunk_text(content);
+            return raw_chunks
+                .into_iter()
+                .map(|raw| {
+                    let parent_idx = raw.chunk_index / parent_window_chunks;
+                    StructureAwareRawChunk {
+                        text_slice: raw.text_slice,
+                        line_start: raw.line_start,
+                        line_end: raw.line_end,
+                        char_start: raw.char_start,
+                        char_end: raw.char_end,
+                        chunk_index: raw.chunk_index,
+                        parent_chunk_index: parent_idx,
+                        section_path: String::new(),
+                        section_title: String::new(),
+                        section_hierarchy: Vec::new(),
+                        section_level: 0,
+                    }
+                })
+                .collect();
+        }
+
+        let mut stack = SectionHierarchyStack::default();
+        let mut result = Vec::new();
+        let mut chunk_index = 0;
+
+        // 1. Preamble before the first header (if any non-whitespace content exists)
+        let first_header_offset = header_events[0].byte_offset;
+        if first_header_offset > 0 {
+            let preamble = &content[..first_header_offset];
+            if !preamble.trim().is_empty() {
+                if preamble.len() <= self.config.target_chunk_size {
+                    let line_end = Self::byte_to_line(&line_starts, first_header_offset.saturating_sub(1)).max(1);
+                    result.push(StructureAwareRawChunk {
+                        text_slice: preamble,
+                        line_start: 1,
+                        line_end,
+                        char_start: 0,
+                        char_end: first_header_offset,
+                        chunk_index,
+                        parent_chunk_index: chunk_index / parent_window_chunks,
+                        section_path: String::new(),
+                        section_title: String::new(),
+                        section_hierarchy: Vec::new(),
+                        section_level: 0,
+                    });
+                    chunk_index += 1;
+                } else {
+                    let sub_chunks = self.chunk_text(preamble);
+                    for sub in sub_chunks {
+                        let cs = sub.char_start;
+                        let ce = sub.char_end;
+                        let ls = Self::byte_to_line(&line_starts, cs).max(1);
+                        let le = Self::byte_to_line(&line_starts, ce.saturating_sub(1)).max(ls);
+                        result.push(StructureAwareRawChunk {
+                            text_slice: &content[cs..ce],
+                            line_start: ls,
+                            line_end: le,
+                            char_start: cs,
+                            char_end: ce,
+                            chunk_index,
+                            parent_chunk_index: chunk_index / parent_window_chunks,
+                            section_path: String::new(),
+                            section_title: String::new(),
+                            section_hierarchy: Vec::new(),
+                            section_level: 0,
+                        });
+                        chunk_index += 1;
+                    }
+                }
+            }
+        }
+
+        // 2. Iterate each section demarcated by header boundaries
+        for (i, h) in header_events.iter().enumerate() {
+            stack.push(h.level, h.title.clone(), h.line_number, h.byte_offset);
+            let start_byte = h.byte_offset;
+            let end_byte = if i + 1 < header_events.len() {
+                header_events[i + 1].byte_offset
+            } else {
+                content.len()
+            };
+
+            let section_text = &content[start_byte..end_byte];
+            if section_text.trim().is_empty() {
+                continue;
+            }
+
+            let section_path = stack.breadcrumb_string();
+            let section_title = stack.current_title();
+            let section_hierarchy = stack.hierarchy_titles();
+            let section_level = stack.current_level();
+
+            if section_text.len() <= self.config.target_chunk_size {
+                let line_start = Self::byte_to_line(&line_starts, start_byte).max(1);
+                let line_end = Self::byte_to_line(&line_starts, end_byte.saturating_sub(1)).max(line_start);
+                result.push(StructureAwareRawChunk {
+                    text_slice: section_text,
+                    line_start,
+                    line_end,
+                    char_start: start_byte,
+                    char_end: end_byte,
+                    chunk_index,
+                    parent_chunk_index: chunk_index / parent_window_chunks,
+                    section_path,
+                    section_title,
+                    section_hierarchy,
+                    section_level,
+                });
+                chunk_index += 1;
+            } else {
+                let sub_chunks = self.chunk_text(section_text);
+                for sub in sub_chunks {
+                    let cs = start_byte + sub.char_start;
+                    let ce = start_byte + sub.char_end;
+                    let ls = Self::byte_to_line(&line_starts, cs).max(1);
+                    let le = Self::byte_to_line(&line_starts, ce.saturating_sub(1)).max(ls);
+                    result.push(StructureAwareRawChunk {
+                        text_slice: &content[cs..ce],
+                        line_start: ls,
+                        line_end: le,
+                        char_start: cs,
+                        char_end: ce,
+                        chunk_index,
+                        parent_chunk_index: chunk_index / parent_window_chunks,
+                        section_path: section_path.clone(),
+                        section_title: section_title.clone(),
+                        section_hierarchy: section_hierarchy.clone(),
+                        section_level,
+                    });
+                    chunk_index += 1;
+                }
+            }
+        }
+
+        result
+    }
+
     /// Construct validated `DocumentChunk` items using a vector provider closure.
     pub fn create_document_chunks<F>(
         &self,
@@ -374,15 +648,15 @@ impl TextChunker {
     where
         F: FnMut(&str, &str) -> Vec<f32>, // (slice, chunk_b3) -> vector
     {
-        let raw_chunks = self.chunk_text(content);
-        let mut document_chunks = Vec::with_capacity(raw_chunks.len());
+        let structure_chunks = self.chunk_text_structure_aware(content);
+        let mut document_chunks = Vec::with_capacity(structure_chunks.len());
 
         let path_str = path.to_string_lossy().to_string();
         let header = build_contextual_header(path, content);
 
-        for raw in raw_chunks {
+        for raw in structure_chunks {
             let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-            let chunk_content = prepend_contextual_header(&header, raw.text_slice);
+            let chunk_content = prepend_contextual_header_with_section(&header, &raw.section_path, raw.text_slice);
             let vector = vector_provider(raw.text_slice, &raw_b3);
             let chunk_id = format!("{}:{}", file_blake3, raw.chunk_index);
 
@@ -390,6 +664,14 @@ impl TextChunker {
                 "char_start": raw.char_start,
                 "char_end": raw.char_end,
                 "chunk_index": raw.chunk_index,
+                "parent_doc_id": file_blake3,
+                "parent_chunk_id": format!("{}:p{}", file_blake3, raw.parent_chunk_index),
+                "heading_path": raw.section_path,
+                "section_path": raw.section_path,
+                "section_title": raw.section_title,
+                "section_hierarchy": raw.section_hierarchy,
+                "section_level": raw.section_level,
+                "source_path": path_str,
             })
             .to_string();
 
@@ -504,6 +786,17 @@ pub fn build_contextual_header(path: &Path, content: &str) -> String {
 pub fn prepend_contextual_header(header: &str, raw_slice: &str) -> String {
     if raw_slice.starts_with("[Document:") {
         raw_slice.to_string()
+    } else {
+        format!("{}\n\n{}", header, raw_slice)
+    }
+}
+
+/// Prepends the contextual header and active section breadcrumb to raw slice.
+pub fn prepend_contextual_header_with_section(header: &str, section_path: &str, raw_slice: &str) -> String {
+    if raw_slice.starts_with("[Document:") || raw_slice.starts_with("[Section:") {
+        raw_slice.to_string()
+    } else if !section_path.is_empty() {
+        format!("{}\n[Section: {}]\n\n{}", header, section_path, raw_slice)
     } else {
         format!("{}\n\n{}", header, raw_slice)
     }

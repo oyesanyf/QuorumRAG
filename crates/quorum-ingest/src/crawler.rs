@@ -193,9 +193,92 @@ impl FilesystemCrawler {
         Ok(summary)
     }
 
-    fn build_walker(&self, root: &Path) -> WalkParallel {
-        let mut builder = WalkBuilder::new(root);
+    /// Synchronously crawls multiple directory roots in a unified work-stealing parallel traversal.
+    pub fn crawl_multi_root_sync(&self, roots: &[PathBuf]) -> Result<Vec<DiscoveredCandidate>, IngestError> {
+        let valid_roots: Vec<&Path> = roots.iter().map(|p| p.as_path()).filter(|p| p.exists()).collect();
+        if valid_roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stats = Arc::new(AtomicCrawlerStats::new());
+        let mut builder = WalkBuilder::new(valid_roots[0]);
+        for root in &valid_roots[1..] {
+            builder.add(root);
+        }
+        self.configure_builder(&mut builder);
+        let walker = builder.build_parallel();
+        let router = self.router.clone();
 
+        walker.run(move || {
+            let tx = tx.clone();
+            let router = router.clone();
+            let stats = Arc::clone(&stats);
+
+            Box::new(move |entry_result| {
+                if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
+                    if tx.send(candidate).is_err() {
+                        return WalkState::Quit;
+                    }
+                }
+                WalkState::Continue
+            })
+        });
+
+        Ok(rx.into_iter().collect())
+    }
+
+    /// Streams candidate files across multiple directory roots through a bounded Tokio MPSC channel
+    /// using OS low-priority background thread scheduling and work-stealing parallel traversal.
+    pub fn stream_crawl_multi_root(
+        self: Arc<Self>,
+        roots: Vec<PathBuf>,
+        tx: mpsc::Sender<DiscoveredCandidate>,
+        io_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> tokio::task::JoinHandle<Result<CrawlerStats, IngestError>> {
+        tokio::task::spawn_blocking(move || {
+            crate::throttling::set_background_thread_priority();
+            let start = Instant::now();
+            let stats = Arc::new(AtomicCrawlerStats::new());
+
+            let valid_roots: Vec<PathBuf> = roots.into_iter().filter(|p| p.exists()).collect();
+            if !valid_roots.is_empty() {
+                let mut builder = WalkBuilder::new(&valid_roots[0]);
+                for root in &valid_roots[1..] {
+                    builder.add(root);
+                }
+                self.configure_builder(&mut builder);
+                let walker = builder.build_parallel();
+                let router = self.router.clone();
+                let stats_clone = Arc::clone(&stats);
+                let tx_clone = tx.clone();
+                let io_sem = Arc::clone(&io_semaphore);
+
+                walker.run(move || {
+                    let tx = tx_clone.clone();
+                    let router = router.clone();
+                    let stats = Arc::clone(&stats_clone);
+                    let io_permit = io_sem.clone().try_acquire_owned().ok();
+
+                    Box::new(move |entry_result| {
+                        let _permit_guard = &io_permit;
+                        if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
+                            if tx.blocking_send(candidate).is_err() {
+                                return WalkState::Quit;
+                            }
+                        }
+                        WalkState::Continue
+                    })
+                });
+            }
+
+            let summary = stats.snapshot(start.elapsed().as_millis() as u64);
+            crate::throttling::end_background_thread_priority();
+            Ok(summary)
+        })
+    }
+
+    /// Configures ignore rules, source code exclusions, and binary filters on the WalkBuilder.
+    pub fn configure_builder(&self, builder: &mut WalkBuilder) {
         builder
             .hidden(self.config.skip_hidden)
             .ignore(self.config.ignore_files)
@@ -297,11 +380,6 @@ impl FilesystemCrawler {
                             | "composer.lock"
                             | "gemfile.lock"
                     )
-                    || std::path::Path::new(&lower)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(quorum_classifier::is_binary_executable_extension)
-                        .unwrap_or(false)
                 {
                     return false;
                 } else if exclude_source_code {
@@ -324,7 +402,11 @@ impl FilesystemCrawler {
         if self.config.crawler_threads > 0 {
             builder.threads(self.config.crawler_threads);
         }
+    }
 
+    fn build_walker(&self, root: &Path) -> WalkParallel {
+        let mut builder = WalkBuilder::new(root);
+        self.configure_builder(&mut builder);
         builder.build_parallel()
     }
 

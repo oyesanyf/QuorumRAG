@@ -22,6 +22,7 @@ walkdir = { workspace = true }
 # Concurrency & Async
 tokio = { workspace = true }
 futures = { workspace = true }
+rayon = "1.10"
 
 # Cryptography & Serialization
 blake3 = { workspace = true }
@@ -53,6 +54,8 @@ windows = { version = "0.58", features = [
     "Globalization",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

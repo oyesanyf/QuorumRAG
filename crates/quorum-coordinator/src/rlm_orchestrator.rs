@@ -8,6 +8,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+use dashmap::DashMap;
+use tokio::task::JoinSet;
 use quorum_contract::rlm::*;
 use crate::hardware::HardwareTelemetry;
 use crate::offline_engine::DeterministicOfflineSynthesisEngine;
@@ -912,6 +915,356 @@ impl RlmOrchestrator {
             external_node_ids,
         })
     }
+
+    /// Concurrent version of `enrich_retrieved_chunks_with_parent_rlm` executing
+    /// parent document expansion and regex grep over a `JoinSet` bounded by `RlmDepthAwareSemaphore`.
+    pub async fn enrich_retrieved_chunks_with_parent_rlm_concurrent(
+        prompt: &str,
+        chunks: &mut [quorum_types::ScoredChunk],
+        storage: Arc<dyn crate::scatter_gather::StorageSearcher>,
+        max_tier: u8,
+        semaphore: Arc<RlmDepthAwareSemaphore>,
+        slice_cache: Option<Arc<RlmParentSliceCache>>,
+    ) {
+        const STOPWORDS: &[&str] = &[
+            "the", "and", "for", "with", "that", "this", "from", "what", "who", "where",
+            "when", "which", "how", "tell", "about", "show", "give", "list", "find",
+            "does", "have", "has", "his", "her", "their", "details", "information",
+        ];
+
+        let query_terms: Vec<String> = prompt
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|w| w.to_ascii_lowercase())
+            .filter(|w| w.len() >= 3 && !STOPWORDS.contains(&w.as_str()))
+            .collect();
+
+        let mut candidate_indices = Vec::new();
+        for (idx, scored) in chunks.iter().enumerate() {
+            if candidate_indices.len() >= 12 {
+                break;
+            }
+            if scored.is_remote
+                || (!scored.source_peer.is_empty() && !scored.source_peer.eq_ignore_ascii_case("local"))
+            {
+                continue;
+            }
+            let head = scored.chunk.text_content.trim_start();
+            if head.starts_with("[Image Document:") || head.starts_with("[Audio Document:") {
+                continue;
+            }
+            candidate_indices.push(idx);
+        }
+
+        if candidate_indices.is_empty() {
+            return;
+        }
+
+        let mut join_set = JoinSet::new();
+
+        for (rank, &chunk_idx) in candidate_indices.iter().enumerate() {
+            let scored = chunks[chunk_idx].clone();
+            let storage = Arc::clone(&storage);
+            let sem = Arc::clone(&semaphore);
+            let terms = query_terms.clone();
+            let cache = slice_cache.clone();
+
+            join_set.spawn(async move {
+                let _permit = sem.acquire(0).await;
+
+                let doc_key = if !scored.chunk.file_path.is_empty() {
+                    scored.chunk.file_path.clone()
+                } else {
+                    scored.chunk.document_id.clone()
+                };
+
+                let is_chunk_0 = scored.chunk.chunk_id.ends_with(":0")
+                    || scored.chunk.line_start <= 25
+                    || serde_json::from_str::<serde_json::Value>(&scored.chunk.metadata_json)
+                        .ok()
+                        .and_then(|v| v.get("chunk_index").and_then(|idx| idx.as_u64()))
+                        .map(|idx| idx == 0)
+                        .unwrap_or(false);
+                let is_primary_hit = rank < 6 || is_chunk_0;
+                let window_bytes = if is_primary_hit { 10000 } else { 3000 };
+
+                let expanded = storage.expand_parent_window(&doc_key, &scored.chunk.text_content, window_bytes, max_tier);
+                let Some((win_start, win_end, mut expanded_text, title_opt, author_opt)) = expanded else {
+                    return (chunk_idx, None);
+                };
+
+                if expanded_text.trim().is_empty() {
+                    return (chunk_idx, None);
+                }
+
+                if let Some(ref c) = cache {
+                    c.insert_or_get(&doc_key, expanded_text.as_bytes());
+                }
+
+                let win_low = expanded_text.to_ascii_lowercase();
+                let missing_terms: Vec<String> = terms
+                    .iter()
+                    .filter(|qt| !win_low.contains(qt.as_str()))
+                    .take(4)
+                    .map(|qt| regex::escape(qt))
+                    .collect();
+
+                if !missing_terms.is_empty() {
+                    let pattern = format!("(?:{})", missing_terms.join("|"));
+                    let grep_hits = storage.regex_grep(&doc_key, &pattern, 3, max_tier);
+                    for hit in grep_hits {
+                        if hit.start_byte < win_start || hit.end_byte > win_end {
+                            let ctx = hit.context_window.trim();
+                            if !ctx.is_empty() && !expanded_text.contains(ctx) {
+                                expanded_text.push_str(&format!(
+                                    "\n\n[Parent Document Match @ bytes {}..{}]\n{}",
+                                    hit.start_byte, hit.end_byte, ctx
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                let mut header_parts = Vec::new();
+                if let Some(t) = title_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    header_parts.push(format!("Title: \"{}\"", t));
+                }
+                if let Some(a) = author_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    header_parts.push(format!("Author: {}", a));
+                }
+                let final_text = if !header_parts.is_empty() && !expanded_text.trim_start().starts_with("[Document:") {
+                    format!("[Document: {}]\n{}", header_parts.join(" | "), expanded_text)
+                } else {
+                    expanded_text
+                };
+
+                let mut meta_val = serde_json::from_str::<serde_json::Value>(&scored.chunk.metadata_json)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(obj) = meta_val.as_object_mut() {
+                    obj.insert("parent_window_start_byte".to_string(), serde_json::json!(win_start));
+                    obj.insert("parent_window_end_byte".to_string(), serde_json::json!(win_end));
+                    obj.insert("rlm_parent_enriched".to_string(), serde_json::json!(true));
+                }
+
+                (chunk_idx, Some((final_text, meta_val.to_string())))
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((idx, Some((text, meta)))) = res {
+                chunks[idx].chunk.text_content = text;
+                chunks[idx].chunk.metadata_json = meta;
+            }
+        }
+    }
+}
+
+/// Depth-aware concurrency semaphore for Recursive Language Models (arXiv:2512.24601)
+/// preventing recursive deadlocks between parent reasoning agents and child sub-queries.
+#[derive(Clone)]
+pub struct RlmDepthAwareSemaphore {
+    pub max_depth: usize,
+    pub depth_semaphores: Arc<Vec<Arc<tokio::sync::Semaphore>>>,
+}
+
+impl RlmDepthAwareSemaphore {
+    pub fn new(max_depth: usize, root_permits: usize, child_permits_per_depth: usize) -> Self {
+        let mut sems = Vec::with_capacity(max_depth + 1);
+        sems.push(Arc::new(tokio::sync::Semaphore::new(root_permits.max(1))));
+        for _ in 1..=max_depth {
+            sems.push(Arc::new(tokio::sync::Semaphore::new(child_permits_per_depth.max(1))));
+        }
+        Self {
+            max_depth,
+            depth_semaphores: Arc::new(sems),
+        }
+    }
+
+    pub fn default_depth_aware() -> Self {
+        Self::new(4, 16, 8)
+    }
+
+    pub async fn acquire(&self, depth: usize) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        if depth >= self.depth_semaphores.len() {
+            return Err("Exhausted: Max RLM recursion depth reached".to_string());
+        }
+        let sem = self.depth_semaphores[depth].clone();
+        sem.acquire_owned().await.map_err(|e| format!("RLM depth semaphore closed at depth {}: {}", depth, e))
+    }
+
+    pub fn try_acquire(&self, depth: usize) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        if depth >= self.depth_semaphores.len() {
+            return Err("Exhausted: Max RLM recursion depth reached".to_string());
+        }
+        let sem = self.depth_semaphores[depth].clone();
+        sem.try_acquire_owned().map_err(|e| format!("RLM depth semaphore unavailable at depth {}: {}", depth, e))
+    }
+
+    pub fn available_permits(&self, depth: usize) -> usize {
+        if depth >= self.depth_semaphores.len() {
+            0
+        } else {
+            self.depth_semaphores[depth].available_permits()
+        }
+    }
+}
+
+/// Zero-copy document slice cache using DashMap<String, Arc<Bytes>> with safe UTF-8 boundary snapping.
+#[derive(Clone, Default)]
+pub struct RlmParentSliceCache {
+    documents: Arc<DashMap<String, Arc<Bytes>>>,
+}
+
+impl RlmParentSliceCache {
+    pub fn new() -> Self {
+        Self {
+            documents: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn insert_or_get(&self, doc_id: &str, content: &[u8]) -> Arc<Bytes> {
+        self.documents
+            .entry(doc_id.to_string())
+            .or_insert_with(|| Arc::new(Bytes::copy_from_slice(content)))
+            .value()
+            .clone()
+    }
+
+    pub fn insert(&self, doc_id: &str, bytes: Bytes) {
+        self.documents.insert(doc_id.to_string(), Arc::new(bytes));
+    }
+
+    /// Slices bytes with zero-copy and safe UTF-8 boundary snapping.
+    pub fn slice_safe_utf8(
+        &self,
+        doc_id: &str,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Option<String> {
+        let b = self.documents.get(doc_id)?.value().clone();
+        let total_len = b.len();
+        if total_len == 0 || start_byte >= total_len {
+            return Some(String::new());
+        }
+
+        let mut s = start_byte.min(total_len);
+        let mut e = end_byte.min(total_len).max(s);
+
+        // Snap start boundary backward to valid UTF-8 leading byte
+        while s > 0 && s < total_len && (b[s] & 0xC0) == 0x80 {
+            s -= 1;
+        }
+
+        // Snap end boundary backward to valid UTF-8 boundary
+        while e > s && e < total_len && (b[e] & 0xC0) == 0x80 {
+            e -= 1;
+        }
+
+        let sub_bytes = b.slice(s..e);
+        std::str::from_utf8(&sub_bytes).ok().map(|s| s.to_string())
+    }
+
+    pub fn clear(&self) {
+        self.documents.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.documents.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+    }
+}
+
+/// Structured RLM tool invocation variants for concurrent execution.
+#[derive(Debug, Clone)]
+pub enum RlmToolInvocation {
+    PeekSlice {
+        doc_id: String,
+        start_byte: usize,
+        end_byte: usize,
+    },
+    RegexGrep {
+        doc_id: String,
+        pattern: String,
+        max_matches: usize,
+    },
+    SpawnSubQuery {
+        query: String,
+    },
+}
+
+/// Structured RLM tool outputs.
+#[derive(Debug, Clone)]
+pub enum RlmToolOutput {
+    PeekSlice(Option<String>),
+    RegexGrep(Vec<quorum_types::RegexMatchSpan>),
+    SubQuery(String),
+}
+
+/// Concurrently executes a batch of RLM tool invocations using `JoinSet` bounded by `RlmDepthAwareSemaphore`.
+pub async fn execute_rlm_tools_concurrent(
+    tools: Vec<RlmToolInvocation>,
+    storage: Arc<dyn crate::scatter_gather::StorageSearcher>,
+    max_tier: u8,
+    semaphore: Arc<RlmDepthAwareSemaphore>,
+    depth: usize,
+    slice_cache: Option<Arc<RlmParentSliceCache>>,
+) -> Vec<RlmToolOutput> {
+    let mut set = JoinSet::new();
+
+    for (idx, tool) in tools.into_iter().enumerate() {
+        let storage = Arc::clone(&storage);
+        let semaphore = Arc::clone(&semaphore);
+        let slice_cache = slice_cache.clone();
+
+        set.spawn(async move {
+            let output = match semaphore.acquire(depth).await {
+                Ok(_permit) => match tool {
+                    RlmToolInvocation::PeekSlice {
+                        doc_id,
+                        start_byte,
+                        end_byte,
+                    } => {
+                        let text = if let Some(ref cache) = slice_cache {
+                            cache.slice_safe_utf8(&doc_id, start_byte, end_byte).or_else(|| {
+                                storage.peek_slice(&doc_id, start_byte, end_byte, max_tier)
+                            })
+                        } else {
+                            storage.peek_slice(&doc_id, start_byte, end_byte, max_tier)
+                        };
+                        RlmToolOutput::PeekSlice(text)
+                    }
+                    RlmToolInvocation::RegexGrep {
+                        doc_id,
+                        pattern,
+                        max_matches,
+                    } => {
+                        let spans = storage.regex_grep(&doc_id, &pattern, max_matches, max_tier);
+                        RlmToolOutput::RegexGrep(spans)
+                    }
+                    RlmToolInvocation::SpawnSubQuery { query } => {
+                        RlmToolOutput::SubQuery(format!("Evaluated sub-query: {}", query.trim()))
+                    }
+                },
+                Err(e) => match tool {
+                    RlmToolInvocation::PeekSlice { .. } => RlmToolOutput::PeekSlice(None),
+                    RlmToolInvocation::RegexGrep { .. } => RlmToolOutput::RegexGrep(Vec::new()),
+                    RlmToolInvocation::SpawnSubQuery { .. } => RlmToolOutput::SubQuery(format!("Exhausted: {}", e)),
+                },
+            };
+            (idx, output)
+        });
+    }
+
+    let mut results_with_idx = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(item) = res {
+            results_with_idx.push(item);
+        }
+    }
+    results_with_idx.sort_by_key(|&(idx, _)| idx);
+    results_with_idx.into_iter().map(|(_, out)| out).collect()
 }
 
 #[cfg(test)]

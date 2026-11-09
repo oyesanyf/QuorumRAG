@@ -358,7 +358,7 @@ impl ReindexWorker {
 
             let access_tier = self.config.resolve_access_tier(file_path);
             let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
-            let raw_chunks = chunker.chunk_text(&content);
+            let raw_chunks = chunker.chunk_text_structure_aware(&content);
             if raw_chunks.is_empty() {
                 continue;
             }
@@ -370,7 +370,11 @@ impl ReindexWorker {
 
             for raw in raw_chunks {
                 let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-                let chunk_content = crate::chunker::prepend_contextual_header(&header, raw.text_slice);
+                let chunk_content = crate::chunker::prepend_contextual_header_with_section(
+                    &header,
+                    &raw.section_path,
+                    raw.text_slice,
+                );
                 file_chunk_hashes.push(raw_b3.clone());
 
                 let vector = if let Some(cached) = self.dedup.cache().get(&raw_b3) {
@@ -390,6 +394,14 @@ impl ReindexWorker {
                     "char_end": raw.char_end,
                     "chunk_index": raw.chunk_index,
                     "contract_hash": contract_hash,
+                    "parent_doc_id": file_b3.clone(),
+                    "parent_chunk_id": format!("{}:p{}", file_b3, raw.parent_chunk_index),
+                    "heading_path": raw.section_path,
+                    "section_path": raw.section_path,
+                    "section_title": raw.section_title,
+                    "section_hierarchy": raw.section_hierarchy,
+                    "section_level": raw.section_level,
+                    "source_path": path_str.clone(),
                 })
                 .to_string();
 
@@ -585,53 +597,22 @@ impl ReindexWorker {
             .collect();
         let chunker = TextChunker::new(ChunkerConfig::default());
 
-        // Phase 1: Decoupled Upfront Discovery across all target slices (Semaphore-bounded parallel crawl)
-        let mut all_candidates: Vec<DiscoveredCandidate> = Vec::new();
-        let mut seen_paths: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
-        let crawl_concurrency = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(4, 16))
-            .unwrap_or(8);
-        let crawl_semaphore = Arc::new(tokio::sync::Semaphore::new(crawl_concurrency));
-        let mut crawl_futures = FuturesUnordered::new();
-
-        for target in &targets {
-            if !target.exists() {
-                warn!("Target path does not exist, skipping: {}", target.display());
-                continue;
-            }
-            if cancel_flag.load(Ordering::SeqCst) {
-                return Err(IngestError::Cancelled);
-            }
-            let cfg_clone = config.clone();
-            let target_clone = target.clone();
-            let sem_clone = Arc::clone(&crawl_semaphore);
-            crawl_futures.push(async move {
-                let _permit = sem_clone.acquire_owned().await.map_err(|_| IngestError::Cancelled)?;
-                tokio::task::spawn_blocking(move || {
-                    crate::throttling::set_background_thread_priority();
-                    let crawler = FilesystemCrawler::new(cfg_clone);
-                    crawler.crawl_path_sync(&target_clone)
-                })
-                .await
-                .map_err(|e| IngestError::Io(std::io::Error::other(format!("Crawl task panicked: {}", e))))?
-            });
-        }
-
-        while let Some(crawl_res) = crawl_futures.next().await {
-            if cancel_flag.load(Ordering::SeqCst) {
-                return Err(IngestError::Cancelled);
-            }
-            let candidates = crawl_res?;
-            for candidate in candidates {
-                if seen_paths.insert(candidate.path.clone()) {
-                    all_candidates.push(candidate);
-                }
-            }
-            {
-                let mut lock = progress.write().await;
-                if let Some(ref mut p) = *lock {
-                    p.files_total_estimated = all_candidates.len();
-                }
+        // Phase 1: Decoupled Upfront Discovery across all target slices (Unified work-stealing parallel crawl)
+        let crawler = Arc::new(FilesystemCrawler::new(config.clone()));
+        let crawler_c = Arc::clone(&crawler);
+        let targets_c = targets.clone();
+        let all_candidates = tokio::task::spawn_blocking(move || {
+            crate::throttling::set_background_thread_priority();
+            let res = crawler_c.crawl_multi_root_sync(&targets_c);
+            crate::throttling::end_background_thread_priority();
+            res
+        })
+        .await
+        .map_err(|e| IngestError::Io(std::io::Error::other(format!("Crawler task join failed: {}", e))))??;
+        {
+            let mut lock = progress.write().await;
+            if let Some(ref mut p) = *lock {
+                p.files_total_estimated = all_candidates.len();
             }
         }
 
@@ -657,7 +638,8 @@ impl ReindexWorker {
                 .map(|n| (n.get() * 2).clamp(8, 32))
                 .unwrap_or(16)
         };
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let permit_tiers = crate::thread_pool::IngestPermitTiers::new(concurrency);
+        let thread_pool = crate::thread_pool::IngestThreadPool::shared();
 
         let mut batch_chunks: Vec<DocumentChunk> = Vec::with_capacity(options.batch_size.max(64));
         let mut batch_parents: Vec<(quorum_types::IngestedParentDocument, u8)> = Vec::with_capacity(options.batch_size.max(64));
@@ -714,7 +696,7 @@ impl ReindexWorker {
                     }
                 }
 
-                let permit = semaphore.clone().acquire_owned().await.map_err(|_| IngestError::Cancelled)?;
+                let permit = permit_tiers.acquire_extraction().await?;
                 let embedder_c = Arc::clone(&embedder);
                 let dedup_c = Arc::clone(&dedup);
                 let storage_c = Arc::clone(&storage);
@@ -722,10 +704,8 @@ impl ReindexWorker {
                 let force_reembed = options.force_reembed;
                 let full_rebuild = options.full_rebuild;
 
-                futures.push(tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    crate::throttling::set_background_thread_priority();
-                    let outcome = process_candidate_sync(
+                futures.push(thread_pool.spawn_blocking_pinned(permit, move || {
+                    process_candidate_sync(
                         candidate,
                         access_tier,
                         force_reembed || full_rebuild,
@@ -733,9 +713,7 @@ impl ReindexWorker {
                         embedder_c,
                         dedup_c,
                         chunker_c,
-                    );
-                    crate::throttling::end_background_thread_priority();
-                    outcome
+                    )
                 }));
             }
 
@@ -799,6 +777,7 @@ impl ReindexWorker {
                 // If micro-batch is full, flush to storage
                 if batch_chunks.len() >= options.batch_size {
                     if !options.dry_run {
+                        let _commit_permit = permit_tiers.acquire_storage_commit().await?;
                         Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
                         let _ = storage.insert_chunks(&batch_chunks).await?;
                         for (pdoc, ptier) in batch_parents.drain(..) {
@@ -817,6 +796,7 @@ impl ReindexWorker {
 
         // Flush remaining micro-batch
         if !batch_chunks.is_empty() && !options.dry_run {
+            let _commit_permit = permit_tiers.acquire_storage_commit().await?;
             Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
             let _ = storage.insert_chunks(&batch_chunks).await?;
             for (pdoc, ptier) in batch_parents.drain(..) {
@@ -826,6 +806,7 @@ impl ReindexWorker {
             let _ = storage.bump_index_epoch("reindex_final_flush");
             batch_chunks.clear();
         } else if !batch_parents.is_empty() && !options.dry_run {
+            let _commit_permit = permit_tiers.acquire_storage_commit().await?;
             for (pdoc, ptier) in batch_parents.drain(..) {
                 let _ = storage.upsert_parent_document(&pdoc, ptier);
             }
@@ -1069,7 +1050,7 @@ fn process_candidate_sync(
                     size_bytes: candidate.size_bytes,
                 };
             }
-            let raw_chunks = chunker.chunk_text(&content);
+            let raw_chunks = chunker.chunk_text_structure_aware(&content);
             let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
             let path_str = path.to_string_lossy().to_string();
             let header = crate::chunker::build_contextual_header(path, &content);
@@ -1080,7 +1061,11 @@ fn process_candidate_sync(
 
             for raw in raw_chunks {
                 let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-                let chunk_content = crate::chunker::prepend_contextual_header(&header, raw.text_slice);
+                let chunk_content = crate::chunker::prepend_contextual_header_with_section(
+                    &header,
+                    &raw.section_path,
+                    raw.text_slice,
+                );
                 let chunk_b3 = DocumentChunk::compute_blake3_hash(&chunk_content);
                 file_chunk_hashes.push(raw_b3.clone());
 
@@ -1111,6 +1096,14 @@ fn process_candidate_sync(
                     "char_end": raw.char_end,
                     "chunk_index": raw.chunk_index,
                     "contract_hash": embedder.contract().derive_contract_hash_hex(),
+                    "parent_doc_id": file_b3.clone(),
+                    "parent_chunk_id": format!("{}:p{}", file_b3, raw.parent_chunk_index),
+                    "heading_path": raw.section_path,
+                    "section_path": raw.section_path,
+                    "section_title": raw.section_title,
+                    "section_hierarchy": raw.section_hierarchy,
+                    "section_level": raw.section_level,
+                    "source_path": path_str.clone(),
                 })
                 .to_string();
 

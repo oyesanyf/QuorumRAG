@@ -457,6 +457,8 @@ pub struct RawTrajectoryCandidate {
     /// Additional subscriber-specific strings (e.g., subscriber name, organization, client aliases) to scrub.
     pub extra_redact_terms: Vec<String>,
     pub created_unix_secs: i64,
+    pub source_file_path: Option<String>,
+    pub interaction_nonce_hex: Option<String>,
 }
 
 /// Policy parameters for VaultGemma-1B / RedactX-v3 Differential Privacy (DP) de-identification.
@@ -1136,6 +1138,8 @@ mod tests {
             citations: vec![(slice_text.to_string(), quote.to_string())],
             extra_redact_terms: vec!["Alice Walker".to_string()],
             created_unix_secs: 1_760_000_000,
+            source_file_path: None,
+            interaction_nonce_hex: None,
         };
 
         let sanitized =

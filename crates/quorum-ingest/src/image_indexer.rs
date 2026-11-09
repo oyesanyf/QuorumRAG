@@ -994,6 +994,9 @@ if ($engine) {
         addr: std::net::SocketAddr,
         preferred_model: Option<&str>,
     ) -> Result<String, String> {
+        static VISION_CAPTION_SEMAPHORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _vision_permit = VISION_CAPTION_SEMAPHORE.lock().unwrap_or_else(|e| e.into_inner());
+
         use std::io::{Read, Write};
         use std::net::TcpStream;
         use std::time::Duration;

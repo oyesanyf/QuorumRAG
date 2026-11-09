@@ -409,11 +409,72 @@ impl StorageEngine {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
+                .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
         });
         prioritize_media_intent(text, &mut combined);
         combined.truncate(top_k);
 
         Ok(combined)
+    }
+
+    /// Exposes standalone Reciprocal Rank Fusion ($k=60.0$) combining dense and sparse hits.
+    pub fn reciprocal_rank_fusion(
+        vector_hits: Vec<ScoredChunk>,
+        text_hits: Vec<ScoredChunk>,
+        k: f32,
+        dense_weight: f32,
+        sparse_weight: f32,
+        exclude_chunk_ids: &[String],
+        top_k: usize,
+    ) -> Vec<ScoredChunk> {
+        let exclude_set: HashSet<&str> = exclude_chunk_ids.iter().map(|s| s.as_str()).collect();
+        let mut rrf_map: HashMap<String, (f32, DocumentChunk)> = HashMap::new();
+
+        let mut current_rank = 1;
+        for (i, scored) in vector_hits.iter().enumerate() {
+            if exclude_set.contains(scored.chunk.chunk_id.as_str()) {
+                continue;
+            }
+            if i > 0 && (scored.score - vector_hits[i - 1].score).abs() > 1e-6 {
+                current_rank = i + 1;
+            }
+            let rrf = dense_weight / (k + current_rank as f32);
+            let entry = rrf_map
+                .entry(scored.chunk.chunk_id.clone())
+                .or_insert_with(|| (0.0, scored.chunk.clone()));
+            entry.0 += rrf;
+        }
+
+        let mut current_rank = 1;
+        for (i, scored) in text_hits.iter().enumerate() {
+            if exclude_set.contains(scored.chunk.chunk_id.as_str()) {
+                continue;
+            }
+            if i > 0 && (scored.score - text_hits[i - 1].score).abs() > 1e-6 {
+                current_rank = i + 1;
+            }
+            let rrf = sparse_weight / (k + current_rank as f32);
+            let entry = rrf_map
+                .entry(scored.chunk.chunk_id.clone())
+                .or_insert_with(|| (0.0, scored.chunk.clone()));
+            entry.0 += rrf;
+        }
+
+        let mut combined: Vec<ScoredChunk> = rrf_map
+            .into_iter()
+            .map(|(_id, (score, chunk))| ScoredChunk::new(chunk, score, "local", false))
+            .collect();
+
+        combined.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
+                .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
+        });
+
+        combined.truncate(top_k);
+        combined
     }
 
     /// Hybrid search combining vector search and BM25 full-text search via Reciprocal Rank Fusion (RRF).

@@ -6756,6 +6756,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "quorum-cli"
+version = "0.6.3"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "clap",
+ "ed25519-dalek 2.2.0",
+ "quorum-contract",
+ "quorum-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "quorum-contract"
 version = "0.6.3"
 dependencies = [
@@ -6783,7 +6803,9 @@ dependencies = [
  "async-trait",
  "axum",
  "blake3",
+ "bytes",
  "chrono",
+ "dashmap",
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
@@ -6862,12 +6884,14 @@ dependencies = [
  "flate2",
  "futures",
  "ignore",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "quorum-classifier",
  "quorum-contract",
  "quorum-storage",
  "quorum-types",
+ "rayon",
  "regex",
  "rusqlite",
  "serde",

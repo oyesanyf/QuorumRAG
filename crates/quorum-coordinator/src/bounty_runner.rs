@@ -79,6 +79,8 @@ impl BountyRunner {
             citations: raw.citations.clone(),
             extra_redact_terms: Vec::new(),
             created_unix_secs: chrono::Utc::now().timestamp(),
+            source_file_path: None,
+            interaction_nonce_hex: None,
         }
     }
 
