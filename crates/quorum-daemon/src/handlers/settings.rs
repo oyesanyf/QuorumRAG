@@ -673,7 +673,7 @@ pub async fn browse_folders_handler(
 
 /// POST /api/fs/pick-folder - Triggers native operating system folder selection dialog.
 pub async fn pick_folder_dialog_handler() -> impl IntoResponse {
-    let result = tokio::task::spawn_blocking(|| {
+    let result: Option<String> = tokio::task::spawn_blocking(|| -> Option<String> {
         #[cfg(windows)]
         {
             use std::process::Command;
@@ -706,9 +706,37 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
                 _ => None,
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
-            None
+            use std::process::Command;
+            let output = Command::new("osascript")
+                .args(["-e", "POSIX path of (choose folder with prompt \"Select a folder for QuorumRAG\")"])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if path.is_empty() { None } else { Some(path) }
+                }
+                _ => None,
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use std::process::Command;
+            let output = Command::new("zenity")
+                .args(["--file-selection", "--directory", "--title=Select a folder for QuorumRAG"])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if path.is_empty() { None } else { Some(path) }
+                }
+                _ => None,
+            }
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            None::<String>
         }
     })
     .await

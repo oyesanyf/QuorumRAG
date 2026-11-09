@@ -646,6 +646,7 @@ impl ReindexWorker {
 
         let mut futures = FuturesUnordered::new();
         let mut candidate_iter = all_candidates.into_iter();
+        let mut last_catalog_save = std::time::Instant::now();
 
         loop {
             if cancel_flag.load(Ordering::SeqCst) {
@@ -783,7 +784,10 @@ impl ReindexWorker {
                         for (pdoc, ptier) in batch_parents.drain(..) {
                             let _ = storage.upsert_parent_document(&pdoc, ptier);
                         }
-                        let _ = dedup.save_catalog_to_file(&catalog_path);
+                        if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                            let _ = dedup.save_catalog_to_file(&catalog_path);
+                            last_catalog_save = std::time::Instant::now();
+                        }
                         let _ = storage.bump_index_epoch("reindex_micro_batch");
                     } else {
                         batch_parents.clear();
