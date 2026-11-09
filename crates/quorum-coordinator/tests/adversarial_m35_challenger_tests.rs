@@ -268,6 +268,8 @@ fn test_marketplace_sanitizer_end_to_end_airlock_invariants() {
         citations: vec![(slice_text.to_string(), verbatim_quote.to_string())],
         extra_redact_terms: Vec::new(),
         created_unix_secs: 1_760_000_000,
+        source_file_path: None,
+        interaction_nonce_hex: None,
     };
 
     // 1. Clean candidate passes and produces valid Ed25519 signature

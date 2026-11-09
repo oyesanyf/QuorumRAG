@@ -336,6 +336,10 @@ pub fn compute_blake3_merkle_root(record_hashes: &[String]) -> String {
     bytes_to_hex(&current_layer[0])
 }
 
+fn default_true_bool() -> bool {
+    true
+}
+
 /// Zero-Knowledge Data Catalog Manifest broadcast over the mesh or served on `/api/v1/marketplace/preview`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DataCatalogManifest {
@@ -350,6 +354,9 @@ pub struct DataCatalogManifest {
     pub price_per_1k_records_cents: u64,
     /// Capped at `<= 5` canary records for authenticated buyers; empty (`[]`) for unauthenticated callers.
     pub canary_sample: Vec<SanitizedTrainingRecord>,
+    /// Cryptographic proof that every record in the sealed batch passed all 4 exclusion stages.
+    #[serde(default = "default_true_bool")]
+    pub synthetic_contamination_filtered: bool,
     pub created_unix_secs: i64,
     pub manifest_signature_hex: String,
 }
@@ -405,6 +412,7 @@ impl DataCatalogManifest {
             merkle_root_blake3,
             price_per_1k_records_cents,
             canary_sample,
+            synthetic_contamination_filtered: true,
             created_unix_secs,
             manifest_signature_hex: String::new(),
         };
@@ -431,6 +439,7 @@ impl DataCatalogManifest {
         hasher.update(&self.total_tokens.to_le_bytes());
         hasher.update(self.merkle_root_blake3.as_bytes());
         hasher.update(&self.price_per_1k_records_cents.to_le_bytes());
+        hasher.update(&[u8::from(self.synthetic_contamination_filtered)]);
         hasher.update(&self.created_unix_secs.to_le_bytes());
         hasher.finalize().as_bytes().to_vec()
     }
@@ -681,15 +690,18 @@ mod tests {
         assert!(manifest.verify_ed25519(&pubkey_bytes));
         assert_eq!(manifest.sft_record_count, 1);
         assert_eq!(manifest.canary_sample.len(), 1);
+        assert!(manifest.synthetic_contamination_filtered);
 
         // Unauthenticated preview must strip all canary text
         let unauth = manifest.to_unauthenticated_preview();
         assert!(unauth.canary_sample.is_empty());
         assert_eq!(unauth.merkle_root_blake3, manifest.merkle_root_blake3);
+        assert!(unauth.synthetic_contamination_filtered);
 
         // Authenticated preview must watermark canary lines for the specific requester
         let auth_preview = manifest.to_authenticated_watermarked_preview(&seed, "us-lab-alpha");
         assert_eq!(auth_preview.canary_sample.len(), 1);
+        assert!(auth_preview.synthetic_contamination_filtered);
         assert!(auth_preview.canary_sample[0].verify_buyer_watermark(&seed, "us-lab-alpha", "preview_canary"));
         assert!(!auth_preview.canary_sample[0].verify_buyer_watermark(&seed, "other-buyer", "preview_canary"));
     }

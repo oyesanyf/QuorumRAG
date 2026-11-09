@@ -35,7 +35,7 @@ fn test_adversarial_interrogative_restatements_matrix() {
         ("what was the decision", "The Decision was "),
         ("what are the requirements", "The Requirements are "),
         ("what were the findings", "The Findings were "),
-        ("what the patientpoint dispute", "The Patientpoint Dispute is "),
+        ("what the patientpoint dispute", "The PatientPoint Dispute is "),
         ("where did Femi attend", "Femi attended "),
         ("where did Femi graduate", "Femi studied at "),
         ("what did Femi do at Cigna", "At Cigna, Femi "),

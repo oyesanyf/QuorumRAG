@@ -2479,8 +2479,51 @@ function secureRandomIndex(n) {
   btnOpenReindex.addEventListener('click', () => {
     modalReindex.classList.remove('hidden');
     checkReindexStatus();
+    renderReindexExplorer();
   });
   btnCloseReindex.addEventListener('click', () => modalReindex.classList.add('hidden'));
+
+  if (modalReindex) {
+    modalReindex.addEventListener('click', async (e) => {
+      const actionEl = e.target.closest('[data-action]');
+      if (!actionEl) return;
+      const action = actionEl.dataset.action;
+      const folderPath = actionEl.dataset.folderPath || '';
+      if (action === 'browse-dir') {
+        e.preventDefault();
+        await window.quorumBrowseDir(folderPath);
+      } else if (action === 'browse-up') {
+        e.preventDefault();
+        await window.quorumBrowseDir(folderPath || currentBrowseParentPath || '');
+      } else if (action === 'browse-root') {
+        e.preventDefault();
+        await window.quorumBrowseDir('');
+      } else if (action === 'reindex-pick-folder') {
+        e.preventDefault();
+        e.stopPropagation();
+        const inp = document.getElementById('reindex-target-path');
+        if (inp && folderPath) inp.value = folderPath;
+        renderReindexExplorer();
+        showSettingsToast('Target reindex folder set: ' + folderPath);
+      } else if (action === 'trigger-native-folder-picker') {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          const resp = await fetch('/api/fs/pick-folder', { method: 'POST' });
+          const data = await resp.json();
+          if (data.status === 'ok' && data.path) {
+            const chosen = data.path;
+            const inp = document.getElementById('reindex-target-path');
+            if (inp) inp.value = chosen;
+            await window.quorumBrowseDir(chosen);
+            showSettingsToast('✓ Target folder set: ' + chosen);
+          }
+        } catch (err) {
+          showSettingsToast('Native folder picker failed: ' + err.message);
+        }
+      }
+    });
+  }
 
   btnStartReindex.addEventListener('click', async () => {
     const targetPath = document.getElementById('reindex-target-path').value.trim();
@@ -3039,20 +3082,223 @@ function secureRandomIndex(n) {
     }
   }
 
+  let cachedDrives = ['D:\\', 'C:\\'];
+
   async function fetchBrowseFolders(pathStr) {
     try {
-      const resp = await fetch(`/api/mesh/browse-folders?path=${encodeURIComponent(pathStr || '')}`);
+      let resp = await fetch(`/api/fs/browse-folders?path=${encodeURIComponent(pathStr || '')}`);
+      if (!resp.ok) {
+        resp = await fetch(`/api/mesh/browse-folders?path=${encodeURIComponent(pathStr || '')}`);
+      }
       if (!resp.ok) return;
       const data = await resp.json();
       currentBrowsePath = data.current_path || '';
       currentBrowseParentPath = data.parent_path || '';
-      cachedBrowseDirs = data.directories || [];
+      cachedBrowseDirs = Array.isArray(data.directories) ? data.directories : [];
+      if (Array.isArray(data.drives) && data.drives.length > 0) {
+        cachedDrives = data.drives;
+      }
     } catch (_) {}
+  }
+
+  function buildPathBreadcrumbs(currentPath) {
+    if (!currentPath) {
+      return [{ label: '💽 This PC', path: '' }];
+    }
+
+    const normalized = currentPath.replace(/\//g, '\\');
+    const crumbs = [{ label: '💽 This PC', path: '' }];
+
+    let remaining = normalized;
+    const driveMatch = remaining.match(/^([a-zA-Z]:\\?)/);
+    let accumulated = '';
+
+    if (driveMatch) {
+      const driveRoot = driveMatch[1].endsWith('\\') ? driveMatch[1] : driveMatch[1] + '\\';
+      accumulated = driveRoot;
+      crumbs.push({ label: `💽 ${driveRoot}`, path: driveRoot });
+      remaining = remaining.slice(driveMatch[0].length);
+    }
+
+    const parts = remaining.split('\\').filter(Boolean);
+    for (const part of parts) {
+      accumulated = accumulated ? (accumulated.endsWith('\\') ? accumulated + part : accumulated + '\\' + part) : part;
+      crumbs.push({ label: part, path: accumulated });
+    }
+
+    return crumbs;
+  }
+
+  function renderWindowsFileExplorerHtml(opts) {
+    const {
+      contextId = 'general',
+      currentPath = currentBrowsePath,
+      parentPath = currentBrowseParentPath,
+      drives = cachedDrives,
+      directories = cachedBrowseDirs,
+      selectedSet = new Set(),
+      selectAction = 'mkt-toggle-folder',
+      selectButtonText = '+ Select Folder',
+      activePathAction = '',
+      activePathButtonText = '+ Select Active Folder',
+      allowNativeDialog = true,
+    } = opts || {};
+
+    const crumbs = buildPathBreadcrumbs(currentPath);
+    const crumbsHtml = crumbs.map((c, idx) => {
+      const isLast = idx === crumbs.length - 1;
+      return `
+        <button type="button" class="folder-breadcrumb-segment ${isLast ? 'active' : ''}" data-action="browse-dir" data-folder-path="${escapeHtml(c.path)}" title="Go to ${escapeHtml(c.label)}">
+          ${escapeHtml(c.label)}
+        </button>
+        ${!isLast ? '<span class="folder-breadcrumb-sep">›</span>' : ''}
+      `;
+    }).join('');
+
+    const drivesList = (Array.isArray(drives) && drives.length > 0) ? drives : ['D:\\', 'C:\\'];
+    const drivesHtml = drivesList.map(drv => {
+      const isCur = currentPath && currentPath.toLowerCase().startsWith(drv.toLowerCase());
+      return `
+        <button type="button" class="pill-btn folder-drive-pill ${isCur ? 'active' : ''}" data-action="browse-dir" data-folder-path="${escapeHtml(drv)}" title="Explore drive ${escapeHtml(drv)}">
+          💽 ${escapeHtml(drv)}
+        </button>
+      `;
+    }).join('');
+
+    const dirRowsHtml = (Array.isArray(directories) && directories.length > 0) ? directories.map(d => {
+      const p = String(d.path || '');
+      const isSelected = selectedSet && selectedSet.has(p.toLowerCase());
+      const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
+      return `
+        <div class="folder-browser-item folder-row ${isSelected ? 'selected' : ''}" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Click row to open ${escapeHtml(d.name)}">
+          <div class="folder-row-left">
+            <input type="checkbox" class="folder-row-checkbox" ${isSelected ? 'checked' : ''} data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}" title="Toggle selection for ${escapeHtml(d.name)}">
+            <span class="folder-row-icon">${icon}</span>
+            <div class="folder-row-details">
+              <span class="folder-row-name">${escapeHtml(d.name)}</span>
+              ${p && p !== d.name ? `<span class="folder-row-path">${escapeHtml(p)}</span>` : ''}
+            </div>
+          </div>
+          <div class="folder-row-actions">
+            <button type="button" class="pill-btn folder-select-btn ${isSelected ? 'selected' : ''}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}">
+              ${isSelected ? '✓ Selected' : (selectButtonText || '+ Select Folder')}
+            </button>
+            <button type="button" class="pill-btn folder-open-btn" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Open folder">
+              Open →
+            </button>
+          </div>
+        </div>
+      `;
+    }).join('') : `
+      <div style="padding:14px; text-align:center; color:var(--text-muted); font-size:12.5px;">
+        No subdirectories found in this folder.
+      </div>
+    `;
+
+    return `
+      <div class="folder-explorer-container" data-explorer-context="${contextId}">
+        <div class="folder-explorer-toolbar">
+          <div class="folder-explorer-nav-buttons">
+            <button type="button" class="pill-btn folder-nav-btn" data-action="browse-root" title="Go to This PC (Drives Root)">
+              💽 This PC
+            </button>
+            ${currentPath ? `
+              <button type="button" class="pill-btn folder-nav-btn" data-action="browse-up" data-folder-path="${escapeHtml(parentPath || '')}" title="Up to parent directory">
+                ⬅ Back / Up
+              </button>
+            ` : ''}
+          </div>
+
+          <div class="folder-explorer-drives">
+            ${drivesHtml}
+          </div>
+
+          ${allowNativeDialog ? `
+            <button type="button" class="pill-btn folder-native-picker-btn" data-action="trigger-native-folder-picker" data-context="${contextId}" title="Browse with Windows File Explorer dialog">
+              📂 Browse with Windows Explorer...
+            </button>
+          ` : ''}
+        </div>
+
+        <div class="folder-explorer-address-bar">
+          <span class="folder-address-label">Address:</span>
+          <div class="folder-breadcrumbs custom-scroll">
+            ${crumbsHtml}
+          </div>
+        </div>
+
+        ${currentPath && activePathAction ? `
+          <div class="folder-explorer-active-bar">
+            <div class="folder-active-info">
+              <span class="folder-active-icon">📁</span>
+              <span class="folder-active-path">Active: <code>${escapeHtml(currentPath)}</code></span>
+            </div>
+            <button type="button" class="btn-primary folder-active-action-btn" data-action="${activePathAction}" data-folder-path="${escapeHtml(currentPath)}" data-context="${contextId}">
+              ${escapeHtml(activePathButtonText || '+ Select Active Folder')}
+            </button>
+          </div>
+        ` : ''}
+
+        <div class="folder-explorer-list custom-scroll">
+          ${dirRowsHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderReindexExplorer() {
+    const mount = document.getElementById('reindex-folder-explorer-mount');
+    if (!mount) return;
+    const curTarget = document.getElementById('reindex-target-path');
+    const targetVal = curTarget ? curTarget.value.trim().toLowerCase() : '';
+    const selectedSet = new Set(targetVal ? [targetVal] : []);
+    mount.innerHTML = renderWindowsFileExplorerHtml({
+      contextId: 'reindex',
+      currentPath: currentBrowsePath,
+      parentPath: currentBrowseParentPath,
+      drives: cachedDrives,
+      directories: cachedBrowseDirs,
+      selectedSet: selectedSet,
+      selectAction: 'reindex-pick-folder',
+      selectButtonText: 'Select for Reindex',
+      activePathAction: 'reindex-pick-folder',
+      activePathButtonText: 'Reindex Active Folder',
+      allowNativeDialog: true,
+    });
+  }
+
+  async function toggleMarketplaceFolder(targetPath, forceAdd) {
+    if (!targetPath) return;
+    const mkt = cachedMarketplaceStatus || {};
+    const curFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders.slice() : [];
+    const existingIdx = curFolders.findIndex(f => f.toLowerCase() === targetPath.toLowerCase());
+    let toastMsg = '';
+    if (existingIdx >= 0) {
+      if (forceAdd) return;
+      curFolders.splice(existingIdx, 1);
+      toastMsg = 'Removed folder from Opt-In scope: ' + targetPath;
+    } else {
+      curFolders.push(targetPath);
+      toastMsg = '✓ Added folder to Opt-In scope: ' + targetPath;
+    }
+    await fetch('/api/v1/marketplace/opt-in', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        opt_in_enabled: !!mkt.opt_in_enabled,
+        user_consent_checked: !!mkt.user_consent_checked,
+        opt_in_folders: curFolders
+      })
+    });
+    await fetchMarketplaceData();
+    renderSettingsTabContent(activeSettingsTab, '');
+    if (toastMsg) showSettingsToast(toastMsg);
   }
 
   window.quorumBrowseDir = async function(pathStr) {
     await fetchBrowseFolders(pathStr);
     renderSettingsTabContent(activeSettingsTab, '');
+    renderReindexExplorer();
     showSettingsToast(pathStr ? ('Browsing ' + pathStr) : 'Showing physical drives');
   };
 
@@ -3448,13 +3694,75 @@ function secureRandomIndex(n) {
 
         case 'browse-up':
           e.preventDefault();
-          await window.quorumBrowseDir(folderPath || '');
+          await window.quorumBrowseDir(folderPath || currentBrowseParentPath || '');
           break;
 
         case 'browse-root':
           e.preventDefault();
           await window.quorumBrowseDir('');
           break;
+
+        case 'trigger-native-folder-picker': {
+          e.preventDefault();
+          e.stopPropagation();
+          const ctx = actionEl.dataset.context || 'general';
+          showSettingsToast('Opening Windows File Explorer folder picker...');
+          try {
+            const resp = await fetch('/api/fs/pick-folder', { method: 'POST' });
+            const data = await resp.json();
+            if (data.status === 'ok' && data.path) {
+              const chosen = data.path;
+              showSettingsToast('✓ Selected folder: ' + chosen);
+              await window.quorumBrowseDir(chosen);
+              if (ctx === 'reindex') {
+                const inp = document.getElementById('reindex-target-path');
+                if (inp) inp.value = chosen;
+                renderReindexExplorer();
+              } else if (ctx === 'newdoc') {
+                const inp = document.getElementById('new-doc-path-input');
+                if (inp) inp.value = chosen;
+              } else if (ctx === 'mesh') {
+                await window.quorumShareFolder(chosen);
+              } else if (ctx === 'mkt' || ctx === 'general') {
+                await toggleMarketplaceFolder(chosen, true);
+              }
+            } else {
+              showSettingsToast('Folder selection cancelled');
+            }
+          } catch (err) {
+            showSettingsToast('Native folder picker unavailable: ' + err.message);
+          }
+          break;
+        }
+
+        case 'newdoc-pick-folder': {
+          e.preventDefault();
+          e.stopPropagation();
+          if (folderPath) {
+            const inp = document.getElementById('new-doc-path-input');
+            if (inp) inp.value = folderPath;
+            showSettingsToast('Selected for indexing: ' + folderPath);
+          }
+          break;
+        }
+
+        case 'reindex-pick-folder': {
+          e.preventDefault();
+          e.stopPropagation();
+          if (folderPath) {
+            const inp = document.getElementById('reindex-target-path');
+            if (inp) inp.value = folderPath;
+            renderReindexExplorer();
+            showSettingsToast('Target reindex folder set: ' + folderPath);
+          }
+          break;
+        }
+
+        case 'storage-browse-dir': {
+          e.preventDefault();
+          if (folderPath) await window.quorumBrowseDir(folderPath);
+          break;
+        }
 
         case 'share-folder':
           e.preventDefault();
@@ -4011,31 +4319,10 @@ function secureRandomIndex(n) {
 
         case 'mkt-toggle-folder': {
           e.preventDefault();
+          e.stopPropagation();
           const targetPath = (actionEl.dataset.folderPath || '').trim();
           if (!targetPath) return;
-          const mkt = cachedMarketplaceStatus || {};
-          const curFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders.slice() : [];
-          const existingIdx = curFolders.findIndex(f => f.toLowerCase() === targetPath.toLowerCase());
-          let toastText = '';
-          if (existingIdx >= 0) {
-            curFolders.splice(existingIdx, 1);
-            toastText = 'Removed folder from Opt-In scope: ' + targetPath;
-          } else {
-            curFolders.push(targetPath);
-            toastText = '✓ Added folder to Opt-In scope: ' + targetPath;
-          }
-          await fetch('/api/v1/marketplace/opt-in', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              opt_in_enabled: !!mkt.opt_in_enabled,
-              user_consent_checked: !!mkt.user_consent_checked,
-              opt_in_folders: curFolders
-            })
-          });
-          await fetchMarketplaceData();
-          renderSettingsTabContent(activeSettingsTab, '');
-          showSettingsToast(toastText);
+          await toggleMarketplaceFolder(targetPath, false);
           break;
         }
 
@@ -4048,28 +4335,13 @@ function secureRandomIndex(n) {
             if (inp) inp.focus();
             return;
           }
-          const mkt = cachedMarketplaceStatus || {};
-          const curFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders.slice() : [];
-          if (!curFolders.some(f => f.toLowerCase() === targetPath.toLowerCase())) {
-            curFolders.push(targetPath);
-          }
-          await fetch('/api/v1/marketplace/opt-in', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              opt_in_enabled: !!mkt.opt_in_enabled,
-              user_consent_checked: !!mkt.user_consent_checked,
-              opt_in_folders: curFolders
-            })
-          });
-          await fetchMarketplaceData();
-          renderSettingsTabContent(activeSettingsTab, '');
-          showSettingsToast('✓ Added folder to Opt-In scope: ' + targetPath);
+          await toggleMarketplaceFolder(targetPath, true);
           break;
         }
 
         case 'mkt-remove-folder': {
           e.preventDefault();
+          e.stopPropagation();
           const targetPath = (actionEl.dataset.folderPath || '').trim();
           if (!targetPath) return;
           const mkt = cachedMarketplaceStatus || {};
@@ -4087,6 +4359,24 @@ function secureRandomIndex(n) {
           await fetchMarketplaceData();
           renderSettingsTabContent(activeSettingsTab, '');
           showSettingsToast('Removed folder from Opt-In scope: ' + targetPath);
+          break;
+        }
+
+        case 'mkt-clear-all-folders': {
+          e.preventDefault();
+          const mkt = cachedMarketplaceStatus || {};
+          await fetch('/api/v1/marketplace/opt-in', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              opt_in_enabled: !!mkt.opt_in_enabled,
+              user_consent_checked: !!mkt.user_consent_checked,
+              opt_in_folders: []
+            })
+          });
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast('Cleared all selected Opt-In folders');
           break;
         }
 
@@ -4143,6 +4433,66 @@ function secureRandomIndex(n) {
           await fetchMarketplaceData();
           renderSettingsTabContent(activeSettingsTab, '');
           showSettingsToast(`✓ Fulfilled bounty ${bountyId} ($${((resData.payout_cents || 0) / 100).toFixed(2)} credited to Ledger)`);
+          break;
+        }
+
+        case 'mkt-issue-test-cert': {
+          e.preventDefault();
+          const resp = await fetch('/api/v1/marketplace/test/issue-cert', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              buyer_id: 'localhost-ui-buyer',
+              legal_entity_name: 'Localhost UI Test Lab',
+              authorized_egress_cidrs: ['127.0.0.1/32']
+            })
+          });
+          const resData = await resp.json().catch(() => ({}));
+          const outBox = document.getElementById('marketplace-test-output-box');
+          if (!resp.ok) {
+            showSettingsToast('⚠ Failed to issue test certificate: ' + (resData.error || resp.status));
+            if (outBox) outBox.textContent = 'Error: ' + JSON.stringify(resData, null, 2);
+            return;
+          }
+          if (outBox) {
+            const certObj = resData.cert || resData.certificate;
+            outBox.textContent = '=== Sovereign Buyer Certificate Issued (127.0.0.1/32) ===\n' +
+              JSON.stringify(certObj, null, 2);
+          }
+          showSettingsToast('✓ Issued 127.0.0.1/32 Test Certificate for localhost evaluation');
+          break;
+        }
+
+        case 'mkt-exec-test-transaction': {
+          e.preventDefault();
+          showSettingsToast('Running end-to-end localhost buy-and-sell escrow test...');
+          const resp = await fetch('/api/v1/marketplace/test/execute-transaction', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+          });
+          const resData = await resp.json().catch(() => ({}));
+          const outBox = document.getElementById('marketplace-test-output-box');
+          if (!resp.ok) {
+            showSettingsToast('⚠ Localhost transaction failed: ' + (resData.error || resp.status));
+            if (outBox) outBox.textContent = 'Transaction Failed: ' + JSON.stringify(resData, null, 2);
+            return;
+          }
+          if (outBox) {
+            const payoutCents = resData.payout_cents !== undefined ? resData.payout_cents : (resData.amount_paid_cents || 0);
+            outBox.textContent = '=== Localhost End-to-End Escrow & Pull Test PASSED ===\n' +
+              'Batch ID:           ' + resData.batch_id + '\n' +
+              'Status:             ' + resData.status + '\n' +
+              'Escrow Receipt ID:  ' + resData.receipt_id + '\n' +
+              'Records Pulled:     ' + resData.records_downloaded + '\n' +
+              'Watermark Verified: ' + (resData.watermark_verified ? 'Yes (Canary match)' : 'No') + '\n' +
+              'Synthetic Filtered: ' + (resData.synthetic_contamination_filtered ? 'Passed (4-Stage Gate) [true]' : 'No') + '\n' +
+              'Total Payout:       $' + (payoutCents / 100).toFixed(2) + '\n' +
+              'Layer 4 CIDR Check: PASSED (127.0.0.1/32 matched caller IP)';
+          }
+          await fetchMarketplaceData();
+          renderSettingsTabContent(activeSettingsTab, '');
+          showSettingsToast('✓ Localhost transaction verified: watermarked pull & escrow completed');
           break;
         }
 
@@ -4349,6 +4699,12 @@ function secureRandomIndex(n) {
       const action = inputEl.dataset.inputAction;
       if (action === 'filter-archived-search') {
         window._filterArchivedChats(inputEl.value);
+      } else if (action === 'filter-codebase-folders') {
+        codebaseFolderSearchFilter = (inputEl.value || '').trim().toLowerCase();
+        document.querySelectorAll('.codebase-folder-card[data-folder-search]').forEach(card => {
+          const hay = (card.dataset.folderSearch || '').toLowerCase();
+          card.style.display = (!codebaseFolderSearchFilter || hay.includes(codebaseFolderSearchFilter)) ? 'flex' : 'none';
+        });
       } else if (action === 'update-temperature-label') {
         const valEl = document.getElementById('val-temperature');
         if (valEl) valEl.textContent = Number(inputEl.value).toFixed(2);
@@ -4400,8 +4756,10 @@ function secureRandomIndex(n) {
     const optInFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders : [];
     const consentLedger = Array.isArray(mkt.consent_ledger) ? mkt.consent_ledger : [];
 
+    const optInLowerSet = new Set(optInFolders.map(f => String(f || '').toLowerCase()));
+
     const quickSubTabsBar = (activeSub) => `
-      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid var(--border-color);">
+      <div class="settings-subtab-nav">
         <button type="button" class="pill-btn" data-action="jump-tab" data-tab="general" style="${activeSub === 'general' ? 'background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;' : ''}">⚙️ General</button>
         <button type="button" class="pill-btn" data-action="jump-tab" data-tab="marketplace" style="${activeSub === 'marketplace' ? 'background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;' : ''}">💎 Data Opt-In &amp; Folders (${optInFolders.length})</button>
         <button type="button" class="pill-btn" data-action="jump-tab" data-tab="marketplace-ledger" style="${activeSub === 'marketplace-ledger' ? 'background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;' : ''}">📜 Consent &amp; Revenue Ledger (${consentLedger.length})</button>
@@ -4413,11 +4771,13 @@ function secureRandomIndex(n) {
       const lang = ui.language || 'Auto';
       const efforts = ui.reasoning_efforts || '6 selected';
       const folderSummaryText = optInFolders.length > 0
-        ? optInFolders.map(f => `<code>${escapeHtml(f)}</code>`).join(', ')
-        : '<span style="color:var(--text-muted);">No folders selected yet (Not Global — click "Select Opt-In Folders" to choose specific folders)</span>';
+        ? optInFolders.map(f => `<button type="button" class="pill-btn" style="padding:3px 9px; font-size:11.5px; border-color:#10a37f; color:#10a37f;" data-action="mkt-toggle-folder" data-folder-path="${escapeHtml(f)}" title="Click to remove ${escapeHtml(f)}">✓ ${escapeHtml(f)} ×</button>`).join(' ')
+        : '<span style="color:var(--text-muted);">No folders selected yet (Not Global — browse drives below or open "Data Opt-In &amp; Folders")</span>';
 
       settingsContent.innerHTML = `
-        <h2 class="settings-page-title" style="margin-bottom:10px;">General</h2>
+        <div class="settings-centered-container">
+        <h2 class="settings-page-title">General</h2>
+        <p class="settings-page-subtitle">Manage your Opt-In data sharing consent, folder selection, language, and retrieval defaults.</p>
         ${quickSubTabsBar('general')}
 
         <div class="settings-card" style="border:1.5px solid ${mkt.opt_in_enabled ? '#10a37f' : 'rgba(99,102,241,0.45)'};">
@@ -4425,7 +4785,7 @@ function secureRandomIndex(n) {
             <div>
               <div style="font-weight:700; font-size:15px;">💎 Sell / Share De-Identified Personal &amp; AI Training Data (Opt-Out by Default)</div>
               <div style="font-size:12.5px; color:var(--text-muted); margin-top:2px;">
-                Disabled by default (<code>opt_in_enabled: false</code>). You must explicitly check the agreement box and select specific folders to Opt-In.
+                Disabled by default (<code>opt_in_enabled: false</code>). You must explicitly check the agreement box and click to select specific folders to Opt-In.
               </div>
             </div>
             <span style="font-size:11.5px; font-weight:700; padding:4px 10px; border-radius:999px; background:${mkt.opt_in_enabled ? 'rgba(16,163,127,0.2)' : 'rgba(239,68,68,0.18)'}; color:${mkt.opt_in_enabled ? '#10a37f' : '#f87171'};">
@@ -4440,11 +4800,31 @@ function secureRandomIndex(n) {
             </span>
           </label>
 
-          <div style="margin-top:10px; font-size:12.5px;">
+          <div style="margin-top:10px; font-size:12.5px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
             <strong>Selected Opt-In Folders (${optInFolders.length}):</strong> ${folderSummaryText}
           </div>
 
-          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
+          <div style="margin-top:12px;">
+            <div style="font-size:13px; font-weight:700; margin-bottom:4px;">📁 Browse Physical Drives &amp; Folders to Select for Opt-In:</div>
+            <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">
+              Click any drive or folder row to open and explore its subfolders. Click checkbox or "Select Folder" to toggle Opt-In.
+            </div>
+            ${renderWindowsFileExplorerHtml({
+              contextId: 'general',
+              currentPath: currentBrowsePath,
+              parentPath: currentBrowseParentPath,
+              drives: cachedDrives,
+              directories: cachedBrowseDirs,
+              selectedSet: optInLowerSet,
+              selectAction: 'mkt-toggle-folder',
+              selectButtonText: '+ Select Folder',
+              activePathAction: 'mkt-toggle-folder',
+              activePathButtonText: '+ Select Active Folder for Opt-In',
+              allowNativeDialog: true
+            })}
+          </div>
+
+          <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-top:12px;">
             <button type="button" class="pill-btn" data-action="mkt-save-optin-general" style="background:#10a37f; color:#fff; border-color:#10a37f; font-weight:600;">✅ Agree &amp; Save Opt-In to Ledger</button>
             <button type="button" class="pill-btn" data-action="mkt-revoke-optout" style="border-color:#f87171; color:#f87171;">🔒 Opt-Out &amp; Revoke (Default)</button>
             <button type="button" class="pill-btn" data-action="jump-tab" data-tab="marketplace">📁 Select Opt-In Folders &amp; Add Documents (${optInFolders.length}) →</button>
@@ -4523,41 +4903,26 @@ function secureRandomIndex(n) {
             <button type="button" class="pill-btn" data-action="jump-tab" data-tab="diagnostics">🔬 Open Deep Research &amp; Diagnostics →</button>
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'marketplace') {
-      const optInSet = new Set(optInFolders.map(f => f.toLowerCase()));
-      const mktBrowserItemsHtml = (cachedBrowseDirs || []).map(d => {
-        const isOptedIn = optInSet.has(String(d.path || '').toLowerCase());
-        return `
-          <div class="folder-browser-item" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
-            <span class="folder-item-label" style="cursor:pointer; flex:1;" data-action="browse-dir" data-folder-path="${escapeHtml(d.path)}" title="Browse inside ${escapeHtml(d.path)}">
-              ${d.is_drive ? '💽' : '📁'} ${escapeHtml(d.name)} <span style="font-size:11px; color:var(--text-muted);">(${escapeHtml(d.path)})</span>
-            </span>
-            <button type="button" class="${isOptedIn ? 'btn-secondary' : 'btn-primary'}" style="padding:3px 10px; font-size:11.5px; cursor:pointer; ${isOptedIn ? 'color:#10a37f; border-color:#10a37f;' : ''}" data-action="mkt-toggle-folder" data-folder-path="${escapeHtml(d.path)}">
-              ${isOptedIn ? '✓ Opted In (Click to Remove)' : '+ Opt-In This Folder'}
-            </button>
-          </div>
-        `;
-      }).join('');
-
       const selectedFoldersHtml = optInFolders.length === 0
-        ? `<div style="padding:12px; border-radius:8px; background:rgba(255,255,255,0.03); border:1px dashed var(--border-color); color:var(--text-muted); font-size:13px;">
-             No folders opted in yet. Opt-In is <strong>folder-scoped (not global)</strong> — select one or more folders below or enter a path to specify which folders you want to opt in for.
+        ? `<div style="padding:12px; border-radius:8px; background:rgba(255,255,255,0.03); border:1px dashed var(--border-color); color:var(--text-muted); font-size:13px; text-align:center;">
+             No folders opted in yet. Opt-In is <strong>folder-scoped (not global)</strong> — click any folder card below to select the folders you want to opt in for.
            </div>`
-        : optInFolders.map(folder => `
-            <div class="settings-row" style="padding:8px 0;">
-              <div class="settings-row-info">
-                <span class="settings-row-label">📁 <code>${escapeHtml(folder)}</code></span>
-                <div class="settings-row-desc">Included in Opt-In de-identified training trajectory scope (3-Engine Airlock scrubbed)</div>
-              </div>
-              <button type="button" class="pill-btn-danger" data-action="mkt-remove-folder" data-folder-path="${escapeHtml(folder)}">Remove Folder</button>
-            </div>
-          `).join('');
+        : `<div style="display:flex; flex-wrap:wrap; gap:8px; padding:10px; border-radius:8px; background:rgba(16,163,127,0.07); border:1px solid rgba(16,163,127,0.35);">
+             ${optInFolders.map(folder => `
+               <button type="button" class="pill-btn" style="padding:5px 10px; font-size:12px; border-color:#10a37f; color:#10a37f; background:rgba(16,163,127,0.15);" data-action="mkt-remove-folder" data-folder-path="${escapeHtml(folder)}" title="Click to remove ${escapeHtml(folder)} from Opt-In">
+                 ☑️ <code>${escapeHtml(folder)}</code> &nbsp;✕
+               </button>
+             `).join('')}
+           </div>`;
 
       settingsContent.innerHTML = `
-        <h2 class="settings-page-title" style="margin-bottom:6px;">💎 Data Opt-In &amp; Folders (Sell Personal / AI Data)</h2>
-        <p class="settings-page-subtitle" style="margin-bottom:12px;">
-          Opt-Out by default (<code>opt_in_enabled: false</code>). Check the agreement box and choose the specific folders you want to Opt-In for (not global). Every decision is signed and saved to the Consent Ledger.
+        <div class="settings-centered-container">
+        <h2 class="settings-page-title">💎 Data Opt-In &amp; Folders (Sell Personal / AI Data)</h2>
+        <p class="settings-page-subtitle">
+          Opt-Out by default (<code>opt_in_enabled: false</code>). Check the agreement box and click to select the specific folders you want to Opt-In for (not global). Every decision is signed and saved to the Consent Ledger.
         </p>
         ${quickSubTabsBar('marketplace')}
 
@@ -4604,31 +4969,40 @@ function secureRandomIndex(n) {
         </div>
 
         <!-- STEP 2: FOLDER-SCOPED OPT-IN SELECTION (NOT GLOBAL) -->
-        <div class="settings-section-heading">Step 2: Select Specific Folders to Opt-In (Folder-Scoped — Never Global)</div>
+        <div class="settings-section-heading">Step 2: Click &amp; Select Specific Folders to Opt-In (Folder-Scoped — Never Global)</div>
         <div class="settings-card">
-          <div style="font-size:13px; color:var(--text-muted); margin-bottom:10px;">
-            Choose the specific folders you want to Opt-In for. Files outside your selected folders are never included in training data synthesis.
+          <div style="font-size:13px; color:var(--text-muted); margin-bottom:10px; text-align:center;">
+            Click any folder below to select or deselect it for Opt-In. Files outside your selected folders are never included in training data synthesis.
           </div>
 
-          ${selectedFoldersHtml}
-
-          <div style="display:flex; gap:8px; margin-top:14px; flex-wrap:wrap;">
-            <input type="text" id="mkt-folder-input" class="settings-input" style="flex:1; min-width:240px;" placeholder="Enter folder path to Opt-In (e.g. D:\\Research or C:\\Projects)..." value="${escapeHtml(currentBrowsePath || '')}">
-            <button type="button" class="pill-btn" data-action="mkt-add-input-folder" style="background:var(--accent); color:#fff; border-color:var(--accent);">+ Add Folder to Opt-In</button>
+          <div style="margin-bottom:12px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:6px;">
+              <span style="font-size:13px; font-weight:700;">Currently Selected Opt-In Folders (${optInFolders.length}):</span>
+              ${optInFolders.length > 0 ? `<button type="button" class="pill-btn-danger" style="padding:3px 10px; font-size:11.5px;" data-action="mkt-clear-all-folders">✕ Clear All Selected Folders</button>` : ''}
+            </div>
+            ${selectedFoldersHtml}
           </div>
 
-          <div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--border-color);">
-            <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
-              <span style="font-size:13px; font-weight:600;">Browse Physical Drives &amp; Folders to Opt-In: <code>${escapeHtml(currentBrowsePath || 'Physical Drives (D:\\, C:\\)')}</code></span>
-              <div style="display:flex; gap:6px;">
-                <button type="button" class="pill-btn" data-action="browse-dir" data-folder-path="">💽 Drives Root</button>
-                ${currentBrowseParentPath ? `<button type="button" class="pill-btn" data-action="browse-dir" data-folder-path="${escapeHtml(currentBrowseParentPath)}">⬆ Up One Level</button>` : ''}
-                ${currentBrowsePath ? `<button type="button" class="pill-btn" style="border-color:#10a37f; color:#10a37f;" data-action="mkt-toggle-folder" data-folder-path="${escapeHtml(currentBrowsePath)}">+ Opt-In Current Folder (${escapeHtml(currentBrowsePath)})</button>` : ''}
-              </div>
-            </div>
-            <div class="folder-browser-list" style="max-height:220px; overflow-y:auto;">
-              ${mktBrowserItemsHtml || '<div style="padding:10px; font-size:12.5px; color:var(--text-muted);">Click "Drives Root" above to browse physical drives and select folders.</div>'}
-            </div>
+          <div style="display:flex; gap:8px; margin-top:10px; margin-bottom:12px; flex-wrap:wrap;">
+            <input type="text" id="mkt-folder-input" class="settings-input" style="flex:1; min-width:240px;" placeholder="Or enter any custom folder path to Opt-In (e.g. D:\\Research or C:\\Projects)..." value="${escapeHtml(currentBrowsePath || '')}">
+            <button type="button" class="pill-btn" data-action="mkt-add-input-folder" style="background:var(--accent); color:#fff; border-color:var(--accent);">+ Add Custom Folder Path</button>
+          </div>
+
+          <div>
+            <div style="font-size:13px; font-weight:700; margin-bottom:4px;">💽 Browse Physical Drives &amp; Folders (Windows File Explorer):</div>
+            ${renderWindowsFileExplorerHtml({
+              contextId: 'mkt',
+              currentPath: currentBrowsePath,
+              parentPath: currentBrowseParentPath,
+              drives: cachedDrives,
+              directories: cachedBrowseDirs,
+              selectedSet: optInLowerSet,
+              selectAction: 'mkt-toggle-folder',
+              selectButtonText: '+ Select Folder',
+              activePathAction: 'mkt-toggle-folder',
+              activePathButtonText: '+ Select Active Folder for Opt-In',
+              allowNativeDialog: true
+            })}
           </div>
         </div>
 
@@ -4659,6 +5033,27 @@ function secureRandomIndex(n) {
             <input type="text" id="new-doc-path-input" class="settings-input" style="flex:1; min-width:240px;" placeholder="Or enter a local document or folder path to index (e.g. D:\\Docs\\Paper.pdf)...">
             <button type="button" class="pill-btn" data-action="add-new-doc-path">+ Add &amp; Index Document Path</button>
           </div>
+
+          <div style="margin-top:12px;">
+            <div style="font-size:12.5px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">
+              Or browse and click a folder on your computer to index:
+            </div>
+            ${renderWindowsFileExplorerHtml({
+              contextId: 'newdoc',
+              currentPath: currentBrowsePath,
+              parentPath: currentBrowseParentPath,
+              drives: cachedDrives,
+              directories: cachedBrowseDirs,
+              selectedSet: new Set(),
+              selectAction: 'newdoc-pick-folder',
+              selectButtonText: 'Use Folder',
+              activePathAction: 'newdoc-pick-folder',
+              activePathButtonText: 'Use Active Folder for Indexing',
+              allowNativeDialog: true
+            })}
+          </div>
+        </div>
+        </div>
         </div>
       `;
     } else if (tab === 'marketplace-ledger') {
@@ -4685,7 +5080,7 @@ function secureRandomIndex(n) {
 
       const latestManifest = mkt.latest_manifest;
       const manifestSummary = latestManifest
-        ? `Batch ID: ${latestManifest.batch_id}\nOrigin Node: ${latestManifest.origin_node_id} (Ed25519 Signed)\nSFT Records: ${latestManifest.sft_record_count} | DPO Pairs: ${latestManifest.dpo_record_count} | Verified Tokens: ${latestManifest.total_tokens}\nBLAKE3 Merkle Root: ${latestManifest.merkle_root_blake3}`
+        ? `Batch ID: ${latestManifest.batch_id}\nOrigin Node: ${latestManifest.origin_node_id} (Ed25519 Signed)\nSFT Records: ${latestManifest.sft_record_count} | DPO Pairs: ${latestManifest.dpo_record_count} | Verified Tokens: ${latestManifest.total_tokens}\nSynthetic Contamination Filtered: ${latestManifest.synthetic_contamination_filtered ? 'Passed (4-Stage Gate) [true]' : 'Unfiltered [false]'}\nBLAKE3 Merkle Root: ${latestManifest.merkle_root_blake3}`
         : 'No harvested batch yet. Enable Opt-In on the "Data Opt-In & Folders" tab, then click "Harvest & Sanitize Preview" above.';
 
       const peerShares = (mkt.latest_ledger && mkt.latest_ledger.peer_shares)
@@ -4716,7 +5111,8 @@ function secureRandomIndex(n) {
       `).join('');
 
       settingsContent.innerHTML = `
-        <h2 class="settings-page-title" style="margin-bottom:6px;">📜 Opt-In Consent &amp; Revenue Ledger</h2>
+        <div class="settings-centered-container">
+        <h2 class="settings-page-title">📜 Opt-In Consent &amp; Revenue Ledger</h2>
         <p class="settings-page-subtitle" style="margin-bottom:12px;">
           Tamper-evident BLAKE3 hash-chained &amp; Ed25519-signed User Consent Ledger, 3-Engine Privacy Scrubber, and Federated Swarm Revenue Share Ledger.
         </p>
@@ -4752,7 +5148,7 @@ function secureRandomIndex(n) {
         <div class="settings-card">
           <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
             <span style="font-size:13px; color:var(--text-muted);">Staged Batches: <strong>${mkt.staged_batches_count || 0}</strong> | HITL Approved &amp; Sealed: <strong>${mkt.approved_batches_count || 0}</strong></span>
-            <div style="display:flex; gap:8px;">
+            <div class="settings-row-controls">
               <button type="button" class="pill-btn" data-action="mkt-harvest">🌾 Harvest &amp; Sanitize Preview</button>
               <button type="button" class="pill-btn" data-action="mkt-approve" style="background:#10a37f; color:#fff; border-color:#10a37f;">✍️ Approve &amp; Seal Batch (HITL)</button>
             </div>
@@ -4785,10 +5181,27 @@ function secureRandomIndex(n) {
             ${bountiesHtml || '<div style="font-size:12.5px; color:var(--text-muted);">No active bounties for current jurisdiction.</div>'}
           </div>
         </div>
+
+        <!-- 4. LOCALHOST MARKETPLACE ISSUER & BUYER TEST PANEL -->
+        <div class="settings-section-heading">4. Localhost Marketplace Issuer &amp; Buyer Test Panel (127.0.0.1/32 Verification)</div>
+        <div class="settings-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
+            <div style="font-size:13px; color:var(--text-muted);">
+              Sovereign Jurisdictional Escrow Verification: Layer 4 CIDR Check (<code>127.0.0.1/32</code>), Hardware TPM Binding, and 4-Stage Synthetic Gate.
+            </div>
+            <div class="settings-row-controls">
+              <button type="button" class="pill-btn" data-action="mkt-issue-test-cert" style="background:#4f46e5; color:#fff; border-color:#4f46e5;">📜 Issue 127.0.0.1/32 Test Cert</button>
+              <button type="button" class="pill-btn" data-action="mkt-exec-test-transaction" style="background:#0891b2; color:#fff; border-color:#0891b2;">🚀 Execute Localhost Escrow Pull</button>
+            </div>
+          </div>
+          <pre id="marketplace-test-output-box" style="font-size:12px; font-family:monospace; background:rgba(0,0,0,0.35); padding:10px; border-radius:8px; white-space:pre-wrap; margin:0; max-height:160px; overflow-y:auto;">Click "Issue 127.0.0.1/32 Test Cert" or "Execute Localhost Escrow Pull" to test against local daemon.</pre>
+        </div>
+        </div>
       `;
     } else if (tab === 'diagnostics') {
       settingsContent.innerHTML = `
-        <h2 class="settings-page-title" style="margin-bottom:6px;">🔬 Deep Research, Streaming &amp; Diagnostics</h2>
+        <div class="settings-centered-container">
+        <h2 class="settings-page-title">🔬 Deep Research, Streaming &amp; Diagnostics</h2>
         <p class="settings-page-subtitle" style="margin-bottom:12px;">
           Core QuorumRAG indexing subsystems, token streaming controls, dynamic RAM/VRAM hardware sizing, and live platform diagnostics.
         </p>
@@ -4856,6 +5269,7 @@ function secureRandomIndex(n) {
             </div>
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'models') {
       const ollamaUrl = ui.ollama_url || 'http://127.0.0.1:11434';
@@ -4886,10 +5300,9 @@ function secureRandomIndex(n) {
             : [workhorse]);
 
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">AI Models &amp; Endpoints</h2>
-        <div class="settings-row-desc" style="margin-top:-10px; margin-bottom:18px;">
-          Configure local Ollama instance, QuorumRAG Master IPC bridge, Chrome DevTools Protocol, multi-model fusion panels, and 256k recursive agentic loop chaining.
-        </div>
+        <p class="settings-page-subtitle">Configure local Ollama instance, QuorumRAG Master IPC bridge, Chrome DevTools Protocol, multi-model fusion panels, and 256k recursive agentic loop chaining.</p>
 
         <div class="settings-card">
           <!-- Model Catalog Banner -->
@@ -4922,7 +5335,7 @@ function secureRandomIndex(n) {
                 }
               </div>
             </div>
-            <div style="display:flex; gap:8px; align-items:center;">
+            <div class="settings-row-controls">
               <button type="button" class="pill-btn" data-action="install-ollama-auto" style="${window._modelsData && window._modelsData.ollama_installed ? '' : 'background:#ef4444; color:#fff; border-color:#ef4444; font-weight:600;'}">
                 ${window._modelsData && window._modelsData.ollama_installed ? '🔄 Reinstall / Update' : '⚡ Install Ollama Automatically'}
               </button>
@@ -4936,7 +5349,7 @@ function secureRandomIndex(n) {
               <div class="settings-row-desc">Base URL for local Ollama HTTP REST API serving workhorse models.</div>
               <div id="result-test-ollama" style="font-size:11.5px; margin-top:4px;"></div>
             </div>
-            <div style="display:flex; gap:8px; align-items:center;">
+            <div class="settings-row-controls">
               <input type="text" id="setting-ollama-url" class="form-input" value="${escapeHtml(ollamaUrl)}" spellcheck="false" style="width:220px;" data-change-action="ui-patch" data-patch-key="ollama_url">
               <button type="button" class="pill-btn" data-action="probe-endpoint" data-endpoint="ollama">Test Connection</button>
             </div>
@@ -4949,7 +5362,7 @@ function secureRandomIndex(n) {
               <div class="settings-row-desc">Local IPC daemon endpoint for autonomous orchestration, hybrid RAG index, and P2P mesh.</div>
               <div id="result-test-ipc" style="font-size:11.5px; margin-top:4px;"></div>
             </div>
-            <div style="display:flex; gap:8px; align-items:center;">
+            <div class="settings-row-controls">
               <input type="text" id="setting-ipc-url" class="form-input" value="${escapeHtml(ipcUrl)}" spellcheck="false" style="width:220px;" data-change-action="ui-patch" data-patch-key="ipc_url">
               <button type="button" class="pill-btn" data-action="probe-endpoint" data-endpoint="ipc">Test Connection</button>
             </div>
@@ -4962,7 +5375,7 @@ function secureRandomIndex(n) {
               <div class="settings-row-desc">Target TCP port for remote debugging, DOM inspection, and HAR capture.</div>
               <div id="result-test-cdp" style="font-size:11.5px; margin-top:4px;"></div>
             </div>
-            <div style="display:flex; gap:8px; align-items:center;">
+            <div class="settings-row-controls">
               <input type="number" id="setting-cdp-port" class="form-input" value="${cdpPort}" min="1" max="65535" style="width:110px;" data-change-action="ui-patch" data-patch-key="cdp_port" data-patch-type="number">
               <button type="button" class="pill-btn" data-action="probe-endpoint" data-endpoint="cdp">Test CDP</button>
             </div>
@@ -4974,7 +5387,7 @@ function secureRandomIndex(n) {
               <label for="setting-active-model" class="settings-row-label">Primary Workhorse Model</label>
               <div class="settings-row-desc">Active model used for interactive directives, RAG synthesis, and multi-turn chat.</div>
             </div>
-            <div style="display:flex; gap:8px; align-items:center;">
+            <div class="settings-row-controls">
               <select id="setting-active-model" class="pill-select" style="min-width:250px;" data-change-action="set-model">
                 ${discoveredTags.concat(customModels.map(m => m.tag)).filter((v, i, a) => v && a.indexOf(v) === i).map(tag => `
                   <option value="${escapeHtml(tag)}" ${workhorse === tag ? 'selected' : ''}>${escapeHtml(tag)}</option>
@@ -5227,6 +5640,7 @@ function secureRandomIndex(n) {
             </select>
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'appearance') {
       const mode = ui.appearance_mode || (ui.theme === 'theme-white' ? 'light' : (ui.theme === 'theme-obsidian' ? 'dark' : 'system'));
@@ -5236,6 +5650,7 @@ function secureRandomIndex(n) {
       const accentDotColor = accent === 'Emerald' ? '#10a37f' : (accent === 'Violet' ? '#8b5cf6' : (accent === 'Amber' ? '#f59e0b' : '#2563eb'));
 
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Appearance</h2>
         <div class="settings-section-heading">Visual style</div>
         <div class="settings-card">
@@ -5282,7 +5697,7 @@ function secureRandomIndex(n) {
             <div class="settings-row-info">
               <span class="settings-row-label">Theme</span>
             </div>
-            <div style="display:flex; align-items:center; gap:8px;">
+            <div class="settings-row-controls">
               <button class="btn-icon" title="Export theme JSON" data-action="export-theme-config" style="font-size:14px;">⬇</button>
               <button class="btn-icon" title="Copy theme CSS variables" data-action="copy-theme-config" style="font-size:14px;">❐</button>
               <select class="pill-select" data-change-action="apply-theme">
@@ -5298,7 +5713,7 @@ function secureRandomIndex(n) {
             <div class="settings-row-info">
               <span class="settings-row-label">Accent</span>
             </div>
-            <div style="display:flex; align-items:center; gap:8px;">
+            <div class="settings-row-controls">
               <span style="width:10px; height:10px; border-radius:50%; background:${accentDotColor}; display:inline-block;"></span>
               <select class="pill-select" data-change-action="apply-accent">
                 <option value="Blue" ${accent === 'Blue' ? 'selected' : ''}>Blue</option>
@@ -5354,6 +5769,7 @@ function secureRandomIndex(n) {
             <input id="sw-telemetry-bar" type="checkbox" class="quorum-switch" ${ui.show_telemetry_bar !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="show_telemetry_bar" data-toast-message="Telemetry bar setting saved">
           </div>
         </div>` : ''}
+        </div>
       `;
     } else if (tab === 'mesh') {
       const p2pEnabled = mesh.p2p_enabled !== false;
@@ -5416,7 +5832,7 @@ function secureRandomIndex(n) {
               <span class="settings-row-label">TPM Specification &amp; Manufacturer</span>
               <div class="settings-row-desc">Vendor: <strong>${escapeHtml(tpm.vendor || 'Unknown')}</strong> (ID: <code>${tpm.manufacturer_id ? '0x' + tpm.manufacturer_id.toString(16).toUpperCase() : '0x0'}</code>) | Version: <strong>TPM ${escapeHtml(tpm.tpm_version || '2.0')}</strong></div>
             </div>
-            <div style="display:flex; align-items:center; gap:8px;">
+            <div class="settings-row-controls">
               <span class="pill-btn" style="font-family:monospace; font-size:11px; padding:4px 10px;">${isHw ? 'Silicon Active' : 'Virtual / Dev'}</span>
             </div>
           </div>
@@ -5655,6 +6071,7 @@ function secureRandomIndex(n) {
           `).join('');
 
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Mesh Network &amp; Shared Folders</h2>
         <p class="settings-page-subtitle">OshoosiClaw-adapted P2P GossipSub/Kademlia Swarm with explicit folder-level sharing control and cryptographic epoch isolation.</p>
         ${bannerHtml}
@@ -5689,17 +6106,25 @@ function secureRandomIndex(n) {
             <button type="button" class="btn-primary" style="cursor:pointer;" data-action="share-input-folder">+ Share Folder with Mesh</button>
           </div>
 
-          <!-- Interactive Physical Drive & Folder Browser -->
-          <div style="border-top:1px solid var(--border-color); padding-top:12px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
-              <span style="font-size:12.5px; font-weight:600;">Browse Physical Drives to Select Folders: <code>${escapeHtml(currentBrowsePath || 'Physical Drives (D:\\, C:\\)')}</code></span>
-              <div style="display:flex; gap:6px;">
-                ${currentBrowsePath ? `<button type="button" class="btn-secondary" style="padding:4px 10px; font-size:12px; cursor:pointer;" data-action="browse-up" data-folder-path="${escapeHtml(currentBrowseParentPath || '')}">⬅ Up</button>` : ''}
-                <button type="button" class="btn-secondary" style="padding:4px 10px; font-size:12px; cursor:pointer;" data-action="browse-root">💽 Drives Root</button>
-                ${currentBrowsePath ? `<button type="button" class="btn-primary" style="padding:4px 10px; font-size:12px; cursor:pointer;" data-action="share-folder" data-folder-path="${escapeHtml(currentBrowsePath)}">+ Share Current Folder</button>` : ''}
-              </div>
+          <!-- Interactive Windows File Explorer for Mesh Sharing -->
+          <div style="border-top:1px solid var(--border-color); padding-top:12px; margin-top:12px;">
+            <div style="font-size:13px; font-weight:700; margin-bottom:4px;">💽 Browse Physical Drives to Select Folders to Share:</div>
+            <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">
+              Click any drive or folder row to open and explore its subfolders. Click checkbox or "+ Share Folder" to share with Mesh.
             </div>
-            <div class="folder-browser-grid">${browserItemsHtml || '<div style="font-size:12px; color:var(--text-muted);">No subdirectories found.</div>'}</div>
+            ${renderWindowsFileExplorerHtml({
+              contextId: 'mesh',
+              currentPath: currentBrowsePath,
+              parentPath: currentBrowseParentPath,
+              drives: cachedDrives,
+              directories: cachedBrowseDirs,
+              selectedSet: new Set(sharedFolders.filter(f => f.enabled).map(f => String(f.path || '').toLowerCase())),
+              selectAction: 'share-folder',
+              selectButtonText: '+ Share Folder',
+              activePathAction: 'share-folder',
+              activePathButtonText: '+ Share Active Folder with Mesh',
+              allowNativeDialog: true
+            })}
           </div>
         </div>
 
@@ -5714,7 +6139,7 @@ function secureRandomIndex(n) {
               <span class="settings-row-label">Node Alias &amp; Mesh Zone</span>
               <div class="settings-row-desc">Broadcast identity on GossipSub topic <code>osoosi-quorum-${escapeHtml(mesh.zone || 'quorum-lan-mesh')}</code>.</div>
             </div>
-            <div style="display:flex; gap:8px;">
+            <div class="settings-row-controls">
               <input type="text" id="mesh-alias-input" class="settings-input" style="width:170px;" value="${escapeHtml(mesh.node_alias || 'QuorumRAG-Master-Core')}">
               <button class="btn-secondary" data-action="save-mesh-alias">Save</button>
             </div>
@@ -5724,7 +6149,7 @@ function secureRandomIndex(n) {
               <span class="settings-row-label">Bootstrap Peer Multiaddrs (LAN / WAN)</span>
               <div class="settings-row-desc">Comma-separated libp2p multiaddrs (e.g. <code>/ip4/10.0.0.5/tcp/3032</code>).</div>
             </div>
-            <div style="display:flex; gap:8px; width:340px;">
+            <div class="settings-row-controls" style="width:340px;">
               <input type="text" id="mesh-peers-input" class="settings-input" style="flex:1;" value="${escapeHtml((mesh.bootstrap_peers || []).join(', '))}" placeholder="/ip4/10.0.0.x/tcp/3032">
               <button class="btn-primary" data-action="save-mesh-bootstrap">Dial &amp; Save</button>
             </div>
@@ -5734,7 +6159,7 @@ function secureRandomIndex(n) {
               <span class="settings-row-label">Max Peer Responses Per Query</span>
               <div class="settings-row-desc">Deterministic cap on remote peer candidate sets collected and fused per federated search.</div>
             </div>
-            <div style="display:flex; gap:8px; align-items:center;">
+            <div class="settings-row-controls">
               <input type="number" id="mesh-max-peer-responses" class="settings-input" style="width:90px;" min="1" max="64" value="${escapeHtml(String(mesh.max_peer_responses || 8))}" data-change-action="mesh-config" data-config-key="max_peer_responses">
               <span style="font-size:12px; color:var(--text-muted);">peers</span>
             </div>
@@ -5746,6 +6171,7 @@ function secureRandomIndex(n) {
             </div>
             <button class="btn-secondary" data-action="rotate-epoch">🔄 Rotate Epoch Key (#${(mesh.hmac_epoch || 1) + 1})</button>
           </div>
+        </div>
         </div>
       `;
     } else if (tab === 'dlp') {
@@ -5764,6 +6190,7 @@ function secureRandomIndex(n) {
       `).join('');
 
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">DLP &amp; PHI Protection (Microsoft Presidio + GLiNER)</h2>
         <p class="settings-page-subtitle">OshoosiClaw Two-Tier Data Loss Prevention Gate powered by <strong>Microsoft Presidio</strong> (<code>presidio-analyzer</code> + <code>presidio-anonymizer</code> ContextEnhancer) and <strong>GLiNER</strong> (<code>${escapeHtml(glinerModel)}</code>) zero-shot Named Entity Recognition—auto-provisioned on every computer.</p>
 
@@ -5781,7 +6208,7 @@ function secureRandomIndex(n) {
                 <strong>Local Model Cache:</strong> <code>${escapeHtml(prov.model_cache_dir || '.quorumrag-live-data/models/gliner_multi_pii-v1')}</code> • <strong>Active Labels:</strong> ${Number(prov.entity_labels_count || 17)} HIPAA/PII entities
               </div>
             </div>
-            <div style="display:flex; gap:8px; align-items:center;">
+            <div class="settings-row-controls">
               <button type="button" class="pill-btn" data-action="reprovision-gliner">⚡ Verify &amp; Provision GLiNER</button>
             </div>
           </div>
@@ -5934,9 +6361,11 @@ function secureRandomIndex(n) {
             </tbody>
           </table>
         </div>
+        </div>
       `;
     } else if (tab === 'notifications') {
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Notifications</h2>
         <p class="settings-page-subtitle">Control real-time alerts for filesystem drift healing, Mesh peer events, and DLP interceptions.</p>
         <div class="settings-card">
@@ -5969,9 +6398,11 @@ function secureRandomIndex(n) {
             <button class="pill-btn" data-action="test-notification">Send Test Notification</button>
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'profile') {
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Profile</h2>
         <p class="settings-page-subtitle">Manage your local sovereign operator profile and node attribution.</p>
         <div class="settings-card">
@@ -5991,9 +6422,11 @@ function secureRandomIndex(n) {
             <button class="pill-btn" style="background:var(--accent); color:#fff; border-color:var(--accent);" data-action="save-profile">Save Profile</button>
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'security') {
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Security and login</h2>
         <p class="settings-page-subtitle">Cryptographic Mesh containment rings, split-plane wire validation, and access tier boundaries.</p>
         <div class="settings-card">
@@ -6034,9 +6467,11 @@ function secureRandomIndex(n) {
             <button class="pill-btn" data-action="rotate-epoch">🔑 Rotate Epoch Key</button>
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'account') {
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Account</h2>
         <p class="settings-page-subtitle">Cryptographic node identity, listen addresses, and runtime telemetry.</p>
         <div class="settings-card">
@@ -6067,6 +6502,7 @@ function secureRandomIndex(n) {
             </div>
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'archived') {
       const archived = stripMockArchivedChats(Array.isArray(ui.archived_chats) ? ui.archived_chats : []);
@@ -6088,7 +6524,7 @@ function secureRandomIndex(n) {
                   <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">${escapeHtml(c.archived_at || 'Archived session')}${c.message_count ? ' • ' + Number(c.message_count) + ' msg(s)' : ''}</div>
                 </div>
               </div>
-              <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+              <div class="settings-row-controls">
                 <button type="button" class="pill-btn" data-action="unarchive-chat" data-chat-id="${escapeHtml(c.id)}">Unarchive</button>
                 <button type="button" class="pill-btn-danger" data-action="delete-archived-chat" data-chat-id="${escapeHtml(c.id)}">Delete</button>
               </div>
@@ -6096,8 +6532,9 @@ function secureRandomIndex(n) {
           `).join('');
 
       settingsContent.innerHTML = `
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
-          <h2 class="settings-page-title" style="margin:0;">Archived chats</h2>
+        <div class="settings-centered-container">
+        <div class="settings-header-action-row">
+          <h2 class="settings-page-title">Archived chats</h2>
           <button class="pill-btn" data-action="archive-current-chat">+ Archive Current Chat</button>
         </div>
 
@@ -6127,6 +6564,7 @@ function secureRandomIndex(n) {
         <div class="settings-card" style="padding:6px 18px;">
           ${rowsHtml}
         </div>
+        </div>
       `;
     } else if (tab === 'parental') {
       const members = Array.isArray(ui.family_members) ? ui.family_members : [];
@@ -6146,11 +6584,12 @@ function secureRandomIndex(n) {
            </div>`;
 
       settingsContent.innerHTML = `
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-          <h2 class="settings-page-title" style="margin:0;">Parental controls</h2>
+        <div class="settings-centered-container">
+        <div class="settings-header-action-row">
+          <h2 class="settings-page-title">Parental controls</h2>
           <button class="pill-btn" title="About Parental Controls" data-action="test-notification">?</button>
         </div>
-        <p class="settings-page-subtitle" style="max-width:660px;">
+        <p class="settings-page-subtitle">
           Parents and teens can link accounts, giving parents tools to adjust certain features, set limits, and add safeguards that work for their family.
           <a href="#" style="color:var(--text-primary); text-decoration:underline;" data-action="toggle-add-family">Learn more</a>
         </p>
@@ -6193,6 +6632,7 @@ function secureRandomIndex(n) {
             <input id="sw-lock-tier3" type="checkbox" class="quorum-switch" ${ui.lock_tier3_restricted_folders !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="lock_tier3_restricted_folders" data-toast-message="Tier-3 folder lock updated">
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'trusted') {
       const contacts = Array.isArray(ui.trusted_contacts) ? ui.trusted_contacts : [];
@@ -6206,7 +6646,7 @@ function secureRandomIndex(n) {
                    <span class="settings-row-label">🛡️ ${escapeHtml(c.name)}</span>
                    <div class="settings-row-desc">${escapeHtml(c.email)} ${c.peer ? ' • Peer: <code>' + escapeHtml(c.peer) + '</code>' : ''}</div>
                  </div>
-                 <div style="display:flex; gap:8px;">
+                 <div class="settings-row-controls">
                    <button type="button" class="pill-btn" data-action="verify-trusted-contact" data-contact-name="${escapeHtml(c.name)}">Verify</button>
                    <button type="button" class="pill-btn-danger" data-action="remove-trusted-contact" data-index="${idx}">Remove</button>
                  </div>
@@ -6215,11 +6655,12 @@ function secureRandomIndex(n) {
            </div>`;
 
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Trusted contact</h2>
         <p class="settings-page-subtitle" style="margin-bottom:14px;">
           Having a trusted contact can make it easier to get support from someone who knows you well.
         </p>
-        <p class="settings-page-subtitle" style="max-width:680px;">
+        <p class="settings-page-subtitle">
           If a safety concern or critical node recovery event occurs in QuorumRAG, we can notify your trusted contact so they can check in with you. They must be 18+ to participate.
           <a href="#" style="color:var(--text-primary); text-decoration:underline;" data-action="toggle-add-contact">Learn more</a>
         </p>
@@ -6240,6 +6681,7 @@ function secureRandomIndex(n) {
         </div>` : ''}
 
         ${contactsHtml}
+        </div>
       `;
     } else if (tab === 'voice') {
       const voiceName = ui.preferred_voice || 'Juniper';
@@ -6247,14 +6689,16 @@ function secureRandomIndex(n) {
       const recordings = Array.isArray(ui.voice_recordings) ? ui.voice_recordings : [];
 
       settingsContent.innerHTML = `
-        <h2 class="settings-page-title" style="margin-bottom:18px;">Voice</h2>
+        <div class="settings-centered-container">
+        <h2 class="settings-page-title">Voice</h2>
+        <p class="settings-page-subtitle">Choose the voice used for voice chat and audio synthesis.</p>
         <div class="settings-card">
           <div class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">Voice</span>
               <div class="settings-row-desc">Choose the voice used for voice chat and read aloud</div>
             </div>
-            <div style="display:flex; align-items:center; gap:8px;">
+            <div class="settings-row-controls">
               <button class="pill-btn" data-action="preview-voice">🔊 Preview</button>
               <select id="voice-name-select" class="pill-select" data-change-action="ui-patch" data-patch-key="preferred_voice" data-toast-message="Voice updated">
                 <option value="Juniper" ${voiceName === 'Juniper' ? 'selected' : ''}>Juniper</option>
@@ -6297,7 +6741,7 @@ function secureRandomIndex(n) {
               <span class="settings-row-label">Recent recordings</span>
               <div class="settings-row-desc">Your last 20 recordings are saved on this device (${recordings.length} saved)</div>
             </div>
-            <div style="display:flex; gap:8px;">
+            <div class="settings-row-controls">
               <button class="pill-btn" data-action="record-voice">🎙️ Record Note</button>
               ${recordings.length > 0 ? `<button class="pill-btn-danger" data-action="clear-voice">Clear</button>` : ''}
             </div>
@@ -6307,6 +6751,7 @@ function secureRandomIndex(n) {
             ${recordings.map(r => `<div style="font-size:12.5px; padding:4px 0; display:flex; justify-content:space-between;"><span>🎙️ ${escapeHtml(r.transcript)}</span><span style="color:var(--text-muted);">${escapeHtml(r.time)}</span></div>`).join('')}
           </div>` : ''}
         </div>
+        </div>
       `;
     } else if (tab === 'storage') {
       const liveChunks = Number(rt.total_chunks || 0);
@@ -6314,8 +6759,9 @@ function secureRandomIndex(n) {
       const estIndexGb = Math.max(0.01, (liveChunks * 4096) / (1024 * 1024 * 1024));
       const pctUsed = Math.max(0, Math.min(98, Math.round((estIndexGb / 20) * 100)));
       settingsContent.innerHTML = `
-        <h2 class="settings-page-title" style="margin-bottom:18px;">Storage</h2>
-        <div style="font-size:14px; font-weight:600; color:var(--text-primary);">${estIndexGb.toFixed(2)} GB of 20 GB local index quota used (${liveChunks.toLocaleString()} chunks • ${liveFiles.toLocaleString()} cataloged files)</div>
+        <div class="settings-centered-container">
+        <h2 class="settings-page-title">Storage</h2>
+        <p class="settings-page-subtitle" style="font-weight:600; color:var(--text-primary); margin-bottom:12px;">${estIndexGb.toFixed(2)} GB of 20 GB local index quota used (${liveChunks.toLocaleString()} chunks • ${liveFiles.toLocaleString()} cataloged files)</p>
         <div class="storage-progress-track">
           <div class="storage-progress-fill" style="width: ${pctUsed}%;"></div>
         </div>
@@ -6340,14 +6786,20 @@ function secureRandomIndex(n) {
               <button class="pill-btn" data-action="open-modal" data-modal-id="modal-drift">🛡️ Run 5-Drift Remediation</button>
             </div>
             <div style="border-top:1px solid var(--border-color); padding-top:10px; margin-top:10px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
-                <span style="font-size:12px; font-weight:600; color:var(--text-primary);">Browse Local Folders: <code>${escapeHtml(currentBrowsePath || 'Physical Drives (D:\\, C:\\)')}</code></span>
-                <div style="display:flex; gap:6px;">
-                  ${currentBrowsePath ? `<button type="button" class="btn-secondary" style="padding:3px 8px; font-size:11px; cursor:pointer;" data-action="browse-up" data-folder-path="${escapeHtml(currentBrowseParentPath || '')}">⬅ Up</button>` : ''}
-                  <button type="button" class="btn-secondary" style="padding:3px 8px; font-size:11px; cursor:pointer;" data-action="browse-root">💽 Drives Root</button>
-                </div>
-              </div>
-              <div class="folder-browser-grid">${browserItemsHtml || '<div style="font-size:12px; color:var(--text-muted);">No subdirectories found.</div>'}</div>
+              <div style="font-size:12px; font-weight:600; color:var(--text-primary); margin-bottom:6px;">Browse Local Drives &amp; Folders:</div>
+              ${renderWindowsFileExplorerHtml({
+                contextId: 'storage',
+                currentPath: currentBrowsePath,
+                parentPath: currentBrowseParentPath,
+                drives: cachedDrives,
+                directories: cachedBrowseDirs,
+                selectedSet: new Set((rt.watched_paths || []).map(p => String(p || '').toLowerCase())),
+                selectAction: 'storage-browse-dir',
+                selectButtonText: 'Explore',
+                activePathAction: '',
+                activePathButtonText: '',
+                allowNativeDialog: true
+              })}
             </div>
           </div>` : ''}
 
@@ -6366,6 +6818,7 @@ function secureRandomIndex(n) {
             </div>
           </div>` : ''}
         </div>
+        </div>
       `;
     } else if (tab === 'personalization') {
       const memories = Array.isArray(ui.saved_memories) ? ui.saved_memories : [];
@@ -6377,6 +6830,7 @@ function secureRandomIndex(n) {
       const headersLists = ui.headers_and_lists || 'Less';
 
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Personalization</h2>
 
         <div class="settings-section-heading" style="margin-bottom:2px;">QuorumRAG memory</div>
@@ -6595,9 +7049,11 @@ function secureRandomIndex(n) {
             <input id="sw-conn-search" type="checkbox" class="quorum-switch" ${ui.connector_search_enabled !== false ? 'checked' : ''} data-change-action="ui-patch" data-patch-key="connector_search_enabled" data-toast-message="Connector search setting saved">
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'pets') {
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Pets</h2>
         <p class="settings-page-subtitle">Your interactive QuorumRAG Mesh &amp; DLP guardian companion.</p>
         <div class="settings-card" style="text-align:center; padding:28px;">
@@ -6611,9 +7067,11 @@ function secureRandomIndex(n) {
             <button class="pill-btn" data-action="save-pet-name">Rename Guardian</button>
           </div>
         </div>
+        </div>
       `;
     } else if (tab === 'keyboard') {
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Keyboard</h2>
         <p class="settings-page-subtitle">Keyboard shortcuts for fast navigation and querying.</p>
         <div class="settings-card">
@@ -6623,9 +7081,11 @@ function secureRandomIndex(n) {
           <div class="settings-row"><span class="settings-row-label">Open / Close Settings</span><code>Ctrl + ,</code></div>
           <div class="settings-row"><span class="settings-row-label">Close Modal / Settings</span><code>Esc</code></div>
         </div>
+        </div>
       `;
     } else if (tab === 'usage') {
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Usage</h2>
         <p class="settings-page-subtitle">Live telemetry across local storage, BLAKE3 cache, P2P Mesh, and HIPAA PHI DLP inspection.</p>
         <div class="settings-card">
@@ -6635,9 +7095,11 @@ function secureRandomIndex(n) {
           <div class="settings-row"><span class="settings-row-label">Unshared Folder Accesses Blocked</span><strong>${dlpStats.total_blocked_unshared_folder_chunks || 0}</strong></div>
           <div class="settings-row"><span class="settings-row-label">Zero-Knowledge BLAKE3 Proofs Verified</span><strong>${dlpStats.zk_commitments_verified || 0}</strong></div>
         </div>
+        </div>
       `;
     } else if (tab === 'datacontrols') {
       settingsContent.innerHTML = `
+        <div class="settings-centered-container">
         <h2 class="settings-page-title">Data controls</h2>
         <p class="settings-page-subtitle">Control how your local drives, chat history, and Mesh queries are handled.</p>
         <div class="settings-card">
@@ -6660,7 +7122,7 @@ function secureRandomIndex(n) {
               <span class="settings-row-label">Manage Shared Mesh Folders &amp; PHI Rules</span>
               <div class="settings-row-desc">Jump directly to folder-level sharing or HIPAA PHI/PII controls.</div>
             </div>
-            <div style="display:flex; gap:8px;">
+            <div class="settings-row-controls">
               <button class="pill-btn" data-action="jump-tab" data-tab="mesh">🌐 Shared Folders</button>
               <button class="pill-btn" data-action="jump-tab" data-tab="dlp">🛡️ PHI DLP Gate</button>
             </div>
@@ -6708,7 +7170,17 @@ function secureRandomIndex(n) {
             <button class="pill-btn-danger" data-action="clear-archived-chats">Clear Archived</button>
           </div>
         </div>
+        </div>
       `;
+    }
+
+    if (settingsContent.firstElementChild && !settingsContent.firstElementChild.classList.contains('settings-centered-container')) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'settings-centered-container';
+      while (settingsContent.firstChild) {
+        wrapper.appendChild(settingsContent.firstChild);
+      }
+      settingsContent.appendChild(wrapper);
     }
   }
 
@@ -6723,7 +7195,10 @@ function secureRandomIndex(n) {
     const modal = document.getElementById(modalId);
     if (modal) modal.classList.remove('hidden');
     if (modalId === 'modal-recache') refreshCacheStats();
-    if (modalId === 'modal-reindex') checkReindexStatus();
+    if (modalId === 'modal-reindex') {
+      checkReindexStatus();
+      renderReindexExplorer();
+    }
   };
 
   window._setConsensusFromSettings = async function(val) {

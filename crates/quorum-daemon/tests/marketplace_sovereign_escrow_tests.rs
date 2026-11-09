@@ -1173,3 +1173,532 @@ async fn test_9_explicit_consent_checkbox_folder_scoped_opt_in_and_signed_consen
     assert_eq!(add_doc_json["status"], "added_and_indexed");
     assert_eq!(add_doc_json["added_count"], 1);
 }
+
+#[tokio::test]
+async fn test_10_localhost_test_certificate_and_buyer_pull_escrow() {
+    let (app, _state, _td) = setup_marketplace_test_app().await;
+
+    // 1. Enable Opt-In with explicit consent agreement
+    let opt_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/opt-in")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "opt_in_enabled": true,
+                        "user_consent_checked": true,
+                        "consent_statement": "Localhost test consent agreement",
+                        "opt_in_folders": ["D:\\LocalhostVault"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opt_res.status(), StatusCode::OK);
+
+    // 2. Harvest default batch
+    let harvest_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/harvest")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "batch_id": "batch-localhost-e2e-01",
+                        "auto_approve": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(harvest_res.status(), StatusCode::OK);
+    let harvest_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(harvest_res).await).unwrap();
+    assert_eq!(harvest_json["approved"], true);
+    assert_eq!(harvest_json["accepted_count"], 2);
+
+    // 3. Issue test certificate via POST /api/v1/marketplace/test/issue-cert supporting 127.0.0.1/32
+    let issue_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/test/issue-cert")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "buyer_id": "localhost-test-buyer",
+                        "egress_cidr": "127.0.0.1/32",
+                        "legal_entity_name": "Localhost Verification Labs"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issue_res.status(), StatusCode::OK);
+    let issue_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(issue_res).await).unwrap();
+    assert_eq!(issue_json["status"], "ok");
+    let test_cert: BuyerJurisdictionCertificate =
+        serde_json::from_value(issue_json["certificate"].clone()).unwrap();
+    assert!(test_cert.authorized_egress_cidrs.contains(&"127.0.0.1/32".to_string()));
+
+    // 4. Authenticated preview request from localhost presenting test_cert
+    let preview_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/preview")
+                .header("content-type", "application/json")
+                .header("x-quorum-caller-ip", "127.0.0.1")
+                .header("x-quorum-tpm-pubkey-blake3", &test_cert.bound_tpm_pubkey_blake3)
+                .body(Body::from(
+                    serde_json::json!({
+                        "batch_id": "batch-localhost-e2e-01",
+                        "buyer_cert": test_cert
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview_res.status(), StatusCode::OK);
+    let preview_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(preview_res).await).unwrap();
+    assert_eq!(preview_json["synthetic_contamination_filtered"], true);
+    let canaries = preview_json["canary_sample"].as_array().unwrap();
+    assert!(!canaries.is_empty());
+    assert!(canaries[0]["buyer_watermark_hex"].is_string());
+
+    // 5. Unlock batch from localhost (issue EscrowReceiptToken)
+    let unlock_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/unlock")
+                .header("content-type", "application/json")
+                .header("x-quorum-caller-ip", "127.0.0.1")
+                .header("x-quorum-tpm-pubkey-blake3", &test_cert.bound_tpm_pubkey_blake3)
+                .body(Body::from(
+                    serde_json::json!({
+                        "batch_id": "batch-localhost-e2e-01",
+                        "buyer_cert": test_cert,
+                        "amount_paid_cents": 5000
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unlock_res.status(), StatusCode::OK);
+    let receipt: EscrowReceiptToken =
+        serde_json::from_slice(&read_body_bytes(unlock_res).await).unwrap();
+    assert!(!receipt.keyed_blake3_mac_hex.is_empty());
+
+    // 6. Download watermarked records from localhost
+    let download_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/download")
+                .header("content-type", "application/json")
+                .header("x-quorum-caller-ip", "127.0.0.1")
+                .header("x-quorum-tpm-pubkey-blake3", &test_cert.bound_tpm_pubkey_blake3)
+                .body(Body::from(
+                    serde_json::json!({
+                        "batch_id": "batch-localhost-e2e-01",
+                        "buyer_cert": test_cert,
+                        "receipt_token": receipt
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(download_res.status(), StatusCode::OK);
+    let download_body = String::from_utf8(read_body_bytes(download_res).await).unwrap();
+    let downloaded_records: Vec<SanitizedTrainingRecord> = download_body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(downloaded_records.len(), 2);
+    assert!(downloaded_records[0].buyer_watermark_hex.is_some());
+
+    // 7. Negative case: Request from 127.0.0.1 presenting a certificate pinned ONLY to 198.51.100.0/24
+    let mut foreign_cidr_cert = test_cert.clone();
+    foreign_cidr_cert.authorized_egress_cidrs = vec!["198.51.100.0/24".to_string()];
+    let node_seed = [0x42u8; 32];
+    let authority_seed = blake3::derive_key("QuorumRAG-Marketplace-AuthoritySeed-v1", &node_seed);
+    foreign_cidr_cert.sign_ed25519(&authority_seed).unwrap();
+
+    let denied_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/unlock")
+                .header("content-type", "application/json")
+                .header("x-quorum-caller-ip", "127.0.0.1")
+                .header("x-quorum-tpm-pubkey-blake3", &foreign_cidr_cert.bound_tpm_pubkey_blake3)
+                .body(Body::from(
+                    serde_json::json!({
+                        "batch_id": "batch-localhost-e2e-01",
+                        "buyer_cert": foreign_cidr_cert,
+                        "amount_paid_cents": 5000
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied_res.status(), StatusCode::FORBIDDEN);
+    let denied_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(denied_res).await).unwrap();
+    assert!(denied_json["error"]
+        .as_str()
+        .unwrap()
+        .contains("caller IP does not match certificate's pinned corporate authorized_egress_cidrs"));
+
+    // 8. Test execute-transaction endpoint directly
+    let exec_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/test/execute-transaction")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "amount_paid_cents": 5000
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exec_res.status(), StatusCode::OK);
+    let exec_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(exec_res).await).unwrap();
+    assert_eq!(exec_json["status"], "ok");
+    assert_eq!(exec_json["watermark_verified"], true);
+    assert_eq!(exec_json["synthetic_contamination_filtered"], true);
+}
+
+#[tokio::test]
+async fn test_11_synthetic_gate_rejection_and_manifest_filtered_flag() {
+    let (app, _state, _td) = setup_marketplace_test_app().await;
+
+    // Enable Opt-In
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/opt-in")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "opt_in_enabled": true,
+                        "user_consent_checked": true,
+                        "opt_in_folders": ["D:\\Vault"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // 1. Submit candidate contaminated with invisible zero-width watermarks -> must be rejected
+    let watermarked_cand = serde_json::json!({
+        "candidates": [{
+            "record_id": "rec-wm-01",
+            "prompt": "Explain zero-trust access control protocols in modern architectures.",
+            "chosen_response": "Zero-trust enforces strict continuous verification.\u{200B} Never trust, always verify every single network packet.\u{200C} Periodic re-authentication is mandatory.",
+            "citations": [("Zero-trust enforces strict continuous verification.", "Zero-trust enforces strict continuous verification.")]
+        }]
+    });
+    let wm_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/harvest")
+                .header("content-type", "application/json")
+                .body(Body::from(watermarked_cand.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wm_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let wm_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(wm_res).await).unwrap();
+    assert_eq!(wm_json["rejected_count"], 1);
+    assert!(wm_json["rejected_candidates"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("invisible zero-width/Unicode tag watermark characters"));
+
+    // 2. Submit candidate with AI clichés ("rich tapestry" & "stands as a beacon") -> must be rejected
+    let cliche_cand = serde_json::json!({
+        "candidates": [{
+            "record_id": "rec-cliche-01",
+            "prompt": "Summarize the history of cryptography and modern secure systems.",
+            "chosen_response": "This technology stands as a beacon of mathematical rigor. It reflects the rich tapestry of human ingenuity across centuries. In conclusion, cryptography continues to evolve.",
+            "citations": [("This technology stands as a beacon of mathematical rigor.", "This technology stands as a beacon of mathematical rigor.")]
+        }]
+    });
+    let cliche_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/harvest")
+                .header("content-type", "application/json")
+                .body(Body::from(cliche_cand.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cliche_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let cliche_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(cliche_res).await).unwrap();
+    assert!(cliche_json["rejected_candidates"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("synthetic AI cliché patterns"));
+
+    // 3. Submit candidate with invalid Stage 4 nonce -> must be rejected
+    let bad_nonce_cand = serde_json::json!({
+        "candidates": [{
+            "record_id": "rec-nonce-01",
+            "prompt": "How does memory safety work in Rust systems programming?",
+            "chosen_response": "Rust provides compile-time guarantees through its ownership model. Borrow checking prevents data races. Lifetimes track reference validity without garbage collection overhead.",
+            "citations": [("Rust provides compile-time guarantees through its ownership model.", "Rust provides compile-time guarantees through its ownership model.")],
+            "interaction_nonce_hex": "bad:nonce:structure:00"
+        }]
+    });
+    let nonce_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/harvest")
+                .header("content-type", "application/json")
+                .body(Body::from(bad_nonce_cand.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nonce_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let nonce_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(nonce_res).await).unwrap();
+    assert!(nonce_json["rejected_candidates"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("Stage 4 Rejection"));
+
+    // 4. Issue a valid nonce via POST /api/v1/marketplace/issue-nonce
+    let issue_nonce_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/issue-nonce")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "trajectory_id": "rec-valid-01",
+                        "context_token_count": 30
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issue_nonce_res.status(), StatusCode::OK);
+    let issue_nonce_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(issue_nonce_res).await).unwrap();
+    let valid_nonce = issue_nonce_json["nonce_hex"].as_str().unwrap().to_string();
+
+    // 5. Submit clean human candidate with valid nonce and varied sentence burstiness
+    let clean_cand = serde_json::json!({
+        "candidates": [{
+            "record_id": "rec-valid-01",
+            "prompt": "How does QuorumRAG prevent chunk-0 contact-header starvation on biographical and technical queries?",
+            "chosen_response": "QuorumRAG eliminates chunk-0 contact-header starvation by expanding primary retrieval hits into parent-document byte windows (0..10000 bytes). This approach directly captures full context. By deduplicating near-identical document revisions across local and mesh peers and verifying verbatim substring citations before synthesis, executive summaries, biographical narratives, and technical sections are always preserved in the final grounded response. The result is robust.",
+            "citations": [("QuorumRAG expands primary search hits into parent-document byte windows (0..10000 bytes).", "parent-document byte windows (0..10000 bytes)")],
+            "rlm_trajectory": [
+                {
+                    "step_index": 1,
+                    "action_kind": "peek_slice",
+                    "sanitized_query_or_pattern": "inspect parent document bytes 0..10000",
+                    "abstracted_takeaway": "Expanded primary hit into 10 KB parent window to capture executive summary."
+                }
+            ],
+            "interaction_nonce_hex": valid_nonce
+        }],
+        "auto_approve": true
+    });
+    let clean_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/harvest")
+                .header("content-type", "application/json")
+                .body(Body::from(clean_cand.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clean_res.status(), StatusCode::OK);
+    let clean_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(clean_res).await).unwrap();
+    assert_eq!(clean_json["accepted_count"], 1);
+    assert_eq!(clean_json["rejected_count"], 0);
+
+    // 6. Verify GET /api/v1/marketplace/preview reflects synthetic_contamination_filtered: true
+    let preview_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/marketplace/preview")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview_res.status(), StatusCode::OK);
+    let preview_json: serde_json::Value =
+        serde_json::from_slice(&read_body_bytes(preview_res).await).unwrap();
+    assert_eq!(preview_json["synthetic_contamination_filtered"], true);
+}
+
+#[test]
+fn test_12_synthetic_gate_statistical_boundary_conditions() {
+    use quorum_daemon::handlers::synthetic_gate::*;
+
+    let config = SyntheticGateConfig::default();
+    assert_eq!(config.min_burstiness_cv, 0.30);
+    assert_eq!(config.min_mattr, 0.38);
+    assert_eq!(config.min_shannon_entropy, 3.0);
+
+    // -----------------------------------------------------------------------
+    // Boundary 1: Sentence burstiness CV threshold (0.29 vs 0.31)
+    // -----------------------------------------------------------------------
+    // Sub-threshold CV (~0.286 < 0.30): 18 words in sentence 1, 10 words in sentence 2.
+    // Total words = 28 (>= 25). |18 - 10| / (18 + 10) = 8 / 28 = 0.2857.
+    let text_cv_029 = "The quick brown fox jumps over the lazy dog every single morning before heading out to work today. A fast rabbit runs through the green forest right now.";
+    let cv_val_low = compute_sentence_burstiness_cv(text_cv_029);
+    assert!(cv_val_low < 0.30, "Expected CV < 0.30, got {}", cv_val_low);
+    assert!(cv_val_low >= 0.28, "Expected CV around 0.29, got {}", cv_val_low);
+    let s1_low_cv = evaluate_stage1_statistics(text_cv_029, &config);
+    assert!(!s1_low_cv.passed, "CV 0.29 must fail Stage 1");
+    assert!(s1_low_cv.rejection_reason.as_ref().unwrap().contains("Sentence burstiness CV"));
+
+    // Supra-threshold CV (~0.310 >= 0.30): 19 words in sentence 1, 10 words in sentence 2.
+    // Total words = 29 (>= 25). |19 - 10| / (19 + 10) = 9 / 29 = 0.3103.
+    let text_cv_031 = "The quick brown fox jumps over the lazy dog every single sunny morning before heading out to work today. A fast rabbit runs through the green forest right now.";
+    let cv_val_high = compute_sentence_burstiness_cv(text_cv_031);
+    assert!(cv_val_high >= 0.30, "Expected CV >= 0.30, got {}", cv_val_high);
+    assert!(cv_val_high <= 0.32, "Expected CV around 0.31, got {}", cv_val_high);
+    let s1_high_cv = evaluate_stage1_statistics(text_cv_031, &config);
+    assert!(s1_high_cv.passed, "CV 0.31 must pass Stage 1 burstiness");
+
+    // -----------------------------------------------------------------------
+    // Boundary 2: MATTR threshold (0.37 vs 0.39)
+    // -----------------------------------------------------------------------
+    // Generate text with 100 total words, varied sentence lengths (70 words, then 30 words)
+    // so burstiness CV >= 0.30 does not fail first.
+    // Low MATTR = 37 unique words out of 100 words -> MATTR = 0.370 < 0.380
+    let mut words_037: Vec<String> = (1..=37).map(|i| format!("token{}", i)).collect();
+    for i in 0..63 {
+        words_037.push(format!("token{}", (i % 37) + 1));
+    }
+    assert_eq!(words_037.len(), 100);
+    let text_mattr_037 = format!("{}. {}.", words_037[..70].join(" "), words_037[70..].join(" "));
+    let mattr_037 = compute_mattr(&text_mattr_037, 200);
+    assert_eq!((mattr_037 * 1000.0).round() / 1000.0, 0.370);
+    let s1_mattr_low = evaluate_stage1_statistics(&text_mattr_037, &config);
+    assert!(!s1_mattr_low.passed, "MATTR 0.37 must fail Stage 1");
+    assert!(s1_mattr_low.rejection_reason.as_ref().unwrap().contains("MATTR 0.370 is below human vocabulary threshold"));
+
+    // High MATTR = 39 unique words out of 100 words -> MATTR = 0.390 >= 0.380
+    let mut words_039: Vec<String> = (1..=39).map(|i| format!("token{}", i)).collect();
+    for i in 0..61 {
+        words_039.push(format!("token{}", (i % 39) + 1));
+    }
+    assert_eq!(words_039.len(), 100);
+    let text_mattr_039 = format!("{}. {}.", words_039[..70].join(" "), words_039[70..].join(" "));
+    let mattr_039 = compute_mattr(&text_mattr_039, 200);
+    assert_eq!((mattr_039 * 1000.0).round() / 1000.0, 0.390);
+    let s1_mattr_high = evaluate_stage1_statistics(&text_mattr_039, &config);
+    assert!(s1_mattr_high.passed, "MATTR 0.39 must pass Stage 1 MATTR threshold");
+
+    // -----------------------------------------------------------------------
+    // Boundary 3: Character Shannon entropy (2.99 vs 3.01)
+    // -----------------------------------------------------------------------
+    // For 100 characters:
+    // Low entropy (~2.99 < 3.00): 8 symbols with counts [16, 12, 12, 12, 12, 12, 12, 12]
+    let chars_low = format!(
+        "{}{}{}{}{}{}{}{}",
+        "a".repeat(16),
+        "b".repeat(12),
+        "c".repeat(12),
+        "d".repeat(12),
+        "e".repeat(12),
+        "f".repeat(12),
+        "g".repeat(12),
+        "h".repeat(12)
+    );
+    assert_eq!(chars_low.len(), 100);
+    let ent_low = compute_shannon_entropy(&chars_low);
+    assert!(ent_low < 3.0, "Expected entropy < 3.0, got {}", ent_low);
+    assert!(ent_low >= 2.98, "Expected entropy around 2.99, got {}", ent_low);
+    let s1_ent_low = evaluate_stage1_statistics(&chars_low, &config);
+    assert!(!s1_ent_low.passed, "Entropy 2.99 must fail Stage 1");
+    assert!(s1_ent_low.rejection_reason.as_ref().unwrap().contains("Character Shannon entropy"));
+
+    // High entropy (~3.01..3.03 >= 3.00): 9 symbols with counts [21, 12, 12, 12, 11, 11, 10, 9, 2]
+    let chars_high = format!(
+        "{}{}{}{}{}{}{}{}{}",
+        "a".repeat(21),
+        "b".repeat(12),
+        "c".repeat(12),
+        "d".repeat(12),
+        "e".repeat(11),
+        "f".repeat(11),
+        "g".repeat(10),
+        "h".repeat(9),
+        "i".repeat(2)
+    );
+    assert_eq!(chars_high.len(), 100);
+    let ent_high = compute_shannon_entropy(&chars_high);
+    assert!(ent_high >= 3.0, "Expected entropy >= 3.0, got {}", ent_high);
+    assert!(ent_high <= 3.05, "Expected entropy around 3.01..3.05, got {}", ent_high);
+    let s1_ent_high = evaluate_stage1_statistics(&chars_high, &config);
+    assert!(s1_ent_high.passed, "Entropy 3.01 must pass Stage 1 entropy threshold");
+}

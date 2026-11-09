@@ -424,7 +424,7 @@ impl DriftHealer {
                         let content = crate::document_extractor::DocumentExtractor::extract_text(path, &identity)?;
                         let file_b3 = blake3::hash(content.as_bytes()).to_hex().to_string();
                         let chunker = TextChunker::new(ChunkerConfig::default());
-                        let raw_chunks = chunker.chunk_text(&content);
+                        let raw_chunks = chunker.chunk_text_structure_aware(&content);
 
                         let mut file_chunk_hashes = Vec::new();
                         let mut chunks = Vec::new();
@@ -432,7 +432,11 @@ impl DriftHealer {
 
                         for raw in raw_chunks {
                             let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-                            let chunk_content = crate::chunker::prepend_contextual_header(&header, raw.text_slice);
+                            let chunk_content = crate::chunker::prepend_contextual_header_with_section(
+                                &header,
+                                &raw.section_path,
+                                raw.text_slice,
+                            );
                             let _chunk_b3 = DocumentChunk::compute_blake3_hash(&chunk_content);
                             file_chunk_hashes.push(raw_b3.clone());
 
@@ -453,6 +457,14 @@ impl DriftHealer {
                                 "char_end": raw.char_end,
                                 "chunk_index": raw.chunk_index,
                                 "contract_hash": self.embedder.contract().derive_contract_hash_hex(),
+                                "parent_doc_id": file_b3.clone(),
+                                "parent_chunk_id": format!("{}:p{}", file_b3, raw.parent_chunk_index),
+                                "heading_path": raw.section_path,
+                                "section_path": raw.section_path,
+                                "section_title": raw.section_title,
+                                "section_hierarchy": raw.section_hierarchy,
+                                "section_level": raw.section_level,
+                                "source_path": path_str.clone(),
                             })
                             .to_string();
 

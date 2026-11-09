@@ -109,6 +109,55 @@ pub fn global_peer_health_registry() -> &'static PeerHealthRegistry {
     REGISTRY.get_or_init(PeerHealthRegistry::new)
 }
 
+/// Bounded Admission Controller and Stream Pool Manager for outbound federated P2P mesh queries.
+#[derive(Clone)]
+pub struct MeshQueryAdmissionController {
+    pub global_semaphore: Arc<tokio::sync::Semaphore>,
+    pub per_peer_semaphores: Arc<dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>>,
+    pub max_per_peer: usize,
+}
+
+impl MeshQueryAdmissionController {
+    pub fn new(global_concurrency: usize, max_per_peer: usize) -> Self {
+        Self {
+            global_semaphore: Arc::new(tokio::sync::Semaphore::new(global_concurrency.clamp(8, 128))),
+            per_peer_semaphores: Arc::new(dashmap::DashMap::new()),
+            max_per_peer: max_per_peer.clamp(1, 16),
+        }
+    }
+
+    pub fn global() -> &'static Self {
+        static INSTANCE: OnceLock<MeshQueryAdmissionController> = OnceLock::new();
+        INSTANCE.get_or_init(|| MeshQueryAdmissionController::new(64, 4))
+    }
+
+    pub async fn acquire_permit(
+        &self,
+        peer_id: &str,
+    ) -> Result<(tokio::sync::OwnedSemaphorePermit, tokio::sync::OwnedSemaphorePermit), CoordinatorError> {
+        let global_permit = self
+            .global_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| CoordinatorError::Network(format!("Global mesh query semaphore closed: {}", e)))?;
+
+        let peer_sem = self
+            .per_peer_semaphores
+            .entry(peer_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.max_per_peer)))
+            .value()
+            .clone();
+
+        let peer_permit = peer_sem
+            .acquire_owned()
+            .await
+            .map_err(|e| CoordinatorError::Network(format!("Peer query semaphore closed: {}", e)))?;
+
+        Ok((global_permit, peer_permit))
+    }
+}
+
 /// Clean interface abstraction separating mesh querying mechanisms.
 #[async_trait::async_trait]
 pub trait MeshQueryDispatcher: Send + Sync {
@@ -328,6 +377,20 @@ impl SwarmMeshDispatcher {
             last_bootstrap_dial_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
+
+    /// Calculate dynamic per-peer tail-latency deadline based on historical RTT.
+    pub fn calculate_peer_deadline(peer_id: &str, requested_timeout: Duration) -> Duration {
+        let registry = global_peer_health_registry();
+        if let Some(stats) = registry.get(peer_id) {
+            if let Some(avg_rtt) = stats.avg_rtt_ms {
+                if avg_rtt > 0.0 {
+                    let dyn_ms = ((avg_rtt * 2.5) + 50.0).round() as u64;
+                    return Duration::from_millis(dyn_ms.clamp(150, requested_timeout.as_millis().max(150) as u64));
+                }
+            }
+        }
+        requested_timeout
+    }
 }
 
 #[async_trait::async_trait]
@@ -471,14 +534,33 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
         let mut pending_peer_ids: HashSet<String> =
             peers.iter().map(|p| p.to_string()).collect();
 
+        let admission = MeshQueryAdmissionController::global().clone();
         let mut futures = FuturesUnordered::new();
         for peer in peers {
             let peer_str = peer.to_string();
             let handle = self.handle.clone();
             let req = request.clone();
+            let admission = admission.clone();
             futures.push(tokio::spawn(async move {
+                let _permits = match admission.acquire_permit(&peer_str).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return (
+                            peer_str,
+                            Err(quorum_network::NetworkError::Io(std::io::Error::other(e.to_string()))),
+                            0.0,
+                        );
+                    }
+                };
+                let peer_timeout = Self::calculate_peer_deadline(&peer_str, timeout);
                 let started = Instant::now();
-                let res = handle.send_query(peer, req).await;
+                let res = match tokio::time::timeout(peer_timeout, handle.send_query(peer, req)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(quorum_network::NetworkError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("Dynamic tail-latency deadline ({:?}) exceeded for peer {}", peer_timeout, peer_str),
+                    ))),
+                };
                 let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
                 (peer_str, res, rtt_ms)
             }));

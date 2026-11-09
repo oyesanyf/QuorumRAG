@@ -10,6 +10,7 @@ members = [
     "crates/quorum-coordinator",
     "crates/quorum-ui",
     "crates/quorum-daemon",
+    "crates/quorum-cli",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ quorum-network = { path = "crates/quorum-network" }
 quorum-coordinator = { path = "crates/quorum-coordinator" }
 quorum-ui = { path = "crates/quorum-ui" }
 quorum-daemon = { path = "crates/quorum-daemon" }
+quorum-cli = { path = "crates/quorum-cli" }
 
 # Ingestion & Traversal
 ignore = "0.4.22"

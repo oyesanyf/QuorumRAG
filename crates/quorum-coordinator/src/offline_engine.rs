@@ -1749,11 +1749,16 @@ impl DeterministicOfflineSynthesisEngine {
                 || rest.contains("graduate")
             {
                 let sub = rest
-                    .replace("attend", "")
-                    .replace("graduate", "")
-                    .replace("go to school", "")
                     .replace("go to university", "")
+                    .replace("go to school", "")
+                    .replace("graduated", "")
+                    .replace("graduate", "")
+                    .replace("attended", "")
+                    .replace("attend", "")
+                    .replace("studied", "")
                     .replace("study", "")
+                    .replace("university", "")
+                    .replace("college", "")
                     .replace("school", "");
                 let clean_sub = sub.trim();
                 if !clean_sub.is_empty() {

@@ -48,6 +48,9 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         .route("/api/mesh/config", post(settings::update_mesh_config_handler))
         .route("/api/mesh/shared-folders", post(settings::manage_shared_folders_handler))
         .route("/api/mesh/browse-folders", get(settings::browse_folders_handler))
+        .route("/api/fs/browse-folders", get(settings::browse_folders_handler))
+        .route("/api/fs/pick-folder", post(settings::pick_folder_dialog_handler))
+        .route("/api/dialog/pick-folder", post(settings::pick_folder_dialog_handler))
         .route("/api/dlp/status", get(settings::dlp_status_handler))
         .route("/api/dlp/policy", post(settings::update_dlp_policy_handler))
         .route("/api/dlp/test", post(settings::test_dlp_inspection_handler))
@@ -110,6 +113,10 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         .route("/api/v1/marketplace/ledger", get(marketplace::marketplace_ledger_handler))
         .route("/api/v1/marketplace/bounties", get(marketplace::marketplace_bounties_handler))
         .route("/api/v1/marketplace/bounties/submit", post(marketplace::marketplace_bounty_submit_handler))
+        .route("/api/v1/marketplace/test/issue-cert", post(marketplace::marketplace_test_issue_cert_handler))
+        .route("/api/v1/marketplace/issue-cert", post(marketplace::marketplace_test_issue_cert_handler))
+        .route("/api/v1/marketplace/test/execute-transaction", post(marketplace::marketplace_test_execute_transaction_handler))
+        .route("/api/v1/marketplace/issue-nonce", post(marketplace::marketplace_issue_nonce_handler))
 
         // Health & Models Telemetry
         .route("/api/health", get(health::health_handler))

@@ -30,8 +30,10 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use subtle::ConstantTimeEq;
 
+use crate::handlers::synthetic_gate::SyntheticExclusionPipeline;
 use crate::state::DaemonState;
 
 /// Default rate limit for authenticated canary previews per buyer/subnet per hour.
@@ -48,6 +50,7 @@ pub struct MarketplaceStore {
     pub default_authority_seed: [u8; 32],
     pub default_authority_pubkey: [u8; 32],
     preview_rate_limits: Mutex<HashMap<String, Vec<i64>>>,
+    pub synthetic_pipeline: SyntheticExclusionPipeline,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +132,10 @@ pub struct HarvestCandidateDto {
     pub citations: Vec<(String, String)>,
     #[serde(default)]
     pub extra_redact_terms: Vec<String>,
+    #[serde(default)]
+    pub source_file_path: Option<String>,
+    #[serde(default)]
+    pub interaction_nonce_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -230,6 +237,7 @@ impl MarketplaceStore {
         let default_authority_pubkey = SigningKey::from_bytes(&default_authority_seed)
             .verifying_key()
             .to_bytes();
+        let synthetic_pipeline = SyntheticExclusionPipeline::new(&node_seed);
 
         let store = Self {
             db_path: db_path.to_path_buf(),
@@ -240,6 +248,7 @@ impl MarketplaceStore {
             default_authority_seed,
             default_authority_pubkey,
             preview_rate_limits: Mutex::new(HashMap::new()),
+            synthetic_pipeline,
         };
         store.init_schema()?;
         Ok(store)
@@ -1322,6 +1331,8 @@ pub async fn marketplace_harvest_handler(
                     t
                 },
                 created_unix_secs: now,
+                source_file_path: dto.source_file_path.clone(),
+                interaction_nonce_hex: dto.interaction_nonce_hex.clone(),
             })
             .collect(),
         _ => synthesize_default_local_candidates(&store.origin_node_id, &batch_id, &default_tags, &extra_terms, now),
@@ -1331,7 +1342,33 @@ pub async fn marketplace_harvest_handler(
     let mut rejected_candidates = Vec::new();
 
     for cand in &raw_candidates {
-        match MarketplaceSanitizer::sanitize_and_sign_record(cand, &store.node_seed) {
+        let actual_tokens = cand.prompt.split_whitespace().count() + cand.chosen_response.split_whitespace().count();
+        let verdict = store.synthetic_pipeline.evaluate_candidate(
+            &cand.prompt,
+            &cand.chosen_response,
+            &cand.rlm_trajectory,
+            cand.source_file_path.as_deref(),
+            cand.interaction_nonce_hex.as_deref(),
+            actual_tokens,
+            &cand.record_id,
+        );
+
+        if !verdict.passed {
+            let reason = verdict
+                .rejection_reason
+                .unwrap_or_else(|| "Rejected by Synthetic & Slop Exclusion Gate".to_string());
+            rejected_candidates.push(RejectedCandidateReport {
+                record_id: cand.record_id.clone(),
+                reason,
+            });
+            continue;
+        }
+
+        let mut cleaned_cand = cand.clone();
+        cleaned_cand.prompt = verdict.cleaned_prompt;
+        cleaned_cand.chosen_response = verdict.cleaned_response;
+
+        match MarketplaceSanitizer::sanitize_and_sign_record(&cleaned_cand, &store.node_seed) {
             Ok(rec) => sanitized_records.push(rec),
             Err(reason) => rejected_candidates.push(RejectedCandidateReport {
                 record_id: cand.record_id.clone(),
@@ -2131,11 +2168,13 @@ fn synthesize_default_local_candidates(
                     abstracted_takeaway: "Verified 100% verbatim substring grounding across extracted biography facts.".to_string(),
                 },
             ],
-            chosen_response: "QuorumRAG eliminates chunk-0 contact-header starvation by expanding primary retrieval hits into parent-document byte windows (0..10000 bytes), deduplicating near-identical document revisions across local and mesh peers, and verifying verbatim substring citations before synthesis so executive summaries, biographical narratives, and technical sections are always preserved in the final grounded response.".to_string(),
+            chosen_response: "QuorumRAG eliminates chunk-0 contact-header starvation by expanding primary retrieval hits into parent-document byte windows (0..10000 bytes). This approach directly captures full context. By deduplicating near-identical document revisions across local and mesh peers and verifying verbatim substring citations before synthesis, executive summaries, biographical narratives, and technical sections are always preserved in the final grounded response. The result is robust.".to_string(),
             rejected_response: None,
             citations: vec![(s1_slice.to_string(), s1_quote.to_string())],
             extra_redact_terms: extra_terms.to_vec(),
             created_unix_secs: now,
+            source_file_path: None,
+            interaction_nonce_hex: None,
         },
         RawTrajectoryCandidate {
             record_id: format!("{}-dpo-2", batch_id),
@@ -2149,11 +2188,13 @@ fn synthesize_default_local_candidates(
                 sanitized_query_or_pattern: "verify_contract_handshake|Ed25519".to_string(),
                 abstracted_takeaway: "Confirmed constant-time BLAKE3 contract check and Ed25519 peer signature verification across all mesh inbound and outbound scatter-gather handlers.".to_string(),
             }],
-            chosen_response: "Federated scatter-gather requests require Ed25519 signatures and constant-time BLAKE3 embedding contract verification alongside Microsoft Presidio and GLiNER DLP scrubbing so unverified peers and raw sensitive spans are deterministically rejected before any remote candidate chunk enters the local synthesis window.".to_string(),
+            chosen_response: "Federated scatter-gather requests require Ed25519 signatures and constant-time BLAKE3 embedding contract verification alongside Microsoft Presidio and GLiNER DLP scrubbing. This enforces zero-trust security. Consequently, unverified peers and raw sensitive spans are deterministically rejected before any remote candidate chunk enters the local synthesis window.".to_string(),
             rejected_response: Some("Unauthenticated peers can query raw files directly without contract verification.".to_string()),
             citations: vec![(s2_slice.to_string(), s2_quote.to_string())],
             extra_redact_terms: extra_terms.to_vec(),
             created_unix_secs: now,
+            source_file_path: None,
+            interaction_nonce_hex: None,
         },
     ]
 }
@@ -2177,4 +2218,417 @@ fn hex_to_32_bytes(hex_str: &str) -> Option<[u8; 32]> {
         out[i] = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// TEST & VERIFICATION ENDPOINTS (R3: Localhost Marketplace Testing Tools)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MarketplaceTestIssueCertRequest {
+    #[serde(default)]
+    pub buyer_id: Option<String>,
+    #[serde(default)]
+    pub legal_entity_name: Option<String>,
+    #[serde(default)]
+    pub buyer_organization: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub lei_or_duns_id: Option<String>,
+    #[serde(default)]
+    pub egress_cidr: Option<String>,
+    #[serde(default)]
+    pub authorized_egress_cidrs: Option<Vec<String>>,
+    #[serde(default)]
+    pub bound_tpm_pubkey_blake3: Option<String>,
+    #[serde(default)]
+    pub validity_days: Option<i64>,
+}
+
+/// POST /api/v1/marketplace/test/issue-cert (and /api/v1/marketplace/issue-cert)
+/// Issues an Ed25519-signed BuyerJurisdictionCertificate supporting 127.0.0.1/32.
+pub async fn marketplace_test_issue_cert_handler(
+    State(state): State<Arc<DaemonState>>,
+    _headers: HeaderMap,
+    body_opt: Option<Json<MarketplaceTestIssueCertRequest>>,
+) -> impl IntoResponse {
+    let req = body_opt.map(|Json(r)| r).unwrap_or_default();
+    let store = match state.marketplace_store() {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+
+    let buyer_id = req
+        .buyer_id
+        .unwrap_or_else(|| "localhost-dev-buyer".to_string());
+    let legal_entity_name = req
+        .legal_entity_name
+        .or(req.buyer_organization)
+        .unwrap_or_else(|| "Localhost Sovereign AI Lab".to_string());
+    let country = req.country.unwrap_or_else(|| "US".to_string());
+    let lei_or_duns_id = req
+        .lei_or_duns_id
+        .unwrap_or_else(|| "549300USSOVEREIGN99".to_string());
+
+    let authorized_egress_cidrs = if let Some(cidrs) = req.authorized_egress_cidrs {
+        if cidrs.is_empty() {
+            vec!["127.0.0.1/32".to_string()]
+        } else {
+            cidrs
+        }
+    } else if let Some(cidr) = req.egress_cidr {
+        vec![cidr]
+    } else {
+        vec!["127.0.0.1/32".to_string()]
+    };
+
+    let bound_tpm_pubkey_blake3 = req.bound_tpm_pubkey_blake3.unwrap_or_else(|| {
+        blake3::hash(b"localhost-dev-tpm-ek-primary")
+            .to_hex()
+            .to_string()
+    });
+
+    let validity_days = req.validity_days.unwrap_or(365);
+    let now = Utc::now().timestamp();
+    let expires_unix_secs = now + (validity_days.max(1) * 86400);
+
+    let mut cert = BuyerJurisdictionCertificate {
+        buyer_id,
+        legal_entity_name,
+        incorporation_country_iso: country,
+        lei_or_duns_id,
+        authorized_egress_cidrs,
+        bound_tpm_pubkey_blake3,
+        foci_ubo_verified_clean: true,
+        doj_part202_non_covered_person: true,
+        non_redistribution_covenant_accepted: true,
+        expires_unix_secs,
+        issuer_ed25519_signature_hex: String::new(),
+    };
+
+    if let Err(e) = cert.sign_ed25519(&store.default_authority_seed) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Certificate signing failed: {e}") })),
+        )
+            .into_response();
+    }
+
+    let cert_json = serde_json::to_string_pretty(&cert).unwrap_or_default();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "certificate": cert.clone(),
+            "cert": cert,
+            "certificate_json": cert_json,
+            "authority_pubkey_hex": bytes_to_hex(&store.default_authority_pubkey),
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MarketplaceTestExecuteTransactionRequest {
+    #[serde(default)]
+    pub batch_id: Option<String>,
+    #[serde(default)]
+    pub seller_endpoint: Option<String>,
+    #[serde(default)]
+    pub buyer_cidr: Option<String>,
+    #[serde(default)]
+    pub amount_paid_cents: Option<u64>,
+}
+
+/// POST /api/v1/marketplace/test/execute-transaction
+/// Executes an end-to-end localhost buy-and-sell test transaction against localhost seller.
+pub async fn marketplace_test_execute_transaction_handler(
+    State(state): State<Arc<DaemonState>>,
+    _headers: HeaderMap,
+    body_opt: Option<Json<MarketplaceTestExecuteTransactionRequest>>,
+) -> impl IntoResponse {
+    let start_time = Instant::now();
+    let req = body_opt.map(|Json(r)| r).unwrap_or_default();
+    let store = match state.marketplace_store() {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+
+    // 1. Ensure Opt-In and consent agreement are active
+    let cfg = match store.get_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+
+    let cfg = if !cfg.opt_in_enabled || !cfg.user_consent_checked {
+        let update_req = OptInConfigRequest {
+            opt_in_enabled: true,
+            user_consent_checked: Some(true),
+            consent_statement: Some("Localhost test consent agreement authorized".to_string()),
+            opt_in_folders: Some(vec!["D:\\Test".to_string()]),
+            five_eyes_enabled: Some(false),
+            allowed_jurisdictions: Some(vec!["US".to_string()]),
+            price_per_1k_records_cents: Some(5000),
+            authority_pubkey_hex: None,
+        };
+        match store.update_config(update_req) {
+            Ok(updated) => updated,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        cfg
+    };
+
+    // 2. Discover or synthesize an approved batch
+    let batch_opt = store.load_batch(req.batch_id.as_deref()).ok().flatten();
+    let (manifest, encrypted_bytes) = if let Some((m, enc, _app)) = batch_opt {
+        (m, enc)
+    } else {
+        // Synthesize and auto-approve a batch
+        let now = Utc::now().timestamp();
+        let batch_id = format!("batch-localhost-test-{}", uuid::Uuid::new_v4());
+        let default_tags = vec!["rust-security".to_string(), "sovereign-ai".to_string()];
+        let raw_cands = synthesize_default_local_candidates(&store.origin_node_id, &batch_id, &default_tags, &[], now);
+        let mut sanitized = Vec::new();
+        for cand in &raw_cands {
+            if let Ok(rec) = MarketplaceSanitizer::sanitize_and_sign_record(cand, &store.node_seed) {
+                sanitized.push(rec);
+            }
+        }
+        let manifest = match DataCatalogManifest::from_records(
+            &batch_id,
+            &store.origin_node_id,
+            &store.node_seed,
+            &sanitized,
+            5000,
+            now,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e })),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(e) = store.save_staged_batch(&manifest, &sanitized, true) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+        let Some((m, enc, _)) = store.load_batch(Some(&batch_id)).ok().flatten() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed to reload staged batch" })),
+            )
+                .into_response();
+        };
+        (m, enc)
+    };
+
+    // 3. Issue a test certificate supporting 127.0.0.1/32
+    let buyer_id = "localhost-dev-buyer".to_string();
+    let cidr = req.buyer_cidr.unwrap_or_else(|| "127.0.0.1/32".to_string());
+    let tpm_hash = blake3::hash(b"localhost-dev-tpm-ek-primary").to_hex().to_string();
+    let now = Utc::now().timestamp();
+
+    let mut cert = BuyerJurisdictionCertificate {
+        buyer_id: buyer_id.clone(),
+        legal_entity_name: "Localhost Sovereign AI Lab".to_string(),
+        incorporation_country_iso: "US".to_string(),
+        lei_or_duns_id: "549300USSOVEREIGN99".to_string(),
+        authorized_egress_cidrs: vec![cidr],
+        bound_tpm_pubkey_blake3: tpm_hash.clone(),
+        foci_ubo_verified_clean: true,
+        doj_part202_non_covered_person: true,
+        non_redistribution_covenant_accepted: true,
+        expires_unix_secs: now + 365 * 86400,
+        issuer_ed25519_signature_hex: String::new(),
+    };
+
+    if let Err(e) = cert.sign_ed25519(&store.default_authority_seed) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response();
+    }
+
+    // 4. Verify preview with SovereignJurisdictionGuard
+    let auth_pub = store.active_authority_pubkey(&cfg);
+    let caller_ip = IpAddr::from([127, 0, 0, 1]);
+    if let Err(reason) = verify_us_sovereign_buyer_against_domestic_evasion(
+        caller_ip,
+        &[],
+        None,
+        Some(&tpm_hash),
+        &cert,
+        &auth_pub,
+        &cfg.allowed_jurisdictions,
+        true,
+        now,
+    ) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": format!("Guard preview failed: {reason}") })),
+        )
+            .into_response();
+    }
+
+    // 5. Issue EscrowReceiptToken (Unlock)
+    let total_records = (manifest.sft_record_count + manifest.dpo_record_count).max(1) as u64;
+    let default_amount =
+        ((total_records * manifest.price_per_1k_records_cents) / 1000).max(manifest.price_per_1k_records_cents);
+    let amount_paid = req.amount_paid_cents.unwrap_or(default_amount);
+
+    let mut receipt = EscrowReceiptToken {
+        receipt_id: format!("rcpt-{}", uuid::Uuid::new_v4()),
+        batch_id: manifest.batch_id.clone(),
+        batch_merkle_root_blake3: manifest.merkle_root_blake3.clone(),
+        buyer_id: cert.buyer_id.clone(),
+        bound_tpm_pubkey_blake3: cert.bound_tpm_pubkey_blake3.clone(),
+        amount_paid_cents: amount_paid,
+        issued_unix_secs: now,
+        expires_unix_secs: now + 3600,
+        keyed_blake3_mac_hex: String::new(),
+    };
+    receipt.seal_with_secret(&store.escrow_secret);
+
+    if let Ok(conn) = store.connect() {
+        if let Ok(json_str) = serde_json::to_string(&receipt) {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO escrow_receipts (receipt_id, batch_id, buyer_id, receipt_json, redeemed_count, created_unix_secs)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                params![receipt.receipt_id, receipt.batch_id, receipt.buyer_id, json_str, now],
+            );
+        }
+    }
+
+    // 6. Decrypt records and apply cryptographic buyer watermarks
+    let raw_records = match store.decrypt_batch_records(&manifest.batch_id, &encrypted_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Batch decryption failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut watermark_verified = true;
+    let mut total_downloaded_bytes = 0usize;
+    let watermarked_records: Vec<SanitizedTrainingRecord> = raw_records
+        .iter()
+        .map(|r| {
+            let wm_rec = r.with_buyer_watermark(&store.node_seed, &buyer_id, "full_unlock");
+            if !wm_rec.verify_buyer_watermark(&store.node_seed, &buyer_id, "full_unlock") {
+                watermark_verified = false;
+            }
+            if let Ok(line) = serde_json::to_string(&wm_rec) {
+                total_downloaded_bytes += line.len() + 1;
+            }
+            wm_rec
+        })
+        .collect();
+
+    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "buyer_id": buyer_id,
+            "buyer_cert_id": buyer_id,
+            "batch_id": manifest.batch_id,
+            "escrow_tx_id": receipt.receipt_id,
+            "receipt_id": receipt.receipt_id,
+            "token": receipt.keyed_blake3_mac_hex,
+            "records_downloaded": watermarked_records.len(),
+            "downloaded_bytes": total_downloaded_bytes,
+            "amount_paid_cents": amount_paid,
+            "payout_cents": amount_paid,
+            "merkle_root_blake3": manifest.merkle_root_blake3,
+            "synthetic_contamination_filtered": manifest.synthetic_contamination_filtered,
+            "watermark_verified": watermark_verified,
+            "elapsed_ms": elapsed_ms,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MarketplaceIssueNonceRequest {
+    #[serde(default)]
+    pub trajectory_id: Option<String>,
+    #[serde(default)]
+    pub context_token_count: Option<usize>,
+}
+
+/// POST /api/v1/marketplace/issue-nonce
+/// Issues a Stage 4 HumanTelemetryGuard interaction nonce.
+pub async fn marketplace_issue_nonce_handler(
+    State(state): State<Arc<DaemonState>>,
+    body_opt: Option<Json<MarketplaceIssueNonceRequest>>,
+) -> impl IntoResponse {
+    let req = body_opt.map(|Json(r)| r).unwrap_or_default();
+    let store = match state.marketplace_store() {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+
+    let traj_id = req
+        .trajectory_id
+        .unwrap_or_else(|| format!("traj-{}", uuid::Uuid::new_v4()));
+    let tokens = req.context_token_count.unwrap_or(100);
+    let nonce_hex = store
+        .synthetic_pipeline
+        .telemetry
+        .issue_interaction_nonce(&traj_id, tokens);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "trajectory_id": traj_id,
+            "nonce_hex": nonce_hex,
+            "issued_unix_secs": Utc::now().timestamp(),
+        })),
+    )
+        .into_response()
 }

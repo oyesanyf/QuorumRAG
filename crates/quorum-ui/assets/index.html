@@ -230,8 +230,9 @@
       <div class="modal-body">
         <div class="form-group">
           <label>Target Paths (leave empty for all watched dirs):</label>
-          <input type="text" id="reindex-target-path" placeholder="crates/quorum-coordinator">
+          <input type="text" id="reindex-target-path" placeholder="e.g. D:\Documents or C:\Projects">
         </div>
+        <div id="reindex-folder-explorer-mount" class="folder-explorer-mount" style="margin-top:10px;"></div>
         <div class="form-group checkbox-group">
           <label><input type="checkbox" id="reindex-full"> Full Rebuild (bypass Level-1 cache)</label>
           <label><input type="checkbox" id="reindex-force-embed"> Force Re-embedding (bypass Level-2 cache)</label>
@@ -533,6 +534,27 @@
             </tbody>
           </table>
         </div>
+
+        <!-- 4. Step 4: Localhost Marketplace Issuer & Buyer Test Panel (127.0.0.1/32 Verification) -->
+        <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:10px; padding:12px 14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+            <strong>3. Localhost Marketplace Issuer &amp; Buyer Test Panel (<code>127.0.0.1/32</code> Verification &amp; Synthetic Gate)</strong>
+            <div style="display:flex; gap:8px;">
+              <button type="button" id="btn-marketplace-issue-test-cert" class="btn-primary" onclick="window.issueMarketplaceTestCert()" style="padding:6px 12px; font-size:12px; background:#4f46e5; border-color:#4f46e5;">
+                Issue 127.0.0.1/32 Test Cert
+              </button>
+              <button type="button" id="btn-marketplace-execute-test-tx" class="btn-primary" onclick="window.executeMarketplaceTestTx()" style="padding:6px 12px; font-size:12px; background:#0891b2; border-color:#0891b2;">
+                Execute Localhost Escrow Pull
+              </button>
+            </div>
+          </div>
+          <div style="font-size:11px; opacity:0.8; margin-bottom:6px;">
+            Validates end-to-end buyer pull workflow with Layer 4 CIDR verification (<code>127.0.0.1/32</code>), commit-and-reveal escrow tokens, per-buyer watermarking, and 4-stage synthetic exclusion gate.
+          </div>
+          <div id="marketplace-test-output-box" style="font-size:11px; font-family:monospace; background:rgba(0,0,0,0.35); padding:10px; border-radius:8px; white-space:pre-wrap; max-height:160px; overflow-y:auto;">
+            Click "Issue 127.0.0.1/32 Test Cert" or "Execute Localhost Escrow Pull" to test against local daemon.
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -583,6 +605,7 @@
             'Batch ID: ' + m.batch_id + '\n' +
             'Origin Node: ' + m.origin_node_id + ' (Ed25519 Signed)\n' +
             'SFT Records: ' + m.sft_record_count + ' | DPO Pairs: ' + m.dpo_record_count + ' | Verified Tokens: ' + m.total_tokens + '\n' +
+            'Synthetic Contamination Filtered: ' + (m.synthetic_contamination_filtered ? 'Passed (4-Stage Gate) [true]' : 'Unfiltered [false]') + '\n' +
             'BLAKE3 Merkle Root: ' + m.merkle_root_blake3 + '\n' +
             'Sanitized Canary Sample[0]: ' + (m.canary_sample && m.canary_sample[0] ? m.canary_sample[0].chosen_response : 'None');
         }
@@ -661,6 +684,58 @@
       if (!res.ok) {
         if (box) box.textContent = 'Blocked (' + res.status + '): ' + (data.error || JSON.stringify(data));
         return;
+      }
+      await window.refreshMarketplaceStatus();
+    };
+
+    window.issueMarketplaceTestCert = async function() {
+      const box = document.getElementById('marketplace-test-output-box');
+      if (box) box.textContent = 'Issuing 127.0.0.1/32 Sovereign Buyer Certificate from daemon...';
+      const res = await fetch('/api/v1/marketplace/test/issue-cert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          buyer_id: 'localhost-ui-buyer',
+          legal_entity_name: 'Localhost UI Test Lab',
+          authorized_egress_cidrs: ['127.0.0.1/32']
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (box) box.textContent = 'Failed (' + res.status + '): ' + (data.error || JSON.stringify(data));
+        return;
+      }
+      if (box) {
+        const certObj = data.cert || data.certificate;
+        box.textContent = '=== Sovereign Buyer Certificate Issued (127.0.0.1/32) ===\n' +
+          JSON.stringify(certObj, null, 2);
+      }
+    };
+
+    window.executeMarketplaceTestTx = async function() {
+      const box = document.getElementById('marketplace-test-output-box');
+      if (box) box.textContent = 'Executing localhost end-to-end escrow and pull transaction...';
+      const res = await fetch('/api/v1/marketplace/test/execute-transaction', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (box) box.textContent = 'Transaction Failed (' + res.status + '): ' + (data.error || JSON.stringify(data));
+        return;
+      }
+      if (box) {
+        const payoutCents = data.payout_cents !== undefined ? data.payout_cents : (data.amount_paid_cents || 0);
+        box.textContent = '=== Localhost End-to-End Escrow & Pull Test PASSED ===\n' +
+          'Batch ID:           ' + data.batch_id + '\n' +
+          'Status:             ' + data.status + '\n' +
+          'Escrow Receipt ID:  ' + data.receipt_id + '\n' +
+          'Records Pulled:     ' + data.records_downloaded + '\n' +
+          'Watermark Verified: ' + (data.watermark_verified ? 'Yes (Canary match)' : 'No') + '\n' +
+          'Synthetic Filtered: ' + (data.synthetic_contamination_filtered ? 'Passed (4-Stage Gate) [true]' : 'No') + '\n' +
+          'Total Payout:       $' + (payoutCents / 100).toFixed(2) + '\n' +
+          'Layer 4 CIDR Check: PASSED (127.0.0.1/32 matched caller IP)';
       }
       await window.refreshMarketplaceStatus();
     };

@@ -17,12 +17,15 @@ pub use crate::types::AgenticGraphState;
 use tokio::sync::mpsc::Sender;
 use std::sync::Arc;
 use crate::cache::CacheManager;
+use crate::rlm_orchestrator::{RlmDepthAwareSemaphore, RlmParentSliceCache};
 use quorum_contract::EmbeddingGenerator;
 
 pub struct AgenticStateGraphRunner {
     pub max_hops: usize,
     pub relevance_threshold: f32,
     pub cache_manager: Arc<CacheManager>,
+    pub rlm_semaphore: Arc<RlmDepthAwareSemaphore>,
+    pub rlm_slice_cache: Arc<RlmParentSliceCache>,
 }
 
 impl Default for AgenticStateGraphRunner {
@@ -31,6 +34,8 @@ impl Default for AgenticStateGraphRunner {
             max_hops: 3,
             relevance_threshold: 0.60,
             cache_manager: Arc::new(CacheManager::default()),
+            rlm_semaphore: Arc::new(RlmDepthAwareSemaphore::default_depth_aware()),
+            rlm_slice_cache: Arc::new(RlmParentSliceCache::new()),
         }
     }
 }
@@ -41,11 +46,23 @@ impl AgenticStateGraphRunner {
             max_hops,
             relevance_threshold,
             cache_manager: Arc::new(CacheManager::default()),
+            rlm_semaphore: Arc::new(RlmDepthAwareSemaphore::default_depth_aware()),
+            rlm_slice_cache: Arc::new(RlmParentSliceCache::new()),
         }
     }
 
     pub fn with_cache_manager(mut self, cache_manager: Arc<CacheManager>) -> Self {
         self.cache_manager = cache_manager;
+        self
+    }
+
+    pub fn with_rlm_semaphore(mut self, rlm_semaphore: Arc<RlmDepthAwareSemaphore>) -> Self {
+        self.rlm_semaphore = rlm_semaphore;
+        self
+    }
+
+    pub fn with_rlm_slice_cache(mut self, rlm_slice_cache: Arc<RlmParentSliceCache>) -> Self {
+        self.rlm_slice_cache = rlm_slice_cache;
         self
     }
 
@@ -470,15 +487,18 @@ impl AgenticStateGraphRunner {
                 }
 
                 AgenticStateName::SynthesizeWithCitations => {
-                    // Live RLM Parent-Document Enrichment: expand local chunks into surrounding
-                    // parent-document byte windows and regex-grep uncovered query terms (leaving
-                    // federated P2P mesh chunks untouched).
-                    crate::rlm_orchestrator::RlmOrchestrator::enrich_retrieved_chunks_with_parent_rlm(
+                    // Live Concurrent RLM Parent-Document Enrichment: concurrently expand local chunks
+                    // into surrounding parent-document byte windows and regex-grep uncovered query terms
+                    // bounded by RlmDepthAwareSemaphore over a JoinSet.
+                    crate::rlm_orchestrator::RlmOrchestrator::enrich_retrieved_chunks_with_parent_rlm_concurrent(
                         &graph_state.current_query,
                         &mut graph_state.retrieved_chunks,
-                        engine.local_storage.as_ref(),
+                        Arc::clone(&engine.local_storage),
                         access_tier,
-                    );
+                        Arc::clone(&self.rlm_semaphore),
+                        Some(Arc::clone(&self.rlm_slice_cache)),
+                    )
+                    .await;
 
                     let installed = crate::offline_engine::DeterministicOfflineSynthesisEngine::probe_installed_ollama_models_default();
                     if !installed.is_empty() {

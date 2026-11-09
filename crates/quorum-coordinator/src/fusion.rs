@@ -9,6 +9,59 @@ impl RrfCombiner {
         ranks.iter().map(|&r| 1.0 / (k + r as f32)).sum()
     }
 
+    /// Combines dense vector hits and sparse lexical BM25 hits via Reciprocal Rank Fusion ($k=60.0$)
+    /// with deterministic tie-breaking on `(score DESC, chunk_id ASC, blake3_hash ASC)`.
+    pub fn fuse_dense_and_sparse(
+        dense_hits: Vec<ScoredChunk>,
+        sparse_hits: Vec<ScoredChunk>,
+        k: f32,
+        dense_weight: f32,
+        sparse_weight: f32,
+        top_k: usize,
+    ) -> Vec<ScoredChunk> {
+        let mut rrf_map: HashMap<String, (f32, DocumentChunk)> = HashMap::new();
+
+        let mut current_rank = 1;
+        for (i, scored) in dense_hits.iter().enumerate() {
+            if i > 0 && (scored.score - dense_hits[i - 1].score).abs() > 1e-6 {
+                current_rank = i + 1;
+            }
+            let rrf = dense_weight / (k + current_rank as f32);
+            let entry = rrf_map
+                .entry(scored.chunk.chunk_id.clone())
+                .or_insert_with(|| (0.0, scored.chunk.clone()));
+            entry.0 += rrf;
+        }
+
+        let mut current_rank = 1;
+        for (i, scored) in sparse_hits.iter().enumerate() {
+            if i > 0 && (scored.score - sparse_hits[i - 1].score).abs() > 1e-6 {
+                current_rank = i + 1;
+            }
+            let rrf = sparse_weight / (k + current_rank as f32);
+            let entry = rrf_map
+                .entry(scored.chunk.chunk_id.clone())
+                .or_insert_with(|| (0.0, scored.chunk.clone()));
+            entry.0 += rrf;
+        }
+
+        let mut combined: Vec<ScoredChunk> = rrf_map
+            .into_iter()
+            .map(|(_id, (score, chunk))| ScoredChunk::new(chunk, score, "local", false))
+            .collect();
+
+        combined.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
+                .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
+        });
+
+        combined.truncate(top_k);
+        combined
+    }
+
     /// Combines local rankings and remote peer candidate lists using Reciprocal Rank Fusion ($k=60.0$)
     /// with BLAKE3 deduplication, 1.25x multi-peer consensus boost, and deterministic tie-breaking on `(chunk_id, blake3_hash)`.
     pub fn fuse_rankings(
