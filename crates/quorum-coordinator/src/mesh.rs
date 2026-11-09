@@ -137,14 +137,21 @@ pub struct MeshQueryAdmissionController {
     pub global_semaphore: Arc<tokio::sync::Semaphore>,
     pub per_peer_semaphores: Arc<dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>>,
     pub max_per_peer: usize,
+    pub global_capacity: usize,
+    pub peak_global_in_use: Arc<std::sync::atomic::AtomicUsize>,
+    pub total_admitted: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MeshQueryAdmissionController {
     pub fn new(global_concurrency: usize, max_per_peer: usize) -> Self {
+        let cap = global_concurrency.clamp(8, 128);
         Self {
-            global_semaphore: Arc::new(tokio::sync::Semaphore::new(global_concurrency.clamp(8, 128))),
+            global_semaphore: Arc::new(tokio::sync::Semaphore::new(cap)),
             per_peer_semaphores: Arc::new(dashmap::DashMap::new()),
             max_per_peer: max_per_peer.clamp(1, 16),
+            global_capacity: cap,
+            peak_global_in_use: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            total_admitted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -176,7 +183,27 @@ impl MeshQueryAdmissionController {
             .await
             .map_err(|e| CoordinatorError::Network(format!("Peer query semaphore closed: {}", e)))?;
 
+        let in_use = self
+            .global_capacity
+            .saturating_sub(self.global_semaphore.available_permits());
+        self.peak_global_in_use
+            .fetch_max(in_use, std::sync::atomic::Ordering::Relaxed);
+        self.total_admitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         Ok((global_permit, peer_permit))
+    }
+
+    pub fn peak_in_use(&self) -> usize {
+        self.peak_global_in_use.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn total_admitted(&self) -> usize {
+        self.total_admitted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn available_global_permits(&self) -> usize {
+        self.global_semaphore.available_permits()
     }
 }
 
@@ -291,6 +318,9 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
         for peer in peers {
             let req = request.clone();
             futures.push(tokio::spawn(async move {
+                let _permits = MeshQueryAdmissionController::global()
+                    .acquire_permit(&peer.peer_id)
+                    .await;
                 let start = std::time::Instant::now();
                 let chunks = peer.handle_query(0).await;
                 let latency_ms = start.elapsed().as_millis() as u64;

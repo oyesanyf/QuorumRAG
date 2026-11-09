@@ -1064,18 +1064,37 @@ impl RlmOrchestrator {
 pub struct RlmDepthAwareSemaphore {
     pub max_depth: usize,
     pub depth_semaphores: Arc<Vec<Arc<tokio::sync::Semaphore>>>,
+    pub capacities: Arc<Vec<usize>>,
+    pub peak_in_use_per_depth: Arc<Vec<std::sync::atomic::AtomicUsize>>,
+    pub total_acquired_per_depth: Arc<Vec<std::sync::atomic::AtomicUsize>>,
 }
 
 impl RlmDepthAwareSemaphore {
     pub fn new(max_depth: usize, root_permits: usize, child_permits_per_depth: usize) -> Self {
         let mut sems = Vec::with_capacity(max_depth + 1);
-        sems.push(Arc::new(tokio::sync::Semaphore::new(root_permits.max(1))));
+        let mut caps = Vec::with_capacity(max_depth + 1);
+        let mut peaks = Vec::with_capacity(max_depth + 1);
+        let mut totals = Vec::with_capacity(max_depth + 1);
+
+        let r_cap = root_permits.max(1);
+        sems.push(Arc::new(tokio::sync::Semaphore::new(r_cap)));
+        caps.push(r_cap);
+        peaks.push(std::sync::atomic::AtomicUsize::new(0));
+        totals.push(std::sync::atomic::AtomicUsize::new(0));
+
+        let c_cap = child_permits_per_depth.max(1);
         for _ in 1..=max_depth {
-            sems.push(Arc::new(tokio::sync::Semaphore::new(child_permits_per_depth.max(1))));
+            sems.push(Arc::new(tokio::sync::Semaphore::new(c_cap)));
+            caps.push(c_cap);
+            peaks.push(std::sync::atomic::AtomicUsize::new(0));
+            totals.push(std::sync::atomic::AtomicUsize::new(0));
         }
         Self {
             max_depth,
             depth_semaphores: Arc::new(sems),
+            capacities: Arc::new(caps),
+            peak_in_use_per_depth: Arc::new(peaks),
+            total_acquired_per_depth: Arc::new(totals),
         }
     }
 
@@ -1083,12 +1102,27 @@ impl RlmDepthAwareSemaphore {
         Self::new(4, 16, 8)
     }
 
+    fn record_acquire(&self, depth: usize) {
+        if depth < self.depth_semaphores.len() {
+            let cap = self.capacities[depth];
+            let avail = self.depth_semaphores[depth].available_permits();
+            let in_use = cap.saturating_sub(avail);
+            self.peak_in_use_per_depth[depth].fetch_max(in_use, std::sync::atomic::Ordering::Relaxed);
+            self.total_acquired_per_depth[depth].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub async fn acquire(&self, depth: usize) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
         if depth >= self.depth_semaphores.len() {
             return Err("Exhausted: Max RLM recursion depth reached".to_string());
         }
         let sem = self.depth_semaphores[depth].clone();
-        sem.acquire_owned().await.map_err(|e| format!("RLM depth semaphore closed at depth {}: {}", depth, e))
+        let permit = sem
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("RLM depth semaphore closed at depth {}: {}", depth, e))?;
+        self.record_acquire(depth);
+        Ok(permit)
     }
 
     pub fn try_acquire(&self, depth: usize) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
@@ -1096,7 +1130,11 @@ impl RlmDepthAwareSemaphore {
             return Err("Exhausted: Max RLM recursion depth reached".to_string());
         }
         let sem = self.depth_semaphores[depth].clone();
-        sem.try_acquire_owned().map_err(|e| format!("RLM depth semaphore unavailable at depth {}: {}", depth, e))
+        let permit = sem
+            .try_acquire_owned()
+            .map_err(|e| format!("RLM depth semaphore unavailable at depth {}: {}", depth, e))?;
+        self.record_acquire(depth);
+        Ok(permit)
     }
 
     pub fn available_permits(&self, depth: usize) -> usize {
@@ -1105,6 +1143,24 @@ impl RlmDepthAwareSemaphore {
         } else {
             self.depth_semaphores[depth].available_permits()
         }
+    }
+
+    pub fn capacity_at_depth(&self, depth: usize) -> usize {
+        self.capacities.get(depth).copied().unwrap_or(0)
+    }
+
+    pub fn peak_at_depth(&self, depth: usize) -> usize {
+        self.peak_in_use_per_depth
+            .get(depth)
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    pub fn total_acquired_at_depth(&self, depth: usize) -> usize {
+        self.total_acquired_per_depth
+            .get(depth)
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
     }
 }
 
@@ -1265,6 +1321,44 @@ pub async fn execute_rlm_tools_concurrent(
     }
     results_with_idx.sort_by_key(|&(idx, _)| idx);
     results_with_idx.into_iter().map(|(_, out)| out).collect()
+}
+
+/// Executes recursive RLM sub-queries concurrently using `FuturesUnordered`,
+/// bounded at `depth + 1` by `RlmDepthAwareSemaphore` to guarantee zero parent-child deadlock.
+pub async fn execute_rlm_subqueries_unordered<F, Fut>(
+    queries: Vec<String>,
+    semaphore: Arc<RlmDepthAwareSemaphore>,
+    parent_depth: usize,
+    evaluator: F,
+) -> Vec<Result<String, String>>
+where
+    F: Fn(String, usize) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let child_depth = parent_depth + 1;
+    let evaluator = Arc::new(evaluator);
+    let mut futs = FuturesUnordered::new();
+
+    for (idx, q) in queries.into_iter().enumerate() {
+        let sem = Arc::clone(&semaphore);
+        let eval = Arc::clone(&evaluator);
+        futs.push(async move {
+            let out = match sem.acquire(child_depth).await {
+                Ok(_permit) => eval(q, child_depth).await,
+                Err(e) => Err(e),
+            };
+            (idx, out)
+        });
+    }
+
+    let mut ordered = Vec::new();
+    while let Some(item) = futs.next().await {
+        ordered.push(item);
+    }
+    ordered.sort_by_key(|&(idx, _)| idx);
+    ordered.into_iter().map(|(_, res)| res).collect()
 }
 
 #[cfg(test)]

@@ -26,8 +26,9 @@ pub use audio_indexer::{AudioIndexer, AudioMetadata};
 pub use classifier_router::{CandidateKind, ClassifierRouter, FilterDecision};
 pub use chunker::{
     build_contextual_header, parse_section_header_line, prepend_contextual_header,
-    prepend_contextual_header_with_section, RawTextChunk, SectionHeader,
-    SectionHierarchyStack, StructureAwareRawChunk, TextChunker,
+    prepend_contextual_header_with_section, resolve_document_metadata, RawTextChunk,
+    ResolvedDocumentMetadata, SectionHeader, SectionHierarchyStack, StructureAwareRawChunk,
+    TextChunker,
 };
 pub use config::{ChunkerConfig, DriftFixOptions, DriftType, IngestConfig, ReindexOptions};
 pub use crawler::{CrawlerStats, DiscoveredCandidate, FilesystemCrawler};
@@ -42,7 +43,10 @@ pub use error::IngestError;
 pub use image_indexer::{ImageIndexer, ImageMetadata, OcrOutcome};
 pub use reindex::{ReindexPhase, ReindexProgress, ReindexWorker};
 pub use reverse_geocoder::{resolve_location, GeoLocation};
-pub use throttling::{end_background_thread_priority, set_background_thread_priority};
-pub use thread_pool::{IngestPermitTiers, IngestThreadPool};
+pub use throttling::{
+    current_process_rss_bytes, end_background_thread_priority,
+    pin_worker_thread_to_background_core, set_background_thread_priority,
+};
+pub use thread_pool::{IngestPermitTiers, IngestThreadPool, PermitTierTelemetrySnapshot};
 pub use warmer::{CacheWarmReport, CacheWarmer, WarmConfig};
 pub use watcher::{FilesystemWatcher, WatcherEvent, WatcherHandle};
