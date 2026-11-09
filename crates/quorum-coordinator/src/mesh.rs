@@ -20,6 +20,8 @@ pub struct PeerHealthStats {
     pub peer_id: String,
     pub last_rtt_ms: Option<f64>,
     pub avg_rtt_ms: Option<f64>,
+    #[serde(default)]
+    pub canary_rtt_ms: Option<f64>,
     pub success_count: u64,
     pub failure_count: u64,
     pub consecutive_failures: u32,
@@ -58,6 +60,26 @@ impl PeerHealthRegistry {
         entry.success_count = entry.success_count.saturating_add(1);
         entry.consecutive_failures = 0;
         entry.last_chunks_returned = chunks_returned;
+        entry.last_seen_rfc3339 = Some(Utc::now().to_rfc3339());
+        entry.last_error = None;
+    }
+
+    /// Record a lightweight canary probe (updates liveness & canary_rtt_ms without corrupting search avg_rtt_ms).
+    pub fn record_canary_probe(&self, peer_id: &str, rtt_ms: f64) {
+        let mut guard = self.stats.write().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PeerHealthStats {
+                peer_id: peer_id.to_string(),
+                ..Default::default()
+            });
+        let rounded = (rtt_ms * 100.0).round() / 100.0;
+        entry.canary_rtt_ms = Some(rounded);
+        if entry.last_rtt_ms.is_none() {
+            entry.last_rtt_ms = Some(rounded);
+        }
+        entry.success_count = entry.success_count.saturating_add(1);
+        entry.consecutive_failures = 0;
         entry.last_seen_rfc3339 = Some(Utc::now().to_rfc3339());
         entry.last_error = None;
     }
@@ -289,7 +311,7 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
         let mut responses = Vec::new();
         let primary_deadline = tokio::time::Instant::now() + timeout;
         let mut active_deadline = primary_deadline;
-        let mut got_non_empty = false;
+        let mut _got_non_empty = false;
 
         loop {
             if futures.is_empty() {
@@ -325,17 +347,13 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
                     if responses.len() >= max_peer_responses || pending_ids.is_empty() {
                         break;
                     }
-                    let max_straggler_grace = if chunks_count > 0 {
-                        got_non_empty = true;
-                        Duration::from_millis(120)
-                    } else if !got_non_empty {
-                        Duration::from_millis(200)
-                    } else {
-                        Duration::from_millis(120)
-                    };
-                    let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
-                    if straggler_deadline < active_deadline {
-                        active_deadline = straggler_deadline;
+                    if chunks_count > 0 {
+                        _got_non_empty = true;
+                        let max_straggler_grace = Duration::from_millis(300);
+                        let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
+                        if straggler_deadline < active_deadline {
+                            active_deadline = straggler_deadline;
+                        }
                     }
                 }
                 _ => break,
@@ -384,8 +402,10 @@ impl SwarmMeshDispatcher {
         if let Some(stats) = registry.get(peer_id) {
             if let Some(avg_rtt) = stats.avg_rtt_ms {
                 if avg_rtt > 0.0 {
-                    let dyn_ms = ((avg_rtt * 2.5) + 50.0).round() as u64;
-                    return Duration::from_millis(dyn_ms.clamp(150, requested_timeout.as_millis().max(150) as u64));
+                    let req_ms = requested_timeout.as_millis() as u64;
+                    let min_floor = 4000u64.min(req_ms.max(1000));
+                    let dyn_ms = ((avg_rtt * 2.5) + 3000.0).round() as u64;
+                    return Duration::from_millis(dyn_ms.clamp(min_floor, req_ms.max(min_floor)));
                 }
             }
         }
@@ -497,15 +517,16 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             }
         });
 
-        // Filter out known dead peers (>=3 consecutive failures) when healthy peers exist
+        // Filter out known dead peers (>=3 consecutive failures) when healthy peers exist,
+        // but do not evict peers if confirmed reachable by the watcher.
         let registry = global_peer_health_registry();
         if peers.len() > 1 {
             let has_healthy = peers.iter().any(|p| {
-                registry.get(&p.to_string()).map_or(true, |s| s.consecutive_failures < 3)
+                registry.get(&p.to_string()).map_or(true, |s| s.consecutive_failures < 3 || s.canary_rtt_ms.is_some())
             });
             if has_healthy {
                 peers.retain(|p| {
-                    registry.get(&p.to_string()).map_or(true, |s| s.consecutive_failures < 3)
+                    registry.get(&p.to_string()).map_or(true, |s| s.consecutive_failures < 3 || s.canary_rtt_ms.is_some())
                 });
             }
         }
@@ -578,7 +599,7 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
 
         let primary_deadline = tokio::time::Instant::now() + timeout;
         let mut active_deadline = primary_deadline;
-        let mut got_non_empty_peer = false;
+        let mut _got_non_empty_peer = false;
         let mut responses = Vec::new();
 
         loop {
@@ -622,20 +643,16 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                         break;
                     }
 
-                    // 2. Once responses have arrived, do NOT wait out 5,000ms!
-                    // If we have received matching chunks, clamp straggler grace to 120ms max.
-                    // If chunks == 0, clamp straggler grace to 200ms max.
-                    let max_straggler_grace = if chunks_len > 0 {
-                        got_non_empty_peer = true;
-                        Duration::from_millis(120)
-                    } else if !got_non_empty_peer {
-                        Duration::from_millis(200)
-                    } else {
-                        Duration::from_millis(120)
-                    };
-                    let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
-                    if straggler_deadline < active_deadline {
-                        active_deadline = straggler_deadline;
+                    // 2. Once responses have arrived with matching chunks, activate straggler grace.
+                    // Straggler grace must only activate when got_non_empty_peer is true (chunks_len > 0).
+                    // Never reduce the remaining search deadline when chunks_len == 0 and no other peer has returned hits.
+                    if chunks_len > 0 {
+                        _got_non_empty_peer = true;
+                        let max_straggler_grace = Duration::from_millis(300);
+                        let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
+                        if straggler_deadline < active_deadline {
+                            active_deadline = straggler_deadline;
+                        }
                     }
                 }
                 Ok(Some(Ok((peer_str, Err(err), rtt_ms)))) => {
@@ -874,7 +891,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
 
         // Fast-path P2P Watcher signed canary ping: proves full libp2p + Ed25519 + ACL liveness in <1ms
         if req.query_text == P2P_WATCHER_CANARY_QUERY {
-            global_peer_health_registry().record_success(&req.sender_peer_id, 0.5, 0);
+            global_peer_health_registry().record_canary_probe(&req.sender_peer_id, 0.5);
             return FederatedQueryResponse {
                 query_id: req.query_id,
                 responder_peer_id: self.local_peer_id.clone(),

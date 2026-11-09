@@ -50,7 +50,7 @@ fn test_adversarial_interrogative_restatements_matrix() {
         ("can you explain Presidio", "Presidio refers to "),
         ("can you tell me about Cigna", "Cigna is "),
         ("femi oyesanya", "Femi Oyesanya is "),
-        ("redactx", "Redactx is "),
+        ("redactx", "RedactX is "),
         // Edge cases with excess punctuation, quotes, and whitespace
         ("  Who is femi???  ", "Femi is "),
         ("\"what is RedactX\"", "RedactX is "),

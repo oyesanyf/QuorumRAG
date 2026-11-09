@@ -102,9 +102,13 @@ function secureRandomIndex(n) {
   const themeSelector = document.getElementById('theme-selector');
   const modelPills = document.querySelectorAll('.model-pill');
   const searchPills = document.querySelectorAll('.search-pill');
-  const promptInput = document.getElementById('prompt-input');
+  const promptInput = document.getElementById('prompt-input') || document.getElementById('chat-input');
   const chatForm = document.getElementById('chat-form');
   const btnSend = document.getElementById('btn-send');
+  const btnVoiceChat = document.getElementById('btn-voice-chat') || document.getElementById('btn-voice-input');
+  const btnVoiceInput = btnVoiceChat;
+  const btnVoiceTtsToggle = document.getElementById('btn-voice-tts-toggle');
+  const voiceWaveformIndicator = document.getElementById('voice-waveform-indicator');
   const chatStream = document.getElementById('chat-stream');
   const welcomeBanner = document.getElementById('welcome-banner');
   const btnToggleSidebar = document.getElementById('btn-toggle-sidebar');
@@ -705,6 +709,235 @@ function secureRandomIndex(n) {
     submitPrompt();
   });
 
+  // =========================================================================
+  // 7b. VOICE CHAT (SPEECH-TO-TEXT, TEXT-TO-SPEECH & HANDS-FREE MODE)
+  // =========================================================================
+  let ttsEnabled = (function() {
+    try {
+      return localStorage.getItem('voice_tts_enabled') === 'true';
+    } catch (_) {
+      return false;
+    }
+  })();
+
+  function updateTtsUi() {
+    if (!btnVoiceTtsToggle) return;
+    if (ttsEnabled) {
+      btnVoiceTtsToggle.classList.add('active');
+      btnVoiceTtsToggle.title = 'Text-to-Speech Response: ON (Click to mute)';
+      btnVoiceTtsToggle.setAttribute('aria-label', 'Text-to-Speech Audio Response Active');
+      const icon = btnVoiceTtsToggle.querySelector('.tts-icon');
+      if (icon) icon.textContent = '🔊';
+    } else {
+      btnVoiceTtsToggle.classList.remove('active');
+      btnVoiceTtsToggle.title = 'Text-to-Speech Response: OFF (Click to enable)';
+      btnVoiceTtsToggle.setAttribute('aria-label', 'Text-to-Speech Audio Response Disabled');
+      const icon = btnVoiceTtsToggle.querySelector('.tts-icon');
+      if (icon) icon.textContent = '🔇';
+    }
+  }
+  updateTtsUi();
+
+  if (btnVoiceTtsToggle) {
+    btnVoiceTtsToggle.addEventListener('click', () => {
+      ttsEnabled = !ttsEnabled;
+      try {
+        localStorage.setItem('voice_tts_enabled', ttsEnabled ? 'true' : 'false');
+      } catch (_) {}
+      updateTtsUi();
+      if (!ttsEnabled && typeof window !== 'undefined' && window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
+      if (typeof showSettingsToast === 'function') {
+        showSettingsToast(ttsEnabled ? '🔊 Voice responses enabled' : '🔇 Voice responses muted');
+      }
+    });
+  }
+
+  function cleanTextForSpeech(raw) {
+    if (!raw) return '';
+    return raw
+      .replace(/```[\s\S]*?```/g, ' [code omitted] ')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\[\d+\]/g, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/[*_#~>]/g, ' ')
+      .replace(/###\s*[^\n]+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function speakAssistantResponse(text) {
+    if (!ttsEnabled || typeof window === 'undefined' || !window.speechSynthesis) return;
+    const clean = cleanTextForSpeech(text);
+    if (!clean) return;
+    try {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(clean);
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      utterance.lang = (typeof navigator !== 'undefined' && navigator.language) ? navigator.language : 'en-US';
+      const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
+      if (voices && voices.length > 0) {
+        const preferred = voices.find(v => (v.lang.startsWith('en') || v.lang === utterance.lang) && (v.name.includes('Natural') || v.name.includes('Neural') || v.name.includes('Google') || v.default));
+        if (preferred) utterance.voice = preferred;
+      }
+      window.speechSynthesis.speak(utterance);
+    } catch (e) {
+      console.warn('Speech synthesis error:', e);
+    }
+  }
+
+  let speechRecognizer = null;
+  let isVoiceRecording = false;
+  let voiceSilenceTimer = null;
+  const SILENCE_SUBMIT_DELAY_MS = 1500;
+
+  function updateVoiceRecordingUi(active) {
+    isVoiceRecording = active;
+    if (btnVoiceChat) {
+      if (active) {
+        btnVoiceChat.classList.add('recording', 'voice-active');
+        btnVoiceChat.title = 'Listening... (Speak now, auto-submits on pause, or click to stop)';
+        btnVoiceChat.setAttribute('aria-label', 'Stop Voice Input');
+      } else {
+        btnVoiceChat.classList.remove('recording', 'voice-active');
+        btnVoiceChat.title = 'Voice Input / Speech-to-Text (Click to start, auto-submits on pause)';
+        btnVoiceChat.setAttribute('aria-label', 'Start Voice Input');
+      }
+    }
+    if (voiceWaveformIndicator) {
+      if (active) {
+        voiceWaveformIndicator.classList.remove('hidden');
+        voiceWaveformIndicator.setAttribute('aria-hidden', 'false');
+      } else {
+        voiceWaveformIndicator.classList.add('hidden');
+        voiceWaveformIndicator.setAttribute('aria-hidden', 'true');
+      }
+    }
+  }
+
+  function stopVoiceRecording() {
+    if (voiceSilenceTimer) {
+      clearTimeout(voiceSilenceTimer);
+      voiceSilenceTimer = null;
+    }
+    if (speechRecognizer) {
+      try {
+        speechRecognizer.stop();
+      } catch (_) {}
+      speechRecognizer = null;
+    }
+    updateVoiceRecordingUi(false);
+  }
+
+  function startVoiceRecording() {
+    if (typeof window === 'undefined') return;
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      if (spellcheckStatus) {
+        spellcheckStatus.textContent = '⚠️ Speech Recognition API not supported in this browser';
+      }
+      if (typeof showSettingsToast === 'function') {
+        showSettingsToast('Speech recognition is not supported in this browser (Web Speech API)');
+      }
+      return;
+    }
+
+    if (isVoiceRecording) {
+      stopVoiceRecording();
+      return;
+    }
+
+    // Cancel any active TTS speech when user starts talking
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+
+    try {
+      speechRecognizer = new SpeechRecognition();
+      speechRecognizer.continuous = true;
+      speechRecognizer.interimResults = true;
+      speechRecognizer.lang = (typeof navigator !== 'undefined' && navigator.language) ? navigator.language : 'en-US';
+
+      speechRecognizer.onstart = () => {
+        updateVoiceRecordingUi(true);
+      };
+
+      speechRecognizer.onresult = (event) => {
+        let interimTranscript = '';
+        let finalTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalTranscript += transcript;
+          } else {
+            interimTranscript += transcript;
+          }
+        }
+
+        const spoken = (finalTranscript || interimTranscript).trim();
+        if (spoken && promptInput) {
+          promptInput.value = spoken;
+          promptInput.style.height = 'auto';
+          promptInput.style.height = Math.min(promptInput.scrollHeight, 160) + 'px';
+          promptInput.setSelectionRange(spoken.length, spoken.length);
+        }
+
+        // Hands-Free Mode: Reset silence timer; auto-submit when user pauses speaking
+        if (voiceSilenceTimer) {
+          clearTimeout(voiceSilenceTimer);
+        }
+        voiceSilenceTimer = setTimeout(() => {
+          if (isVoiceRecording && promptInput && promptInput.value.trim() && !isGenerating) {
+            stopVoiceRecording();
+            submitPrompt();
+          }
+        }, SILENCE_SUBMIT_DELAY_MS);
+      };
+
+      speechRecognizer.onerror = (event) => {
+        console.warn('Speech recognition event error:', event.error);
+        if (event.error !== 'no-speech') {
+          stopVoiceRecording();
+        }
+      };
+
+      speechRecognizer.onend = () => {
+        stopVoiceRecording();
+      };
+
+      speechRecognizer.start();
+    } catch (e) {
+      console.warn('Failed to start SpeechRecognition:', e);
+      stopVoiceRecording();
+    }
+  }
+
+  if (btnVoiceChat) {
+    btnVoiceChat.addEventListener('click', () => {
+      if (isVoiceRecording) {
+        stopVoiceRecording();
+      } else {
+        startVoiceRecording();
+      }
+    });
+  }
+
+  // Expose voice chat helpers globally for diagnostics & automated tests
+  if (typeof window !== 'undefined') {
+    window._voiceChat = {
+      startVoiceRecording,
+      stopVoiceRecording,
+      speakAssistantResponse,
+      cleanTextForSpeech,
+      isRecording: () => isVoiceRecording,
+      isTtsEnabled: () => ttsEnabled,
+      toggleTts: () => btnVoiceTtsToggle && btnVoiceTtsToggle.click(),
+    };
+  }
+
   // PROBE HARDWARE ON LOAD (400ms fast-timeout law)
   fetchWithTimeout('/api/health', {}, 400)
     .then(r => r.json())
@@ -721,6 +954,9 @@ function secureRandomIndex(n) {
 
   if (btnStop) {
     btnStop.addEventListener('click', () => {
+      if (typeof window !== 'undefined' && window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
       if (activeAbortController) {
         activeAbortController.abort();
         activeAbortController = null;
@@ -900,6 +1136,7 @@ function secureRandomIndex(n) {
             );
           }
         }
+        speakAssistantResponse(cleanAssistantHistory);
       } else {
         const cursor = bodyEl.querySelector('.typing-cursor');
         if (cursor) cursor.remove();
@@ -1054,6 +1291,7 @@ function secureRandomIndex(n) {
             { role: 'assistant', content: cleanAssistantHistory }
           );
         }
+        speakAssistantResponse(cleanAssistantHistory);
       } else {
         const cursor = bodyEl.querySelector('.typing-cursor');
         if (cursor) cursor.remove();
@@ -1095,6 +1333,12 @@ function secureRandomIndex(n) {
   }
 
   async function submitPrompt() {
+    if (typeof stopVoiceRecording === 'function') {
+      stopVoiceRecording();
+    }
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
     if (spellcheckDebounceTimer) {
       clearTimeout(spellcheckDebounceTimer);
       spellcheckDebounceTimer = null;

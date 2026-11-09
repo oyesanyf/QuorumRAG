@@ -271,7 +271,8 @@ impl ScoredChunk {
 
         let is_ext = self.is_remote && !self.source_peer.is_empty() && !self.source_peer.eq_ignore_ascii_case("local");
         let node_id = if is_ext { Some(self.source_peer.clone()) } else { None };
-        let origin_label = if is_ext { Some("mesh".to_string()) } else { Some("local".to_string()) };
+        let origin_label = if is_ext { Some("Mesh Peer".to_string()) } else { Some("local".to_string()) };
+        let node_alias = if is_ext { Some("(Mesh Peer)".to_string()) } else { Some("(local)".to_string()) };
 
         Citation {
             peer_id: self.source_peer.clone(),
@@ -283,7 +284,7 @@ impl ScoredChunk {
             node_id,
             is_external_node: is_ext,
             origin_label,
-            node_alias: None,
+            node_alias,
             verbatim_quote: None,
             byte_range: None,
             grounding_rationale: None,

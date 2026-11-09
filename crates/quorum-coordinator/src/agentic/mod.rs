@@ -596,6 +596,30 @@ impl AgenticStateGraphRunner {
                         } else {
                             engine.sender_peer_id.clone()
                         };
+
+                        if let Some(ref mut diag) = graph_state.peer_diagnostics {
+                            for cit in &graph_state.citations {
+                                if !cit.peer_id.is_empty() && cit.peer_id != "local" && !diag.contributing_peer_ids.contains(&cit.peer_id) {
+                                    diag.contributing_peer_ids.push(cit.peer_id.clone());
+                                }
+                            }
+                        } else if graph_state.citations.iter().any(|c| !c.peer_id.is_empty() && c.peer_id != "local") {
+                            let mut contributing = Vec::new();
+                            for cit in &graph_state.citations {
+                                if !cit.peer_id.is_empty() && cit.peer_id != "local" && !contributing.contains(&cit.peer_id) {
+                                    contributing.push(cit.peer_id.clone());
+                                }
+                            }
+                            graph_state.peer_diagnostics = Some(quorum_types::FederatedPeerDiagnostics {
+                                connected_peers_count: contributing.len(),
+                                connected_peer_ids: contributing.clone(),
+                                queried_peers_count: contributing.len(),
+                                peer_outcomes: Vec::new(),
+                                summary_reason: None,
+                                contributing_peer_ids: contributing,
+                            });
+                        }
+
                         let _ = tx
                             .send(AgenticTelemetryEvent::ExecutionFinished {
                                 total_hops: graph_state.hop_count,

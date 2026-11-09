@@ -59,6 +59,8 @@ impl StorageSearcher for EmptyOrCustomStorage {
     }
 }
 
+static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Reset global mesh DLP controller settings cleanly for test isolation.
 fn reset_mesh_controller(max_peer_responses: usize, p2p_enabled: bool) {
     let ctrl = global_mesh_dlp_controller();
@@ -69,6 +71,7 @@ fn reset_mesh_controller(max_peer_responses: usize, p2p_enabled: bool) {
 
 #[tokio::test]
 async fn test_adversarial_max_peer_responses_capping_k_less_than_n() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let mock_disp = Arc::new(MockMeshDispatcher::default());
 
     // Setup N = 6 mock peers, each with 2 distinct chunks
@@ -361,6 +364,7 @@ fn test_adversarial_filename_and_peer_disambiguation_three_peers() {
 
 #[tokio::test]
 async fn test_adversarial_retrieve_mesh_node_federated_entity_search() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let mock_disp = Arc::new(MockMeshDispatcher::default());
     let peer_id = "12D3KooWPeerOmega99999".to_string();
 
@@ -475,6 +479,7 @@ fn test_adversarial_engine_mode_contract_hash_differentiation() {
 
 #[tokio::test]
 async fn test_adversarial_max_peer_responses_zero_fallback() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let mock_disp = Arc::new(MockMeshDispatcher::default());
 
     for i in 1..=3 {
@@ -530,6 +535,7 @@ async fn test_adversarial_max_peer_responses_zero_fallback() {
 
 #[tokio::test]
 async fn test_federated_mesh_citation_interleaved_when_six_local_docs_and_split_remote_resume_exist() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     reset_mesh_controller(4, true);
 
     let remote_peer_id = "12D3KooWKHc3HiYDTmS9jymRJxHjuBEQ6Z3veB21KmzuH52iRFYu".to_string();

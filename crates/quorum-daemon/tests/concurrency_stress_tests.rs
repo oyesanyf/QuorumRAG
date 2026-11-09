@@ -172,17 +172,17 @@ async fn test_rlm_slice_cache_bounded_rss_zero_copy() {
 async fn test_mesh_dynamic_tail_latency_deadlines() {
     let registry = global_peer_health_registry();
 
-    // Fast peer: avg RTT 20ms -> 20 * 2.5 + 50 = 100ms -> clamped to min 150ms
+    // Fast peer: avg RTT 20ms -> ((20 * 2.5) + 3000) = 3050ms -> clamped to min 4000ms floor
     let fast_peer = "peer_fast_123";
     registry.record_success(fast_peer, 20.0, 5);
     let d_fast = SwarmMeshDispatcher::calculate_peer_deadline(fast_peer, Duration::from_millis(5000));
-    assert_eq!(d_fast, Duration::from_millis(150), "Fast peer clamped to min 150ms");
+    assert_eq!(d_fast, Duration::from_millis(4000), "Fast peer clamped to min 4000ms floor");
 
-    // Medium peer: avg RTT 120ms -> 120 * 2.5 + 50 = 350ms
-    let med_peer = "peer_medium_456";
-    registry.record_success(med_peer, 120.0, 3);
-    let d_med = SwarmMeshDispatcher::calculate_peer_deadline(med_peer, Duration::from_millis(5000));
-    assert_eq!(d_med, Duration::from_millis(350), "Medium peer deadline scales with RTT");
+    // Slower peer: avg RTT 600ms -> ((600 * 2.5) + 3000) = 4500ms
+    let slow_peer = "peer_slow_456";
+    registry.record_success(slow_peer, 600.0, 3);
+    let d_slow = SwarmMeshDispatcher::calculate_peer_deadline(slow_peer, Duration::from_millis(5000));
+    assert_eq!(d_slow, Duration::from_millis(4500), "Slower peer deadline scales with RTT");
 
     // Unknown peer: returns requested timeout
     let unknown_peer = "peer_unknown_789";

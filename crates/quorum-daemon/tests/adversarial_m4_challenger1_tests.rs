@@ -528,23 +528,23 @@ async fn test_challenge_mesh_admission_mass_cancellation_stress() {
 fn test_challenge_mesh_dynamic_deadlines_boundary_clamping() {
     let registry = global_peer_health_registry();
 
-    // Peer with ultra-fast RTT (2ms) -> 2 * 2.5 + 50 = 55ms -> clamped to min 150ms
+    // Peer with ultra-fast RTT (2ms) -> (2 * 2.5) + 3000 = 3005ms -> clamped to min floor 4000ms
     let fast_peer = "peer_ultrafast_99";
     registry.record_success(fast_peer, 2.0, 10);
     let d_fast = SwarmMeshDispatcher::calculate_peer_deadline(fast_peer, Duration::from_millis(4000));
-    assert_eq!(d_fast, Duration::from_millis(150), "Must clamp to min 150ms");
+    assert_eq!(d_fast, Duration::from_millis(4000), "Must clamp to min 4000ms floor");
 
-    // Peer with high RTT (2000ms) -> 2000 * 2.5 + 50 = 5050ms -> clamped to requested timeout 1000ms
+    // Peer with high RTT (2000ms) -> (2000 * 2.5) + 3000 = 8000ms -> clamped to requested timeout 5000ms
     let slow_peer = "peer_high_latency_88";
     registry.record_success(slow_peer, 2000.0, 5);
-    let d_slow = SwarmMeshDispatcher::calculate_peer_deadline(slow_peer, Duration::from_millis(1000));
-    assert_eq!(d_slow, Duration::from_millis(1000), "Must clamp to requested timeout max");
+    let d_slow = SwarmMeshDispatcher::calculate_peer_deadline(slow_peer, Duration::from_millis(5000));
+    assert_eq!(d_slow, Duration::from_millis(5000), "Must clamp to requested timeout max");
 
-    // Peer with medium RTT (60ms) -> 60 * 2.5 + 50 = 200ms
+    // Peer with medium-high RTT (600ms) -> (600 * 2.5) + 3000 = 4500ms
     let med_peer = "peer_med_77";
-    registry.record_success(med_peer, 60.0, 4);
-    let d_med = SwarmMeshDispatcher::calculate_peer_deadline(med_peer, Duration::from_millis(3000));
-    assert_eq!(d_med, Duration::from_millis(200), "Calculates exact RTT * 2.5 + 50");
+    registry.record_success(med_peer, 600.0, 4);
+    let d_med = SwarmMeshDispatcher::calculate_peer_deadline(med_peer, Duration::from_millis(6000));
+    assert_eq!(d_med, Duration::from_millis(4500), "Calculates exact RTT * 2.5 + 3000");
 
     // Unregistered peer -> requested timeout
     let unk_peer = "peer_never_seen_before";
