@@ -79,20 +79,21 @@ pub const STOPWORDS: &[&str] = &[
 pub struct RetrieveMeshNode;
 
 impl RetrieveMeshNode {
-    /// Capping helper: Caps excerpts per document stem across the entire federation (max 2 per document family),
-    /// keying on document stem alone without partitioning by `source_peer`.
+    /// Capping helper: Caps excerpts per document stem per peer across the federation (max 2 per document family per peer),
+    /// keying on (source_peer, stem) so local document families do not evict remote peer chunks from the same document family.
     pub fn cap_document_families_federated(
         chunks: Vec<quorum_types::ScoredChunk>,
         max_per_family: usize,
     ) -> Vec<quorum_types::ScoredChunk> {
-        let mut stem_counts: std::collections::HashMap<String, usize> =
+        let mut stem_counts: std::collections::HashMap<(String, String), usize> =
             std::collections::HashMap::new();
         let mut stem_deduped: Vec<quorum_types::ScoredChunk> = Vec::with_capacity(chunks.len());
         for c in chunks {
             let stem = crate::offline_engine::DeterministicOfflineSynthesisEngine::normalize_file_stem(
                 &c.chunk.file_path,
             );
-            let count = stem_counts.entry(stem).or_insert(0);
+            let key = (c.source_peer.to_ascii_lowercase(), stem);
+            let count = stem_counts.entry(key).or_insert(0);
             if *count < max_per_family {
                 *count += 1;
                 stem_deduped.push(c);
@@ -1004,7 +1005,8 @@ impl RetrieveMeshNode {
                 paired.retain(|(c, crit)| {
                     let wanted_media = media_prefix
                         .map_or(false, |p| c.chunk.text_content.trim_start().starts_with(p) && crit.weighted_hits > 0);
-                    wanted_media
+                    c.is_remote
+                        || wanted_media
                         || (crit.is_relevant
                             && crit.weighted_hits > 0
                             && crit.intent_bonus > -100
@@ -1119,19 +1121,19 @@ impl RetrieveMeshNode {
         for rc in chunks.iter().filter(|c| c.source_peer != "local") {
             if seen_remote_peers.insert(rc.source_peer.clone()) {
                 preserved_remote.push(rc.clone());
-                if preserved_remote.len() >= 4 {
+                if preserved_remote.len() >= 8 {
                     break;
                 }
             }
         }
-        if preserved_remote.len() < 4 {
+        if preserved_remote.len() < 8 {
             for rc in chunks.iter().filter(|c| c.source_peer != "local") {
                 if !preserved_remote
                     .iter()
                     .any(|p| p.source_peer == rc.source_peer && p.chunk.chunk_id == rc.chunk.chunk_id)
                 {
                     preserved_remote.push(rc.clone());
-                    if preserved_remote.len() >= 4 {
+                    if preserved_remote.len() >= 8 {
                         break;
                     }
                 }
@@ -1153,10 +1155,15 @@ impl RetrieveMeshNode {
         }
 
         chunks.truncate(top_k);
+
+        // Dedicated quota for remote volatile mesh chunks so local sibling expansion
+        // and supplemental text queries cannot crowd out remote peer chunks in top-K context packing.
+        let remote_quota = preserved_remote.len().min((top_k / 3).max(2));
+
         // Interleave preserved remote peer chunks right after the #1 local chunk (slots 1..=4) rather than
         // burying them at the tail behind 6+ local files so synthesis and `SOURCES` surface `(mesh)` peers prominently.
         let mut insert_cursor = 1usize.min(chunks.len());
-        for rem in preserved_remote {
+        for rem in preserved_remote.into_iter().take(remote_quota.max(4)) {
             if let Some(existing_idx) = chunks
                 .iter()
                 .position(|c| c.source_peer == rem.source_peer && c.chunk.chunk_id == rem.chunk.chunk_id)
@@ -1166,9 +1173,11 @@ impl RetrieveMeshNode {
                     continue;
                 }
                 chunks.remove(existing_idx);
-            } else if chunks.len() >= top_k && chunks.len() > 2 {
+            } else if chunks.len() >= top_k {
                 if let Some(pos) = chunks.iter().rposition(|c| c.source_peer == "local") {
                     chunks.remove(pos);
+                } else if !chunks.is_empty() {
+                    chunks.pop();
                 }
             }
             let target_idx = insert_cursor.min(chunks.len());

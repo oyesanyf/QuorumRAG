@@ -29,12 +29,15 @@ use quorum_coordinator::{
 use quorum_storage::{SearchMode, StorageConfig, StorageEngine};
 use quorum_types::{DocumentChunk, ScoredChunk};
 
+static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // =========================================================================
 // 1. ZeroizeOnDrop Zero-Trust Memory Cleanup Verification
 // =========================================================================
 
 #[test]
 fn test_zeroize_on_drop_explicit_remote_chunk_memory_wiping() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let canary_payload = "SENSITIVE_TOP_SECRET_REMOTE_PEER_CHUNK_CANARY_HEX_987654321".to_string();
     let raw_ptr = canary_payload.as_ptr();
     let payload_len = canary_payload.len();
@@ -104,6 +107,7 @@ fn test_zeroize_on_drop_explicit_remote_chunk_memory_wiping() {
 
 #[test]
 fn test_zeroize_on_eviction_under_capacity_pressure() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let capacity = 10;
     let cache = QueryCache::new(capacity, Duration::from_secs(3600));
 
@@ -195,6 +199,7 @@ fn test_zeroize_on_eviction_under_capacity_pressure() {
 
 #[test]
 fn test_query_cache_10k_flood_eviction_bounds() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let capacity = 250;
     let cache = QueryCache::new(capacity, Duration::from_secs(3600));
 
@@ -252,6 +257,7 @@ fn test_query_cache_10k_flood_eviction_bounds() {
 
 #[test]
 fn test_embedding_cache_10k_flood_eviction_bounds() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let capacity = 300;
     let cache = EmbeddingCache::new(capacity, Duration::from_secs(3600));
     let contract_hash = [0x55u8; 32];
@@ -295,6 +301,7 @@ fn test_embedding_cache_10k_flood_eviction_bounds() {
 
 #[test]
 fn test_repeated_key_update_storm_no_memory_leak() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let capacity = 50;
     let cache = QueryCache::new(capacity, Duration::from_secs(3600));
     let repeated_query = "Frequently repeated query with rapid state updates";
@@ -354,6 +361,7 @@ fn test_repeated_key_update_storm_no_memory_leak() {
 
 #[tokio::test]
 async fn test_concurrent_recache_and_query_load_race_stress() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let temp_dir = tempdir().expect("tempdir");
     let storage_config = StorageConfig::new(temp_dir.path().to_path_buf());
     let storage = Arc::new(StorageEngine::open(storage_config).await.expect("storage open"));

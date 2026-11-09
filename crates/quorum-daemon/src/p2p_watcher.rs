@@ -509,8 +509,8 @@ pub async fn run_in_daemon_canary_probe(state: &Arc<DaemonState>) -> Vec<PeerCan
         if let Ok((peer, ma_str, outcome, rtt_ms)) = joined {
             let peer_id_str = peer.to_string();
             match outcome {
-                Ok(Ok(resp)) => {
-                    registry.record_success(&peer_id_str, rtt_ms, resp.chunks.len());
+                Ok(Ok(_resp)) => {
+                    registry.record_canary_probe(&peer_id_str, rtt_ms);
                     results.push(PeerCanaryProbeResult {
                         peer_id: peer_id_str,
                         multiaddr: ma_str,

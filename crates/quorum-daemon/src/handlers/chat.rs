@@ -203,7 +203,7 @@ pub async fn chat_sse_attach_handler(
 pub async fn chat_sse_handler(
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<ChatRequest>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+) -> impl IntoResponse {
     let query_id = payload
         .query_id
         .clone()
@@ -370,7 +370,38 @@ pub async fn chat_sse_handler(
 
     task.set_abort_handle(query_task.abort_handle());
 
-    create_chat_task_sse_stream(task)
+    let local_peer_id = if state.coordinator.engine.sender_peer_id.trim().is_empty() {
+        "local".to_string()
+    } else {
+        state.coordinator.engine.sender_peer_id.clone()
+    };
+    let connected_peers: Vec<String> = {
+        let registry = quorum_coordinator::mesh::global_peer_health_registry();
+        registry.snapshot().keys().cloned().collect()
+    };
+    let mesh_peers_str = connected_peers.join(", ");
+    let mut contributing = connected_peers.clone();
+    if !contributing.contains(&local_peer_id) {
+        contributing.push(local_peer_id.clone());
+    }
+    let contributing_str = contributing.join(", ");
+
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(val) = axum::http::HeaderValue::from_str(&local_peer_id) {
+        headers.insert("x-quorum-local-peer-id", val);
+    }
+    if !mesh_peers_str.is_empty() {
+        if let Ok(val) = axum::http::HeaderValue::from_str(&mesh_peers_str) {
+            headers.insert("x-quorum-mesh-peers", val);
+        }
+    }
+    if !contributing_str.is_empty() {
+        if let Ok(val) = axum::http::HeaderValue::from_str(&contributing_str) {
+            headers.insert("x-quorum-contributing-peers", val);
+        }
+    }
+
+    (headers, create_chat_task_sse_stream(task)).into_response()
 }
 
 /// One-shot query endpoint: `POST /api/query`.
@@ -430,22 +461,58 @@ pub async fn query_handler(
                 .map(|c| c.chunk.chunk_id.clone())
                 .collect();
             state.sessions.record_seen_chunks(&session_id, &newly_seen);
+            let local_peer_id = if state.coordinator.engine.sender_peer_id.trim().is_empty() {
+                "local".to_string()
+            } else {
+                state.coordinator.engine.sender_peer_id.clone()
+            };
             if let Ok(hist_store) = state.history_store() {
-                let responder_peer = if state.coordinator.engine.sender_peer_id.trim().is_empty() {
-                    "local"
-                } else {
-                    state.coordinator.engine.sender_peer_id.as_str()
-                };
                 let _ = hist_store.record_turn(
                     &session_id,
                     prompt,
                     &result.synthesis_prompt,
                     &result.sources_cited,
-                    responder_peer,
+                    &local_peer_id,
                     &format!("{:?}", family),
                 );
             }
-            Json(result).into_response()
+
+            let mut contributing_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+            contributing_peers.insert(local_peer_id.clone());
+            for c in &result.chunks {
+                if !c.source_peer.is_empty() && c.source_peer != "local" {
+                    contributing_peers.insert(c.source_peer.clone());
+                }
+            }
+            for cit in &result.sources_cited {
+                if !cit.peer_id.is_empty() && cit.peer_id != "local" {
+                    contributing_peers.insert(cit.peer_id.clone());
+                }
+            }
+            let contributing_str = contributing_peers.into_iter().collect::<Vec<_>>().join(", ");
+
+            let connected_peers: Vec<String> = {
+                let registry = quorum_coordinator::mesh::global_peer_health_registry();
+                registry.snapshot().keys().cloned().collect()
+            };
+            let mesh_peers_str = connected_peers.join(", ");
+
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&local_peer_id) {
+                headers.insert("x-quorum-local-peer-id", val);
+            }
+            if !contributing_str.is_empty() {
+                if let Ok(val) = axum::http::HeaderValue::from_str(&contributing_str) {
+                    headers.insert("x-quorum-contributing-peers", val);
+                }
+            }
+            if !mesh_peers_str.is_empty() {
+                if let Ok(val) = axum::http::HeaderValue::from_str(&mesh_peers_str) {
+                    headers.insert("x-quorum-mesh-peers", val);
+                }
+            }
+
+            (headers, Json(result)).into_response()
         }
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,

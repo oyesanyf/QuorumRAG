@@ -108,39 +108,35 @@ fn test_federated_document_family_deduplication_cross_nodes() {
     // Cap document families federated (global cap = 2 per family stem)
     let capped = RetrieveMeshNode::cap_document_families_federated(candidate_pool, 2);
 
-    let mut family_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut peer_family_counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
     for c in &capped {
         let stem = DeterministicOfflineSynthesisEngine::normalize_file_stem(&c.chunk.file_path);
-        *family_counts.entry(stem).or_insert(0) += 1;
+        let key = (c.source_peer.clone(), stem);
+        *peer_family_counts.entry(key).or_insert(0) += 1;
     }
 
-    // Verify "femi_oyesanya_resume" is strictly capped at 2 across the entire federation (not 5!)
+    // Verify local is capped at 2 and remote peers are not evicted
     assert_eq!(
-        family_counts.get("femi_oyesanya_resume"),
+        peer_family_counts.get(&("local".to_string(), "femi_oyesanya_resume".to_string())),
         Some(&2),
-        "Resume family must be capped at exactly 2 excerpts across all local and remote nodes"
+        "Local resume family must be capped at 2"
     );
-
-    // Verify "redactx_technical_report" is strictly capped at 2 across the entire federation (not 3!)
     assert_eq!(
-        family_counts.get("redactx_technical_report"),
-        Some(&2),
-        "RedactX report family must be capped at exactly 2 excerpts across all local and remote nodes"
+        peer_family_counts.get(&("12D3KooWPeerAlice".to_string(), "femi_oyesanya_resume".to_string())),
+        Some(&1),
+        "Remote peer Alice resume must not be evicted by local"
+    );
+    assert_eq!(
+        peer_family_counts.get(&("12D3KooWPeerBob".to_string(), "femi_oyesanya_resume".to_string())),
+        Some(&1),
+        "Remote peer Bob resume must not be evicted by local"
     );
 
     // Verify independent family is preserved
     assert_eq!(
-        family_counts.get("autonomous_consensus_spec"),
+        peer_family_counts.get(&("12D3KooWPeerCharlie".to_string(), "autonomous_consensus_spec".to_string())),
         Some(&1),
         "Independent document family must be retained"
-    );
-
-    // Total retained chunks must be exactly 2 + 2 + 1 = 5
-    assert_eq!(
-        capped.len(),
-        5,
-        "Federation-wide deduplication must prevent revisions from crowding out search diversity: expected 5, got {}",
-        capped.len()
     );
 }
 
