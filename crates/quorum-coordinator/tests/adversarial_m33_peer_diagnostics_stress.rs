@@ -7,7 +7,9 @@ use quorum_coordinator::offline_engine::DeterministicOfflineSynthesisEngine;
 use quorum_types::{
     DocumentChunk, FederatedPeerDiagnostics, PeerQueryOutcome, PeerQueryStatus, ScoredChunk,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 fn make_test_chunk(id: &str, file: &str, content: &str, source: &str, is_remote: bool) -> ScoredChunk {
     let doc = DocumentChunk::new(
@@ -396,8 +398,12 @@ fn test_sources_block_empty_chunks_with_and_without_diagnostics() {
 /// 9. Stress-tests ACTIVE_PEER_DIAGNOSTICS under high concurrency:
 /// 30 tokio tasks concurrently setting, reading, clearing, and formatting sources.
 /// Asserts that no panics, poison errors, or thread crashes occur.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn test_active_peer_diagnostics_rwlock_concurrency_stress() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    DeterministicOfflineSynthesisEngine::clear_active_peer_diagnostics();
+
     let local_chunk = Arc::new(make_test_chunk("c_c1", "C:/docs/conc.md", "Concurrent data", "local", false));
 
     let mut handles = Vec::new();
@@ -446,6 +452,9 @@ async fn test_active_peer_diagnostics_rwlock_concurrency_stress() {
 /// is strictly isolated from global state, whereas `format_sources_block` reads global state.
 #[test]
 fn test_differential_oracle_format_sources_block_isolation() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    DeterministicOfflineSynthesisEngine::clear_active_peer_diagnostics();
+
     let local_chunk = make_test_chunk("c_diff", "C:/docs/diff.md", "Differential text", "local", false);
 
     let mut diag_isolated = FederatedPeerDiagnostics::new(1, vec!["peer_isolated".into()]);
