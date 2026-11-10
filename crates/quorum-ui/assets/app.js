@@ -1788,7 +1788,16 @@ function secureRandomIndex(n) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: String(path || '') })
       });
-      if (btn) btn.textContent = res.ok ? '\u2713 Opened' : (res.status === 403 ? '\u26A0 Not allowed' : '\u26A0 Failed');
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const parentDir = data.parent_dir || String(path || '').replace(/[\\/][^\\/]+$/, '');
+        if (typeof window.openPureRustFolderPicker === 'function' && parentDir) {
+          await window.openPureRustFolderPicker('storage', parentDir);
+        }
+        if (btn) btn.textContent = '\u2713 Opened in UI';
+      } else {
+        if (btn) btn.textContent = res.status === 403 ? '\u26A0 Not allowed' : '\u26A0 Failed';
+      }
     } catch (_) {
       if (btn) btn.textContent = '\u26A0 Failed';
     }
@@ -2745,17 +2754,7 @@ function secureRandomIndex(n) {
   if (btnBrowseReindexFolder) {
     btnBrowseReindexFolder.addEventListener('click', async (e) => {
       e.preventDefault();
-      try {
-        const resp = await fetch('/api/fs/pick-folder', { method: 'POST' });
-        const data = await resp.json();
-        if (data.status === 'ok' && data.path) {
-          updateReindexSelectedBadge(data.path);
-          await window.quorumBrowseDir(data.path);
-          showSettingsToast('✓ Target folder selected: ' + data.path);
-        }
-      } catch (err) {
-        showSettingsToast('Native folder picker failed: ' + err.message);
-      }
+      await window.openPureRustFolderPicker('reindex', currentBrowsePath);
     });
   }
 
@@ -2793,18 +2792,7 @@ function secureRandomIndex(n) {
       } else if (action === 'trigger-native-folder-picker') {
         e.preventDefault();
         e.stopPropagation();
-        try {
-          const resp = await fetch('/api/fs/pick-folder', { method: 'POST' });
-          const data = await resp.json();
-          if (data.status === 'ok' && data.path) {
-            const chosen = data.path;
-            updateReindexSelectedBadge(chosen);
-            await window.quorumBrowseDir(chosen);
-            showSettingsToast('✓ Target folder set: ' + chosen);
-          }
-        } catch (err) {
-          showSettingsToast('Native folder picker failed: ' + err.message);
-        }
+        await window.openPureRustFolderPicker('reindex', currentBrowsePath);
       }
     });
   }
@@ -3403,6 +3391,7 @@ function secureRandomIndex(n) {
   }
 
   let cachedDrives = ['D:\\', 'C:\\'];
+  let cachedQuickAccess = [];
 
   async function fetchBrowseFolders(pathStr) {
     try {
@@ -3417,6 +3406,9 @@ function secureRandomIndex(n) {
       cachedBrowseDirs = Array.isArray(data.directories) ? data.directories : [];
       if (Array.isArray(data.drives) && data.drives.length > 0) {
         cachedDrives = data.drives;
+      }
+      if (Array.isArray(data.quick_access) && data.quick_access.length > 0) {
+        cachedQuickAccess = data.quick_access;
       }
     } catch (_) {}
   }
@@ -3455,6 +3447,7 @@ function secureRandomIndex(n) {
       currentPath = currentBrowsePath,
       parentPath = currentBrowseParentPath,
       drives = cachedDrives,
+      quickAccess = cachedQuickAccess,
       directories = cachedBrowseDirs,
       selectedSet = new Set(),
       selectAction = 'mkt-toggle-folder',
@@ -3484,6 +3477,16 @@ function secureRandomIndex(n) {
         </button>
       `;
     }).join('');
+
+    const quickHtml = (Array.isArray(quickAccess) && quickAccess.length > 0) ? quickAccess.map(qa => {
+      const qaPath = String(qa.path || '');
+      const isCur = currentPath && currentPath.toLowerCase() === qaPath.toLowerCase();
+      return `
+        <button type="button" class="pill-btn folder-drive-pill ${isCur ? 'active' : ''}" data-action="browse-dir" data-folder-path="${escapeHtml(qaPath)}" title="Jump to ${escapeHtml(qa.name)}: ${escapeHtml(qaPath)}">
+          ⭐ ${escapeHtml(qa.name)}
+        </button>
+      `;
+    }).join('') : '';
 
     const dirRowsHtml = (Array.isArray(directories) && directories.length > 0) ? directories.map(d => {
       const p = String(d.path || '');
@@ -3531,11 +3534,12 @@ function secureRandomIndex(n) {
 
           <div class="folder-explorer-drives">
             ${drivesHtml}
+            ${quickHtml}
           </div>
 
           ${allowNativeDialog ? `
-            <button type="button" class="pill-btn folder-native-picker-btn" data-action="trigger-native-folder-picker" data-context="${contextId}" title="Browse with Windows File Explorer dialog">
-              📂 Browse with Windows Explorer...
+            <button type="button" class="pill-btn folder-native-picker-btn" data-action="trigger-native-folder-picker" data-context="${contextId}" title="Open Pure Rust Folder Picker Modal">
+              📂 Open Pure Rust Folder Picker...
             </button>
           ` : ''}
         </div>
@@ -3565,6 +3569,350 @@ function secureRandomIndex(n) {
       </div>
     `;
   }
+
+  let pureRustPickerContext = 'general';
+  let pureRustPickerCurrentPath = '';
+  let pureRustPickerParentPath = '';
+  let pureRustPickerDrives = ['D:\\', 'C:\\'];
+  let pureRustPickerQuickAccess = [];
+  let pureRustPickerDirectories = [];
+  let pureRustPickerFilterText = '';
+  let pureRustPickerListenersBound = false;
+
+  const CONTEXT_LABELS = {
+    general: 'Marketplace Opt-In Folder',
+    mkt: 'Marketplace Opt-In Folder',
+    newdoc: 'Watch & Index Folder Immediately',
+    storage: 'Watch & Index Storage Folder',
+    mesh: 'Share Folder with P2P Mesh',
+    dlp: 'HIPAA PHI/PII DLP Simulation Folder',
+    reindex: 'Target Reindex Folder',
+    artemis: 'Artemis DFIR .jsonl / Forensic Folder',
+  };
+
+  window.applyPickedFolderToContext = async function(ctx, chosenPath) {
+    const chosen = (chosenPath || '').trim();
+    if (!chosen) {
+      showSettingsToast('Please navigate into a drive or folder before confirming selection.');
+      return false;
+    }
+
+    await window.quorumBrowseDir(chosen);
+
+    if (ctx === 'reindex') {
+      updateReindexSelectedBadge(chosen);
+      renderReindexExplorer();
+      showSettingsToast('✓ Target reindex folder set: ' + chosen);
+    } else if (ctx === 'newdoc' || ctx === 'storage') {
+      await window.quorumIndexFolderImmediate(chosen);
+    } else if (ctx === 'mesh') {
+      await window.quorumShareFolder(chosen);
+    } else if (ctx === 'mkt' || ctx === 'general') {
+      const mktInp = document.getElementById('mkt-folder-input');
+      if (mktInp) mktInp.value = chosen;
+      await toggleMarketplaceFolder(chosen, true);
+    } else if (ctx === 'dlp') {
+      const simPathInp = document.getElementById('dlp-sim-path');
+      const simPathBadge = document.getElementById('dlp-sim-path-badge');
+      const fullSimPath = /\.[a-z0-9]{2,5}$/i.test(chosen)
+        ? chosen
+        : (chosen.replace(/[\\/]+$/, '') + '\\clinical_note.txt');
+      if (simPathInp) simPathInp.value = fullSimPath;
+      if (simPathBadge) simPathBadge.textContent = fullSimPath;
+      showSettingsToast('✓ DLP simulation folder set: ' + fullSimPath);
+    } else if (ctx === 'artemis') {
+      artemisSelectedDir = chosen;
+      const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
+      const displayPill = document.getElementById('artemis-selected-folder-display');
+      if (hiddenInp) hiddenInp.value = chosen;
+      if (displayPill) {
+        displayPill.textContent = '📁 Selected: ' + chosen;
+        displayPill.title = chosen;
+        displayPill.style.color = '#10a37f';
+        displayPill.style.background = 'rgba(16,163,127,0.15)';
+        displayPill.style.borderColor = 'rgba(16,163,127,0.35)';
+      }
+      renderSettingsTabContent('artemis-dfir', '');
+      showSettingsToast('✓ Selected Artemis DFIR folder: ' + chosen);
+    } else {
+      showSettingsToast('✓ Selected folder: ' + chosen);
+    }
+    return true;
+  };
+
+  function renderPureRustPickerModalContent() {
+    const badgeEl = document.getElementById('pure-rust-picker-context-badge');
+    if (badgeEl) {
+      badgeEl.textContent = CONTEXT_LABELS[pureRustPickerContext] || ('Context: ' + pureRustPickerContext);
+    }
+
+    const drivesBar = document.getElementById('pure-rust-picker-drives-bar');
+    if (drivesBar) {
+      const drvHtml = (pureRustPickerDrives.length ? pureRustPickerDrives : ['D:\\', 'C:\\']).map(drv => {
+        const isActive = pureRustPickerCurrentPath && pureRustPickerCurrentPath.toLowerCase().startsWith(drv.toLowerCase());
+        return `<button type="button" class="pill-btn folder-drive-pill ${isActive ? 'active' : ''}" data-picker-nav="${escapeHtml(drv)}">💽 ${escapeHtml(drv)}</button>`;
+      }).join('');
+      drivesBar.innerHTML = `<span style="font-size:11.5px; font-weight:700; color:var(--text-muted); margin-right:4px;">Drives:</span>${drvHtml}`;
+    }
+
+    const quickBar = document.getElementById('pure-rust-picker-quick-bar');
+    if (quickBar) {
+      if (pureRustPickerQuickAccess.length > 0) {
+        const qaHtml = pureRustPickerQuickAccess.map(qa => {
+          const p = String(qa.path || '');
+          const isActive = pureRustPickerCurrentPath && pureRustPickerCurrentPath.toLowerCase() === p.toLowerCase();
+          return `<button type="button" class="pill-btn folder-drive-pill ${isActive ? 'active' : ''}" data-picker-nav="${escapeHtml(p)}" title="${escapeHtml(p)}">⭐ ${escapeHtml(qa.name)}</button>`;
+        }).join('');
+        quickBar.innerHTML = `<span style="font-size:11.5px; font-weight:700; color:var(--text-muted); margin-right:4px;">Quick Access:</span>${qaHtml}`;
+      } else {
+        quickBar.innerHTML = '';
+      }
+    }
+
+    const upBtn = document.getElementById('btn-pure-rust-picker-up');
+    if (upBtn) {
+      upBtn.disabled = !pureRustPickerCurrentPath;
+      upBtn.style.opacity = pureRustPickerCurrentPath ? '1' : '0.45';
+    }
+
+    const crumbsEl = document.getElementById('pure-rust-picker-breadcrumbs');
+    if (crumbsEl) {
+      const crumbs = buildPathBreadcrumbs(pureRustPickerCurrentPath);
+      crumbsEl.innerHTML = crumbs.map((c, idx) => {
+        const isLast = idx === crumbs.length - 1;
+        return `
+          <button type="button" class="folder-breadcrumb-segment ${isLast ? 'active' : ''}" data-picker-nav="${escapeHtml(c.path)}">
+            ${escapeHtml(c.label)}
+          </button>
+          ${!isLast ? '<span class="folder-breadcrumb-sep">›</span>' : ''}
+        `;
+      }).join('');
+    }
+
+    const selectedLabel = document.getElementById('pure-rust-picker-selected-label');
+    if (selectedLabel) {
+      selectedLabel.textContent = pureRustPickerCurrentPath || 'This PC (Click any drive or folder below)';
+    }
+
+    const confirmBtn = document.getElementById('btn-confirm-pure-rust-picker');
+    if (confirmBtn) {
+      confirmBtn.disabled = !pureRustPickerCurrentPath;
+      confirmBtn.textContent = pureRustPickerCurrentPath
+        ? `✅ Select Folder (${pureRustPickerCurrentPath.split(/[\\/]/).filter(Boolean).pop() || pureRustPickerCurrentPath})`
+        : 'Select a Drive or Folder Above';
+    }
+
+    const listEl = document.getElementById('pure-rust-picker-dir-list');
+    if (listEl) {
+      const q = (pureRustPickerFilterText || '').trim().toLowerCase();
+      const filtered = pureRustPickerDirectories.filter(d => {
+        if (!q) return true;
+        return String(d.name || '').toLowerCase().includes(q) || String(d.path || '').toLowerCase().includes(q);
+      });
+
+      if (filtered.length === 0) {
+        listEl.innerHTML = `
+          <div style="padding:18px; text-align:center; color:var(--text-muted); font-size:12.5px;">
+            ${q ? 'No subfolders match filter "' + escapeHtml(pureRustPickerFilterText) + '".' : 'No subdirectories in this folder. Click "✅ Select Folder" below to choose this directory, or create a new subfolder above.'}
+          </div>
+        `;
+      } else {
+        listEl.innerHTML = filtered.map(d => {
+          const p = String(d.path || '');
+          const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
+          return `
+            <div class="folder-browser-item folder-row" data-picker-nav="${escapeHtml(p)}" title="Click to open ${escapeHtml(p)}">
+              <div class="folder-row-left">
+                <span class="folder-row-icon">${icon}</span>
+                <div class="folder-row-details">
+                  <span class="folder-row-name">${escapeHtml(d.name)}</span>
+                  ${p && p !== d.name ? `<span class="folder-row-path">${escapeHtml(p)}</span>` : ''}
+                </div>
+              </div>
+              <div class="folder-row-actions">
+                <button type="button" class="pill-btn folder-select-btn" data-picker-pick="${escapeHtml(p)}" style="border-color:#10a37f; color:#10a37f; font-weight:600;">
+                  ✓ Pick This Folder
+                </button>
+                <button type="button" class="pill-btn folder-open-btn" data-picker-nav="${escapeHtml(p)}">
+                  Open →
+                </button>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+    }
+  }
+
+  async function loadPureRustPickerDirectory(targetPath, createSubfolder) {
+    try {
+      const payload = { path: targetPath !== undefined ? targetPath : pureRustPickerCurrentPath };
+      if (createSubfolder) {
+        payload.create_subfolder = createSubfolder;
+      }
+      const resp = await fetch('/api/fs/pick-folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      pureRustPickerCurrentPath = data.current_path !== undefined ? data.current_path : (data.path || '');
+      pureRustPickerParentPath = data.parent_path || '';
+      if (Array.isArray(data.drives) && data.drives.length > 0) {
+        pureRustPickerDrives = data.drives;
+        cachedDrives = data.drives;
+      }
+      if (Array.isArray(data.quick_access) && data.quick_access.length > 0) {
+        pureRustPickerQuickAccess = data.quick_access;
+        cachedQuickAccess = data.quick_access;
+      }
+      pureRustPickerDirectories = Array.isArray(data.directories) ? data.directories : [];
+      renderPureRustPickerModalContent();
+    } catch (err) {
+      showSettingsToast('Pure Rust folder browser error: ' + err.message);
+    }
+  }
+
+  function ensurePureRustPickerModal() {
+    let modal = document.getElementById('modal-pure-rust-folder-picker');
+    if (modal) return modal;
+    modal = document.createElement('div');
+    modal.id = 'modal-pure-rust-folder-picker';
+    modal.className = 'modal-backdrop hidden';
+    modal.style.zIndex = '100000';
+    modal.innerHTML = `
+      <div class="modal-card" style="max-width: 720px; width: 94%; max-height: 86vh; display: flex; flex-direction: column;">
+        <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <h3 style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
+            <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Folder</span>
+          </div>
+          <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker">&times;</button>
+        </div>
+        <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px;">
+          <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+          <div id="pure-rust-picker-quick-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+          <div class="folder-explorer-address-bar" style="display:flex; align-items:center; gap:8px;">
+            <button type="button" class="pill-btn" id="btn-pure-rust-picker-root" style="padding:4px 9px; font-size:11.5px;">💽 This PC</button>
+            <button type="button" class="pill-btn" id="btn-pure-rust-picker-up" style="padding:4px 9px; font-size:11.5px;">⬅ Up</button>
+            <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1;"></div>
+          </div>
+          <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:340px; min-height:200px;"></div>
+        </div>
+        <div class="modal-footer" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+          <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+            Active Path: <code id="pure-rust-picker-selected-label" style="color:#10a37f; font-weight:600;">This PC</code>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button type="button" id="btn-cancel-pure-rust-picker" class="pill-btn">Cancel</button>
+            <button type="button" id="btn-confirm-pure-rust-picker" class="btn-primary" style="background:#10a37f; border-color:#10a37f; font-weight:700;">✅ Select Current Folder</button>
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    return modal;
+  }
+
+  function bindPureRustPickerModalListeners() {
+    if (pureRustPickerListenersBound) return;
+    const modal = ensurePureRustPickerModal();
+    if (!modal) return;
+    pureRustPickerListenersBound = true;
+
+    const closePicker = () => {
+      modal.classList.add('hidden');
+    };
+
+    const btnClose = document.getElementById('btn-close-pure-rust-picker');
+    const btnCancel = document.getElementById('btn-cancel-pure-rust-picker');
+    if (btnClose) btnClose.addEventListener('click', closePicker);
+    if (btnCancel) btnCancel.addEventListener('click', closePicker);
+
+    const btnRoot = document.getElementById('btn-pure-rust-picker-root');
+    if (btnRoot) {
+      btnRoot.addEventListener('click', async () => {
+        pureRustPickerFilterText = '';
+        const resp = await fetch('/api/fs/browse-folders?path=');
+        if (resp.ok) {
+          const data = await resp.json();
+          pureRustPickerCurrentPath = '';
+          pureRustPickerParentPath = '';
+          pureRustPickerDirectories = Array.isArray(data.directories) ? data.directories : [];
+          if (Array.isArray(data.drives)) pureRustPickerDrives = data.drives;
+          if (Array.isArray(data.quick_access)) pureRustPickerQuickAccess = data.quick_access;
+          renderPureRustPickerModalContent();
+        }
+      });
+    }
+
+    const btnUp = document.getElementById('btn-pure-rust-picker-up');
+    if (btnUp) {
+      btnUp.addEventListener('click', async () => {
+        pureRustPickerFilterText = '';
+        if (!pureRustPickerParentPath) {
+          if (btnRoot) btnRoot.click();
+        } else {
+          await loadPureRustPickerDirectory(pureRustPickerParentPath);
+        }
+      });
+    }
+
+    const btnConfirm = document.getElementById('btn-confirm-pure-rust-picker');
+    if (btnConfirm) {
+      btnConfirm.addEventListener('click', async () => {
+        if (!pureRustPickerCurrentPath) {
+          showSettingsToast('Click a drive or folder first.');
+          return;
+        }
+        const ok = await window.applyPickedFolderToContext(pureRustPickerContext, pureRustPickerCurrentPath);
+        if (ok) closePicker();
+      });
+    }
+
+    modal.addEventListener('click', async (e) => {
+      if (e.target === modal) {
+        closePicker();
+        return;
+      }
+      const pickBtn = e.target.closest('[data-picker-pick]');
+      if (pickBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const chosen = pickBtn.getAttribute('data-picker-pick') || '';
+        if (chosen) {
+          const ok = await window.applyPickedFolderToContext(pureRustPickerContext, chosen);
+          if (ok) closePicker();
+        }
+        return;
+      }
+      const navBtn = e.target.closest('[data-picker-nav]');
+      if (navBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const target = navBtn.getAttribute('data-picker-nav') || '';
+        pureRustPickerFilterText = '';
+        if (!target) {
+          if (btnRoot) btnRoot.click();
+        } else {
+          await loadPureRustPickerDirectory(target);
+        }
+      }
+    });
+  }
+
+  window.openPureRustFolderPicker = async function(contextId = 'general', initialPath = '') {
+    pureRustPickerContext = contextId || 'general';
+    pureRustPickerFilterText = '';
+    bindPureRustPickerModalListeners();
+    const modal = ensurePureRustPickerModal();
+    const startPath = (initialPath || currentBrowsePath || (contextId === 'artemis' ? artemisSelectedDir : '') || '').trim();
+    if (modal) {
+      modal.classList.remove('hidden');
+      await loadPureRustPickerDirectory(startPath);
+    }
+  };
 
   function renderReindexExplorer() {
     const mount = document.getElementById('reindex-folder-explorer-mount');
@@ -4060,50 +4408,7 @@ function secureRandomIndex(n) {
           e.preventDefault();
           e.stopPropagation();
           const ctx = actionEl.dataset.context || 'general';
-          showSettingsToast('Opening Windows File Explorer folder picker...');
-          try {
-            const resp = await fetch('/api/fs/pick-folder', { method: 'POST' });
-            const data = await resp.json();
-            if (data.status === 'ok' && data.path) {
-              const chosen = data.path;
-              showSettingsToast('✓ Selected folder: ' + chosen);
-              await window.quorumBrowseDir(chosen);
-              if (ctx === 'reindex') {
-                updateReindexSelectedBadge(chosen);
-                renderReindexExplorer();
-              } else if (ctx === 'newdoc' || ctx === 'storage') {
-                await window.quorumIndexFolderImmediate(chosen);
-              } else if (ctx === 'mesh') {
-                await window.quorumShareFolder(chosen);
-              } else if (ctx === 'mkt' || ctx === 'general') {
-                await toggleMarketplaceFolder(chosen, true);
-              } else if (ctx === 'dlp') {
-                const simPathInp = document.getElementById('dlp-sim-path');
-                const simPathBadge = document.getElementById('dlp-sim-path-badge');
-                const fullSimPath = chosen.replace(/[\\/]+$/, '') + '\\clinical_note.txt';
-                if (simPathInp) simPathInp.value = fullSimPath;
-                if (simPathBadge) simPathBadge.textContent = fullSimPath;
-              } else if (ctx === 'artemis') {
-                artemisSelectedDir = chosen;
-                const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
-                const displayPill = document.getElementById('artemis-selected-folder-display');
-                if (hiddenInp) hiddenInp.value = chosen;
-                if (displayPill) {
-                  displayPill.textContent = '📁 Selected: ' + chosen;
-                  displayPill.title = chosen;
-                  displayPill.style.color = '#10a37f';
-                  displayPill.style.background = 'rgba(16,163,127,0.15)';
-                  displayPill.style.borderColor = 'rgba(16,163,127,0.35)';
-                }
-                renderSettingsTabContent('artemis-dfir', '');
-                showSettingsToast('✓ Selected Artemis DFIR folder: ' + chosen);
-              }
-            } else {
-              showSettingsToast('Folder selection cancelled');
-            }
-          } catch (err) {
-            showSettingsToast('Native folder picker unavailable: ' + err.message);
-          }
+          await window.openPureRustFolderPicker(ctx, currentBrowsePath);
           break;
         }
 
@@ -4788,12 +5093,20 @@ function secureRandomIndex(n) {
           if (!isNaN(memIdx)) await window._removeMemoryItem(memIdx);
           break;
 
-        case 'trigger-file-click':
+        case 'trigger-file-click': {
           e.preventDefault();
+          e.stopPropagation();
           const tid = actionEl.dataset.targetId;
           const targetInput = tid ? document.getElementById(tid) : null;
-          if (targetInput) targetInput.click();
+          if (tid === 'artemis-folder-upload-input') {
+            await window.openPureRustFolderPicker('artemis', currentBrowsePath);
+          } else if (tid === 'add-new-folder-file-input' || (targetInput && targetInput.hasAttribute('webkitdirectory'))) {
+            await window.openPureRustFolderPicker('newdoc', currentBrowsePath);
+          } else if (targetInput) {
+            targetInput.click();
+          }
           break;
+        }
 
         case 'toggle-custom-inst':
           e.preventDefault();
@@ -5659,7 +5972,7 @@ function secureRandomIndex(n) {
           <input type="hidden" id="mkt-folder-input" value="${escapeHtml(currentBrowsePath || '')}">
           <div style="display:flex; gap:8px; margin-top:10px; margin-bottom:12px; flex-wrap:wrap; align-items:center;">
             <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="mkt" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">
-              📂 Browse &amp; Select Folder (OS Dialog)...
+              📂 Open Pure Rust Folder Picker...
             </button>
             ${currentBrowsePath ? `<button type="button" class="pill-btn" data-action="mkt-toggle-folder" data-folder-path="${escapeHtml(currentBrowsePath)}" style="border-color:#10a37f; color:#10a37f; font-weight:600;">+ Select Active Folder (${escapeHtml(currentBrowsePath)})</button>` : ''}
           </div>
@@ -6782,7 +7095,7 @@ function secureRandomIndex(n) {
           <!-- Click to Select Folder to Share -->
           <input type="hidden" id="new-shared-folder-input" value="">
           <div style="display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; align-items:center;">
-            <button type="button" class="btn-primary" style="cursor:pointer;" data-action="trigger-native-folder-picker" data-context="mesh">📂 Browse &amp; Select Folder to Share (OS Dialog)...</button>
+            <button type="button" class="btn-primary" style="cursor:pointer;" data-action="trigger-native-folder-picker" data-context="mesh">📂 Open Pure Rust Folder Picker to Share...</button>
             ${currentBrowsePath ? `<button type="button" class="pill-btn" style="cursor:pointer; border-color:#10a37f; color:#10a37f; font-weight:600;" data-action="share-folder" data-folder-path="${escapeHtml(currentBrowsePath)}">+ Share Active Folder (${escapeHtml(currentBrowsePath)})</button>` : ''}
           </div>
 
@@ -7089,7 +7402,7 @@ function secureRandomIndex(n) {
       const prohibitedCategories = [
         { id: 'browser_cookies', name: 'Browser Cookies', desc: 'Session tokens, authentication cookies, and session state keys.' },
         { id: 'browser_history_oauth', name: 'Browser History & OAuth Tokens', desc: 'Browsing URLs, OAuth callback authorization codes, and personal web history.' },
-        { id: 'credential_store', name: 'Credential Store & Vaults', desc: 'LSASS memory dumps, Windows DPAPI vaults, macOS Keychain, and Linux shadow.' },
+        { id: 'credential_store', name: 'Credential Store & Vaults', desc: 'OS password vaults, system keychains, and protected authentication stores.' },
         { id: 'shell_history_raw', name: 'Raw Shell History', desc: 'Unsanitized .bash_history and PSReadLine history containing raw interactive secrets.' }
       ];
 
@@ -7225,7 +7538,7 @@ function secureRandomIndex(n) {
               <span>📁 Artemis .jsonl Dump Directory Selection (Click-to-Select)</span>
             </div>
             <div style="font-size:12.5px; color:var(--text-muted); margin-bottom:12px;">
-              Click any drive or folder below, or use the Windows Explorer picker to select a directory containing Artemis <code>.jsonl</code> dumps for parsing and local vector indexing. Zero text typing required.
+              Click any drive or folder below, or open the Pure Rust Folder Picker to select a directory containing Artemis <code>.jsonl</code> dumps for parsing and local vector indexing. Zero text typing required.
             </div>
 
             <!-- Hidden internal state storage conforming to user invariant -->
@@ -7246,9 +7559,9 @@ function secureRandomIndex(n) {
 
             <!-- Action buttons for click-to-select folder UX -->
             <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:14px;">
-              <!-- 1. Native OS Folder Picker Button -->
+              <!-- 1. Pure Rust Folder Picker Button -->
               <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="artemis" style="background:var(--accent, #6366f1); color:#fff; border-color:var(--accent, #6366f1); font-weight:600;">
-                📂 Browse with Windows Explorer...
+                📂 Open Pure Rust Folder Picker...
               </button>
 
               <!-- 2. Hidden Upload Folder Picker Input & Trigger Button -->
@@ -7324,7 +7637,7 @@ function secureRandomIndex(n) {
               <label for="artemis-preview-input" style="font-size:12.5px; font-weight:600; display:block; margin-bottom:4px;">
                 Sample Telemetry / Forensic Command Line:
               </label>
-              <textarea id="artemis-preview-input" class="prompt-textarea" style="width:100%; min-height:85px; font-family:monospace; font-size:12px; padding:10px; border-radius:8px; border:1px solid var(--border-color); background:rgba(0,0,0,0.3); color:var(--text-primary); box-sizing:border-box;" placeholder="Enter forensic telemetry or command line snippet...">powershell.exe -ExecutionPolicy Bypass -Command "net use \\\\CORP-DC01.local\\admin$ /user:DOMAIN\\Administrator Password123!; Invoke-Mimikatz; ping 10.240.12.5; whoami /user /fo csv; set COMPUTERNAME=SRV-SEC-09; sid S-1-5-21-1234567890-1234567890-1234567890-1001"</textarea>
+              <textarea id="artemis-preview-input" class="prompt-textarea" style="width:100%; min-height:85px; font-family:monospace; font-size:12px; padding:10px; border-radius:8px; border:1px solid var(--border-color); background:rgba(0,0,0,0.3); color:var(--text-primary); box-sizing:border-box;" placeholder="Enter forensic telemetry or command line snippet...">EventID 4688: Process svchost.exe spawned on Computer: CORP-DC01.local for User: DOMAIN\\SecAnalyst with SID S-1-5-21-1234567890-1234567890-1234567890-1001 connecting to 10.240.12.5 and share \\\\CORP-DC01.local\\audit_logs</textarea>
             </div>
 
             <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
