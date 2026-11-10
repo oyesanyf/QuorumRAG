@@ -51,7 +51,9 @@ fn test_every_folder_selector_under_settings_is_click_to_select_not_text_input()
             || js.contains(r#"id="artemis-folder-upload-input" webkitdirectory directory multiple"#),
         "Must support clicking to upload an entire folder via webkitdirectory"
     );
-    for ctx in ["general", "mkt", "newdoc", "mesh", "storage", "reindex", "artemis"] {
+    for ctx in [
+        "general", "mkt", "newdoc", "mesh", "storage", "reindex", "artemis", "dlp",
+    ] {
         let explorer_ctx = format!("contextId: '{ctx}'");
         assert!(
             js.contains(&explorer_ctx),
@@ -108,6 +110,11 @@ fn test_every_folder_selector_under_settings_is_click_to_select_not_text_input()
         js.contains("ensurePureRustPickerModal")
             && js.contains("window.applyPickedFolderToContext = async function"),
         "Pure Rust folder picker modal must be self-initializing and wire all contexts in UI"
+    );
+    assert!(
+        html.contains(r#"id="pure-rust-picker-filter-input""#)
+            && html.contains(r#"id="btn-pure-rust-picker-create-folder""#),
+        "Pure Rust folder picker modal must support live folder filtering and Pure Rust subfolder creation"
     );
 
     // 6. Artemis DFIR Settings tab must include auto-collection schedule, retention window, and live telemetry badges

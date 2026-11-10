@@ -769,6 +769,11 @@ pub async fn pick_folder_dialog_handler(
 ) -> impl IntoResponse {
     let body_val = body.map(|b| b.0).unwrap_or_else(|| serde_json::json!({}));
 
+    let has_explicit_path = body_val.get("path").is_some()
+        || body_val.get("current_path").is_some()
+        || body_val.get("folder_path").is_some()
+        || params.contains_key("path");
+
     let requested_path = body_val
         .get("path")
         .or_else(|| body_val.get("current_path"))
@@ -785,7 +790,10 @@ pub async fn pick_folder_dialog_handler(
         .map(|s| s.trim().to_string())
         .or_else(|| params.get("create_subfolder").map(|s| s.trim().to_string()));
 
-    let effective_path = if requested_path.is_empty() {
+    let effective_path = if has_explicit_path {
+        // Honor explicit `""` so `This PC` root lists all physical drives + Quick Access folders.
+        requested_path
+    } else if requested_path.is_empty() {
         std::env::current_dir()
             .ok()
             .filter(|p| p.is_dir())
@@ -1081,5 +1089,68 @@ pub async fn probe_endpoint_handler(
             }))
             .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn test_pick_folder_dialog_handler_root_vs_default_and_subfolder() {
+        // 1. Explicit {"path": ""} must return This PC root (current_path == "") with drives & directories
+        let resp_root = pick_folder_dialog_handler(
+            Query(HashMap::new()),
+            Some(Json(serde_json::json!({ "path": "" }))),
+        )
+        .await
+        .into_response();
+        let bytes_root = to_bytes(resp_root.into_body(), 1024 * 1024).await.unwrap();
+        let json_root: serde_json::Value = serde_json::from_slice(&bytes_root).unwrap();
+        assert_eq!(json_root["current_path"].as_str(), Some(""));
+        assert!(
+            json_root["directories"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "This PC root must return clickable drive/quick-access entries"
+        );
+
+        // 2. Omitted path {} must default to current working directory / home
+        let resp_default =
+            pick_folder_dialog_handler(Query(HashMap::new()), Some(Json(serde_json::json!({}))))
+                .await
+                .into_response();
+        let bytes_default = to_bytes(resp_default.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json_default: serde_json::Value = serde_json::from_slice(&bytes_default).unwrap();
+        assert!(
+            !json_default["current_path"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty(),
+            "Empty object payload must default to a concrete starting directory"
+        );
+
+        // 3. Pure Rust subfolder creation inside a temp directory
+        let tmp = tempfile::tempdir().unwrap();
+        let resp_sub = pick_folder_dialog_handler(
+            Query(HashMap::new()),
+            Some(Json(serde_json::json!({
+                "path": tmp.path().to_string_lossy().to_string(),
+                "create_subfolder": "pure_rust_created"
+            }))),
+        )
+        .await
+        .into_response();
+        let bytes_sub = to_bytes(resp_sub.into_body(), 1024 * 1024).await.unwrap();
+        let json_sub: serde_json::Value = serde_json::from_slice(&bytes_sub).unwrap();
+        assert!(tmp.path().join("pure_rust_created").is_dir());
+        assert!(json_sub["current_path"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("pure_rust_created"));
     }
 }

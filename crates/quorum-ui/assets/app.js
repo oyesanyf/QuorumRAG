@@ -2729,9 +2729,11 @@ function secureRandomIndex(n) {
   }
 
   // 10. REINDEX MODAL LOGIC
-  btnOpenReindex.addEventListener('click', () => {
+  btnOpenReindex.addEventListener('click', async () => {
     modalReindex.classList.remove('hidden');
     checkReindexStatus();
+    renderReindexExplorer();
+    await fetchBrowseFolders(currentBrowsePath);
     renderReindexExplorer();
   });
   btnCloseReindex.addEventListener('click', () => modalReindex.classList.add('hidden'));
@@ -3488,7 +3490,16 @@ function secureRandomIndex(n) {
       `;
     }).join('') : '';
 
-    const dirRowsHtml = (Array.isArray(directories) && directories.length > 0) ? directories.map(d => {
+    const effectiveDirectories = (Array.isArray(directories) && directories.length > 0)
+      ? directories
+      : (!currentPath
+          ? [
+              ...drivesList.map(drv => ({ name: `Local Disk (${drv})`, path: drv, is_drive: true })),
+              ...(Array.isArray(quickAccess) ? quickAccess.map(qa => ({ name: qa.name, path: qa.path, is_quick_access: true })) : [])
+            ]
+          : []);
+
+    const dirRowsHtml = effectiveDirectories.length > 0 ? effectiveDirectories.map(d => {
       const p = String(d.path || '');
       const isSelected = selectedSet && selectedSet.has(p.toLowerCase());
       const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
@@ -3614,11 +3625,17 @@ function secureRandomIndex(n) {
     } else if (ctx === 'dlp') {
       const simPathInp = document.getElementById('dlp-sim-path');
       const simPathBadge = document.getElementById('dlp-sim-path-badge');
+      const simPathText = document.getElementById('dlp-sim-path-text');
       const fullSimPath = /\.[a-z0-9]{2,5}$/i.test(chosen)
         ? chosen
         : (chosen.replace(/[\\/]+$/, '') + '\\clinical_note.txt');
       if (simPathInp) simPathInp.value = fullSimPath;
-      if (simPathBadge) simPathBadge.textContent = fullSimPath;
+      if (simPathText) {
+        simPathText.textContent = fullSimPath;
+      } else if (simPathBadge) {
+        simPathBadge.textContent = '📁 ' + fullSimPath;
+      }
+      renderSettingsTabContent('dlp', '');
       showSettingsToast('✓ DLP simulation folder set: ' + fullSimPath);
     } else if (ctx === 'artemis') {
       artemisSelectedDir = chosen;
@@ -3745,16 +3762,21 @@ function secureRandomIndex(n) {
   }
 
   async function loadPureRustPickerDirectory(targetPath, createSubfolder) {
+    const requested = targetPath !== undefined ? targetPath : pureRustPickerCurrentPath;
     try {
-      const payload = { path: targetPath !== undefined ? targetPath : pureRustPickerCurrentPath };
+      const payload = { path: requested };
       if (createSubfolder) {
         payload.create_subfolder = createSubfolder;
       }
-      const resp = await fetch('/api/fs/pick-folder', {
+      let resp = await fetch('/api/fs/pick-folder', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
+      if (!resp.ok) {
+        const qs = `path=${encodeURIComponent(requested || '')}` + (createSubfolder ? `&create_subfolder=${encodeURIComponent(createSubfolder)}` : '');
+        resp = await fetch(`/api/fs/browse-folders?${qs}`);
+      }
       if (!resp.ok) return;
       const data = await resp.json();
       pureRustPickerCurrentPath = data.current_path !== undefined ? data.current_path : (data.path || '');
@@ -3768,9 +3790,24 @@ function secureRandomIndex(n) {
         cachedQuickAccess = data.quick_access;
       }
       pureRustPickerDirectories = Array.isArray(data.directories) ? data.directories : [];
-      renderPureRustPickerModalContent();
     } catch (err) {
       showSettingsToast('Pure Rust folder browser error: ' + err.message);
+    } finally {
+      if (pureRustPickerDirectories.length === 0 && !pureRustPickerCurrentPath) {
+        pureRustPickerDirectories = [
+          ...(pureRustPickerDrives.length ? pureRustPickerDrives : ['D:\\', 'C:\\']).map(drv => ({
+            name: `Local Disk (${drv})`,
+            path: drv,
+            is_drive: true
+          })),
+          ...pureRustPickerQuickAccess.map(qa => ({
+            name: qa.name,
+            path: qa.path,
+            is_quick_access: true
+          }))
+        ];
+      }
+      renderPureRustPickerModalContent();
     }
   }
 
@@ -3782,7 +3819,7 @@ function secureRandomIndex(n) {
     modal.className = 'modal-backdrop hidden';
     modal.style.zIndex = '100000';
     modal.innerHTML = `
-      <div class="modal-card" style="max-width: 720px; width: 94%; max-height: 86vh; display: flex; flex-direction: column;">
+      <div class="modal-card" style="max-width: 740px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
         <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
             <h3 style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
@@ -3790,18 +3827,25 @@ function secureRandomIndex(n) {
           </div>
           <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker">&times;</button>
         </div>
-        <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px;">
+        <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
           <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
           <div id="pure-rust-picker-quick-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
           <div class="folder-explorer-address-bar" style="display:flex; align-items:center; gap:8px;">
             <button type="button" class="pill-btn" id="btn-pure-rust-picker-root" style="padding:4px 9px; font-size:11.5px;">💽 This PC</button>
             <button type="button" class="pill-btn" id="btn-pure-rust-picker-up" style="padding:4px 9px; font-size:11.5px;">⬅ Up</button>
-            <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1;"></div>
+            <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1; min-inline-size:0;"></div>
           </div>
-          <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:340px; min-height:200px;"></div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <input type="search" id="pure-rust-picker-filter-input" class="settings-input" placeholder="🔍 Filter folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
+            <div style="display:flex; gap:6px; align-items:center;">
+              <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
+              <button type="button" class="pill-btn" id="btn-pure-rust-picker-create-folder" style="padding:5px 10px; font-size:12px; font-weight:600;">+ Create Subfolder</button>
+            </div>
+          </div>
+          <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:320px; min-height:200px;"></div>
         </div>
         <div class="modal-footer" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-          <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+          <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; min-inline-size:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
             Active Path: <code id="pure-rust-picker-selected-label" style="color:#10a37f; font-weight:600;">This PC</code>
           </div>
           <div style="display:flex; gap:8px;">
@@ -3830,20 +3874,40 @@ function secureRandomIndex(n) {
     if (btnClose) btnClose.addEventListener('click', closePicker);
     if (btnCancel) btnCancel.addEventListener('click', closePicker);
 
+    const filterInp = document.getElementById('pure-rust-picker-filter-input');
+    if (filterInp) {
+      filterInp.addEventListener('input', () => {
+        pureRustPickerFilterText = filterInp.value || '';
+        renderPureRustPickerModalContent();
+      });
+    }
+
+    const newFolderInp = document.getElementById('pure-rust-picker-new-folder-input');
+    const btnCreateFolder = document.getElementById('btn-pure-rust-picker-create-folder');
+    if (btnCreateFolder) {
+      btnCreateFolder.addEventListener('click', async () => {
+        const subName = (newFolderInp ? newFolderInp.value : '').trim();
+        if (!pureRustPickerCurrentPath) {
+          showSettingsToast('Open a drive or parent folder first before creating a subfolder.');
+          return;
+        }
+        if (!subName) {
+          showSettingsToast('Enter a name for the new subfolder.');
+          if (newFolderInp) newFolderInp.focus();
+          return;
+        }
+        await loadPureRustPickerDirectory(pureRustPickerCurrentPath, subName);
+        if (newFolderInp) newFolderInp.value = '';
+        showSettingsToast('✓ Created and opened subfolder: ' + subName);
+      });
+    }
+
     const btnRoot = document.getElementById('btn-pure-rust-picker-root');
     if (btnRoot) {
       btnRoot.addEventListener('click', async () => {
         pureRustPickerFilterText = '';
-        const resp = await fetch('/api/fs/browse-folders?path=');
-        if (resp.ok) {
-          const data = await resp.json();
-          pureRustPickerCurrentPath = '';
-          pureRustPickerParentPath = '';
-          pureRustPickerDirectories = Array.isArray(data.directories) ? data.directories : [];
-          if (Array.isArray(data.drives)) pureRustPickerDrives = data.drives;
-          if (Array.isArray(data.quick_access)) pureRustPickerQuickAccess = data.quick_access;
-          renderPureRustPickerModalContent();
-        }
+        if (filterInp) filterInp.value = '';
+        await loadPureRustPickerDirectory('');
       });
     }
 
@@ -3851,11 +3915,8 @@ function secureRandomIndex(n) {
     if (btnUp) {
       btnUp.addEventListener('click', async () => {
         pureRustPickerFilterText = '';
-        if (!pureRustPickerParentPath) {
-          if (btnRoot) btnRoot.click();
-        } else {
-          await loadPureRustPickerDirectory(pureRustPickerParentPath);
-        }
+        if (filterInp) filterInp.value = '';
+        await loadPureRustPickerDirectory(pureRustPickerParentPath || '');
       });
     }
 
@@ -3893,11 +3954,8 @@ function secureRandomIndex(n) {
         e.stopPropagation();
         const target = navBtn.getAttribute('data-picker-nav') || '';
         pureRustPickerFilterText = '';
-        if (!target) {
-          if (btnRoot) btnRoot.click();
-        } else {
-          await loadPureRustPickerDirectory(target);
-        }
+        if (filterInp) filterInp.value = '';
+        await loadPureRustPickerDirectory(target);
       }
     });
   }
@@ -3906,10 +3964,23 @@ function secureRandomIndex(n) {
     pureRustPickerContext = contextId || 'general';
     pureRustPickerFilterText = '';
     bindPureRustPickerModalListeners();
+    const filterInp = document.getElementById('pure-rust-picker-filter-input');
+    if (filterInp) filterInp.value = '';
     const modal = ensurePureRustPickerModal();
     const startPath = (initialPath || currentBrowsePath || (contextId === 'artemis' ? artemisSelectedDir : '') || '').trim();
+    pureRustPickerCurrentPath = startPath;
+    if (Array.isArray(cachedDrives) && cachedDrives.length > 0) {
+      pureRustPickerDrives = cachedDrives;
+    }
+    if (Array.isArray(cachedQuickAccess) && cachedQuickAccess.length > 0) {
+      pureRustPickerQuickAccess = cachedQuickAccess;
+    }
+    if (Array.isArray(cachedBrowseDirs) && cachedBrowseDirs.length > 0) {
+      pureRustPickerDirectories = cachedBrowseDirs;
+    }
     if (modal) {
       modal.classList.remove('hidden');
+      renderPureRustPickerModalContent();
       await loadPureRustPickerDirectory(startPath);
     }
   };
@@ -4147,7 +4218,7 @@ function secureRandomIndex(n) {
   let showMemoryManager = false;
   let showCustomInstEditor = false;
   let showCodexInstEditor = false;
-  let showStorageFilesDetail = false;
+  let showStorageFilesDetail = true;
   let showStorageImagesDetail = false;
   let archivedSearchFilter = '';
   let archivedProjectFilter = 'all';
@@ -4391,7 +4462,7 @@ function secureRandomIndex(n) {
       switch (action) {
         case 'browse-dir':
           e.preventDefault();
-          if (folderPath) await window.quorumBrowseDir(folderPath);
+          await window.quorumBrowseDir(folderPath);
           break;
 
         case 'browse-up':
@@ -4418,11 +4489,16 @@ function secureRandomIndex(n) {
           if (folderPath) {
             const simPathInp = document.getElementById('dlp-sim-path');
             const simPathBadge = document.getElementById('dlp-sim-path-badge');
+            const simPathText = document.getElementById('dlp-sim-path-text');
             const fullSimPath = /\.[a-z0-9]{2,5}$/i.test(folderPath)
               ? folderPath
               : (folderPath.replace(/[\\/]+$/, '') + '\\clinical_note.txt');
             if (simPathInp) simPathInp.value = fullSimPath;
-            if (simPathBadge) simPathBadge.textContent = fullSimPath;
+            if (simPathText) {
+              simPathText.textContent = fullSimPath;
+            } else if (simPathBadge) {
+              simPathBadge.textContent = '📁 ' + fullSimPath;
+            }
             showSettingsToast('✓ Simulated folder set: ' + fullSimPath);
           }
           break;
@@ -4738,7 +4814,7 @@ function secureRandomIndex(n) {
 
         case 'storage-browse-dir': {
           e.preventDefault();
-          if (folderPath) await window.quorumBrowseDir(folderPath);
+          await window.quorumBrowseDir(folderPath);
           break;
         }
 
@@ -7379,11 +7455,24 @@ function secureRandomIndex(n) {
           <div style="margin-bottom:8px;">
             <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:4px;">Simulated Source Folder / File (Click to Select — No Typing Required):</label>
             <input type="hidden" id="dlp-sim-path" value="D:\\harfile\\QuorumRAG\\docs\\clinical_note.txt">
-            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
               <span id="dlp-sim-path-badge" class="status-pill healthy" style="font-size:12px; padding:4px 10px;">📁 <code id="dlp-sim-path-text">D:\harfile\QuorumRAG\docs\clinical_note.txt</code></span>
-              <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="dlp" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">📂 Browse &amp; Select Folder...</button>
+              <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="dlp" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">📂 Open Pure Rust Folder Picker...</button>
               ${(mesh.shared_folders || []).map(sf => `<button type="button" class="pill-btn" data-action="dlp-select-sim-folder" data-folder-path="${escapeHtml(sf.path)}" style="font-size:11.5px;">📁 ${escapeHtml(sf.path)}</button>`).join('')}
             </div>
+            ${renderWindowsFileExplorerHtml({
+              contextId: 'dlp',
+              currentPath: currentBrowsePath,
+              parentPath: currentBrowseParentPath,
+              drives: cachedDrives,
+              directories: cachedBrowseDirs,
+              selectedSet: new Set(),
+              selectAction: 'dlp-select-sim-folder',
+              selectButtonText: '+ Select for DLP Test',
+              activePathAction: 'dlp-select-sim-folder',
+              activePathButtonText: '+ Use Active Folder for DLP Test',
+              allowNativeDialog: true
+            })}
           </div>
           <div>
             <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:4px;">Sample Payload Containing HIPAA PHI &amp; PII:</label>
@@ -8621,6 +8710,7 @@ function secureRandomIndex(n) {
     if (modalId === 'modal-reindex') {
       checkReindexStatus();
       renderReindexExplorer();
+      fetchBrowseFolders(currentBrowsePath).then(() => renderReindexExplorer());
     }
   };
 
