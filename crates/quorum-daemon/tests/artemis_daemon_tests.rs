@@ -889,3 +889,101 @@ async fn test_pure_rust_folder_picker_and_browse_folders_endpoints() {
     assert!(created_path.ends_with("charlie_dfir_dump"));
     assert!(temp_dir.path().join("charlie_dfir_dump").is_dir());
 }
+
+#[tokio::test]
+async fn test_marketplace_harvest_auto_includes_indexed_artemis_chunks_when_enabled() {
+    let (app, _state, temp_dir) = setup_artemis_test_app().await;
+
+    // 1. Ingest a forensic JSONL file into local Tier3Restricted storage
+    let jsonl_path = temp_dir.path().join("auto_harvest_forensic.jsonl");
+    std::fs::write(
+        &jsonl_path,
+        r#"{"Computer":"WIN-SEC-01","CommandLine":"powershell.exe -NoProfile -Command Get-Service","Image":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","ProcessId":4120,"SubjectUserName":"SecAnalyst","collected_unix_secs":1700000100,"Channel":"Security"}"#,
+    )
+    .unwrap();
+
+    let collect_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/artemis/collect")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "source_type": "file",
+                        "target_path": jsonl_path.to_string_lossy().to_string(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_res.status(), StatusCode::OK);
+
+    // 2. Enable Marketplace Opt-In AND Artemis Training Data Harvesting (`marketplace_harvest_enabled = true`)
+    let opt_in_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/opt-in")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "opt_in_enabled": true }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opt_in_res.status(), StatusCode::OK);
+
+    let art_cfg_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/artemis/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "marketplace_harvest_enabled": true }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(art_cfg_res.status(), StatusCode::OK);
+
+    // 3. Trigger default Marketplace harvest (`POST /api/v1/marketplace/harvest` with empty body)
+    let harvest_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/harvest")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(harvest_res.status(), StatusCode::OK);
+    let harvest_json = read_body_json(harvest_res).await;
+
+    assert_eq!(harvest_json["accepted_count"], 3);
+    assert_eq!(harvest_json["rejected_count"], 0);
+    let records = harvest_json["sanitized_records"]
+        .as_array()
+        .expect("sanitized_records array");
+    assert_eq!(records.len(), 3);
+    assert!(
+        records.iter().any(|r| {
+            r["domain_tags"]
+                .as_array()
+                .map(|tags| tags.iter().any(|t| t == "artemis-dfir"))
+                .unwrap_or(false)
+        }),
+        "Expected harvested batch to include an automatic artemis-dfir trajectory record when marketplace_harvest_enabled is true"
+    );
+}
