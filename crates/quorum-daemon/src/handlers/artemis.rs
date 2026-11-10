@@ -22,7 +22,19 @@ use quorum_coordinator::artemis_airgap::prohibited_categories;
 use quorum_coordinator::dlp_mesh::global_mesh_dlp_controller;
 use quorum_coordinator::ForensicStructuralNormalizer;
 use quorum_ingest::secret_scrubber::SecretScrubber;
-use quorum_ingest::{parse_artemis_jsonl, parse_artemis_jsonl_str, ArtemisTelemetryRecord};
+use quorum_ingest::{
+    collect_forensic_directory, collect_live_os_forensics, parse_artemis_jsonl,
+    parse_artemis_jsonl_str, ArtemisTelemetryRecord,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{OnceLock, RwLock};
+
+static TOTAL_ARTEMIS_COLLECTED_RECORDS: AtomicUsize = AtomicUsize::new(0);
+static LAST_ARTEMIS_COLLECTION_TIMESTAMP: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+fn last_collection_ts_lock() -> &'static RwLock<Option<String>> {
+    LAST_ARTEMIS_COLLECTION_TIMESTAMP.get_or_init(|| RwLock::new(None))
+}
 
 /// Partial or full update payload for Artemis DFIR settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,11 +76,15 @@ pub struct ArtemisPreviewNormalizerRequest {
 /// GET /api/v1/artemis/status
 /// Returns current Artemis DFIR configuration, airgap enforcement, and category allowlists.
 pub async fn artemis_status_handler(
-    State(state): State<Arc<DaemonState>>,
+    State(_state): State<Arc<DaemonState>>,
 ) -> impl IntoResponse {
     let controller = global_mesh_dlp_controller();
     let settings = controller.get_settings();
-    let total_chunks = state.storage.count().await.unwrap_or(0);
+    let total_collected = TOTAL_ARTEMIS_COLLECTED_RECORDS.load(Ordering::Relaxed);
+    let last_ts = last_collection_ts_lock()
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
 
     Json(serde_json::json!({
         "status": "ok",
@@ -83,8 +99,8 @@ pub async fn artemis_status_handler(
         "retention_days": settings.artemis.retention_days,
         "redact_secrets": settings.artemis.redact_secrets,
         "normalize_for_harvest": settings.artemis.normalize_for_harvest,
-        "total_collected_records": total_chunks,
-        "last_collection_timestamp": null,
+        "total_collected_records": total_collected,
+        "last_collection_timestamp": last_ts,
     }))
 }
 
@@ -267,15 +283,17 @@ pub async fn artemis_collect_handler(
                 }
             }
         } else if path.is_dir() {
-            let jsonl_files = collect_jsonl_paths(path);
-            if jsonl_files.is_empty() {
-                // If no .jsonl files found, also check for single non-extension files
-                tracing::info!("No .jsonl files found in directory '{}'", trimmed_path);
+            let dir_clone = path.to_path_buf();
+            if let Ok(records) = tokio::task::spawn_blocking(move || collect_forensic_directory(&dir_clone)).await {
+                parsed_records.extend(records);
             }
-            for jfile in jsonl_files {
-                if let Ok(file) = std::fs::File::open(&jfile) {
-                    if let Ok(records) = parse_artemis_jsonl(file) {
-                        parsed_records.extend(records);
+            if parsed_records.is_empty() {
+                let jsonl_files = collect_jsonl_paths(path);
+                for jfile in jsonl_files {
+                    if let Ok(file) = std::fs::File::open(&jfile) {
+                        if let Ok(records) = parse_artemis_jsonl(file) {
+                            parsed_records.extend(records);
+                        }
                     }
                 }
             }
@@ -303,37 +321,17 @@ pub async fn artemis_collect_handler(
                 .into_response();
         }
     } else if is_live_source {
-        // Genuine live OS telemetry collection via sysinfo
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_all();
-        let host = sysinfo::System::host_name().unwrap_or_else(|| "localhost".to_string());
-        let os_name = sysinfo::System::name().unwrap_or_else(|| std::env::consts::OS.to_string());
-        let now_unix = chrono::Utc::now().timestamp();
-
-        for (pid, process) in sys.processes() {
-            let cmd = process.cmd().join(" ");
-            let exe = process
-                .exe()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let user = process
-                .user_id()
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "system".to_string());
-
-            let val = serde_json::json!({
-                "Computer": host,
-                "CommandLine": cmd,
-                "Image": exe,
-                "ProcessId": pid.as_u32(),
-                "SubjectUserName": user,
-                "collected_unix_secs": now_unix,
-                "Channel": "Security",
-                "source_path": format!("artemis://{}/live/process/{}", std::env::consts::OS, pid),
-            });
-            if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some(&os_name)) {
-                parsed_records.push(rec);
-            }
+        // Multi-category live OS forensic telemetry collection across Windows, macOS, and Linux:
+        // process_execution, network_connection, registry_persistence, prefetch_amcache_execution,
+        // service_daemon, and system_event_log.
+        let active_cats = req
+            .categories
+            .clone()
+            .unwrap_or_else(|| settings.artemis.allowed_artifact_categories.clone());
+        if let Ok(live_records) =
+            tokio::task::spawn_blocking(move || collect_live_os_forensics(&active_cats)).await
+        {
+            parsed_records.extend(live_records);
         }
     }
 
@@ -360,16 +358,27 @@ pub async fn artemis_collect_handler(
         }
     }
 
-    // Convert to DocumentChunks and index into storage
+    // Convert to DocumentChunks and batch-embed into storage
     let mut chunks_to_index = Vec::with_capacity(records_parsed);
     for rec in &parsed_records {
-        if let Ok(mut chunk) = rec.to_document_chunk(0) {
-            let vec = state
-                .embedder
-                .embed_text(&chunk.text_content)
-                .unwrap_or_else(|_| vec![0.0f32; state.embedder.dimension()]);
-            chunk.vector = vec;
+        if let Ok(chunk) = rec.to_document_chunk(0) {
             chunks_to_index.push(chunk);
+        }
+    }
+
+    for batch in chunks_to_index.chunks_mut(64) {
+        let texts: Vec<&str> = batch.iter().map(|c| c.text_content.as_str()).collect();
+        if let Ok(vecs) = state.embedder.embed_batch(&texts) {
+            for (chunk, vec) in batch.iter_mut().zip(vecs.into_iter()) {
+                chunk.vector = vec;
+            }
+        } else {
+            for chunk in batch.iter_mut() {
+                chunk.vector = state
+                    .embedder
+                    .embed_text(&chunk.text_content)
+                    .unwrap_or_else(|_| vec![0.0f32; state.embedder.dimension()]);
+            }
         }
     }
 
@@ -383,6 +392,21 @@ pub async fn artemis_collect_handler(
         0
     };
 
+    if chunks_indexed > 0 {
+        TOTAL_ARTEMIS_COLLECTED_RECORDS.fetch_add(chunks_indexed, Ordering::Relaxed);
+        if let Ok(mut ts) = last_collection_ts_lock().write() {
+            *ts = Some(chrono::Utc::now().to_rfc3339());
+        }
+    }
+
+    let mut categories_collected: Vec<String> = parsed_records
+        .iter()
+        .map(|r| r.telemetry_type.as_str().to_string())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    categories_collected.sort();
+
     let elapsed_ms = start_time.elapsed().as_millis() as u64;
 
     (
@@ -391,6 +415,7 @@ pub async fn artemis_collect_handler(
             "status": "completed",
             "records_parsed": records_parsed,
             "chunks_indexed": chunks_indexed,
+            "categories_collected": categories_collected,
             "elapsed_ms": elapsed_ms,
         })),
     )

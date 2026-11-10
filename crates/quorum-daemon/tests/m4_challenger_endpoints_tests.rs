@@ -37,12 +37,34 @@ use std::time::Instant;
 use tempfile::{tempdir, TempDir};
 use tower::ServiceExt;
 
-async fn setup_challenger_test_app() -> (axum::Router, Arc<DaemonState>, TempDir) {
+static CHALLENGER_ENDPOINTS_MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+struct TestEnv {
+    temp_dir: TempDir,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl TestEnv {
+    #[allow(dead_code)]
+    fn path(&self) -> &std::path::Path {
+        self.temp_dir.path()
+    }
+}
+
+async fn setup_challenger_test_app() -> (axum::Router, Arc<DaemonState>, TestEnv) {
+    let guard = CHALLENGER_ENDPOINTS_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     let temp_dir = tempdir().expect("tempdir");
     let data_dir = temp_dir.path().to_path_buf();
 
     let controller = global_mesh_dlp_controller();
     controller.init_persistence(&data_dir);
+    let mut current = controller.get_settings();
+    current.artemis = quorum_coordinator::artemis_airgap::ArtemisDfirSettings::default();
+    controller.update_settings(current);
 
     let storage_config = quorum_storage::StorageConfig::new(data_dir.clone());
     let storage = Arc::new(
@@ -110,7 +132,14 @@ async fn setup_challenger_test_app() -> (axum::Router, Arc<DaemonState>, TempDir
     });
 
     let router = build_router(Arc::clone(&state));
-    (router, state, temp_dir)
+    (
+        router,
+        state,
+        TestEnv {
+            temp_dir,
+            _guard: guard,
+        },
+    )
 }
 
 async fn read_body_json(resp: axum::response::Response) -> serde_json::Value {

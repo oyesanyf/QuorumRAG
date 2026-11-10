@@ -36,6 +36,7 @@ tempfile = { workspace = true }
 # Error Handling & Tracing
 thiserror = { workspace = true }
 tracing = { workspace = true }
+sysinfo = { workspace = true }
 
 # OLE2, ZIP/OOXML, PDF FlateDecode & SQLite Native Document Parsing
 cfb = "0.7"

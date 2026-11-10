@@ -25,9 +25,10 @@ pub mod thread_pool;
 
 // Re-exports
 pub use artemis::{
-    build_summary_text, infer_host_identifier, infer_os_platform, infer_source_path,
-    infer_telemetry_type, infer_timestamp_unix_secs, parse_artemis_jsonl, parse_artemis_jsonl_str,
-    scrub_json_value, ArtemisTelemetryRecord,
+    build_summary_text, collect_forensic_directory, collect_live_os_forensics,
+    infer_host_identifier, infer_os_platform, infer_source_path, infer_telemetry_type,
+    infer_timestamp_unix_secs, parse_artemis_jsonl, parse_artemis_jsonl_str, scrub_json_value,
+    ArtemisTelemetryRecord,
 };
 pub use audio_indexer::{AudioIndexer, AudioMetadata};
 pub use classifier_router::{CandidateKind, ClassifierRouter, FilterDecision};

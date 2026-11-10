@@ -18,12 +18,32 @@ use std::time::Instant;
 use tempfile::{tempdir, TempDir};
 use tower::ServiceExt;
 
-async fn setup_artemis_test_app() -> (axum::Router, Arc<DaemonState>, TempDir) {
+static ARTEMIS_TEST_MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+struct TestEnv {
+    temp_dir: TempDir,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl TestEnv {
+    fn path(&self) -> &std::path::Path {
+        self.temp_dir.path()
+    }
+}
+
+async fn setup_artemis_test_app() -> (axum::Router, Arc<DaemonState>, TestEnv) {
+    let guard = ARTEMIS_TEST_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     let temp_dir = tempdir().expect("tempdir");
     let data_dir = temp_dir.path().to_path_buf();
 
     let controller = global_mesh_dlp_controller();
     controller.init_persistence(&data_dir);
+    let mut current = controller.get_settings();
+    current.artemis = quorum_coordinator::artemis_airgap::ArtemisDfirSettings::default();
+    controller.update_settings(current);
 
     let storage_config = quorum_storage::StorageConfig::new(data_dir.clone());
     let storage = Arc::new(
@@ -91,7 +111,14 @@ async fn setup_artemis_test_app() -> (axum::Router, Arc<DaemonState>, TempDir) {
     });
 
     let router = build_router(Arc::clone(&state));
-    (router, state, temp_dir)
+    (
+        router,
+        state,
+        TestEnv {
+            temp_dir,
+            _guard: guard,
+        },
+    )
 }
 
 async fn read_body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -687,4 +714,92 @@ async fn test_artemis_collect_deep_directory_bounded() {
     let json = read_body_json(res).await;
     // Shallow file is ingested (1 record); deep file is skipped due to max_depth = 16
     assert_eq!(json["records_parsed"], 1);
+}
+
+#[tokio::test]
+async fn test_artemis_collect_multi_format_directory_and_live_when_enabled() {
+    let (app, _state, temp_dir) = setup_artemis_test_app().await;
+
+    let dump_dir = temp_dir.path().join("forensic_dump_multi");
+    std::fs::create_dir_all(&dump_dir).unwrap();
+
+    std::fs::write(
+        dump_dir.join("events.jsonl"),
+        r#"{"EventID":4688,"Channel":"Security","CommandLine":"cmd.exe /c whoami"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dump_dir.join("POWERSHELL.EXE-ABCDEF12.pf"),
+        b"SCCA_PREFETCH_SAMPLE",
+    )
+    .unwrap();
+    std::fs::write(dump_dir.join("Security.evtx"), b"ElfFile\x00EVTX").unwrap();
+    std::fs::write(
+        dump_dir.join("com.corp.daemon.plist"),
+        b"<plist><dict><key>Label</key><string>com.corp.daemon</string></dict></plist>",
+    )
+    .unwrap();
+    std::fs::write(
+        dump_dir.join("auditd.service"),
+        "[Service]\nExecStart=/sbin/auditd -n\n",
+    )
+    .unwrap();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/artemis/collect")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "source_type": "folder",
+                        "folder_path": dump_dir.to_string_lossy().to_string(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let json = read_body_json(res).await;
+    assert_eq!(json["status"], "completed");
+    assert_eq!(json["records_parsed"], 5);
+    assert_eq!(json["chunks_indexed"], 5);
+
+    // Also test live OS collection when local_collection_enabled is enabled
+    let controller = global_mesh_dlp_controller();
+    let mut current = controller.get_settings();
+    current.artemis.local_collection_enabled = true;
+    controller.update_settings(current);
+
+    let live_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/artemis/collect")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "source_type": "live" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(live_res.status(), StatusCode::OK);
+    let live_json = read_body_json(live_res).await;
+    assert_eq!(live_json["status"], "completed");
+    assert!(
+        live_json["records_parsed"].as_u64().unwrap_or(0) > 0,
+        "Live OS forensic collection must parse real telemetry records"
+    );
+    assert!(
+        live_json["chunks_indexed"].as_u64().unwrap_or(0) > 0,
+        "Live OS forensic collection must index real telemetry chunks"
+    );
 }
