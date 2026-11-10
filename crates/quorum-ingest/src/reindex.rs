@@ -1141,6 +1141,11 @@ impl ReindexWorker {
             "storage",
             "quorumrag",
             ".quorumrag",
+            "documents and settings",
+            "all users",
+            "default user",
+            "default",
+            "$winreagent",
         ];
 
         let mut expanded = Vec::new();
@@ -1166,6 +1171,9 @@ impl ReindexWorker {
             let mut normal_slices = Vec::new();
 
             for entry in entries.flatten() {
+                if entry.file_type().map_or(false, |ft| ft.is_symlink()) {
+                    continue;
+                }
                 let path = entry.path();
                 let name_lower = entry
                     .file_name()
@@ -1174,14 +1182,23 @@ impl ReindexWorker {
                 if SKIP_DIRS.contains(&name_lower.as_str()) {
                     continue;
                 }
+                if path.is_dir() && std::fs::read_dir(&path).is_err() {
+                    continue;
+                }
 
                 // Expand large workspace containers (`femi`, `harfile`, `users`) one level further
                 if path.is_dir() && matches!(name_lower.as_str(), "femi" | "harfile" | "users") {
                     if let Ok(sub_entries) = std::fs::read_dir(&path) {
                         for sub in sub_entries.flatten() {
+                            if sub.file_type().map_or(false, |ft| ft.is_symlink()) {
+                                continue;
+                            }
                             let sub_path = sub.path();
                             let sub_name = sub.file_name().to_string_lossy().to_ascii_lowercase();
                             if SKIP_DIRS.contains(&sub_name.as_str()) {
+                                continue;
+                            }
+                            if sub_path.is_dir() && std::fs::read_dir(&sub_path).is_err() {
                                 continue;
                             }
                             if matches!(

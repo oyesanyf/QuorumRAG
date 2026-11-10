@@ -333,7 +333,14 @@ pub fn format_socket_from_multiaddr(addr: &str) -> Option<String> {
 /// across `/8`, `/16`, and `/24` private networks without waiting for full subnet sweeps.
 pub fn discover_arp_private_lan_neighbors(self_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
     let mut neighbors = BTreeSet::new();
-    let output = match std::process::Command::new("arp").arg("-a").output() {
+    let mut cmd = std::process::Command::new("arp");
+    cmd.arg("-a");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let output = match cmd.output() {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
@@ -777,9 +784,12 @@ pub async fn post_p2p_watcher_heal_handler(
 /// Re-asserts Windows Firewall inbound rules for the running QuorumRAG binary and LAN P2P ports.
 #[cfg(target_os = "windows")]
 pub fn ensure_windows_p2p_firewall_rules(http_port: u16, p2p_port: u16) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     if let Ok(exe_path) = std::env::current_exe() {
         let exe_str = exe_path.to_string_lossy().to_string();
         let _ = std::process::Command::new("netsh")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "advfirewall",
                 "firewall",
@@ -794,6 +804,7 @@ pub fn ensure_windows_p2p_firewall_rules(http_port: u16, p2p_port: u16) {
             ])
             .output();
         let _ = std::process::Command::new("netsh")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "advfirewall",
                 "firewall",
@@ -809,6 +820,7 @@ pub fn ensure_windows_p2p_firewall_rules(http_port: u16, p2p_port: u16) {
             ])
             .output();
         let _ = std::process::Command::new("netsh")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "advfirewall",
                 "firewall",
@@ -1007,7 +1019,9 @@ fn attempt_platform_service_restart(data_dir: &Path) {
     );
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let _ = std::process::Command::new("sc.exe")
+            .creation_flags(0x0800_0000)
             .args(["start", "QuorumRAGDaemon"])
             .output();
     }

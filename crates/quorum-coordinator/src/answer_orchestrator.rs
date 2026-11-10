@@ -169,6 +169,15 @@ pub fn is_contact_bar_or_header(line: &str) -> bool {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("defender antivirus")
+        || lower.contains("codeintegrity")
+        || lower.contains("systemeventlog")
+        || lower.contains("processexecution")
+        || lower.contains("blocked and removed")
+        || lower.contains("event id ")
+    {
+        return false;
+    }
 
     // 1. Explicit contact/metadata label prefixes
     for prefix in &[

@@ -41,6 +41,7 @@ pub const GENERIC_ATTRIBUTE_TERMS: &[&str] = &[
     "position", "positions", "title", "titles", "capacity", "capacities",
     "responsibility", "responsibilities", "duty", "duties", "employer", "employers",
     "employment", "organization", "organizations", "past", "previous", "current", "recent",
+    "last", "latest", "first",
     "project", "projects", "certification", "certifications", "went", "attend",
     "attended", "graduated", "year", "years", "detail", "details", "information",
     "income", "tax", "taxes", "statement", "statements", "plan", "plans",
@@ -150,6 +151,17 @@ impl RetrieveMeshNode {
         {
             format!(
                 "{} professional summary experience work history engineer architect analyst lead consultant manager",
+                state.current_query
+            )
+        } else if q_low.contains("antivirus")
+            || q_low.contains("defender")
+            || q_low.contains("codeintegrity")
+            || q_low.contains("malware")
+            || q_low.contains("trojan")
+            || (q_low.contains("process") && (q_low.contains("block") || q_low.contains("blocked")))
+        {
+            format!(
+                "{} SystemEventLog Windows Defender Antivirus CodeIntegrity blocked process threat event 1117 1116 3077",
                 state.current_query
             )
         } else {
@@ -304,6 +316,26 @@ impl RetrieveMeshNode {
             None
         };
 
+        let local_access_tier = {
+            let is_forensic_q = q_low.contains("artemis")
+                || q_low.contains("antivirus")
+                || q_low.contains("defender")
+                || q_low.contains("codeintegrity")
+                || q_low.contains("malware")
+                || q_low.contains("trojan")
+                || (q_low.contains("process") && (q_low.contains("block") || q_low.contains("blocked")));
+            let ctrl = crate::dlp_mesh::global_mesh_dlp_controller();
+            let s = ctrl
+                .settings
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if s.artemis.enabled || s.artemis.local_collection_enabled || is_forensic_q {
+                access_tier.max(quorum_types::AccessTier::Tier3Restricted.as_u8())
+            } else {
+                access_tier
+            }
+        };
+
         // Dispatch primary query + supplemental queries concurrently via tokio::join!
         // Send the unbloated query (`state.current_query`) to remote P2P peers so 1.5M+ chunk remote corpora
         // are not diluted by 7 generic BM25 expansion words, while keeping `search_query` for local storage.
@@ -318,21 +350,21 @@ impl RetrieveMeshNode {
         );
         let entity_fut = async {
             if let Some(ref q) = entity_kw_query_opt {
-                engine.local_storage.search_text(q, access_tier, 96).await
+                engine.local_storage.search_text(q, local_access_tier, 96).await
             } else {
                 Vec::new()
             }
         };
         let prompt_fut = async {
             if let Some(ref q) = prompt_kw_query_opt {
-                engine.local_storage.search_text(q, access_tier, 64).await
+                engine.local_storage.search_text(q, local_access_tier, 64).await
             } else {
                 Vec::new()
             }
         };
         let cue_fut = async {
             if let Some(ref q) = cue_query_opt {
-                engine.local_storage.search_text(q, access_tier, 48).await
+                engine.local_storage.search_text(q, local_access_tier, 48).await
             } else {
                 Vec::new()
             }
@@ -465,6 +497,9 @@ impl RetrieveMeshNode {
             ];
             chunks.retain(|c| {
                 let path_l = c.chunk.file_path.to_ascii_lowercase();
+                if path_l.starts_with("artemis://") {
+                    return true;
+                }
                 let text_l = c.chunk.text_content.to_ascii_lowercase();
                 let file_l = std::path::Path::new(&c.chunk.file_path)
                     .file_name()
@@ -807,6 +842,18 @@ impl RetrieveMeshNode {
                     content_matched_terms += 1;
                 }
 
+                if path_l.starts_with("artemis://")
+                    && (query_lower.contains("antivirus")
+                        || query_lower.contains("defender")
+                        || query_lower.contains("codeintegrity")
+                        || query_lower.contains("malware")
+                        || query_lower.contains("trojan")
+                        || (query_lower.contains("process") && query_lower.contains("block")))
+                {
+                    intent_bonus += 450;
+                    weighted_hits += 40;
+                }
+
                 // Filter out ChatGPT export artifacts from dominating profile queries
                 if text_l.contains("fileciteturn0file0") || text_l.contains("sandbox:/mnt/data") {
                     intent_bonus -= 300;
@@ -1074,7 +1121,7 @@ impl RetrieveMeshNode {
                 if !sibling_ids.is_empty() {
                     let extras = engine
                         .local_storage
-                        .get_chunks_by_ids(&sibling_ids, access_tier)
+                        .get_chunks_by_ids(&sibling_ids, local_access_tier)
                         .await;
                     for extra in extras {
                         if !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(

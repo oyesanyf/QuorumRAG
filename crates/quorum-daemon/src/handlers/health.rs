@@ -151,8 +151,11 @@ pub async fn install_ollama_handler() -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
         #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             // 1. Try winget first (standard Windows package manager)
             let winget_res = std::process::Command::new("winget")
+                .creation_flags(CREATE_NO_WINDOW)
                 .args(["install", "Ollama.Ollama", "--accept-source-agreements", "--accept-package-agreements", "--silent"])
                 .output();
 
@@ -174,6 +177,7 @@ pub async fn install_ollama_handler() -> impl IntoResponse {
                 }
             "#;
             let mut cmd = std::process::Command::new("powershell");
+            cmd.creation_flags(CREATE_NO_WINDOW);
             cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script]);
             match cmd.output() {
                 Ok(out) if out.status.success() => Ok("Ollama installed successfully via official setup installer".to_string()),

@@ -86,21 +86,35 @@ impl FilesystemWatcher {
         )
         .map_err(|e| IngestError::WatcherError(format!("Failed to initialize debouncer: {}", e)))?;
 
-        // Register initial watch paths recursively
+        // Register initial watch paths recursively (gracefully skipping restricted OS junctions)
         for path in &self.config.watch_paths {
             if path.exists() {
-                debouncer
-                    .watcher()
-                    .watch(path, RecursiveMode::Recursive)
-                    .map_err(|e| {
-                        IngestError::WatcherError(format!(
-                            "Failed to watch path '{}': {}",
-                            path.display(),
-                            e
-                        ))
-                    })?;
-                self.active_paths.insert(path.clone());
-                info!(path = %path.display(), "Watching directory recursively");
+                match debouncer.watcher().watch(path, RecursiveMode::Recursive) {
+                    Ok(()) => {
+                        self.active_paths.insert(path.clone());
+                        info!(path = %path.display(), "Watching directory recursively");
+                    }
+                    Err(e) => {
+                        if debouncer
+                            .watcher()
+                            .watch(path, RecursiveMode::NonRecursive)
+                            .is_ok()
+                        {
+                            self.active_paths.insert(path.clone());
+                            debug!(
+                                path = %path.display(),
+                                error = %e,
+                                "Registered non-recursive watch fallback due to nested OS junction"
+                            );
+                        } else {
+                            debug!(
+                                path = %path.display(),
+                                error = %e,
+                                "Skipping unwatchable OS path/junction"
+                            );
+                        }
+                    }
+                }
             } else {
                 warn!("Watch directory does not exist, skipping: {}", path.display());
             }
