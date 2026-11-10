@@ -266,33 +266,58 @@ impl ReindexWorker {
         let pending_priority = Arc::clone(&self.pending_priority_paths);
 
         tokio::spawn(async move {
-            let res = Self::execute_pipeline(
-                worker_config,
-                options,
-                task_id,
-                worker_storage,
-                worker_classifier,
-                worker_embedder,
-                worker_dedup,
-                worker_progress.clone(),
-                cancel_flag,
-                pending_priority,
-            )
-            .await;
+            let mut loop_options = options;
+            loop {
+                let res = Self::execute_pipeline(
+                    worker_config.clone(),
+                    loop_options.clone(),
+                    task_id,
+                    Arc::clone(&worker_storage),
+                    Arc::clone(&worker_classifier),
+                    Arc::clone(&worker_embedder),
+                    Arc::clone(&worker_dedup),
+                    worker_progress.clone(),
+                    Arc::clone(&cancel_flag),
+                    Arc::clone(&pending_priority),
+                )
+                .await;
 
-            let mut final_lock = worker_progress.write().await;
-            if let Some(ref mut prog) = *final_lock {
-                prog.files_total_estimated = prog.files_total_estimated.max(prog.files_scanned);
-                prog.completed_at = Some(Utc::now());
-                prog.elapsed_secs = (Utc::now() - prog.started_at).num_seconds().max(0) as u64;
-                match res {
-                    Ok(_) => prog.phase = ReindexPhase::Completed,
-                    Err(IngestError::Cancelled) => prog.phase = ReindexPhase::Cancelled,
-                    Err(e) => {
-                        prog.phase = ReindexPhase::Failed;
-                        prog.error_message = Some(e.to_string());
+                let mut final_lock = worker_progress.write().await;
+                let leftover_priority: Vec<std::path::PathBuf> = pending_priority
+                    .lock()
+                    .map(|mut g| std::mem::take(&mut *g))
+                    .unwrap_or_default();
+
+                if res.is_ok()
+                    && !cancel_flag.load(Ordering::SeqCst)
+                    && !leftover_priority.is_empty()
+                {
+                    if let Some(ref mut prog) = *final_lock {
+                        prog.files_total_estimated =
+                            prog.files_total_estimated.max(prog.files_scanned);
+                        prog.phase = ReindexPhase::ScanningFilesystem;
+                    }
+                    drop(final_lock);
+                    loop_options.target_paths = leftover_priority;
+                    loop_options.full_rebuild = false;
+                    loop_options.force_reembed = false;
+                    continue;
+                }
+
+                if let Some(ref mut prog) = *final_lock {
+                    prog.files_total_estimated = prog.files_total_estimated.max(prog.files_scanned);
+                    prog.completed_at = Some(Utc::now());
+                    prog.elapsed_secs = (Utc::now() - prog.started_at).num_seconds().max(0) as u64;
+                    match res {
+                        Ok(_) => prog.phase = ReindexPhase::Completed,
+                        Err(IngestError::Cancelled) => prog.phase = ReindexPhase::Cancelled,
+                        Err(e) => {
+                            prog.phase = ReindexPhase::Failed;
+                            prog.error_message = Some(e.to_string());
+                        }
                     }
                 }
+                break;
             }
         });
 
@@ -755,7 +780,12 @@ impl ReindexWorker {
         {
             let mut lock = progress.write().await;
             if let Some(ref mut p) = *lock {
-                p.files_total_estimated = candidate_queue.len();
+                if p.files_scanned == 0 {
+                    p.files_total_estimated = candidate_queue.len();
+                } else {
+                    p.files_total_estimated =
+                        (p.files_total_estimated + candidate_queue.len()).max(p.files_scanned);
+                }
                 p.phase = ReindexPhase::ChunkingAndVectorizing;
             }
         }
