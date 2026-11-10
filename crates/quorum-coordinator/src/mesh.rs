@@ -733,25 +733,43 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
 
         // Any peers still pending when the primary deadline expired (not merely shortened straggler grace)
         // are recorded as timed-out so the P2P Watcher can proactively probe & heal zombie streams.
+        let primary_expired = tokio::time::Instant::now() >= primary_deadline;
         if !pending_peer_ids.is_empty() {
             for stalled_peer in &pending_peer_ids {
-                registry.record_failure(
-                    stalled_peer,
-                    format!("Timed out after {}ms", timeout.as_millis()),
-                );
-                diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
-                    peer_id: stalled_peer.clone(),
-                    status: quorum_types::PeerQueryStatus::TimedOut,
-                    matching_chunk_count: 0,
-                    cited_chunk_count: 0,
-                    latency_ms: timeout.as_millis() as u64,
-                    error_message: Some(format!("Timed out after {}ms", timeout.as_millis())),
-                });
-                tracing::warn!(
-                    peer = %stalled_peer,
-                    timeout_ms = timeout.as_millis() as u64,
-                    "Federated P2P mesh query timed out waiting for peer"
-                );
+                if primary_expired {
+                    registry.record_failure(
+                        stalled_peer,
+                        format!("Timed out after {}ms", timeout.as_millis()),
+                    );
+                    diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
+                        peer_id: stalled_peer.clone(),
+                        status: quorum_types::PeerQueryStatus::TimedOut,
+                        matching_chunk_count: 0,
+                        cited_chunk_count: 0,
+                        latency_ms: timeout.as_millis() as u64,
+                        error_message: Some(format!("Timed out after {}ms", timeout.as_millis())),
+                    });
+                    tracing::warn!(
+                        peer = %stalled_peer,
+                        timeout_ms = timeout.as_millis() as u64,
+                        "Federated P2P mesh query timed out waiting for peer"
+                    );
+                } else {
+                    // Straggler grace cutoff: query succeeded early with faster peers.
+                    // Do NOT record failure against peer health registry to prevent false-positive quarantining.
+                    diagnostics.peer_outcomes.push(quorum_types::PeerQueryOutcome {
+                        peer_id: stalled_peer.clone(),
+                        status: quorum_types::PeerQueryStatus::TimedOut,
+                        matching_chunk_count: 0,
+                        cited_chunk_count: 0,
+                        latency_ms: timeout.as_millis() as u64,
+                        error_message: Some("Cut off by straggler grace period (early resolution)".to_string()),
+                    });
+                    tracing::info!(
+                        peer = %stalled_peer,
+                        "Peer in-flight query superseded by straggler grace cutoff"
+                    );
+                }
             }
         }
 

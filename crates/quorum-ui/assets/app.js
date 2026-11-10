@@ -6101,7 +6101,6 @@ function secureRandomIndex(n) {
           </div>
         </div>
         </div>
-        </div>
       `;
     } else if (tab === 'marketplace-ledger') {
       const consentRowsHtml = consentLedger.length === 0

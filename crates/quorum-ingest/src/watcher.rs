@@ -149,19 +149,35 @@ impl FilesystemWatcher {
         }
     }
 
-    /// Recursively emits individual file events for a directory.
+    /// Recursively emits individual file events for a directory using work-stealing parallel traversal.
     fn dispatch_dir_files<F>(dir: &Path, tx: &mpsc::Sender<WatcherEvent>, constructor: F)
     where
-        F: Fn(PathBuf) -> WatcherEvent,
+        F: Fn(PathBuf) -> WatcherEvent + Send + Sync + 'static,
     {
-        for entry in walkdir::WalkDir::new(dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file() {
-                Self::send_event(tx, constructor(entry.into_path()), dir);
-            }
-        }
+        let constructor = Arc::new(constructor);
+        let tx = tx.clone();
+        let dir_buf = dir.to_path_buf();
+        let walker = ignore::WalkBuilder::new(dir)
+            .hidden(false)
+            .ignore(false)
+            .git_global(false)
+            .git_ignore(false)
+            .git_exclude(false)
+            .build_parallel();
+
+        walker.run(move || {
+            let tx = tx.clone();
+            let constructor = Arc::clone(&constructor);
+            let dir_buf = dir_buf.clone();
+            Box::new(move |result| {
+                if let Ok(entry) = result {
+                    if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                        Self::send_event(&tx, constructor(entry.into_path()), &dir_buf);
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
     }
 
     /// Maps native `DebouncedEvent` into QuorumRAG `WatcherEvent`.

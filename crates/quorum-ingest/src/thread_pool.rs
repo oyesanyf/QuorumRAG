@@ -45,6 +45,7 @@ pub struct PermitTierTelemetry {
 pub struct IngestThreadPool {
     pool: Arc<rayon::ThreadPool>,
     thread_count: usize,
+    permit_tiers: IngestPermitTiers,
 }
 
 impl IngestThreadPool {
@@ -75,10 +76,18 @@ impl IngestThreadPool {
             .build()
             .map_err(|e| IngestError::Io(std::io::Error::other(format!("Failed to build Rayon thread pool: {}", e))))?;
 
+        let permit_tiers = IngestPermitTiers::new(threads);
+
         Ok(Self {
             pool: Arc::new(pool),
             thread_count: threads,
+            permit_tiers,
         })
+    }
+
+    /// Returns a reference to the permit tiers hierarchy.
+    pub fn permit_tiers(&self) -> &IngestPermitTiers {
+        &self.permit_tiers
     }
 
     /// Access the underlying `Arc<rayon::ThreadPool>`.
@@ -231,6 +240,36 @@ impl IngestPermitTiers {
             .total_vision_acquired
             .fetch_add(1, Ordering::Relaxed);
         Ok(permit)
+    }
+
+    /// Synchronously acquire a GPU / VRAM Ollama vision permit, blocking until available.
+    pub fn acquire_vision_blocking(&self) -> Result<OwnedSemaphorePermit, IngestError> {
+        let mut backoff = 1u64;
+        loop {
+            match self.vision_captioning.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    let in_use = self
+                        .vision_capacity
+                        .saturating_sub(self.vision_captioning.available_permits());
+                    self.telemetry
+                        .peak_vision_in_use
+                        .fetch_max(in_use, Ordering::Relaxed);
+                    self.telemetry
+                        .total_vision_acquired
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(permit);
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => return Err(IngestError::Cancelled),
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    if backoff < 16 {
+                        std::thread::yield_now();
+                        backoff += 1;
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        }
     }
 
     /// Returns a snapshot of peak and total permit utilization across all three tiers.

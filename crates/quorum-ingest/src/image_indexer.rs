@@ -1095,7 +1095,12 @@ if ($engine) {
     }
 
     /// Ingest-time bounded Ollama vision inspection (`moondream:latest` / `llava` via `/api/tags`).
+    /// Strictly throttled via `IngestPermitTiers::acquire_vision_blocking` to prevent GPU/VRAM OOM stalls.
     pub fn extract_vision_description(bytes: &[u8]) -> Option<String> {
+        let _permit = crate::thread_pool::IngestThreadPool::shared()
+            .permit_tiers()
+            .acquire_vision_blocking()
+            .ok()?;
         let addr: std::net::SocketAddr = "127.0.0.1:11434".parse().ok()?;
         Self::caption_image_bytes_with_ollama(bytes, addr, None).ok()
     }
