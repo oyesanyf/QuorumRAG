@@ -107,7 +107,7 @@ pub async fn static_handler(uri: Uri) -> Response {
             std::path::Path::new(r"d:\harfile\QuorumRAG\crates\quorum-ui\assets"),
         ] {
             let candidate = base.join(target_path);
-            let cache_header = "no-cache, no-store, must-revalidate";
+            let cache_header = "public, max-age=0, must-revalidate";
             if let Ok(bytes) = std::fs::read(&candidate) {
                 let mime = mime_guess::from_path(target_path)
                     .first_raw()
@@ -129,7 +129,7 @@ pub async fn static_handler(uri: Uri) -> Response {
         }
     }
 
-    let cache_header = "no-cache, no-store, must-revalidate";
+    let cache_header = "public, max-age=0, must-revalidate";
 
     if let Some(content) = WebAssets::get(target_path) {
         let mime = mime_guess::from_path(target_path)
