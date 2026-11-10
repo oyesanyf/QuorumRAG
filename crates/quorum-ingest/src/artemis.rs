@@ -171,6 +171,12 @@ impl ArtemisTelemetryRecord {
     /// - `metadata_json` with all required airgap flags and forensic metadata.
     pub fn to_document_chunk(&self, chunk_index: usize) -> Result<DocumentChunk, TypeError> {
         let chunk_id = format!("{}:{}", self.record_id, chunk_index);
+        let now_unix_secs = chrono::Utc::now().timestamp();
+        let ingested_unix_secs = self
+            .raw_json
+            .get("ingested_unix_secs")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(now_unix_secs);
         let metadata = serde_json::json!({
             "artemis_dfir": true,
             "mesh_sharable": false,
@@ -181,6 +187,7 @@ impl ArtemisTelemetryRecord {
             "os_version": self.os_version,
             "source_path": self.source_path,
             "collected_unix_secs": self.timestamp_unix_secs,
+            "ingested_unix_secs": ingested_unix_secs,
             "harvest_eligible": self.harvest_eligible,
             "raw_payload_blake3": self.raw_payload_blake3,
             "collector_name": self.collector_name,
@@ -198,6 +205,47 @@ impl ArtemisTelemetryRecord {
             self.summary_text.clone(),
             Some(metadata.to_string()),
         )
+    }
+
+    /// Converts this telemetry record into an unchunked `IngestedParentDocument` for RLM
+    /// multi-step environment inspection (`PeekSlice` and `RegexGrep`) at `Tier3Restricted`.
+    pub fn to_parent_document(&self) -> quorum_types::IngestedParentDocument {
+        let pretty_json = serde_json::to_string_pretty(&self.raw_json)
+            .unwrap_or_else(|_| self.raw_json.to_string());
+        let full_text = format!("{}\n\n{}", self.summary_text, pretty_json);
+        let blake3_hash = blake3::hash(full_text.as_bytes()).to_hex().to_string();
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("artemis_dfir".to_string(), "true".to_string());
+        metadata.insert("mesh_sharable".to_string(), "false".to_string());
+        metadata.insert("access_tier".to_string(), "3".to_string());
+        metadata.insert(
+            "telemetry_type".to_string(),
+            self.telemetry_type.as_str().to_string(),
+        );
+        metadata.insert(
+            "collected_unix_secs".to_string(),
+            self.timestamp_unix_secs.to_string(),
+        );
+
+        let ts_i64 = self.timestamp_unix_secs;
+        quorum_types::IngestedParentDocument {
+            doc_id: self.record_id.clone(),
+            blake3_hash,
+            source_path: self.source_path.clone(),
+            os_platform: self.os_platform.clone(),
+            format: quorum_types::DocumentFormat::SourceCode,
+            title: Some(format!(
+                "Artemis DFIR {} ({})",
+                self.telemetry_type.as_str(),
+                self.source_path
+            )),
+            author: Some(self.collector_name.clone()),
+            created_unix_secs: ts_i64,
+            modified_unix_secs: ts_i64,
+            byte_len: full_text.len() as u64,
+            full_text,
+            metadata,
+        }
     }
 
     /// Converts this record into a verifiable `ForensicProvenance` attestation.

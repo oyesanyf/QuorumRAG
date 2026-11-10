@@ -987,3 +987,106 @@ async fn test_marketplace_harvest_auto_includes_indexed_artemis_chunks_when_enab
         "Expected harvested batch to include an automatic artemis-dfir trajectory record when marketplace_harvest_enabled is true"
     );
 }
+
+#[tokio::test]
+async fn test_artemis_retention_pruning_and_rlm_parent_document_inspection() {
+    let (app, state, temp_dir) = setup_artemis_test_app().await;
+
+    // Set retention_days = 7 in Artemis settings
+    let cfg_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/artemis/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "retention_days": 7 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cfg_res.status(), StatusCode::OK);
+
+    // Create a .jsonl file with 1 expired record (ingested_unix_secs = 1_700_000_000)
+    // and 1 fresh record (no ingested_unix_secs override -> defaults to current unix time)
+    let jsonl_path = temp_dir.path().join("retention_and_rlm.jsonl");
+    {
+        let mut f = std::fs::File::create(&jsonl_path).expect("create jsonl");
+        writeln!(
+            f,
+            r#"{{"record_id": "artemis:process_execution:expired-rec", "Computer": "WIN-OLD-01", "CommandLine": "cmd.exe /c echo expired", "Image": "C:\\Windows\\System32\\cmd.exe", "ProcessId": 1001, "ingested_unix_secs": 1700000000}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"record_id": "artemis:process_execution:fresh-rec", "Computer": "WIN-FRESH-02", "CommandLine": "powershell.exe -NoP -W Hidden -File C:\\Triage\\hunt.ps1", "Image": "C:\\Windows\\System32\\powershell.exe", "ProcessId": 9944}}"#
+        )
+        .unwrap();
+    }
+
+    let collect_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/artemis/collect")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "source_type": "file",
+                        "target_path": jsonl_path.to_string_lossy(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_res.status(), StatusCode::OK);
+    let collect_json = read_body_json(collect_res).await;
+
+    assert_eq!(collect_json["records_parsed"], 2);
+    assert_eq!(collect_json["records_pruned"], 1);
+    assert_eq!(collect_json["total_retained_records"], 1);
+
+    // Verify expired chunk was pruned from storage while fresh chunk remains
+    let remaining_chunks = state.storage.scan_all_chunks().await.expect("scan chunks");
+    assert!(
+        !remaining_chunks
+            .iter()
+            .any(|c| c.document_id == "artemis:process_execution:expired-rec"),
+        "Expired Artemis chunk must be pruned from storage"
+    );
+    assert!(
+        remaining_chunks
+            .iter()
+            .any(|c| c.document_id == "artemis:process_execution:fresh-rec"),
+        "Fresh Artemis chunk must be retained in storage"
+    );
+
+    // Verify RLM PeekSlice and RegexGrep work at Tier 3 (local operator) and fail closed at Tier < 3
+    let slice_tier2 = state
+        .storage
+        .peek_slice("artemis:process_execution:fresh-rec", 0, 512, 2)
+        .expect("peek_slice tier 2");
+    assert!(
+        slice_tier2.is_none(),
+        "Tier 3 Artemis parent document must be inaccessible at max_tier=2"
+    );
+
+    let slice_tier3 = state
+        .storage
+        .peek_slice("artemis:process_execution:fresh-rec", 0, 1024, 3)
+        .expect("peek_slice tier 3")
+        .expect("parent document present at tier 3");
+    assert!(slice_tier3.contains("hunt.ps1"));
+
+    let grep_hits = state
+        .storage
+        .regex_grep("artemis:process_execution:fresh-rec", "hunt\\.ps1", 10, 3)
+        .expect("regex_grep tier 3");
+    assert!(!grep_hits.is_empty());
+    assert_eq!(grep_hits[0].matched_text, "hunt.ps1");
+}

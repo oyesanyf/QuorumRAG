@@ -41,6 +41,84 @@ fn last_collection_instant_lock() -> &'static RwLock<Option<Instant>> {
     LAST_ARTEMIS_COLLECTION_INSTANT.get_or_init(|| RwLock::new(None))
 }
 
+/// Prunes expired Artemis DFIR chunks older than `retention_days` (based on `ingested_unix_secs`)
+/// from both LanceDB and Tantivy, and synchronizes `TOTAL_ARTEMIS_COLLECTED_RECORDS` and
+/// `LAST_ARTEMIS_COLLECTION_TIMESTAMP` with the retained storage state.
+pub async fn prune_and_sync_artemis_retention(
+    storage: &quorum_storage::StorageEngine,
+    retention_days: u32,
+) -> (usize, usize) {
+    let Ok(all_chunks) = storage.scan_all_chunks().await else {
+        return (
+            TOTAL_ARTEMIS_COLLECTED_RECORDS.load(Ordering::Relaxed),
+            0,
+        );
+    };
+
+    let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
+    let max_age_secs = u64::from(retention_days).saturating_mul(86_400);
+    let mut retained = 0usize;
+    let mut pruned = 0usize;
+    let mut latest_ts_secs = 0u64;
+
+    for chunk in all_chunks {
+        let is_artemis = chunk.document_id.starts_with("artemis:")
+            || chunk.file_path.starts_with("artemis://")
+            || chunk.metadata_json.contains("\"artemis_dfir\":true");
+        if !is_artemis {
+            continue;
+        }
+
+        let meta = serde_json::from_str::<serde_json::Value>(&chunk.metadata_json).ok();
+        let ingested_secs = meta
+            .as_ref()
+            .and_then(|m| m.get("ingested_unix_secs"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let collected_secs = meta
+            .as_ref()
+            .and_then(|m| m.get("collected_unix_secs"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(ingested_secs);
+
+        if retention_days > 0
+            && ingested_secs > 0
+            && now_secs.saturating_sub(ingested_secs) > max_age_secs
+        {
+            if storage.delete_by_chunk_id(&chunk.chunk_id).await.is_ok() {
+                pruned += 1;
+                continue;
+            }
+        }
+
+        retained += 1;
+        let candidate_ts = ingested_secs.max(collected_secs);
+        if candidate_ts > latest_ts_secs {
+            latest_ts_secs = candidate_ts;
+        }
+    }
+
+    TOTAL_ARTEMIS_COLLECTED_RECORDS.store(retained, Ordering::Relaxed);
+    if latest_ts_secs > 0 {
+        let has_ts = last_collection_ts_lock()
+            .read()
+            .ok()
+            .map_or(false, |g| g.is_some());
+        if !has_ts {
+            if let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                i64::try_from(latest_ts_secs).unwrap_or(0),
+                0,
+            ) {
+                if let Ok(mut ts) = last_collection_ts_lock().write() {
+                    *ts = Some(dt.to_rfc3339());
+                }
+            }
+        }
+    }
+
+    (retained, pruned)
+}
+
 /// Partial or full update payload for Artemis DFIR settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtemisConfigUpdatePayload {
@@ -81,10 +159,14 @@ pub struct ArtemisPreviewNormalizerRequest {
 /// GET /api/v1/artemis/status
 /// Returns current Artemis DFIR configuration, airgap enforcement, and category allowlists.
 pub async fn artemis_status_handler(
-    State(_state): State<Arc<DaemonState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> impl IntoResponse {
     let controller = global_mesh_dlp_controller();
     let settings = controller.get_settings();
+    if TOTAL_ARTEMIS_COLLECTED_RECORDS.load(Ordering::Relaxed) == 0 {
+        let _ =
+            prune_and_sync_artemis_retention(&state.storage, settings.artemis.retention_days).await;
+    }
     let total_collected = TOTAL_ARTEMIS_COLLECTED_RECORDS.load(Ordering::Relaxed);
     let last_ts = last_collection_ts_lock()
         .read()
@@ -363,9 +445,13 @@ pub async fn artemis_collect_handler(
         }
     }
 
-    // Convert to DocumentChunks and batch-embed into storage
+    // Convert to DocumentChunks and batch-embed into storage, plus register full parent documents
+    // at Tier3Restricted (3) for RLM PeekSlice and RegexGrep inspection.
     let mut chunks_to_index = Vec::with_capacity(records_parsed);
     for rec in &parsed_records {
+        let _ = state
+            .storage
+            .upsert_parent_document(&rec.to_parent_document(), 3);
         if let Ok(chunk) = rec.to_document_chunk(0) {
             chunks_to_index.push(chunk);
         }
@@ -398,7 +484,6 @@ pub async fn artemis_collect_handler(
     };
 
     if chunks_indexed > 0 {
-        TOTAL_ARTEMIS_COLLECTED_RECORDS.fetch_add(chunks_indexed, Ordering::Relaxed);
         if let Ok(mut ts) = last_collection_ts_lock().write() {
             *ts = Some(chrono::Utc::now().to_rfc3339());
         }
@@ -406,6 +491,9 @@ pub async fn artemis_collect_handler(
             *inst = Some(Instant::now());
         }
     }
+
+    let (total_retained_records, records_pruned) =
+        prune_and_sync_artemis_retention(&state.storage, settings.artemis.retention_days).await;
 
     let mut categories_collected: Vec<String> = parsed_records
         .iter()
@@ -423,6 +511,8 @@ pub async fn artemis_collect_handler(
             "status": "completed",
             "records_parsed": records_parsed,
             "chunks_indexed": chunks_indexed,
+            "records_pruned": records_pruned,
+            "total_retained_records": total_retained_records,
             "categories_collected": categories_collected,
             "elapsed_ms": elapsed_ms,
         })),
@@ -524,6 +614,9 @@ pub fn spawn_artemis_auto_collector(
 
             let mut chunks_to_index = Vec::with_capacity(parsed_records.len());
             for rec in &parsed_records {
+                let _ = state
+                    .storage
+                    .upsert_parent_document(&rec.to_parent_document(), 3);
                 if let Ok(chunk) = rec.to_document_chunk(0) {
                     chunks_to_index.push(chunk);
                 }
@@ -548,7 +641,6 @@ pub fn spawn_artemis_auto_collector(
             if !chunks_to_index.is_empty() {
                 if let Ok(indexed) = state.storage.insert_chunks(&chunks_to_index).await {
                     if indexed > 0 {
-                        TOTAL_ARTEMIS_COLLECTED_RECORDS.fetch_add(indexed, Ordering::Relaxed);
                         if let Ok(mut ts) = last_collection_ts_lock().write() {
                             *ts = Some(chrono::Utc::now().to_rfc3339());
                         }
@@ -558,6 +650,7 @@ pub fn spawn_artemis_auto_collector(
                     }
                 }
             }
+            let _ = prune_and_sync_artemis_retention(&state.storage, settings.retention_days).await;
         }
     });
 }
