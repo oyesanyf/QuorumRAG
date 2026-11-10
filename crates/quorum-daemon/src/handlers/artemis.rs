@@ -31,9 +31,14 @@ use std::sync::{OnceLock, RwLock};
 
 static TOTAL_ARTEMIS_COLLECTED_RECORDS: AtomicUsize = AtomicUsize::new(0);
 static LAST_ARTEMIS_COLLECTION_TIMESTAMP: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+static LAST_ARTEMIS_COLLECTION_INSTANT: OnceLock<RwLock<Option<Instant>>> = OnceLock::new();
 
 fn last_collection_ts_lock() -> &'static RwLock<Option<String>> {
     LAST_ARTEMIS_COLLECTION_TIMESTAMP.get_or_init(|| RwLock::new(None))
+}
+
+fn last_collection_instant_lock() -> &'static RwLock<Option<Instant>> {
+    LAST_ARTEMIS_COLLECTION_INSTANT.get_or_init(|| RwLock::new(None))
 }
 
 /// Partial or full update payload for Artemis DFIR settings.
@@ -397,6 +402,9 @@ pub async fn artemis_collect_handler(
         if let Ok(mut ts) = last_collection_ts_lock().write() {
             *ts = Some(chrono::Utc::now().to_rfc3339());
         }
+        if let Ok(mut inst) = last_collection_instant_lock().write() {
+            *inst = Some(Instant::now());
+        }
     }
 
     let mut categories_collected: Vec<String> = parsed_records
@@ -466,3 +474,91 @@ pub async fn artemis_preview_normalizer_handler(
     )
         .into_response()
 }
+
+/// Spawns the background periodic Artemis DFIR auto-collection worker.
+///
+/// Remains completely dormant unless the operator has explicitly enabled
+/// `local_collection_enabled = true` AND configured `auto_collection_interval_mins > 0`.
+pub fn spawn_artemis_auto_collector(
+    state: Arc<DaemonState>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_notify.notified() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+            }
+
+            let settings = global_mesh_dlp_controller().get_settings().artemis;
+            if !settings.local_collection_enabled || settings.auto_collection_interval_mins == 0 {
+                continue;
+            }
+
+            let interval =
+                std::time::Duration::from_secs(u64::from(settings.auto_collection_interval_mins) * 60);
+            let due = last_collection_instant_lock()
+                .read()
+                .ok()
+                .map_or(true, |guard| match *guard {
+                    Some(last) => last.elapsed() >= interval,
+                    None => true,
+                });
+
+            if !due {
+                continue;
+            }
+
+            let active_cats = settings.allowed_artifact_categories.clone();
+            let Ok(mut parsed_records) =
+                tokio::task::spawn_blocking(move || collect_live_os_forensics(&active_cats)).await
+            else {
+                continue;
+            };
+
+            if settings.redact_secrets {
+                for record in &mut parsed_records {
+                    record.summary_text = SecretScrubber::scrub_text(&record.summary_text);
+                }
+            }
+
+            let mut chunks_to_index = Vec::with_capacity(parsed_records.len());
+            for rec in &parsed_records {
+                if let Ok(chunk) = rec.to_document_chunk(0) {
+                    chunks_to_index.push(chunk);
+                }
+            }
+
+            for batch in chunks_to_index.chunks_mut(64) {
+                let texts: Vec<&str> = batch.iter().map(|c| c.text_content.as_str()).collect();
+                if let Ok(vecs) = state.embedder.embed_batch(&texts) {
+                    for (chunk, vec) in batch.iter_mut().zip(vecs.into_iter()) {
+                        chunk.vector = vec;
+                    }
+                } else {
+                    for chunk in batch.iter_mut() {
+                        chunk.vector = state
+                            .embedder
+                            .embed_text(&chunk.text_content)
+                            .unwrap_or_else(|_| vec![0.0f32; state.embedder.dimension()]);
+                    }
+                }
+            }
+
+            if !chunks_to_index.is_empty() {
+                if let Ok(indexed) = state.storage.insert_chunks(&chunks_to_index).await {
+                    if indexed > 0 {
+                        TOTAL_ARTEMIS_COLLECTED_RECORDS.fetch_add(indexed, Ordering::Relaxed);
+                        if let Ok(mut ts) = last_collection_ts_lock().write() {
+                            *ts = Some(chrono::Utc::now().to_rfc3339());
+                        }
+                        if let Ok(mut inst) = last_collection_instant_lock().write() {
+                            *inst = Some(Instant::now());
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+

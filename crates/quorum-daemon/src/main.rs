@@ -492,6 +492,12 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         cli.service,
     );
 
+    // Start background periodic Artemis DFIR auto-collector (dormant unless local_collection_enabled && auto_collection_interval_mins > 0)
+    handlers::artemis::spawn_artemis_auto_collector(
+        Arc::clone(&app_state),
+        Arc::clone(&shutdown_notify),
+    );
+
     // Spawn automatic LAN /24 subnet + ARP + persisted-peer dialer so nodes connect even if Wi-Fi AP blocks UDP 5353 multicast
     if let Some(ref handle) = app_state.swarm_handle {
         let dial_handle = handle.clone();
