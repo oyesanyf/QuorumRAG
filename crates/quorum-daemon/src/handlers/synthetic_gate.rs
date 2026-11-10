@@ -476,11 +476,14 @@ pub fn inspect_file_provenance(
 
 /// Counts git commits for a local file if it resides inside a git repository.
 fn count_local_git_commits(path: &Path) -> Option<usize> {
-    let output = std::process::Command::new("git")
-        .args(["log", "--oneline", "-n", "20", "--"])
-        .arg(path)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["log", "--oneline", "-n", "20", "--"]).arg(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let output = cmd.output().ok()?;
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout);
         let count = text.lines().count();

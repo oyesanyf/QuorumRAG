@@ -487,11 +487,29 @@ impl ScatterGatherEngine {
         };
 
         // 2. Execute Local Storage Search concurrently while remote_handle runs on the Tokio pool.
+        // Local Artemis DFIR telemetry chunks are indexed at Tier3Restricted (3) so they never cross the P2P mesh,
+        // but local queries on this host may retrieve them when Artemis local collection is enabled or queried.
+        let local_access_tier = {
+            let ql = query_text.to_ascii_lowercase();
+            let is_forensic_q = ql.contains("artemis")
+                || ql.contains("antivirus")
+                || ql.contains("defender")
+                || ql.contains("codeintegrity")
+                || ql.contains("eventlog")
+                || ql.contains("systemeventlog");
+            let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
+            if s.artemis.enabled || s.artemis.local_collection_enabled || is_forensic_q {
+                access_tier.max(quorum_types::AccessTier::Tier3Restricted.as_u8())
+            } else {
+                access_tier
+            }
+        };
+
         let (local_results, new_cached_vector) = if let Some(cached) = cached_vector {
             if !cached.is_empty() {
                 let text_hits = self
                     .local_storage
-                    .search_text(query_text, access_tier, candidate_limit)
+                    .search_text(query_text, local_access_tier, candidate_limit)
                     .await;
                 let mut rrf_map: std::collections::HashMap<
                     String,
@@ -533,14 +551,14 @@ impl ScatterGatherEngine {
             } else {
                 let results = if exclude_chunk_ids.is_empty() {
                     self.local_storage
-                        .search_hybrid(query_text, query_vec, access_tier, candidate_limit)
+                        .search_hybrid(query_text, query_vec, local_access_tier, candidate_limit)
                         .await
                 } else {
                     self.local_storage
                         .search_hybrid_with_exclusion(
                             query_text,
                             query_vec,
-                            access_tier,
+                            local_access_tier,
                             candidate_limit,
                             exclude_chunk_ids,
                         )
@@ -551,14 +569,14 @@ impl ScatterGatherEngine {
         } else {
             let results = if exclude_chunk_ids.is_empty() {
                 self.local_storage
-                    .search_hybrid(query_text, query_vec, access_tier, candidate_limit)
+                    .search_hybrid(query_text, query_vec, local_access_tier, candidate_limit)
                     .await
             } else {
                 self.local_storage
                     .search_hybrid_with_exclusion(
                         query_text,
                         query_vec,
-                        access_tier,
+                        local_access_tier,
                         candidate_limit,
                         exclude_chunk_ids,
                     )

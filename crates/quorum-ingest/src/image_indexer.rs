@@ -836,13 +836,17 @@ if ($engine) {
     Write-Output "EXTRACTED_OCR_END"
 }
 "#;
-        let child = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script, "-ImagePath"])
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script, "-ImagePath"])
             .arg(path.as_os_str())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let child = cmd.spawn().ok()?;
 
         let output = child.wait_with_output().ok()?;
         if !output.status.success() {

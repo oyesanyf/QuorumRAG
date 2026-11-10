@@ -21,14 +21,58 @@ use state::DaemonState;
 const DEFAULT_LOG_FILTER: &str =
     "quorumrag=info,quorum_daemon=info,quorum_coordinator=info,quorum_storage=info";
 
-/// Console logging normally; with `--service`, append to `<data-dir>/logs/quorumrag-service.log`
-/// because a service has no console.
+/// Returns true when running as a background daemon or P2P watcher on Windows where a visible
+/// DOS/console window must be hidden and detached (unless `QUORUM_SHOW_CONSOLE=1` is set).
+#[cfg(windows)]
+fn should_detach_windows_console(cli: &Cli) -> bool {
+    if std::env::var("QUORUM_SHOW_CONSOLE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    !matches!(
+        cli.command,
+        Some(Commands::Reindex { .. })
+            | Some(Commands::FixDrift { .. })
+            | Some(Commands::Recache { .. })
+    )
+}
+
+/// Immediately hides (`SW_HIDE`) and detaches (`FreeConsole`) any attached Windows console window
+/// so launching `quorumrag.exe` (via shortcut, WMI, Explorer, or service) never shows a DOS window.
+#[cfg(windows)]
+fn detach_and_hide_windows_console(cli: &Cli) {
+    if !should_detach_windows_console(cli) {
+        return;
+    }
+    unsafe extern "system" {
+        fn GetConsoleWindow() -> isize;
+        fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
+        fn FreeConsole() -> i32;
+    }
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if hwnd != 0 {
+            let _ = ShowWindow(hwnd, 0); // SW_HIDE = 0
+        }
+        let _ = FreeConsole();
+    }
+}
+
+/// File logging (`<data-dir>/logs/quorumrag-service.log`) when running as a service or detached
+/// background daemon on Windows; console logging for explicit interactive CLI subcommands.
 fn init_tracing(cli: &Cli) {
     let filter = || {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into())
     };
-    if cli.service {
+    #[cfg(windows)]
+    let use_file_log = cli.service || should_detach_windows_console(cli);
+    #[cfg(not(windows))]
+    let use_file_log = cli.service;
+
+    if use_file_log {
         let log_dir = cli.data_dir.join("logs");
         let opened = std::fs::create_dir_all(&log_dir).and_then(|_| {
             std::fs::OpenOptions::new()
@@ -50,6 +94,8 @@ fn init_tracing(cli: &Cli) {
 
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(windows)]
+    detach_and_hide_windows_console(&cli);
     init_tracing(&cli);
 
     #[cfg(windows)]
@@ -640,7 +686,17 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     }
     for expanded in quorum_ingest::ReindexWorker::expand_drive_roots(&ingest_config.watch_paths) {
         if expanded.is_dir() && !initial_watch_dirs.contains(&expanded) {
-            initial_watch_dirs.push(expanded);
+            // Skip watching the raw `C:\Users\<user>` profile root recursively in ReadDirectoryChangesW
+            // because `discover_user_document_roots()` already watches Documents/Desktop/Downloads/Pictures/OneDrive,
+            // while raw `C:\Users\<user>` floods the watcher with AppData\Local\Temp and browser cache churn.
+            let is_user_profile_root = expanded
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().eq_ignore_ascii_case("users"))
+                .unwrap_or(false);
+            if !is_user_profile_root {
+                initial_watch_dirs.push(expanded);
+            }
         }
     }
     reindex_worker.add_watch_paths(&initial_watch_dirs);
@@ -664,6 +720,24 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             app_state.set_fs_watcher(Arc::clone(&handle_arc));
             let watcher_state = Arc::clone(&app_state);
             let watcher_shutdown = Arc::clone(&shutdown_notify);
+            let abs_data_dir_str = std::fs::canonicalize(&cli.data_dir)
+                .unwrap_or_else(|_| {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(&cli.data_dir))
+                        .unwrap_or_else(|_| cli.data_dir.clone())
+                })
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .to_ascii_lowercase();
+            let abs_uploads_dir_str = std::fs::canonicalize(&uploaded_docs_dir)
+                .unwrap_or_else(|_| {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(&uploaded_docs_dir))
+                        .unwrap_or_else(|_| uploaded_docs_dir.clone())
+                })
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .to_ascii_lowercase();
             let excluded_data_dir = cli.data_dir.clone();
             let allowed_uploads_dir = uploaded_docs_dir.clone();
 
@@ -672,15 +746,37 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                     if p.starts_with(&excluded_data_dir) && !p.starts_with(&allowed_uploads_dir) {
                         return true;
                     }
-                    let s = p.to_string_lossy().to_ascii_lowercase();
+                    let s = p
+                        .to_string_lossy()
+                        .trim_start_matches(r"\\?\")
+                        .to_ascii_lowercase();
+                    if !abs_data_dir_str.is_empty()
+                        && s.starts_with(&abs_data_dir_str)
+                        && !s.starts_with(&abs_uploads_dir_str)
+                    {
+                        return true;
+                    }
                     s.contains("\\target\\")
                         || s.contains("/target/")
                         || s.contains("\\.git\\")
                         || s.contains("/.git/")
                         || s.contains("\\node_modules\\")
                         || s.contains("/node_modules/")
+                        || s.contains("\\appdata\\")
+                        || s.contains("/appdata/")
+                        || s.contains("\\temp\\")
+                        || s.contains("/temp/")
+                        || s.contains("\\.gemini\\")
+                        || s.contains("/.gemini/")
+                        || s.contains("\\.cargo\\")
+                        || s.contains("\\.rustup\\")
                         || s.contains(".lance")
                         || s.contains(".tantivy")
+                        || s.contains("quorumrag-service.log")
+                        || s.contains("p2p-watcher.log")
+                        || s.contains("p2p_watcher")
+                        || s.contains("p2p_known_peers.json")
+                        || s.ends_with(".metadata.json")
                         || s.ends_with(".db-wal")
                         || s.ends_with(".db-shm")
                         || s.ends_with(".db-journal")

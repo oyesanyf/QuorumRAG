@@ -11,6 +11,95 @@ use tracing::{error, info};
 use crate::state::DaemonState;
 use quorum_coordinator::{AgenticTelemetryEvent, ChatTurnMessage, SynthesisModelFamily};
 use quorum_storage::SearchMode;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+static LAST_FORENSIC_QUERY_SYNC_SECS: AtomicI64 = AtomicI64::new(0);
+
+/// When a user query asks about antivirus, Windows Defender, CodeIntegrity, malware, or blocked processes,
+/// ensures local Artemis DFIR collection is enabled and refreshes live OS event log / process records if stale (> 60s).
+async fn ensure_live_forensics_for_query(state: &Arc<DaemonState>, prompt: &str) {
+    let ql = prompt.to_ascii_lowercase();
+    let is_forensic_q = ql.contains("antivirus")
+        || ql.contains("defender")
+        || ql.contains("codeintegrity")
+        || ql.contains("malware")
+        || ql.contains("trojan")
+        || ql.contains("eventlog")
+        || ql.contains("event log")
+        || (ql.contains("process")
+            && (ql.contains("block")
+                || ql.contains("kill")
+                || ql.contains("quarantin")
+                || ql.contains("detect")));
+    if !is_forensic_q {
+        return;
+    }
+
+    {
+        let ctrl = quorum_coordinator::dlp_mesh::global_mesh_dlp_controller();
+        let mut s = ctrl.settings.write().unwrap_or_else(|e| e.into_inner());
+        s.artemis.enabled = true;
+        s.artemis.local_collection_enabled = true;
+    }
+
+    let now_secs = chrono::Utc::now().timestamp();
+    let prev = LAST_FORENSIC_QUERY_SYNC_SECS.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(prev) < 600 {
+        return;
+    }
+    LAST_FORENSIC_QUERY_SYNC_SECS.store(now_secs, Ordering::Relaxed);
+
+    let already_indexed = state
+        .storage
+        .search_text("windows_defender_antivirus_event", 3, 2)
+        .await
+        .map(|hits| !hits.is_empty())
+        .unwrap_or(false);
+
+    let state_clone = state.clone();
+    let sync_fut = async move {
+        let records = tokio::task::spawn_blocking(|| {
+            let cats = vec![
+                "system_event_log".to_string(),
+                "process_execution".to_string(),
+            ];
+            quorum_ingest::artemis::collect_live_os_forensics(&cats)
+        })
+        .await
+        .unwrap_or_default();
+
+        if records.is_empty() {
+            return;
+        }
+
+        let mut chunks = Vec::with_capacity(records.len());
+        for (idx, rec) in records.iter().enumerate() {
+            let _ = state_clone
+                .storage
+                .upsert_parent_document(&rec.to_parent_document(), 3);
+            if let Ok(mut chunk) = rec.to_document_chunk(idx) {
+                chunk.vector = state_clone
+                    .embedder
+                    .embed_text(&chunk.text_content)
+                    .unwrap_or_else(|_| vec![0.0f32; state_clone.embedder.dimension()]);
+                chunks.push(chunk);
+            }
+        }
+        if !chunks.is_empty() {
+            let _ = state_clone.storage.insert_chunks(&chunks).await;
+            info!(
+                records = chunks.len(),
+                "On-demand Artemis live OS forensic event log sync completed for query"
+            );
+        }
+    };
+
+    if already_indexed {
+        tokio::spawn(sync_fut);
+    } else {
+        sync_fut.await;
+    }
+}
 
 /// Request payload for `/api/chat` and `/api/query`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +408,8 @@ pub async fn chat_sse_handler(
                 let _ = coordinator.cache_manager.query_cache.clear();
             }
 
+            ensure_live_forensics_for_query(&state_for_history, &prompt).await;
+
             match coordinator
                 .query_agentic_with_history_and_session(&prompt, history, family, top_k, session_seen, Some(task_tx.clone()))
                 .await
@@ -448,6 +539,8 @@ pub async fn query_handler(
     } else {
         std::collections::HashSet::new()
     };
+
+    ensure_live_forensics_for_query(&state, prompt).await;
 
     match state
         .coordinator

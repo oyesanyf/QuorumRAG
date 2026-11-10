@@ -46,9 +46,14 @@ impl DocumentExtractor {
                     if s.contains("windowsapps") {
                         return false;
                     }
-                    Command::new(cand)
-                        .args(["-c", "import sys; sys.exit(0)"])
-                        .output()
+                    let mut cmd = Command::new(cand);
+                    cmd.args(["-c", "import sys; sys.exit(0)"]);
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        cmd.creation_flags(0x0800_0000);
+                    }
+                    cmd.output()
                         .map(|o| o.status.success())
                         .unwrap_or(false)
                 };
@@ -1459,6 +1464,11 @@ impl DocumentExtractor {
         mut cmd: Command,
         timeout: std::time::Duration,
     ) -> io::Result<std::process::Output> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn()?;
@@ -2535,20 +2545,24 @@ try {
     $conn.Close()
 }
 "#;
-            let output = Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    ps_script,
-                ])
-                .arg(&clean_path)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()?;
+            let mut cmd = Command::new("powershell");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps_script,
+            ])
+            .arg(&clean_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000);
+            }
+            let output = cmd.output().ok()?;
             if !output.status.success() {
                 return None;
             }

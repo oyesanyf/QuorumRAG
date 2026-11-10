@@ -802,10 +802,22 @@ pub fn build_summary_text(
                 .or_else(|| val.get("message"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!(
-                "SystemEventLog [{}]: channel='{}', event_id={}, message='{}'",
-                os_platform, ch, id, msg
-            )
+            let event_date = val
+                .get("EventDate")
+                .or_else(|| val.get("TimeCreated"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !event_date.is_empty() {
+                format!(
+                    "{}\nSystemEventLog [{}]: date='{}', channel='{}', event_id={}, message='{}'.",
+                    msg, os_platform, event_date, ch, id, msg
+                )
+            } else {
+                format!(
+                    "{}\nSystemEventLog [{}]: channel='{}', event_id={}, message='{}'.",
+                    msg, os_platform, ch, id, msg
+                )
+            }
         }
         ForensicTelemetryType::NetworkConnection => {
             let local = val
@@ -949,6 +961,13 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
             sys.refresh_all();
             for (pid, process) in sys.processes() {
                 let cmd = process.cmd().join(" ");
+                let cmd_low = cmd.to_ascii_lowercase();
+                if cmd_low.contains("127.0.0.1:303")
+                    || cmd_low.contains("/api/query")
+                    || cmd_low.contains("/api/chat")
+                {
+                    continue;
+                }
                 let exe = process
                     .exe()
                     .map(|p| p.to_string_lossy().to_string())
@@ -1306,35 +1325,134 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
             }
             #[cfg(target_os = "windows")]
             {
-                let channels = ["System", "Application"];
+                let channels: &[(&str, Option<&str>)] = &[
+                    (
+                        "Microsoft-Windows-Windows Defender/Operational",
+                        Some("*[System[(EventID=1116 or EventID=1117 or EventID=1121 or EventID=1122)]]"),
+                    ),
+                    (
+                        "Microsoft-Windows-CodeIntegrity/Operational",
+                        Some("*[System[(EventID=3077 or EventID=3076 or EventID=3033 or EventID=3089)]]"),
+                    ),
+                    ("System", None),
+                    ("Application", None),
+                ];
                 std::thread::scope(|evt_scope| {
                     let mut handles = Vec::with_capacity(channels.len());
-                    for channel in channels {
+                    for &(channel, query_filter) in channels {
                         handles.push(evt_scope.spawn(move || {
                             let mut ch_recs = Vec::new();
-                            if let Some(evtx_out) = run_hidden_os_command(
-                                "wevtutil",
-                                &["qe", channel, "/c:15", "/rd:true", "/f:Text"],
-                            ) {
+                            let evtx_out_opt = if let Some(q) = query_filter {
+                                let q_arg = format!("/q:{}", q);
+                                run_hidden_os_command(
+                                    "wevtutil",
+                                    &["qe", channel, q_arg.as_str(), "/c:15", "/rd:true", "/f:Text"],
+                                )
+                            } else {
+                                run_hidden_os_command(
+                                    "wevtutil",
+                                    &["qe", channel, "/c:15", "/rd:true", "/f:Text"],
+                                )
+                            };
+                            if let Some(evtx_out) = evtx_out_opt {
                                 for (idx, block) in evtx_out.split("Event[").skip(1).enumerate() {
                                     let mut event_id = 0u64;
+                                    let mut event_date = String::new();
+                                    let mut user_name = String::new();
+                                    let mut threat_name = String::new();
+                                    let mut blocked_path = String::new();
+                                    let mut process_name = String::new();
+                                    let mut action_name = String::new();
                                     let mut desc_lines = Vec::new();
                                     let mut in_desc = false;
                                     for line in block.lines() {
                                         let trimmed = line.trim();
                                         if let Some(rest) = trimmed.strip_prefix("Event ID:") {
                                             event_id = rest.trim().parse::<u64>().unwrap_or(0);
+                                        } else if let Some(rest) = trimmed.strip_prefix("Date:") {
+                                            event_date = rest.trim().to_string();
+                                        } else if let Some(rest) = trimmed.strip_prefix("User Name:") {
+                                            user_name = rest.trim().to_string();
                                         } else if trimmed.starts_with("Description:") {
                                             in_desc = true;
                                         } else if in_desc && !trimmed.is_empty() {
+                                            if let Some(r) = trimmed.strip_prefix("Name:") {
+                                                if threat_name.is_empty() {
+                                                    threat_name = r.trim().to_string();
+                                                }
+                                            } else if let Some(r) = trimmed.strip_prefix("Path:") {
+                                                blocked_path = r.trim().to_string();
+                                            } else if let Some(r) = trimmed.strip_prefix("Process Name:") {
+                                                process_name = r.trim().to_string();
+                                            } else if let Some(r) = trimmed.strip_prefix("Action:") {
+                                                action_name = r.trim().to_string();
+                                            }
                                             desc_lines.push(trimmed);
                                         }
                                     }
-                                    let msg = if desc_lines.is_empty() {
+                                    let raw_desc = if desc_lines.is_empty() {
                                         block.lines().take(6).collect::<Vec<_>>().join(" ")
                                     } else {
                                         desc_lines.join(" ")
                                     };
+                                    let is_defender = channel.contains("Windows Defender");
+                                    let is_code_integrity = channel.contains("CodeIntegrity");
+                                    let msg = if is_defender {
+                                        let rank_label = if idx == 0 {
+                                            "Latest Process Blocked by Antivirus (Windows Defender)"
+                                        } else {
+                                            "Process Blocked by Antivirus (Windows Defender)"
+                                        };
+                                        let target_proc = if !blocked_path.is_empty() {
+                                            blocked_path.as_str()
+                                        } else if !process_name.is_empty() {
+                                            process_name.as_str()
+                                        } else {
+                                            "unknown process"
+                                        };
+                                        format!(
+                                            "[{}] On {} (Event ID {}), Microsoft Defender Antivirus blocked and removed process or command '{}' detected as threat '{}' (Action: {}, User: {}). Details: {}",
+                                            rank_label,
+                                            if event_date.is_empty() { "recent timestamp" } else { event_date.as_str() },
+                                            event_id,
+                                            target_proc,
+                                            if threat_name.is_empty() { "Malware/Trojan" } else { threat_name.as_str() },
+                                            if action_name.is_empty() { "Block/Remove" } else { action_name.as_str() },
+                                            if user_name.is_empty() { "SYSTEM" } else { user_name.as_str() },
+                                            raw_desc
+                                        )
+                                    } else if is_code_integrity {
+                                        let rank_label = if idx == 0 {
+                                            "Latest Process Blocked by Windows CodeIntegrity (Application Control)"
+                                        } else {
+                                            "Process Blocked by Windows CodeIntegrity (Application Control)"
+                                        };
+                                        format!(
+                                            "[{}] On {} (Event ID {}, User: {}), Windows CodeIntegrity blocked an unsigned or policy-violating process or executable: {}",
+                                            rank_label,
+                                            if event_date.is_empty() { "recent timestamp" } else { event_date.as_str() },
+                                            event_id,
+                                            if user_name.is_empty() { "SYSTEM" } else { user_name.as_str() },
+                                            raw_desc
+                                        )
+                                    } else {
+                                        raw_desc
+                                    };
+                                    let slug = if is_defender {
+                                        format!("windows_defender_antivirus_event_{}_{}", event_id, idx)
+                                    } else if is_code_integrity {
+                                        format!("windows_codeintegrity_blocked_process_event_{}_{}", event_id, idx)
+                                    } else {
+                                        format!(
+                                            "{}_event_{}_{}",
+                                            channel.to_ascii_lowercase().replace(['/', ' '], "_"),
+                                            event_id,
+                                            idx
+                                        )
+                                    };
+                                    let event_unix = chrono::DateTime::parse_from_rfc3339(&event_date)
+                                        .map(|dt| dt.timestamp())
+                                        .unwrap_or(now_unix);
                                     let val = serde_json::json!({
                                         "telemetry_type": "system_event_log",
                                         "Computer": host_ref,
@@ -1342,9 +1460,13 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                         "os_version": os_version_ref,
                                         "Channel": channel,
                                         "EventID": event_id,
+                                        "EventDate": event_date,
+                                        "UserName": user_name,
+                                        "ThreatName": threat_name,
+                                        "BlockedProcessPath": blocked_path,
                                         "Message": msg,
-                                        "collected_unix_secs": now_unix,
-                                        "source_path": format!("artemis://windows/eventlog/{}/{}_{}", channel.to_ascii_lowercase(), event_id, idx),
+                                        "collected_unix_secs": event_unix,
+                                        "source_path": format!("artemis://windows/eventlog/{}", slug),
                                     });
                                     if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(
                                         val,

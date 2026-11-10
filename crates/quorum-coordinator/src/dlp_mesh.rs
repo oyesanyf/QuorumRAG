@@ -680,11 +680,16 @@ impl OsoosiMeshDlpController {
         // Check if Python is present on this computer and spawn non-blocking background auto-installer
         // so `presidio-analyzer`, `presidio-anonymizer`, and `gliner` (`urchade/gliner_multi_pii-v1`)
         // are provisioned in the background without blocking startup.
-        let python_available = std::process::Command::new("python")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let python_available = {
+            let mut cmd = std::process::Command::new("python");
+            cmd.arg("--version");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000);
+            }
+            cmd.output().map(|o| o.status.success()).unwrap_or(false)
+        };
 
         let model_dir_bg = model_dir.clone();
         let bridge_bg = bridge_script_path.clone();
@@ -693,23 +698,33 @@ impl OsoosiMeshDlpController {
                 let marker = model_dir_bg.join(".provision_attempted");
                 if !marker.is_file() {
                     let _ = std::fs::write(&marker, Utc::now().to_rfc3339());
-                    let _ = std::process::Command::new("python")
-                        .args([
-                            "-m",
-                            "pip",
-                            "install",
-                            "--quiet",
-                            "--disable-pip-version-check",
-                            "presidio-analyzer",
-                            "presidio-anonymizer",
-                            "gliner",
-                            "onnxruntime",
-                        ])
-                        .output();
-                    let _ = std::process::Command::new("python")
-                        .arg(&bridge_bg)
-                        .arg(&model_dir_bg)
-                        .output();
+                    let mut pip_cmd = std::process::Command::new("python");
+                    pip_cmd.args([
+                        "-m",
+                        "pip",
+                        "install",
+                        "--quiet",
+                        "--disable-pip-version-check",
+                        "presidio-analyzer",
+                        "presidio-anonymizer",
+                        "gliner",
+                        "onnxruntime",
+                    ]);
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        pip_cmd.creation_flags(0x0800_0000);
+                    }
+                    let _ = pip_cmd.output();
+
+                    let mut br_cmd = std::process::Command::new("python");
+                    br_cmd.arg(&bridge_bg).arg(&model_dir_bg);
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        br_cmd.creation_flags(0x0800_0000);
+                    }
+                    let _ = br_cmd.output();
                 }
             });
         }
