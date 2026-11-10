@@ -2257,8 +2257,10 @@ async fn synthesize_artemis_storage_candidates(
     extra_terms: &[String],
     now: i64,
 ) -> Vec<RawTrajectoryCandidate> {
-    let Ok(all_chunks) = state.storage.scan_all_chunks().await else {
-        return Vec::new();
+    let all_chunks = if state.storage.count().await.unwrap_or(usize::MAX) <= 4096 {
+        state.storage.scan_all_chunks().await.unwrap_or_default()
+    } else {
+        crate::handlers::artemis::get_retained_artemis_chunks()
     };
     let mut out = Vec::new();
     for chunk in all_chunks {
