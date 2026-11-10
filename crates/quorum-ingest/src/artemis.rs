@@ -1162,6 +1162,47 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                         }
                     }
                 }
+                // Amcache hive presence & metadata (`C:\Windows\AppCompat\Programs\Amcache.hve`)
+                let amcache_path = std::path::Path::new(r"C:\Windows\AppCompat\Programs\Amcache.hve");
+                if amcache_path.exists() {
+                    out.extend(parse_registry_hive_file(amcache_path, host_ref, now_unix));
+                }
+                // Shimcache (`AppCompatCache`) & registered App Paths execution artifacts
+                if let Some(app_out) = run_hidden_os_command(
+                    "reg",
+                    &[
+                        "query",
+                        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
+                    ],
+                ) {
+                    for line in app_out.lines().take(30) {
+                        let trimmed = line.trim();
+                        if let Some(exe_name) = trimmed.strip_prefix(
+                            r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\",
+                        ) {
+                            let exe_clean = exe_name.trim();
+                            if !exe_clean.is_empty() {
+                                let val = serde_json::json!({
+                                    "telemetry_type": "prefetch_amcache_execution",
+                                    "Computer": host_ref,
+                                    "os_platform": "windows",
+                                    "os_version": os_version_ref,
+                                    "ExecutableName": exe_clean,
+                                    "RunCount": 1,
+                                    "PrefetchFormat": "AMCACHE_APP_PATHS",
+                                    "path": trimmed,
+                                    "collected_unix_secs": now_unix,
+                                    "source_path": format!("artemis://windows/amcache/{}", exe_clean.replace(' ', "_")),
+                                });
+                                if let Ok(rec) =
+                                    ArtemisTelemetryRecord::from_json_value(val, Some("windows"))
+                                {
+                                    out.push(rec);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             out
         });
@@ -1322,6 +1363,56 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                         }
                     }
                 });
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(log_out) = run_hidden_os_command(
+                "log",
+                &["show", "--style", "compact", "--last", "1m"],
+            ) {
+                for (idx, line) in log_out.lines().skip(1).enumerate().take(25) {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let val = serde_json::json!({
+                        "telemetry_type": "system_event_log",
+                        "Computer": host_ref,
+                        "os_platform": "macos",
+                        "os_version": os_version_ref,
+                        "subsystem": "com.apple.unifiedlog",
+                        "Message": trimmed,
+                        "collected_unix_secs": now_unix,
+                        "source_path": format!("artemis://macos/unified_log/{}", idx),
+                    });
+                    if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("macos")) {
+                        out.push(rec);
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(j_out) = run_hidden_os_command(
+                "journalctl",
+                &["-n", "25", "-o", "short-iso", "--no-pager"],
+            ) {
+                for (idx, line) in j_out.lines().enumerate().take(25) {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with("-- ") {
+                        continue;
+                    }
+                    let val = serde_json::json!({
+                        "telemetry_type": "system_event_log",
+                        "Computer": host_ref,
+                        "os_platform": "linux",
+                        "os_version": os_version_ref,
+                        "_SYSTEMD_UNIT": "journald.service",
+                        "MESSAGE": trimmed,
+                        "collected_unix_secs": now_unix,
+                        "source_path": format!("artemis://linux/journald/{}", idx),
+                    });
+                    if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("linux")) {
+                        out.push(rec);
+                    }
+                }
             }
             out
         });
@@ -1538,6 +1629,218 @@ fn parse_systemd_service_file(
         .collect()
 }
 
+/// Parses a Windows Registry hive binary (`regf` header — e.g., `Amcache.hve`, `NTUSER.DAT`, `SYSTEM`, `SOFTWARE`)
+/// or `.reg` export into a structured `PrefetchAmcacheExecution` (for Amcache) or `RegistryPersistence` record.
+fn parse_registry_hive_file(
+    path: &std::path::Path,
+    host: &str,
+    now_unix: i64,
+) -> Vec<ArtemisTelemetryRecord> {
+    let fname = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let fname_lower = fname.to_ascii_lowercase();
+    let is_amcache = fname_lower.contains("amcache");
+    let mut seq1 = 0u32;
+    let mut root_cell_offset = 0u32;
+    let mut embedded_name = fname.clone();
+    let mut hive_format = "REG_EXPORT";
+
+    if let Ok(mut f) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut hdr = [0u8; 128];
+        if let Ok(n) = f.read(&mut hdr) {
+            if n >= 4 && &hdr[0..4] == b"regf" {
+                hive_format = "REGF_BINARY_HIVE";
+                if n >= 0x28 {
+                    seq1 = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+                    root_cell_offset = u32::from_le_bytes([hdr[0x24], hdr[0x25], hdr[0x26], hdr[0x27]]);
+                }
+                if n >= 0x70 {
+                    let u16s: Vec<u16> = hdr[0x30..0x70]
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .take_while(|&ch| ch != 0)
+                        .collect();
+                    let decoded = String::from_utf16_lossy(&u16s).trim().to_string();
+                    if !decoded.is_empty() {
+                        embedded_name = decoded;
+                    }
+                }
+            }
+        }
+    }
+
+    let val = if is_amcache {
+        serde_json::json!({
+            "telemetry_type": "prefetch_amcache_execution",
+            "Computer": host,
+            "os_platform": "windows",
+            "ExecutableName": embedded_name,
+            "RunCount": seq1.max(1),
+            "HiveFormat": hive_format,
+            "RootCellOffset": root_cell_offset,
+            "path": path.to_string_lossy().to_string(),
+            "collected_unix_secs": now_unix,
+            "source_path": format!("artemis://windows/amcache/{}", fname),
+        })
+    } else {
+        serde_json::json!({
+            "telemetry_type": "registry_persistence",
+            "Computer": host,
+            "os_platform": "windows",
+            "Key": format!("HKLM\\{}", embedded_name),
+            "ValueName": fname,
+            "ValueData": format!("format={} seq={} root_cell=0x{:x}", hive_format, seq1, root_cell_offset),
+            "collected_unix_secs": now_unix,
+            "source_path": format!("artemis://windows/registry/hive/{}", fname),
+        })
+    };
+    ArtemisTelemetryRecord::from_json_value(val, Some("windows"))
+        .into_iter()
+        .collect()
+}
+
+/// Parses an NTFS `$MFT` (`FILE` 1024-byte record header) or `$UsnJrnl` (`.usn`) binary artifact
+/// into a structured `SystemEventLog` forensic record.
+fn parse_mft_or_usn_file(
+    path: &std::path::Path,
+    host: &str,
+    now_unix: i64,
+) -> Vec<ArtemisTelemetryRecord> {
+    let fname = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut record_sig = "NTFS_JOURNAL";
+    let mut seq_number = 1u16;
+    let mut flags = 1u16;
+
+    if let Ok(mut f) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut buf = [0u8; 64];
+        if let Ok(n) = f.read(&mut buf) {
+            if n >= 4 && &buf[0..4] == b"FILE" {
+                record_sig = "MFT_FILE_RECORD";
+                if n >= 0x18 {
+                    seq_number = u16::from_le_bytes([buf[0x10], buf[0x11]]);
+                    flags = u16::from_le_bytes([buf[0x16], buf[0x17]]);
+                }
+            } else if n >= 4 && &buf[0..4] == b"BAAD" {
+                record_sig = "MFT_BAAD_RECORD";
+            } else if n >= 8 {
+                let major_ver = u16::from_le_bytes([buf[4], buf[5]]);
+                if matches!(major_ver, 2..=4) {
+                    record_sig = "USN_JOURNAL_RECORD";
+                }
+            }
+        }
+    }
+
+    let val = serde_json::json!({
+        "telemetry_type": "system_event_log",
+        "Computer": host,
+        "os_platform": "windows",
+        "Channel": "NTFS-Forensics",
+        "EventID": 1001,
+        "RecordSignature": record_sig,
+        "SequenceNumber": seq_number,
+        "Flags": flags,
+        "Message": format!(
+            "NTFS forensic journal artifact {} (signature={}, seq={}, flags=0x{:x})",
+            fname, record_sig, seq_number, flags
+        ),
+        "collected_unix_secs": now_unix,
+        "source_path": format!("artemis://windows/ntfs/{}", fname),
+    });
+    ArtemisTelemetryRecord::from_json_value(val, Some("windows"))
+        .into_iter()
+        .collect()
+}
+
+/// Parses a macOS Unified Log `.tracev3` binary archive into a structured `SystemEventLog` record.
+fn parse_tracev3_file(
+    path: &std::path::Path,
+    host: &str,
+    now_unix: i64,
+) -> Vec<ArtemisTelemetryRecord> {
+    let fname = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut header_tag = 0u32;
+    if let Ok(mut f) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut hdr = [0u8; 16];
+        if let Ok(n) = f.read(&mut hdr) {
+            if n >= 4 {
+                header_tag = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+            }
+        }
+    }
+    let val = serde_json::json!({
+        "telemetry_type": "system_event_log",
+        "Computer": host,
+        "os_platform": "macos",
+        "subsystem": "com.apple.unifiedlog.tracev3",
+        "HeaderTag": format!("0x{:08x}", header_tag),
+        "Message": format!("macOS Unified Log tracev3 archive {} ({} bytes, tag=0x{:08x})", fname, file_len, header_tag),
+        "collected_unix_secs": now_unix,
+        "source_path": format!("artemis://macos/unified_log/{}", fname),
+    });
+    ArtemisTelemetryRecord::from_json_value(val, Some("macos"))
+        .into_iter()
+        .collect()
+}
+
+/// Parses a Linux `auditd` `.audit` log file into structured `ProcessExecution` / `SystemEventLog` records.
+fn parse_audit_log_file(
+    path: &std::path::Path,
+    host: &str,
+    now_unix: i64,
+) -> Vec<ArtemisTelemetryRecord> {
+    let fname = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = Vec::new();
+    for (idx, line) in content.lines().enumerate().take(100) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let is_exec = trimmed.contains("type=EXECVE") || trimmed.contains("type=SYSCALL");
+        let val = if is_exec {
+            serde_json::json!({
+                "telemetry_type": "process_execution",
+                "Computer": host,
+                "os_platform": "linux",
+                "type": "EXECVE",
+                "CommandLine": trimmed,
+                "collected_unix_secs": now_unix,
+                "source_path": format!("artemis://linux/auditd/{}_{}", fname, idx),
+            })
+        } else {
+            serde_json::json!({
+                "telemetry_type": "system_event_log",
+                "Computer": host,
+                "os_platform": "linux",
+                "_SYSTEMD_UNIT": "auditd.service",
+                "MESSAGE": trimmed,
+                "collected_unix_secs": now_unix,
+                "source_path": format!("artemis://linux/auditd/{}_{}", fname, idx),
+            })
+        };
+        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("linux")) {
+            out.push(rec);
+        }
+    }
+    out
+}
+
 /// Recursively collects and parses forensic artifacts from a directory on disk (`max_depth = 16`, skipping symlinks),
 /// supporting `.jsonl`, `.json`, `.pf` (Windows Prefetch), `.evtx` (Windows Event Log), `.plist` (macOS LaunchDaemon),
 /// and `.service` (Linux systemd) forensic files in parallel across all CPU cores using `rayon`.
@@ -1675,6 +1978,18 @@ fn parse_forensic_file_path(
         }
         "service" => {
             out.extend(parse_systemd_service_file(path, host, now_unix));
+        }
+        "hve" | "reg" => {
+            out.extend(parse_registry_hive_file(path, host, now_unix));
+        }
+        "mft" | "usn" => {
+            out.extend(parse_mft_or_usn_file(path, host, now_unix));
+        }
+        "tracev3" => {
+            out.extend(parse_tracev3_file(path, host, now_unix));
+        }
+        "audit" => {
+            out.extend(parse_audit_log_file(path, host, now_unix));
         }
         _ => {}
     }
@@ -1923,6 +2238,51 @@ mod tests {
             assert_eq!(r.access_tier, 3);
             assert!(r.artemis_dfir);
             assert!(!r.mesh_sharable);
+            assert!(r.source_path.starts_with("artemis://"));
+        }
+    }
+
+    #[test]
+    fn test_binary_forensic_hive_mft_usn_tracev3_and_audit_parsers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Amcache.hve"),
+            b"regf\x05\x00\x00\x00AMCACHE_HIVE_HEADER_SAMPLE_BYTES_PADDING_0123456789",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("SOFTWARE.reg"),
+            b"regf\x02\x00\x00\x00SOFTWARE_HIVE_HEADER_SAMPLE_BYTES_PADDING_0123456789",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("master_file_table.mft"),
+            b"FILE0123456789ABCDEF\x03\x00\x00\x00\x01\x00MFT_RECORD_SAMPLE",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("usnjrnl.usn"),
+            b"\x38\x00\x00\x00\x02\x00\x00\x00USN_JOURNAL_V2_RECORD",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("unified.tracev3"),
+            b"\x00\x10\x00\x00TRACEV3_UNIFIED_LOG",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("linux.audit"),
+            "type=EXECVE msg=audit(1700000000.123:45): argc=2 a0=\"/usr/bin/id\" a1=\"-u\"\n",
+        )
+        .unwrap();
+
+        let records = collect_forensic_directory(dir.path());
+        assert_eq!(records.len(), 6);
+        for r in &records {
+            assert_eq!(r.access_tier, 3);
+            assert!(r.artemis_dfir);
+            assert!(!r.mesh_sharable);
+            assert!(r.harvest_eligible);
             assert!(r.source_path.starts_with("artemis://"));
         }
     }
