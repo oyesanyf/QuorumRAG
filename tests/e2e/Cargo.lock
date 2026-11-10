@@ -6390,7 +6390,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-classifier"
-version = "0.6.0"
+version = "0.6.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -6400,13 +6400,14 @@ dependencies = [
 
 [[package]]
 name = "quorum-contract"
-version = "0.6.0"
+version = "0.6.3"
 dependencies = [
  "blake3",
  "candle-core",
  "candle-nn",
  "candle-transformers",
  "chrono",
+ "ed25519-dalek 2.2.0",
  "quorum-types",
  "serde",
  "serde_json",
@@ -6419,11 +6420,13 @@ dependencies = [
 
 [[package]]
 name = "quorum-coordinator"
-version = "0.6.0"
+version = "0.6.3"
 dependencies = [
  "async-trait",
  "blake3",
+ "bytes",
  "chrono",
+ "dashmap",
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
@@ -6460,6 +6463,7 @@ dependencies = [
  "quorum-network",
  "quorum-storage",
  "quorum-types",
+ "regex",
  "serde",
  "serde_json",
  "subtle",
@@ -6472,7 +6476,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-ingest"
-version = "0.6.0"
+version = "0.6.3"
 dependencies = [
  "blake3",
  "cfb",
@@ -6480,12 +6484,14 @@ dependencies = [
  "flate2",
  "futures",
  "ignore",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "quorum-classifier",
  "quorum-contract",
  "quorum-storage",
  "quorum-types",
+ "rayon",
  "regex",
  "rusqlite",
  "serde",
@@ -6501,7 +6507,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-network"
-version = "0.6.0"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6523,7 +6529,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-storage"
-version = "0.6.0"
+version = "0.6.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -6546,7 +6552,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-types"
-version = "0.6.0"
+version = "0.6.3"
 dependencies = [
  "blake3",
  "chrono",

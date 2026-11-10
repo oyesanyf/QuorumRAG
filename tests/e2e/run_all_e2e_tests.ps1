@@ -12,7 +12,8 @@ $targets = @(
     "test_federated_mesh",
     "test_web_endpoints",
     "test_cross_feature_combinations",
-    "test_real_world_scenarios"
+    "test_real_world_scenarios",
+    "test_artemis_dfir"
 )
 
 $totalPassed = 0

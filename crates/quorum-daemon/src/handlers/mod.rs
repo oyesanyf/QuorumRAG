@@ -1,3 +1,4 @@
+pub mod artemis;
 pub mod cache;
 pub mod chat;
 pub mod drift;
@@ -11,3 +12,4 @@ pub mod reindex;
 pub mod settings;
 pub mod marketplace;
 pub mod synthetic_gate;
+

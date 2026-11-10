@@ -1228,6 +1228,15 @@ pub async fn marketplace_opt_in_handler(
     };
     match store.update_config(req) {
         Ok(cfg) => {
+            let opt_in_paths: Vec<std::path::PathBuf> = cfg
+                .opt_in_folders
+                .iter()
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.exists())
+                .collect();
+            if !opt_in_paths.is_empty() {
+                let _ = state.watch_and_index_paths(opt_in_paths).await;
+            }
             let consent_ledger = store.list_consent_ledger(50);
             (
                 StatusCode::OK,
@@ -1338,10 +1347,29 @@ pub async fn marketplace_harvest_handler(
         _ => synthesize_default_local_candidates(&store.origin_node_id, &batch_id, &default_tags, &extra_terms, now),
     };
 
+    let settings = quorum_coordinator::dlp_mesh::global_mesh_dlp_controller().get_settings();
+    let gate = quorum_coordinator::ArtifactCategoryGate::new(&settings.artemis.allowed_artifact_categories);
+    let mut normalizer = quorum_coordinator::ForensicStructuralNormalizer::from_node_seed(&store.node_seed, &batch_id);
+
     let mut sanitized_records = Vec::new();
     let mut rejected_candidates = Vec::new();
 
     for cand in &raw_candidates {
+        if let Err(reason) = gate.evaluate_candidate(cand) {
+            rejected_candidates.push(RejectedCandidateReport {
+                record_id: cand.record_id.clone(),
+                reason,
+            });
+            continue;
+        }
+
+        let cand_to_eval = if settings.artemis.normalize_for_harvest {
+            normalizer.normalize_candidate(cand)
+        } else {
+            cand.clone()
+        };
+        let cand = &cand_to_eval;
+
         let actual_tokens = cand.prompt.split_whitespace().count() + cand.chosen_response.split_whitespace().count();
         let verdict = store.synthetic_pipeline.evaluate_candidate(
             &cand.prompt,

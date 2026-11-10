@@ -30,6 +30,11 @@ ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
 tokio = { version = "1.40", features = ["full"] }
 tempfile = "3.10"
 sysinfo = "0.30"
+regex = "1.10"
+
+[[test]]
+name = "test_artemis_dfir"
+path = "test_artemis_dfir.rs"
 
 [[test]]
 name = "test_storage_isolation"

@@ -535,6 +535,8 @@ pub struct PersistedDaemonSettings {
     pub ui: ChatGptUiSettings,
     pub mesh: OsoosiMeshSettings,
     pub dlp: MeshDlpPolicy,
+    #[serde(default)]
+    pub artemis: crate::artemis_airgap::ArtemisDfirSettings,
 }
 
 /// Live runtime telemetry for the DLP & Mesh Governance controller.
@@ -757,6 +759,17 @@ impl OsoosiMeshDlpController {
         }
     }
 
+    /// Returns a clone of current settings.
+    pub fn get_settings(&self) -> PersistedDaemonSettings {
+        self.settings.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Updates persisted settings with the provided structure.
+    pub fn update_settings(&self, new_settings: PersistedDaemonSettings) {
+        let mut guard = self.settings.write().unwrap_or_else(|e| e.into_inner());
+        *guard = new_settings;
+    }
+
     /// Computes OshoosiClaw-compatible keyed BLAKE3/MAC generation epoch signature over `(peer_id, epoch, role)`.
     pub fn sign_epoch_token(&self, peer_id: &str, epoch: u64, role: &str) -> String {
         let canonical = format!(
@@ -837,6 +850,10 @@ impl OsoosiMeshDlpController {
     /// Checks whether a local file path is inside one of the user's explicitly enabled `shared_folders`.
     /// Returns the matching `SharedFolderEntry` if sharing is permitted, or `None` if local-only.
     pub fn check_file_shared_with_mesh(&self, file_path: &str) -> Option<SharedFolderEntry> {
+        // Immediate fail-closed airgap rejection:
+        if crate::artemis_airgap::is_artemis_uri(file_path) {
+            return None;
+        }
         let guard = self.settings.read().unwrap_or_else(|e| e.into_inner());
         if !guard.mesh.p2p_enabled {
             return None;
@@ -881,6 +898,12 @@ impl OsoosiMeshDlpController {
         let mut allowed_chunks = Vec::new();
 
         for mut chunk in chunks {
+            if crate::artemis_airgap::is_airgap_restricted_chunk_dto(&chunk) {
+                let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
+                stats.total_blocked_chunks += 1;
+                continue;
+            }
+
             let shared_entry = match self.check_file_shared_with_mesh(&chunk.file_path) {
                 Some(entry) => entry,
                 None => {
@@ -915,6 +938,11 @@ impl OsoosiMeshDlpController {
     ) -> Vec<VolatileRemoteChunk> {
         let mut clean = Vec::new();
         for mut chunk in chunks {
+            if crate::artemis_airgap::is_artemis_uri(&chunk.file_path) {
+                let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
+                stats.total_blocked_chunks += 1;
+                continue;
+            }
             let res = self.inspect_and_enforce_text(
                 &chunk.content,
                 &chunk.file_path,
@@ -933,6 +961,9 @@ impl OsoosiMeshDlpController {
 
     /// Scrubs or blocks PHI/PII in an outbound search query before sending to remote Mesh peers.
     pub fn sanitize_outbound_query(&self, query_text: &str) -> Option<String> {
+        if crate::artemis_airgap::contains_artemis_query(query_text) {
+            return None;
+        }
         let scrub_queries = self
             .settings
             .read()

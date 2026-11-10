@@ -81,3 +81,12 @@ path = "tests/marketplace_sovereign_escrow_tests.rs"
 name = "concurrency_stress_tests"
 path = "tests/concurrency_stress_tests.rs"
 
+[[test]]
+name = "artemis_daemon_tests"
+path = "tests/artemis_daemon_tests.rs"
+
+[[test]]
+name = "m4_challenger_harvest_tests"
+path = "tests/m4_challenger_harvest_tests.rs"
+
+

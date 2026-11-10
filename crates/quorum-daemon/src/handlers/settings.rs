@@ -368,6 +368,7 @@ pub async fn update_mesh_config_handler(
 
 /// POST /api/mesh/shared-folders - Adds, removes, toggles, or updates user folders shared with the Mesh.
 pub async fn manage_shared_folders_handler(
+    State(state): State<Arc<DaemonState>>,
     Json(payload): Json<SharedFolderActionPayload>,
 ) -> impl IntoResponse {
     let controller = global_mesh_dlp_controller();
@@ -385,6 +386,7 @@ pub async fn manage_shared_folders_handler(
     };
 
     let action = payload.action.trim().to_ascii_lowercase();
+    let mut should_index_target = false;
     {
         let mut guard = controller
             .settings
@@ -413,6 +415,7 @@ pub async fn manage_shared_folders_handler(
 
                 if let Some(entry) = existing {
                     entry.enabled = payload.enabled.unwrap_or(true);
+                    should_index_target = entry.enabled;
                     if let Some(tier) = payload.access_tier {
                         entry.access_tier = tier.min(3);
                     }
@@ -436,10 +439,12 @@ pub async fn manage_shared_folders_handler(
                             Some(DlpEnforcementMode::from_str_lossy(m))
                         }
                     });
+                    let enabled = payload.enabled.unwrap_or(true);
+                    should_index_target = enabled;
                     guard.mesh.shared_folders.push(SharedFolderEntry {
                         path: raw_path.to_string(),
                         label: payload.label.unwrap_or(default_label),
-                        enabled: payload.enabled.unwrap_or(true),
+                        enabled,
                         access_tier: payload.access_tier.unwrap_or(0).min(3),
                         dlp_mode_override: dlp_override,
                         shared_at: Utc::now().to_rfc3339(),
@@ -460,6 +465,9 @@ pub async fn manage_shared_folders_handler(
                         == Some(norm_target.as_str())
                     {
                         f.enabled = payload.enabled.unwrap_or(!f.enabled);
+                        if f.enabled {
+                            should_index_target = true;
+                        }
                     }
                 }
             }
@@ -471,6 +479,9 @@ pub async fn manage_shared_folders_handler(
                     {
                         if let Some(en) = payload.enabled {
                             f.enabled = en;
+                            if en {
+                                should_index_target = true;
+                            }
                         }
                         if let Some(tier) = payload.access_tier {
                             f.access_tier = tier.min(3);
@@ -492,6 +503,12 @@ pub async fn manage_shared_folders_handler(
     }
 
     controller.save_to_disk();
+    if should_index_target {
+        let _ = state
+            .watch_and_index_paths(vec![std::path::PathBuf::from(raw_path)])
+            .await;
+    }
+
     let shared_folders = controller
         .settings
         .read()

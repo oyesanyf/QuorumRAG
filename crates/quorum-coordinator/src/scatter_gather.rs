@@ -447,9 +447,13 @@ impl ScatterGatherEngine {
             p2p_query_text
         };
         let remote_handle = if p2p_enabled {
-            controller
-                .sanitize_outbound_query(effective_p2p_query)
-                .map(|sanitized_query| {
+            if crate::artemis_airgap::contains_artemis_query(effective_p2p_query) {
+                tracing::info!("Suppressed outbound P2P query referencing local-only artemis:// URI: airgap enforced");
+                None
+            } else {
+                controller
+                    .sanitize_outbound_query(effective_p2p_query)
+                    .map(|sanitized_query| {
                     let mut req = FederatedQueryRequest {
                         query_id: Uuid::new_v4(),
                         sender_peer_id: self.sender_peer_id.clone(),
@@ -477,6 +481,7 @@ impl ScatterGatherEngine {
                             .unwrap_or_else(|_| (Vec::new(), quorum_types::FederatedPeerDiagnostics::default()))
                     })
                 })
+            }
         } else {
             None
         };
@@ -608,6 +613,13 @@ impl ScatterGatherEngine {
                         "Rejecting malformed remote chunk line_start {} > line_end {} from peer {}",
                         chunk.line_start,
                         chunk.line_end,
+                        peer_id
+                    );
+                    continue;
+                }
+                if crate::artemis_airgap::is_artemis_uri(&chunk.file_path) {
+                    tracing::warn!(
+                        "Byzantine peer {} returned illegal artemis:// chunk; dropping.",
                         peer_id
                     );
                     continue;
@@ -849,31 +861,36 @@ impl ScatterGatherEngine {
         };
 
         let peer_handle = if p2p_enabled {
-            controller
-                .sanitize_outbound_query(query_text)
-                .map(|sanitized_query| {
-                    use quorum_contract::EmbeddingGenerator;
-                    let embedder = quorum_contract::DeterministicOfflineEngine::new();
-                    let query_vec = embedder
-                        .embed_text(query_text)
-                        .unwrap_or_else(|_| vec![0.0; 768]);
+            if crate::artemis_airgap::contains_artemis_query(query_text) {
+                tracing::info!("Suppressed outbound P2P query referencing local-only artemis:// URI: airgap enforced");
+                None
+            } else {
+                controller
+                    .sanitize_outbound_query(query_text)
+                    .map(|sanitized_query| {
+                        use quorum_contract::EmbeddingGenerator;
+                        let embedder = quorum_contract::DeterministicOfflineEngine::new();
+                        let query_vec = embedder
+                            .embed_text(query_text)
+                            .unwrap_or_else(|_| vec![0.0; 768]);
 
-                    let mut req = FederatedQueryRequest {
-                        query_id: Uuid::new_v4(),
-                        sender_peer_id: self.sender_peer_id.clone(),
-                        sender_pubkey: [0u8; 32],
-                        query_text: sanitized_query,
-                        embedding: query_vec,
-                        top_k,
-                        timestamp: Utc::now().timestamp(),
-                        signature: [0u8; 64],
-                    };
-                    let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
-                    sign_request(&self.secret_seed, &mut req, tier);
-                    let timeout_dur = Duration::from_millis(self.config.timeout_ms);
-                    let dispatcher = Arc::clone(&self.mesh_dispatcher);
-                    tokio::spawn(async move { dispatcher.query_peers(&req, timeout_dur).await.ok() })
-                })
+                        let mut req = FederatedQueryRequest {
+                            query_id: Uuid::new_v4(),
+                            sender_peer_id: self.sender_peer_id.clone(),
+                            sender_pubkey: [0u8; 32],
+                            query_text: sanitized_query,
+                            embedding: query_vec,
+                            top_k,
+                            timestamp: Utc::now().timestamp(),
+                            signature: [0u8; 64],
+                        };
+                        let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
+                        sign_request(&self.secret_seed, &mut req, tier);
+                        let timeout_dur = Duration::from_millis(self.config.timeout_ms);
+                        let dispatcher = Arc::clone(&self.mesh_dispatcher);
+                        tokio::spawn(async move { dispatcher.query_peers(&req, timeout_dur).await.ok() })
+                    })
+            }
         } else {
             None
         };
@@ -904,6 +921,13 @@ impl ScatterGatherEngine {
                 let peer_id = resp.responder_peer_id;
                 for (chunk_idx, mut chunk) in resp.chunks.into_iter().enumerate() {
                     if chunk.line_start > chunk.line_end {
+                        continue;
+                    }
+                    if crate::artemis_airgap::is_artemis_uri(&chunk.file_path) {
+                        tracing::warn!(
+                            "Byzantine peer {} returned illegal artemis:// chunk; dropping.",
+                            peer_id
+                        );
                         continue;
                     }
                     chunk.access_tier = chunk.access_tier.min(access_tier);

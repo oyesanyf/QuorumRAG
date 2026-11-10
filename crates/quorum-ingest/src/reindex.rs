@@ -70,6 +70,8 @@ pub struct ReindexWorker {
     dedup: Arc<TwoLevelDedupEngine>,
     active_task: Arc<RwLock<Option<ReindexProgress>>>,
     cancel_flag: Arc<AtomicBool>,
+    dynamic_watch_paths: Arc<std::sync::RwLock<Vec<std::path::PathBuf>>>,
+    pending_priority_paths: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
 }
 
 impl ReindexWorker {
@@ -85,11 +87,8 @@ impl ReindexWorker {
             config.excluded_paths.push(storage_path);
         }
         if let Some(ref cat_path) = config.dedup_catalog_path {
-            if let Some(parent) = cat_path.parent() {
-                let parent_buf = parent.to_path_buf();
-                if !parent_buf.as_os_str().is_empty() && !config.excluded_paths.iter().any(|p| p == &parent_buf) {
-                    config.excluded_paths.push(parent_buf);
-                }
+            if !cat_path.as_os_str().is_empty() && !config.excluded_paths.iter().any(|p| p == cat_path) {
+                config.excluded_paths.push(cat_path.clone());
             }
         }
         Self {
@@ -100,11 +99,101 @@ impl ReindexWorker {
             dedup,
             active_task: Arc::new(RwLock::new(None)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            dynamic_watch_paths: Arc::new(std::sync::RwLock::new(Vec::new())),
+            pending_priority_paths: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
     pub fn config(&self) -> &IngestConfig {
         &self.config
+    }
+
+    /// Dynamically registers new directories or file paths to be watched and included in continuous reindexing.
+    pub fn add_watch_paths(&self, paths: &[std::path::PathBuf]) {
+        if let Ok(mut guard) = self.dynamic_watch_paths.write() {
+            for p in paths {
+                if p.as_os_str().is_empty() {
+                    continue;
+                }
+                let watch_target = if p.is_file() {
+                    p.parent().map(|parent| parent.to_path_buf()).unwrap_or_else(|| p.clone())
+                } else {
+                    p.clone()
+                };
+                if !guard.iter().any(|existing| existing == &watch_target)
+                    && !self.config.watch_paths.iter().any(|existing| existing == &watch_target)
+                {
+                    guard.push(watch_target);
+                }
+            }
+        }
+    }
+
+    /// Returns dynamically added watch paths.
+    pub fn dynamic_watch_paths(&self) -> Vec<std::path::PathBuf> {
+        self.dynamic_watch_paths
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns the union of static `config.watch_paths` and dynamically registered watch paths.
+    pub fn all_watch_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut all = self.config.watch_paths.clone();
+        for p in self.dynamic_watch_paths() {
+            if !all.iter().any(|existing| existing == &p) {
+                all.push(p);
+            }
+        }
+        all
+    }
+
+    /// Immediately triggers reindexing for `paths` if idle, or injects `paths` into the active pass's
+    /// priority queue so newly uploaded/watched folders are indexed immediately without being dropped.
+    pub async fn trigger_paths(&self, paths: Vec<std::path::PathBuf>) -> Result<Uuid, IngestError> {
+        let clean_paths: Vec<std::path::PathBuf> = paths
+            .into_iter()
+            .filter(|p| !p.as_os_str().is_empty() && p.exists())
+            .collect();
+        if clean_paths.is_empty() {
+            return Err(IngestError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No existing target paths to trigger",
+            )));
+        }
+        self.add_watch_paths(&clean_paths);
+
+        {
+            let active = self.active_task.read().await;
+            if let Some(ref current) = *active {
+                if matches!(
+                    current.phase,
+                    ReindexPhase::ScanningFilesystem
+                        | ReindexPhase::ChunkingAndVectorizing
+                        | ReindexPhase::WritingToStorage
+                        | ReindexPhase::CompactingIndexes
+                ) {
+                    if let Ok(mut pending) = self.pending_priority_paths.lock() {
+                        for p in clean_paths {
+                            if !pending.iter().any(|existing| existing == &p) {
+                                pending.push(p);
+                            }
+                        }
+                    }
+                    return Ok(current.task_id);
+                }
+            }
+        }
+
+        self.start_reindex(ReindexOptions {
+            target_paths: clean_paths,
+            full_rebuild: false,
+            force_reembed: false,
+            batch_size: 64,
+            num_threads: 0,
+            dry_run: false,
+        })
+        .await
     }
 
     pub fn storage(&self) -> &Arc<StorageEngine> {
@@ -125,6 +214,9 @@ impl ReindexWorker {
 
     /// Triggers an asynchronous reindex task, returning immediately with a task UUID.
     pub async fn start_reindex(&self, options: ReindexOptions) -> Result<Uuid, IngestError> {
+        if !options.target_paths.is_empty() {
+            self.add_watch_paths(&options.target_paths);
+        }
         let mut active = self.active_task.write().await;
         if let Some(ref current) = *active {
             if matches!(
@@ -163,13 +255,15 @@ impl ReindexWorker {
         *active = Some(initial_progress);
         drop(active);
 
-        let worker_config = self.config.clone();
+        let mut worker_config = self.config.clone();
+        worker_config.watch_paths = self.all_watch_paths();
         let worker_storage = Arc::clone(&self.storage);
         let worker_classifier = Arc::clone(&self.classifier);
         let worker_embedder = Arc::clone(&self.embedder);
         let worker_dedup = Arc::clone(&self.dedup);
         let worker_progress = Arc::clone(&self.active_task);
         let cancel_flag = Arc::clone(&self.cancel_flag);
+        let pending_priority = Arc::clone(&self.pending_priority_paths);
 
         tokio::spawn(async move {
             let res = Self::execute_pipeline(
@@ -182,11 +276,13 @@ impl ReindexWorker {
                 worker_dedup,
                 worker_progress.clone(),
                 cancel_flag,
+                pending_priority,
             )
             .await;
 
             let mut final_lock = worker_progress.write().await;
             if let Some(ref mut prog) = *final_lock {
+                prog.files_total_estimated = prog.files_total_estimated.max(prog.files_scanned);
                 prog.completed_at = Some(Utc::now());
                 prog.elapsed_secs = (Utc::now() - prog.started_at).num_seconds().max(0) as u64;
                 match res {
@@ -494,8 +590,11 @@ impl ReindexWorker {
         lock.clone()
     }
 
-    /// Synchronous reindex execution (used by CLI commands or unit tests).
+    /// Synchronous reindex execution (used by CLI commands, `POST /api/documents/add`, or unit tests).
     pub async fn run_reindex_sync(&self, options: ReindexOptions) -> Result<ReindexProgress, IngestError> {
+        if !options.target_paths.is_empty() {
+            self.add_watch_paths(&options.target_paths);
+        }
         let task_id = Uuid::new_v4();
         self.cancel_flag.store(false, Ordering::SeqCst);
 
@@ -517,10 +616,39 @@ impl ReindexWorker {
             error_message: None,
         };
 
-        let progress_state = Arc::new(RwLock::new(Some(initial_progress)));
+        // If no background task is currently running in `self.active_task`, publish live progress
+        // directly to `self.active_task` so `GET /api/reindex/status` and the sidebar UI update in real time.
+        let use_shared_active = {
+            let mut active_guard = self.active_task.write().await;
+            let is_busy = active_guard.as_ref().map(|c| {
+                matches!(
+                    c.phase,
+                    ReindexPhase::ScanningFilesystem
+                        | ReindexPhase::ChunkingAndVectorizing
+                        | ReindexPhase::WritingToStorage
+                        | ReindexPhase::CompactingIndexes
+                )
+            }).unwrap_or(false);
+            if !is_busy {
+                *active_guard = Some(initial_progress.clone());
+                true
+            } else {
+                false
+            }
+        };
+
+        let progress_state = if use_shared_active {
+            Arc::clone(&self.active_task)
+        } else {
+            Arc::new(RwLock::new(Some(initial_progress)))
+        };
+
+        let local_pending = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut worker_config = self.config.clone();
+        worker_config.watch_paths = self.all_watch_paths();
 
         Self::execute_pipeline(
-            self.config.clone(),
+            worker_config,
             options,
             task_id,
             Arc::clone(&self.storage),
@@ -529,16 +657,23 @@ impl ReindexWorker {
             Arc::clone(&self.dedup),
             progress_state.clone(),
             Arc::clone(&self.cancel_flag),
+            local_pending,
         )
         .await?;
 
         let mut lock = progress_state.write().await;
-        let mut final_prog = lock.take().ok_or_else(|| {
+        let mut final_prog = lock.clone().ok_or_else(|| {
             IngestError::WatcherError("reindex finished without a progress record".into())
         })?;
+        final_prog.files_total_estimated = final_prog.files_total_estimated.max(final_prog.files_scanned);
         final_prog.phase = ReindexPhase::Completed;
         final_prog.completed_at = Some(Utc::now());
         final_prog.elapsed_secs = (Utc::now() - final_prog.started_at).num_seconds().max(0) as u64;
+        if use_shared_active {
+            *lock = Some(final_prog.clone());
+        } else {
+            *lock = None;
+        }
 
         Ok(final_prog)
     }
@@ -555,6 +690,7 @@ impl ReindexWorker {
         dedup: Arc<TwoLevelDedupEngine>,
         progress: Arc<RwLock<Option<ReindexProgress>>>,
         cancel_flag: Arc<AtomicBool>,
+        pending_priority_paths: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
     ) -> Result<(), IngestError> {
         // RAII guard to ensure bulk indexing is restored when this reindex pass terminates
         struct BulkIndexReset;
@@ -576,11 +712,8 @@ impl ReindexWorker {
             config.excluded_paths.push(storage_path);
         }
         if let Some(ref cat_path) = config.dedup_catalog_path {
-            if let Some(parent) = cat_path.parent() {
-                let parent_buf = parent.to_path_buf();
-                if !parent_buf.as_os_str().is_empty() && !config.excluded_paths.iter().any(|p| p == &parent_buf) {
-                    config.excluded_paths.push(parent_buf);
-                }
+            if !cat_path.as_os_str().is_empty() && !config.excluded_paths.iter().any(|p| p == cat_path) {
+                config.excluded_paths.push(cat_path.clone());
             }
         }
 
@@ -614,18 +747,15 @@ impl ReindexWorker {
         })
         .await
         .map_err(|e| IngestError::Io(std::io::Error::other(format!("Crawler task join failed: {}", e))))??;
-        {
-            let mut lock = progress.write().await;
-            if let Some(ref mut p) = *lock {
-                p.files_total_estimated = all_candidates.len();
-            }
-        }
+
+        let mut candidate_queue: std::collections::VecDeque<DiscoveredCandidate> =
+            all_candidates.into_iter().collect();
 
         // Transition to Phase 2: Chunking & Vectorizing with total candidate count fixed
         {
             let mut lock = progress.write().await;
             if let Some(ref mut p) = *lock {
-                p.files_total_estimated = all_candidates.len();
+                p.files_total_estimated = candidate_queue.len();
                 p.phase = ReindexPhase::ChunkingAndVectorizing;
             }
         }
@@ -650,7 +780,6 @@ impl ReindexWorker {
         let mut batch_parents: Vec<(quorum_types::IngestedParentDocument, u8)> = Vec::with_capacity(options.batch_size.max(64));
 
         let mut futures = FuturesUnordered::new();
-        let mut candidate_iter = all_candidates.into_iter();
         let mut last_catalog_save = std::time::Instant::now();
 
         loop {
@@ -658,9 +787,40 @@ impl ReindexWorker {
                 return Err(IngestError::Cancelled);
             }
 
+            // Drain any priority paths dynamically added via watcher or folder upload while running
+            let newly_queued_paths: Vec<std::path::PathBuf> = pending_priority_paths
+                .lock()
+                .map(|mut g| std::mem::take(&mut *g))
+                .unwrap_or_default();
+            if !newly_queued_paths.is_empty() {
+                let expanded_priority: Vec<std::path::PathBuf> = Self::expand_drive_roots(&newly_queued_paths)
+                    .into_iter()
+                    .filter(|t| !config.excluded_paths.iter().any(|ex| t == ex || t.starts_with(ex)))
+                    .collect();
+                if !expanded_priority.is_empty() {
+                    let crawler_p = Arc::clone(&crawler);
+                    if let Ok(Ok(priority_candidates)) = tokio::task::spawn_blocking(move || {
+                        crawler_p.crawl_multi_root_sync(&expanded_priority)
+                    })
+                    .await
+                    {
+                        if !priority_candidates.is_empty() {
+                            let added_count = priority_candidates.len();
+                            for cand in priority_candidates.into_iter().rev() {
+                                candidate_queue.push_front(cand);
+                            }
+                            let mut lock = progress.write().await;
+                            if let Some(ref mut p) = *lock {
+                                p.files_total_estimated += added_count;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Fill concurrency slots up to capacity
             while futures.len() < concurrency {
-                let Some(candidate) = candidate_iter.next() else { break };
+                let Some(candidate) = candidate_queue.pop_front() else { break };
 
                 let path = candidate.path.clone();
                 let access_tier = config.resolve_access_tier(&path);
@@ -674,6 +834,7 @@ impl ReindexWorker {
                                 let mut lock = progress.write().await;
                                 if let Some(ref mut p) = *lock {
                                     p.files_scanned += 1;
+                                    p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
                                     p.files_skipped_unmodified += 1;
                                     p.bytes_processed += candidate.size_bytes;
                                 }
@@ -695,6 +856,7 @@ impl ReindexWorker {
                                 let mut lock = progress.write().await;
                                 if let Some(ref mut p) = *lock {
                                     p.files_scanned += 1;
+                                    p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
                                     p.files_indexed += 1;
                                     p.bytes_processed += candidate.size_bytes;
                                 }
@@ -719,8 +881,9 @@ impl ReindexWorker {
                 let chunker_c = chunker.clone();
                 let force_reembed = options.force_reembed;
                 let full_rebuild = options.full_rebuild;
+                let path_for_timeout = path.clone();
 
-                futures.push(thread_pool.spawn_blocking_pinned(permit, move || {
+                let blocking_fut = thread_pool.spawn_blocking_pinned(permit, move || {
                     process_candidate_sync(
                         candidate,
                         access_tier,
@@ -731,111 +894,117 @@ impl ReindexWorker {
                         chunker_c,
                         precomputed_file_b3,
                     )
-                }));
+                });
+
+                // Per-candidate 45s timeout so a single hung file is removed from `futures` and counted once
+                futures.push(async move {
+                    match tokio::time::timeout(std::time::Duration::from_secs(45), blocking_fut).await {
+                        Ok(join_res) => join_res,
+                        Err(_) => Ok(CandidateOutcome::Failed {
+                            path: path_for_timeout,
+                            error: "Candidate extraction task timed out after 45s".to_string(),
+                        }),
+                    }
+                });
             }
 
             if futures.is_empty() {
+                let has_more_priority = pending_priority_paths
+                    .lock()
+                    .map(|g| !g.is_empty())
+                    .unwrap_or(false);
+                if has_more_priority {
+                    continue;
+                }
                 break;
             }
 
-            // Await next completed candidate with 45s timeout to prevent thread-pool deadlocks
-            match tokio::time::timeout(std::time::Duration::from_secs(45), futures.next()).await {
-                Ok(Some(join_res)) => {
-                    match join_res {
-                        Ok(outcome) => match outcome {
-                            CandidateOutcome::AlreadyIndexedInFts {
-                                catalog_entry,
-                                size_bytes,
-                            } => {
-                                dedup.register_entry(catalog_entry);
-                                let mut lock = progress.write().await;
-                                if let Some(ref mut p) = *lock {
-                                    p.files_scanned += 1;
-                                    p.files_skipped_unmodified += 1;
-                                    p.bytes_processed += size_bytes;
-                                }
-                            }
-                            CandidateOutcome::Processed {
-                                chunks,
-                                parent_doc,
-                                catalog_entry,
-                                size_bytes,
-                                chunks_reused,
-                                chunks_new,
-                            } => {
-                                dedup.register_entry(catalog_entry);
-                                if let Some(parent) = parent_doc {
-                                    batch_parents.push(parent);
-                                }
-                                batch_chunks.extend(chunks);
-
-                                let mut lock = progress.write().await;
-                                if let Some(ref mut p) = *lock {
-                                    p.files_scanned += 1;
-                                    p.files_indexed += 1;
-                                    p.bytes_processed += size_bytes;
-                                    p.chunks_reused_from_cache += chunks_reused;
-                                    p.chunks_newly_embedded += chunks_new;
-                                }
-                            }
-                            CandidateOutcome::Failed { path, error } => {
-                                warn!("Failed to process '{}': {}", path.display(), error);
-                                let mut lock = progress.write().await;
-                                if let Some(ref mut p) = *lock {
-                                    p.files_scanned += 1;
-                                    p.files_failed += 1;
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            warn!("Blocking reindex worker task failed: {}", e);
+            if let Some(join_res) = futures.next().await {
+                match join_res {
+                    Ok(outcome) => match outcome {
+                        CandidateOutcome::AlreadyIndexedInFts {
+                            catalog_entry,
+                            size_bytes,
+                        } => {
+                            dedup.register_entry(catalog_entry);
                             let mut lock = progress.write().await;
                             if let Some(ref mut p) = *lock {
                                 p.files_scanned += 1;
+                                p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
+                                p.files_skipped_unmodified += 1;
+                                p.bytes_processed += size_bytes;
+                            }
+                        }
+                        CandidateOutcome::Processed {
+                            chunks,
+                            parent_doc,
+                            catalog_entry,
+                            size_bytes,
+                            chunks_reused,
+                            chunks_new,
+                        } => {
+                            dedup.register_entry(catalog_entry);
+                            if let Some(parent) = parent_doc {
+                                batch_parents.push(parent);
+                            }
+                            batch_chunks.extend(chunks);
+
+                            let mut lock = progress.write().await;
+                            if let Some(ref mut p) = *lock {
+                                p.files_scanned += 1;
+                                p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
+                                p.files_indexed += 1;
+                                p.bytes_processed += size_bytes;
+                                p.chunks_reused_from_cache += chunks_reused;
+                                p.chunks_newly_embedded += chunks_new;
+                            }
+                        }
+                        CandidateOutcome::Failed { path, error } => {
+                            warn!("Failed to process '{}': {}", path.display(), error);
+                            let mut lock = progress.write().await;
+                            if let Some(ref mut p) = *lock {
+                                p.files_scanned += 1;
+                                p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
                                 p.files_failed += 1;
                             }
                         }
-                    }
-
-                    if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
-                        let _ = dedup.save_catalog_to_file(&catalog_path);
-                        last_catalog_save = std::time::Instant::now();
-                    }
-
-                    // If micro-batch is full, flush to storage
-                    if batch_chunks.len() >= options.batch_size {
-                        if !options.dry_run {
-                            let _commit_permit = permit_tiers.acquire_storage_commit().await?;
-                            Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
-                            let _ = storage.insert_chunks(&batch_chunks).await?;
-                            for (pdoc, ptier) in batch_parents.drain(..) {
-                                let _ = storage.upsert_parent_document(&pdoc, ptier);
-                            }
-                            let _ = dedup.save_catalog_to_file(&catalog_path);
-                            last_catalog_save = std::time::Instant::now();
-                            let _ = storage.bump_index_epoch("reindex_micro_batch");
-                        } else {
-                            batch_parents.clear();
+                    },
+                    Err(e) => {
+                        warn!("Blocking reindex worker task failed: {}", e);
+                        let mut lock = progress.write().await;
+                        if let Some(ref mut p) = *lock {
+                            p.files_scanned += 1;
+                            p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
+                            p.files_failed += 1;
                         }
-                        batch_chunks.clear();
-                        tokio::task::yield_now().await;
                     }
                 }
-                Ok(None) => {
-                    break;
+
+                if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                    let _ = dedup.save_catalog_to_file(&catalog_path);
+                    last_catalog_save = std::time::Instant::now();
                 }
-                Err(_) => {
-                    warn!("Candidate extraction task timed out after 45s; continuing pipeline");
-                    let mut lock = progress.write().await;
-                    if let Some(ref mut p) = *lock {
-                        p.files_scanned += 1;
-                        p.files_failed += 1;
-                    }
-                    if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+
+                // If micro-batch is full, flush to storage
+                if batch_chunks.len() >= options.batch_size {
+                    if !options.dry_run {
+                        let _commit_permit = permit_tiers.acquire_storage_commit().await?;
+                        Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
+                        let _ = storage.insert_chunks(&batch_chunks).await?;
+                        for (pdoc, ptier) in batch_parents.drain(..) {
+                            let _ = storage.upsert_parent_document(&pdoc, ptier);
+                        }
                         let _ = dedup.save_catalog_to_file(&catalog_path);
                         last_catalog_save = std::time::Instant::now();
+                        let _ = storage.bump_index_epoch("reindex_micro_batch");
+                    } else {
+                        batch_parents.clear();
                     }
+                    batch_chunks.clear();
+                    tokio::task::yield_now().await;
                 }
+            } else {
+                break;
             }
         }
 
