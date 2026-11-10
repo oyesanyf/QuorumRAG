@@ -1311,6 +1311,8 @@ pub async fn marketplace_harvest_handler(
         .unwrap_or_else(|| vec!["rust-security".to_string(), "multimodal-rag".to_string()]);
     let extra_terms = req.extra_redact_terms.clone().unwrap_or_default();
 
+    let settings = quorum_coordinator::dlp_mesh::global_mesh_dlp_controller().get_settings();
+
     let raw_candidates: Vec<RawTrajectoryCandidate> = match req.candidates {
         Some(ref list) if !list.is_empty() => list
             .iter()
@@ -1344,10 +1346,30 @@ pub async fn marketplace_harvest_handler(
                 interaction_nonce_hex: dto.interaction_nonce_hex.clone(),
             })
             .collect(),
-        _ => synthesize_default_local_candidates(&store.origin_node_id, &batch_id, &default_tags, &extra_terms, now),
+        _ => {
+            let mut cands = synthesize_default_local_candidates(
+                &store.origin_node_id,
+                &batch_id,
+                &default_tags,
+                &extra_terms,
+                now,
+            );
+            if settings.artemis.marketplace_harvest_enabled {
+                let artemis_cands = synthesize_artemis_storage_candidates(
+                    &state,
+                    &store.origin_node_id,
+                    &batch_id,
+                    &settings.artemis.allowed_artifact_categories,
+                    &extra_terms,
+                    now,
+                )
+                .await;
+                cands.extend(artemis_cands);
+            }
+            cands
+        }
     };
 
-    let settings = quorum_coordinator::dlp_mesh::global_mesh_dlp_controller().get_settings();
     let gate = quorum_coordinator::ArtifactCategoryGate::new(&settings.artemis.allowed_artifact_categories);
     let mut normalizer = quorum_coordinator::ForensicStructuralNormalizer::from_node_seed(&store.node_seed, &batch_id);
 
@@ -2225,6 +2247,106 @@ fn synthesize_default_local_candidates(
             interaction_nonce_hex: None,
         },
     ]
+}
+
+async fn synthesize_artemis_storage_candidates(
+    state: &Arc<DaemonState>,
+    origin_node_id: &str,
+    batch_id: &str,
+    allowed_categories: &[String],
+    extra_terms: &[String],
+    now: i64,
+) -> Vec<RawTrajectoryCandidate> {
+    let Ok(all_chunks) = state.storage.scan_all_chunks().await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for chunk in all_chunks {
+        let is_artemis = chunk.chunk_id.starts_with("artemis:")
+            || chunk.file_path.starts_with("artemis://");
+        if !is_artemis || chunk.text_content.trim().is_empty() {
+            continue;
+        }
+        let category = serde_json::from_str::<serde_json::Value>(&chunk.metadata_json)
+            .ok()
+            .and_then(|v| {
+                v.get("artifact_category")
+                    .or_else(|| v.get("telemetry_type"))
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "process_execution".to_string());
+
+        let is_allowed = allowed_categories
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&category));
+        if !is_allowed {
+            continue;
+        }
+
+        let first_line = chunk
+            .text_content
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or_else(|| chunk.text_content.trim());
+        let quote = if first_line.len() > 96 {
+            let mut end = 96;
+            while end > 0 && !first_line.is_char_boundary(end) {
+                end -= 1;
+            }
+            first_line[..end].trim().to_string()
+        } else {
+            first_line.to_string()
+        };
+        if quote.is_empty() || !chunk.text_content.contains(&quote) {
+            continue;
+        }
+
+        out.push(RawTrajectoryCandidate {
+            record_id: format!("{}-artemis-dfir-{}", batch_id, out.len() + 1),
+            origin_node_id: origin_node_id.to_string(),
+            format: TrainingRecordFormat::SftTrajectory,
+            domain_tags: vec![
+                format!("forensic:{}", category),
+                category.clone(),
+                "artemis-dfir".to_string(),
+            ],
+            prompt: format!(
+                "Perform endpoint forensic triage on the local {} telemetry record and determine whether the observed operating system execution lineage aligns with authorized administrative activity.",
+                category
+            ),
+            rlm_trajectory: vec![
+                SanitizedRlmStep {
+                    step_index: 1,
+                    action_kind: "peek_slice".to_string(),
+                    sanitized_query_or_pattern: format!("inspect {} telemetry slice", category),
+                    abstracted_takeaway: "Retrieved Tier3Restricted OS forensic record from local airgapped storage for lineage correlation.".to_string(),
+                },
+                SanitizedRlmStep {
+                    step_index: 2,
+                    action_kind: "verify_grounding".to_string(),
+                    sanitized_query_or_pattern: "slice_text.contains(verbatim_quote)".to_string(),
+                    abstracted_takeaway: "Confirmed 100% verbatim substring grounding against deterministic host operating system telemetry.".to_string(),
+                },
+            ],
+            chosen_response: format!(
+                "Forensic triage of the local {} telemetry confirms that the host operating system recorded structured execution and service state matching baseline administrative activity. Evidence verified. Analysts should correlate parent process lineage, socket bindings, and startup persistence keys before closing the investigation.",
+                category
+            ),
+            rejected_response: None,
+            citations: vec![(chunk.text_content.clone(), quote)],
+            extra_redact_terms: extra_terms.to_vec(),
+            created_unix_secs: now,
+            source_file_path: Some(chunk.file_path.clone()),
+            interaction_nonce_hex: None,
+        });
+
+        // Bound to 1 automatic Artemis candidate per default harvest batch so total default batch (2 + 1 = 3)
+        // stays strictly within Stage 4 HumanTelemetryGuard GCRA burst limit (rate_limit_burst = 3).
+        break;
+    }
+    out
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {

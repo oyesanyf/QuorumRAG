@@ -348,6 +348,11 @@ impl ForensicStructuralNormalizer {
     /// Normalizes a candidate trajectory before harvest staging.
     pub fn normalize_candidate(&mut self, candidate: &RawTrajectoryCandidate) -> RawTrajectoryCandidate {
         let mut cloned = candidate.clone();
+        // Pre-scan citation slices first so any labeled User/Computer identifiers are registered
+        // in the session map before normalizing quotes, prompts, and responses.
+        for (citation_slice, _) in &cloned.citations {
+            let _ = self.normalize_text(citation_slice);
+        }
         cloned.prompt = self.normalize_text(&cloned.prompt);
         cloned.chosen_response = self.normalize_text(&cloned.chosen_response);
         if let Some(ref rej) = cloned.rejected_response {
@@ -506,13 +511,16 @@ impl ArtifactCategoryGate {
                 || p_lower.contains("/sam")
                 || p_lower.contains("\\sam")
                 || p_lower.ends_with("sam")
-                || (!p_lower.ends_with(".evtx") && (
-                    p_lower.contains("/config/security")
-                    || p_lower.contains("\\config\\security")
-                    || p_lower.contains("/security")
-                    || p_lower.contains("\\security")
-                    || p_lower.ends_with("security")
-                ))
+                || (!p_lower.ends_with(".evtx")
+                    && !p_lower.contains("eventlog/")
+                    && !p_lower.contains("eventlog\\")
+                    && (
+                        p_lower.contains("/config/security")
+                        || p_lower.contains("\\config\\security")
+                        || p_lower.contains("/security")
+                        || p_lower.contains("\\security")
+                        || p_lower.ends_with("security")
+                    ))
                 || p_lower.contains("dpapi")
                 || p_lower.contains("keychain")
                 || p_lower.contains("consolehost_history")
