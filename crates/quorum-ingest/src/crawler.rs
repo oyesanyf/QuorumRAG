@@ -117,6 +117,27 @@ impl FilesystemCrawler {
         &self.io_semaphore
     }
 
+    /// Blocks until an I/O permit is available, strictly bounding concurrent NVMe/SSD queue depth.
+    pub fn acquire_io_permit_blocking(
+        sem: &tokio::sync::Semaphore,
+    ) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        let mut backoff = 1u64;
+        loop {
+            match sem.try_acquire() {
+                Ok(permit) => return Some(permit),
+                Err(tokio::sync::TryAcquireError::Closed) => return None,
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    if backoff < 16 {
+                        std::thread::yield_now();
+                        backoff += 1;
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                }
+            }
+        }
+    }
+
     /// Asynchronously initiates parallel traversal over all configured watch paths.
     pub fn start_crawl(
         self: Arc<Self>,
@@ -173,8 +194,12 @@ impl FilesystemCrawler {
             let io_sem = Arc::clone(&io_sem);
 
             Box::new(move |entry_result| {
-                let _io_permit = io_sem.try_acquire().ok();
+                let _io_permit = match Self::acquire_io_permit_blocking(&io_sem) {
+                    Some(p) => p,
+                    None => return WalkState::Quit,
+                };
                 if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
+                    drop(_io_permit);
                     if tx.send(candidate).is_err() {
                         return WalkState::Quit;
                     }
@@ -240,8 +265,12 @@ impl FilesystemCrawler {
             let io_sem = Arc::clone(&io_sem);
 
             Box::new(move |entry_result| {
-                let _io_permit = io_sem.try_acquire().ok();
+                let _io_permit = match Self::acquire_io_permit_blocking(&io_sem) {
+                    Some(p) => p,
+                    None => return WalkState::Quit,
+                };
                 if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
+                    drop(_io_permit);
                     if tx.send(candidate).is_err() {
                         return WalkState::Quit;
                     }
@@ -287,7 +316,10 @@ impl FilesystemCrawler {
                     let io_sem = Arc::clone(&io_sem);
 
                     Box::new(move |entry_result| {
-                        let _permit_guard = io_sem.try_acquire().ok();
+                        let _permit_guard = match Self::acquire_io_permit_blocking(&io_sem) {
+                            Some(p) => p,
+                            None => return WalkState::Quit,
+                        };
                         if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
                             drop(_permit_guard);
                             if tx.blocking_send(candidate).is_err() {
@@ -459,7 +491,10 @@ impl FilesystemCrawler {
             let io_sem = Arc::clone(&io_sem);
 
             Box::new(move |entry_result| {
-                let _permit_guard = io_sem.try_acquire().ok();
+                let _permit_guard = match Self::acquire_io_permit_blocking(&io_sem) {
+                    Some(p) => p,
+                    None => return WalkState::Quit,
+                };
                 if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
                     drop(_permit_guard);
                     if tx.blocking_send(candidate).is_err() {

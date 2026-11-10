@@ -138,76 +138,103 @@ impl IngestEngine {
         let access_tier = self.config.resolve_access_tier(path);
         let path_str = path.to_string_lossy().to_string();
 
+        let ext_permit = crate::thread_pool::IngestThreadPool::shared()
+            .permit_tiers()
+            .acquire_extraction()
+            .await?;
+
         let chunks = match kind {
             CandidateKind::Text { .. } => {
-                let content = DocumentExtractor::extract_text(path, &identity)?;
+                let path_buf = path.to_path_buf();
+                let identity = identity.clone();
+                let chunker = self.chunker.clone();
+                let embedder = Arc::clone(&self.embedder);
+                let dedup_cache = self.dedup.cache().clone();
+                let path_str_c = path_str.clone();
+
+                let (content, file_b3, doc_chunks, file_chunk_hashes) =
+                    crate::thread_pool::IngestThreadPool::shared()
+                        .spawn_blocking_pinned(ext_permit, move || -> Result<_, IngestError> {
+                            let content = DocumentExtractor::extract_text(&path_buf, &identity)?;
+                            if content.is_empty() {
+                                return Ok((content, String::new(), Vec::new(), Vec::new()));
+                            }
+
+                            let file_b3 = match precomputed_file_b3 {
+                                Some(b3) => b3,
+                                None => Level1DedupCatalog::hash_file_stream(&path_buf)
+                                    .unwrap_or_else(|_| blake3::hash(content.as_bytes()).to_hex().to_string()),
+                            };
+                            let raw_chunks = chunker.chunk_text_structure_aware(&content);
+
+                            let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
+                            let mut doc_chunks = Vec::with_capacity(raw_chunks.len());
+                            let header = crate::chunker::build_contextual_header(&path_buf, &content);
+
+                            for raw in raw_chunks {
+                                let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
+                                let chunk_content = crate::chunker::prepend_contextual_header_with_section(
+                                    &header,
+                                    &raw.section_path,
+                                    raw.text_slice,
+                                );
+                                let _chunk_b3 = DocumentChunk::compute_blake3_hash(&chunk_content);
+                                file_chunk_hashes.push(raw_b3.clone());
+
+                                // Level-2 Evaluation
+                                let vector = if let Some(cached) = dedup_cache.get(&raw_b3) {
+                                    cached
+                                } else {
+                                    let vec = embedder
+                                        .embed_text(raw.text_slice)
+                                        .unwrap_or_else(|_| vec![0.0; embedder.dimension()]);
+                                    dedup_cache.insert(raw_b3.clone(), vec.clone());
+                                    vec
+                                };
+
+                                let chunk_id = format!("{}:{}", file_b3, raw.chunk_index);
+                                let metadata_json = serde_json::json!({
+                                    "char_start": raw.char_start,
+                                    "char_end": raw.char_end,
+                                    "chunk_index": raw.chunk_index,
+                                    "contract_hash": embedder.contract().derive_contract_hash_hex(),
+                                    "parent_doc_id": file_b3.clone(),
+                                    "parent_chunk_id": format!("{}:p{}", file_b3, raw.parent_chunk_index),
+                                    "heading_path": raw.section_path,
+                                    "section_path": raw.section_path,
+                                    "section_title": raw.section_title,
+                                    "section_hierarchy": raw.section_hierarchy,
+                                    "section_level": raw.section_level,
+                                    "source_path": path_str_c.clone(),
+                                })
+                                .to_string();
+
+                                let doc_chunk = DocumentChunk::new(
+                                    chunk_id,
+                                    file_b3.clone(),
+                                    &path_str_c,
+                                    raw.line_start,
+                                    raw.line_end,
+                                    access_tier,
+                                    vector,
+                                    &chunk_content,
+                                    Some(metadata_json),
+                                )?;
+                                doc_chunks.push(doc_chunk);
+                            }
+
+                            Ok((content, file_b3, doc_chunks, file_chunk_hashes))
+                        })
+                        .await??;
+
                 if content.is_empty() {
                     return Ok(Some(Vec::new()));
                 }
 
-                let file_b3 = match precomputed_file_b3 {
-                    Some(b3) => b3,
-                    None => Level1DedupCatalog::hash_file_stream(path)
-                        .unwrap_or_else(|_| blake3::hash(content.as_bytes()).to_hex().to_string()),
-                };
-                let raw_chunks = self.chunker.chunk_text_structure_aware(&content);
-
-                let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
-                let mut doc_chunks = Vec::with_capacity(raw_chunks.len());
-                let header = crate::chunker::build_contextual_header(path, &content);
-
-                for raw in raw_chunks {
-                    let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-                    let chunk_content = crate::chunker::prepend_contextual_header_with_section(
-                        &header,
-                        &raw.section_path,
-                        raw.text_slice,
-                    );
-                    let _chunk_b3 = DocumentChunk::compute_blake3_hash(&chunk_content);
-                    file_chunk_hashes.push(raw_b3.clone());
-
-                    // Level-2 Evaluation
-                    let vector = if let Some(cached) = self.dedup.cache().get(&raw_b3) {
-                        cached
-                    } else {
-                        let vec = self
-                            .embedder
-                            .embed_text(raw.text_slice)
-                            .unwrap_or_else(|_| vec![0.0; self.embedder.dimension()]);
-                        self.dedup.cache().insert(raw_b3.clone(), vec.clone());
-                        vec
-                    };
-
-                    let chunk_id = format!("{}:{}", file_b3, raw.chunk_index);
-                    let metadata_json = serde_json::json!({
-                        "char_start": raw.char_start,
-                        "char_end": raw.char_end,
-                        "chunk_index": raw.chunk_index,
-                        "contract_hash": self.embedder.contract().derive_contract_hash_hex(),
-                        "parent_doc_id": file_b3.clone(),
-                        "parent_chunk_id": format!("{}:p{}", file_b3, raw.parent_chunk_index),
-                        "heading_path": raw.section_path,
-                        "section_path": raw.section_path,
-                        "section_title": raw.section_title,
-                        "section_hierarchy": raw.section_hierarchy,
-                        "section_level": raw.section_level,
-                        "source_path": path_str.clone(),
-                    })
-                    .to_string();
-
-                    let doc_chunk = DocumentChunk::new(
-                        chunk_id,
-                        file_b3.clone(),
-                        &path_str,
-                        raw.line_start,
-                        raw.line_end,
-                        access_tier,
-                        vector,
-                        &chunk_content,
-                        Some(metadata_json),
-                    )?;
-                    doc_chunks.push(doc_chunk);
-                }
+                let _commit_permit = crate::thread_pool::IngestThreadPool::shared()
+                    .permit_tiers()
+                    .acquire_storage_commit()
+                    .await?;
 
                 let _ = self.storage.delete_by_file_path(&path_str).await;
                 if !doc_chunks.is_empty() {
@@ -235,16 +262,30 @@ impl IngestEngine {
                 doc_chunks
             }
             CandidateKind::Image { .. } => {
-                let bytes = std::fs::read(path)?;
-                let doc_chunk = ImageIndexer::index_image(
-                    path,
-                    &bytes,
-                    &identity,
-                    access_tier,
-                    self.embedder.as_ref(),
-                )?;
+                let path_buf = path.to_path_buf();
+                let identity = identity.clone();
+                let embedder = Arc::clone(&self.embedder);
 
-                let file_b3 = doc_chunk.document_id.clone();
+                let (doc_chunk, file_b3) = crate::thread_pool::IngestThreadPool::shared()
+                    .spawn_blocking_pinned(ext_permit, move || -> Result<_, IngestError> {
+                        let bytes = std::fs::read(&path_buf)?;
+                        let doc_chunk = ImageIndexer::index_image(
+                            &path_buf,
+                            &bytes,
+                            &identity,
+                            access_tier,
+                            embedder.as_ref(),
+                        )?;
+                        let file_b3 = doc_chunk.document_id.clone();
+                        Ok((doc_chunk, file_b3))
+                    })
+                    .await??;
+
+                let _commit_permit = crate::thread_pool::IngestThreadPool::shared()
+                    .permit_tiers()
+                    .acquire_storage_commit()
+                    .await?;
+
                 let _ = self.storage.delete_by_file_path(&path_str).await;
                 let _ = self.storage.insert_chunks(std::slice::from_ref(&doc_chunk)).await?;
                 let parent_doc = DocumentExtractor::build_ingested_parent_document(
@@ -269,16 +310,30 @@ impl IngestEngine {
                 vec![doc_chunk]
             }
             CandidateKind::Audio { .. } => {
-                let bytes = std::fs::read(path)?;
-                let doc_chunk = AudioIndexer::index_audio(
-                    path,
-                    &bytes,
-                    &identity,
-                    access_tier,
-                    self.embedder.as_ref(),
-                )?;
+                let path_buf = path.to_path_buf();
+                let identity = identity.clone();
+                let embedder = Arc::clone(&self.embedder);
 
-                let file_b3 = doc_chunk.document_id.clone();
+                let (doc_chunk, file_b3) = crate::thread_pool::IngestThreadPool::shared()
+                    .spawn_blocking_pinned(ext_permit, move || -> Result<_, IngestError> {
+                        let bytes = std::fs::read(&path_buf)?;
+                        let doc_chunk = AudioIndexer::index_audio(
+                            &path_buf,
+                            &bytes,
+                            &identity,
+                            access_tier,
+                            embedder.as_ref(),
+                        )?;
+                        let file_b3 = doc_chunk.document_id.clone();
+                        Ok((doc_chunk, file_b3))
+                    })
+                    .await??;
+
+                let _commit_permit = crate::thread_pool::IngestThreadPool::shared()
+                    .permit_tiers()
+                    .acquire_storage_commit()
+                    .await?;
+
                 let _ = self.storage.delete_by_file_path(&path_str).await;
                 let _ = self.storage.insert_chunks(std::slice::from_ref(&doc_chunk)).await?;
 
@@ -348,14 +403,34 @@ impl IngestEngine {
                         }
                     }
 
-                    // 2. Recursively index all files under the new directory path
-                    for entry in walkdir::WalkDir::new(&to).into_iter().filter_map(|e| e.ok()) {
-                        if entry.file_type().is_file() {
-                            let new_file_path = entry.into_path();
-                            if let Some(chunks) = self.ingest_file(&new_file_path).await? {
-                                if !chunks.is_empty() {
-                                    storage_mutated = true;
+                    // 2. Recursively index all files under the new directory path using work-stealing parallel discovery
+                    let files_to_index = {
+                        let (tx_files, rx_files) = std::sync::mpsc::channel();
+                        let walker = ignore::WalkBuilder::new(&to)
+                            .hidden(false)
+                            .ignore(false)
+                            .git_global(false)
+                            .git_ignore(false)
+                            .git_exclude(false)
+                            .build_parallel();
+                        walker.run(move || {
+                            let tx_files = tx_files.clone();
+                            Box::new(move |res| {
+                                if let Ok(entry) = res {
+                                    if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                                        let _ = tx_files.send(entry.into_path());
+                                    }
                                 }
+                                ignore::WalkState::Continue
+                            })
+                        });
+                        rx_files.into_iter().collect::<Vec<_>>()
+                    };
+
+                    for new_file_path in files_to_index {
+                        if let Some(chunks) = self.ingest_file(&new_file_path).await? {
+                            if !chunks.is_empty() {
+                                storage_mutated = true;
                             }
                         }
                     }

@@ -905,6 +905,9 @@ impl ReindexWorker {
                 }
 
                 let permit = permit_tiers.acquire_extraction().await?;
+                let permit_slot = Arc::new(std::sync::Mutex::new(Some(permit)));
+                let permit_slot_c = Arc::clone(&permit_slot);
+
                 let embedder_c = Arc::clone(&embedder);
                 let dedup_c = Arc::clone(&dedup);
                 let storage_c = Arc::clone(&storage);
@@ -913,8 +916,8 @@ impl ReindexWorker {
                 let full_rebuild = options.full_rebuild;
                 let path_for_timeout = path.clone();
 
-                let blocking_fut = thread_pool.spawn_blocking_pinned(permit, move || {
-                    process_candidate_sync(
+                let blocking_fut = thread_pool.spawn_task(move || {
+                    let outcome = process_candidate_sync(
                         candidate,
                         access_tier,
                         force_reembed || full_rebuild,
@@ -923,17 +926,33 @@ impl ReindexWorker {
                         dedup_c,
                         chunker_c,
                         precomputed_file_b3,
-                    )
+                    );
+                    if let Ok(mut guard) = permit_slot_c.lock() {
+                        drop(guard.take());
+                    }
+                    outcome
                 });
 
                 // Per-candidate 45s timeout so a single hung file is removed from `futures` and counted once
                 futures.push(async move {
                     match tokio::time::timeout(std::time::Duration::from_secs(45), blocking_fut).await {
                         Ok(join_res) => join_res,
-                        Err(_) => Ok(CandidateOutcome::Failed {
-                            path: path_for_timeout,
-                            error: "Candidate extraction task timed out after 45s".to_string(),
-                        }),
+                        Err(_) => {
+                            // Guard against permit abandonment: reclaim and drop extraction permit immediately
+                            if let Ok(mut guard) = permit_slot.lock() {
+                                if let Some(abandoned_permit) = guard.take() {
+                                    tracing::warn!(
+                                        path = %path_for_timeout.display(),
+                                        "Reclaimed abandoned extraction permit after 45s candidate timeout"
+                                    );
+                                    drop(abandoned_permit);
+                                }
+                            }
+                            Ok(CandidateOutcome::Failed {
+                                path: path_for_timeout,
+                                error: "Candidate extraction task timed out after 45s".to_string(),
+                            })
+                        }
                     }
                 });
             }
