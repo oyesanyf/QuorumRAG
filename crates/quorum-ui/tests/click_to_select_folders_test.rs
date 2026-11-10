@@ -104,4 +104,9 @@ fn test_every_folder_selector_under_settings_is_click_to_select_not_text_input()
             && !js.contains("Browse with Windows Explorer..."),
         "UI must never prompt to open a separate Windows Explorer dialog"
     );
+    assert!(
+        js.contains("ensurePureRustPickerModal")
+            && js.contains("window.applyPickedFolderToContext = async function"),
+        "Pure Rust folder picker modal must be self-initializing and wire all contexts in UI"
+    );
 }

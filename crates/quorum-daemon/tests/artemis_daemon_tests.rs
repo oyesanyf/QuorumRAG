@@ -888,4 +888,19 @@ async fn test_pure_rust_folder_picker_and_browse_folders_endpoints() {
     let created_path = create_json["path"].as_str().unwrap_or("");
     assert!(created_path.ends_with("charlie_dfir_dump"));
     assert!(temp_dir.path().join("charlie_dfir_dump").is_dir());
+
+    // 4. Verify UI assets served by daemon contain Pure Rust in-UI folder picker and zero Windows Explorer dialogs
+    let html = quorum_ui::get_index_html();
+    let (js_bytes, _) = quorum_ui::get_asset("app.js").expect("app.js must be embedded");
+    let js = String::from_utf8_lossy(&js_bytes);
+    assert!(
+        html.contains(r#"id="modal-pure-rust-folder-picker""#)
+            && js.contains("window.openPureRustFolderPicker = async function"),
+        "All folder openers must open the in-UI Pure Rust Folder Picker Modal"
+    );
+    assert!(
+        !html.contains("Browse with Windows Explorer...")
+            && !js.contains("Browse with Windows Explorer..."),
+        "UI must never prompt to open a separate Windows Explorer window"
+    );
 }
