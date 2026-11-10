@@ -2,13 +2,13 @@
 //! uses click-to-select controls (native OS folder picker, folder browser, or directory file input)
 //! and never requires typing folder paths into `<input type="text">`.
 
-use quorum_ui::{get_asset, get_index_html};
-
 #[test]
 fn test_every_folder_selector_under_settings_is_click_to_select_not_text_input() {
-    let html = get_index_html();
-    let (js_bytes, _) = get_asset("app.js").expect("app.js must be embedded");
-    let js = String::from_utf8_lossy(&js_bytes);
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let html = std::fs::read_to_string(manifest_dir.join("assets/index.html"))
+        .expect("assets/index.html must exist");
+    let js = std::fs::read_to_string(manifest_dir.join("assets/app.js"))
+        .expect("assets/app.js must exist");
 
     // 1. Reindex modal in index.html must use hidden input + click-to-select explorer & browse button
     assert!(
@@ -108,5 +108,22 @@ fn test_every_folder_selector_under_settings_is_click_to_select_not_text_input()
         js.contains("ensurePureRustPickerModal")
             && js.contains("window.applyPickedFolderToContext = async function"),
         "Pure Rust folder picker modal must be self-initializing and wire all contexts in UI"
+    );
+
+    // 6. Artemis DFIR Settings tab must include auto-collection schedule, retention window, and live telemetry badges
+    assert!(
+        js.contains(r#"id="sel-artemis-auto-interval""#)
+            && js.contains(r#"data-change-action="artemis-update-interval""#),
+        "Artemis DFIR Settings must expose background auto-collection interval control"
+    );
+    assert!(
+        js.contains(r#"id="sel-artemis-retention-days""#)
+            && js.contains(r#"data-change-action="artemis-update-retention""#),
+        "Artemis DFIR Settings must expose retention window control"
+    );
+    assert!(
+        js.contains(r#"id="artemis-total-collected-badge""#)
+            && js.contains(r#"id="artemis-last-collection-badge""#),
+        "Artemis DFIR Settings must expose live collected records and timestamp status badges"
     );
 }

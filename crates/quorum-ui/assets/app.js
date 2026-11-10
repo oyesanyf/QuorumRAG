@@ -4610,18 +4610,24 @@ function secureRandomIndex(n) {
 
         case 'trigger-artemis-collect': {
           e.preventDefault();
+          const collectMode = (actionEl.dataset.collectMode || '').trim();
           const targetPath = (artemisSelectedDir || '').trim();
+          const useFolder = collectMode === 'folder' || (collectMode !== 'live' && Boolean(targetPath));
           const resultBox = document.getElementById('artemis-collect-result-box');
           const resultText = document.getElementById('artemis-collect-result-text');
           const btn = actionEl;
           if (resultBox) resultBox.classList.remove('hidden');
-          if (resultText) resultText.textContent = 'Running Artemis forensic ingestion...';
+          if (resultText) {
+            resultText.textContent = useFolder
+              ? `Running Artemis forensic directory ingestion on ${targetPath}...`
+              : 'Collecting live host OS forensic telemetry (processes, sockets, persistence, services, event logs)...';
+          }
           if (btn) btn.disabled = true;
 
           const payload = {
-            source_type: targetPath ? 'folder' : 'live'
+            source_type: useFolder ? 'folder' : 'live'
           };
-          if (targetPath) {
+          if (useFolder && targetPath) {
             payload.target_path = targetPath;
           }
 
@@ -4637,10 +4643,21 @@ function secureRandomIndex(n) {
               if (resultText) resultText.textContent = '⚠ ' + errMsg;
               showSettingsToast('⚠ Artemis collection failed: ' + errMsg);
             } else {
-              const msg = `✓ Completed: ${data.records_parsed || 0} records parsed, ${data.chunks_indexed || 0} chunks indexed into local storage (${data.elapsed_ms || 0}ms)`;
+              const cats = Array.isArray(data.categories_collected) && data.categories_collected.length > 0
+                ? ` [${data.categories_collected.join(', ')}]`
+                : '';
+              const msg = `✓ Completed: ${data.records_parsed || 0} records parsed, ${data.chunks_indexed || 0} chunks indexed${cats} (${data.elapsed_ms || 0}ms)`;
               if (resultText) resultText.textContent = msg;
               showSettingsToast(msg);
               await fetchArtemisData();
+              const totalBadge = document.getElementById('artemis-total-collected-badge');
+              const lastTsBadge = document.getElementById('artemis-last-collection-badge');
+              if (totalBadge && cachedArtemisStatus) {
+                totalBadge.textContent = `📊 Total Collected Records: ${Number(cachedArtemisStatus.total_collected_records || 0).toLocaleString()}`;
+              }
+              if (lastTsBadge && cachedArtemisStatus && cachedArtemisStatus.last_collection_timestamp) {
+                lastTsBadge.textContent = `🕒 Last Collection: ${cachedArtemisStatus.last_collection_timestamp}`;
+              }
             }
           } catch (err) {
             if (resultText) resultText.textContent = '⚠ Network error: ' + err.message;
@@ -5674,6 +5691,44 @@ function secureRandomIndex(n) {
           }
           renderSettingsTabContent('artemis-dfir', '');
           showSettingsToast(`Selected ${files.length} forensic file(s) from "${folderName}"`);
+          break;
+        }
+
+        case 'artemis-update-interval': {
+          const mins = Math.max(0, Number(changeEl.value || 0));
+          try {
+            const resp = await fetch('/api/v1/artemis/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ auto_collection_interval_mins: mins })
+            });
+            if (resp.ok) {
+              await fetchArtemisData();
+              renderSettingsTabContent('artemis-dfir', '');
+              showSettingsToast(mins === 0 ? 'Background auto-collection set to Manual Only' : `✓ Background auto-collection interval set to every ${mins} min(s)`);
+            }
+          } catch (err) {
+            showSettingsToast('Error updating auto-collection interval: ' + err.message);
+          }
+          break;
+        }
+
+        case 'artemis-update-retention': {
+          const days = Math.max(1, Number(changeEl.value || 30));
+          try {
+            const resp = await fetch('/api/v1/artemis/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ retention_days: days })
+            });
+            if (resp.ok) {
+              await fetchArtemisData();
+              renderSettingsTabContent('artemis-dfir', '');
+              showSettingsToast(`✓ Forensic telemetry retention set to ${days} day(s)`);
+            }
+          } catch (err) {
+            showSettingsToast('Error updating retention policy: ' + err.message);
+          }
           break;
         }
       }
@@ -7515,6 +7570,42 @@ function secureRandomIndex(n) {
               </div>
               <input id="chk-artemis-normalize-harvest" type="checkbox" class="quorum-switch" ${isNormalizeEnabled ? 'checked' : ''} data-action="artemis-toggle-normalize">
             </div>
+
+            <!-- Background Auto-Collection Interval (spawn_artemis_auto_collector) -->
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label for="sel-artemis-auto-interval" class="settings-row-label">Background Periodic Auto-Collection Schedule</label>
+                <div class="settings-row-desc">
+                  When Local Forensic Telemetry Collection is enabled above, the daemon's background worker (<code>spawn_artemis_auto_collector</code>) periodically collects and indexes allowlisted OS telemetry.
+                </div>
+              </div>
+              <select id="sel-artemis-auto-interval" class="pill-select" data-change-action="artemis-update-interval">
+                <option value="0" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 0 ? 'selected' : ''}>Manual Only (Off)</option>
+                <option value="5" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 5 ? 'selected' : ''}>Every 5 minutes</option>
+                <option value="15" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 15 ? 'selected' : ''}>Every 15 minutes</option>
+                <option value="30" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 30 ? 'selected' : ''}>Every 30 minutes</option>
+                <option value="60" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 60 ? 'selected' : ''}>Every 60 minutes (Default)</option>
+                <option value="120" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 120 ? 'selected' : ''}>Every 2 hours</option>
+                <option value="360" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 360 ? 'selected' : ''}>Every 6 hours</option>
+              </select>
+            </div>
+
+            <!-- Retention Window -->
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label for="sel-artemis-retention-days" class="settings-row-label">Local Forensic Index Retention Window</label>
+                <div class="settings-row-desc">
+                  Maximum retention period for locally indexed <code>Tier3Restricted</code> forensic telemetry chunks.
+                </div>
+              </div>
+              <select id="sel-artemis-retention-days" class="pill-select" data-change-action="artemis-update-retention">
+                <option value="7" ${Number(artCfg.retention_days ?? art.retention_days ?? 30) === 7 ? 'selected' : ''}>7 days</option>
+                <option value="14" ${Number(artCfg.retention_days ?? art.retention_days ?? 30) === 14 ? 'selected' : ''}>14 days</option>
+                <option value="30" ${Number(artCfg.retention_days ?? art.retention_days ?? 30) === 30 ? 'selected' : ''}>30 days (Default)</option>
+                <option value="90" ${Number(artCfg.retention_days ?? art.retention_days ?? 30) === 90 ? 'selected' : ''}>90 days</option>
+                <option value="365" ${Number(artCfg.retention_days ?? art.retention_days ?? 30) === 365 ? 'selected' : ''}>365 days</option>
+              </select>
+            </div>
           </div>
 
           <!-- 3. CATEGORY ALLOWLIST & PROHIBITED MATRIX -->
@@ -7602,18 +7693,31 @@ function secureRandomIndex(n) {
 
           <!-- 5. MANUAL COLLECTION EXECUTION -->
           <div class="settings-card">
-            <div class="settings-card-title">
+            <div class="settings-card-title" style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
               <span>⚡ On-Demand Forensic Telemetry Collection</span>
+              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span id="artemis-total-collected-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">
+                  📊 Total Collected Records: ${Number(art.total_collected_records || 0).toLocaleString()}
+                </span>
+                <span id="artemis-last-collection-badge" class="status-pill" style="font-size:11.5px; padding:3px 10px; background:rgba(255,255,255,0.06);">
+                  🕒 Last Collection: ${escapeHtml(art.last_collection_timestamp || 'Never')}
+                </span>
+              </div>
             </div>
             <div style="font-size:12.5px; color:var(--text-muted); margin-bottom:12px;">
-              Trigger immediate ingestion from the currently selected folder or collect live host processes and system event logs into local LanceDB &amp; Tantivy storage.
+              Trigger immediate ingestion from the currently selected folder (<code>.jsonl</code>, <code>.json</code>, <code>.pf</code>, <code>.evtx</code>, <code>.plist</code>, <code>.service</code>) or collect live host processes, sockets, persistence keys, services, and system event logs into local LanceDB &amp; Tantivy storage.
             </div>
 
             <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
               <button type="button" id="btn-artemis-collect" class="btn-primary" data-action="trigger-artemis-collect" style="padding:8px 18px; font-weight:700; background:#10a37f; border-color:#10a37f; display:inline-flex; align-items:center; gap:6px;">
                 <span>⚡</span>
-                <span>${curSelectedDir ? 'Ingest Selected Folder (.jsonl)' : 'Collect Live OS Telemetry'}</span>
+                <span>${curSelectedDir ? 'Ingest Selected Folder (.jsonl / .evtx / .pf)' : 'Collect Live OS Telemetry'}</span>
               </button>
+              ${curSelectedDir ? `
+                <button type="button" id="btn-artemis-collect-live-explicit" class="pill-btn" data-action="trigger-artemis-collect" data-collect-mode="live" style="padding:8px 14px; font-weight:600; border-color:#6366f1; color:#818cf8;">
+                  🖥️ Also Collect Live Host OS Telemetry (${escapeHtml(art.current_platform || 'Windows')})
+                </button>
+              ` : ''}
               <span style="font-size:12px; color:var(--text-muted);">
                 Target: <code>${escapeHtml(curSelectedDir || 'Live Host Telemetry (' + (art.current_platform || 'Windows') + ')')}</code>
               </span>
