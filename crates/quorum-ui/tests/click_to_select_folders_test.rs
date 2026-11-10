@@ -90,6 +90,23 @@ fn test_every_folder_selector_under_settings_is_click_to_select_not_text_input()
     assert!(
         html.contains(r#"data-action="trigger-native-folder-picker" data-context="artemis""#)
             && js.contains(r#"data-action="trigger-native-folder-picker" data-context="artemis""#),
-        "Must contain native folder picker button for context artemis"
+        "Must contain folder picker button for context artemis"
+    );
+
+    // 5. Pure Rust In-UI Folder Picker Modal & Zero External Windows Explorer Dialogs
+    assert!(
+        html.contains(r#"id="modal-pure-rust-folder-picker""#)
+            && js.contains("window.openPureRustFolderPicker = async function"),
+        "All folder openers must open the in-UI Pure Rust Folder Picker Modal (#modal-pure-rust-folder-picker)"
+    );
+    assert!(
+        !html.contains("Browse with Windows Explorer...")
+            && !js.contains("Browse with Windows Explorer..."),
+        "UI must never prompt to open a separate Windows Explorer dialog"
+    );
+    assert!(
+        js.contains("ensurePureRustPickerModal")
+            && js.contains("window.applyPickedFolderToContext = async function"),
+        "Pure Rust folder picker modal must be self-initializing and wire all contexts in UI"
     );
 }

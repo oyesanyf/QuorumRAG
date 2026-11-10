@@ -524,10 +524,30 @@ pub async fn manage_shared_folders_handler(
     .into_response()
 }
 
-/// GET /api/fs/browse-folders?path=... (and /api/mesh/browse-folders) - Lists real directories on physical drives and quick-access user folders.
-pub async fn browse_folders_handler(
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+/// Pure Rust helper that validates a single new subfolder name (no traversal, drive letters, or separators).
+fn is_safe_single_folder_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains(':')
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('%')
+        || trimmed.contains('\0')
+    {
+        return false;
+    }
+    let mut components = Path::new(trimmed).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_))) && components.next().is_none()
+}
+
+/// Pure Rust directory enumeration and folder picker engine (`std::fs::read_dir` + physical drive discovery).
+/// Never spawns external OS dialogs (`powershell`, `explorer.exe`, `osascript`, or `zenity`).
+async fn pure_rust_browse_directory(
+    requested_path: &str,
+    create_subfolder: Option<&str>,
+) -> serde_json::Value {
     let controller = global_mesh_dlp_controller();
     let shared_folders = controller
         .settings
@@ -538,7 +558,9 @@ pub async fn browse_folders_handler(
         .clone();
 
     let is_shared_fn = |candidate: &str| -> bool {
-        let Some(norm_c) = quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(candidate) else {
+        let Some(norm_c) =
+            quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(candidate)
+        else {
             return false;
         };
         shared_folders.iter().any(|f| {
@@ -555,8 +577,47 @@ pub async fn browse_folders_handler(
         .map(|d| d.to_string_lossy().to_string())
         .collect();
 
-    let requested_path = params.get("path").map(|s| s.trim()).unwrap_or("");
-    if requested_path.is_empty() {
+    // Build Pure Rust quick-access folder list so it is always available in the UI
+    let mut quick_access: Vec<serde_json::Value> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.is_dir() {
+            let s = cwd.to_string_lossy().to_string();
+            quick_access.push(serde_json::json!({
+                "name": "Workspace",
+                "path": s,
+                "is_drive": false,
+                "is_quick_access": true,
+                "is_shared": is_shared_fn(&s)
+            }));
+        }
+    }
+    let home_opt = std::env::var("USERPROFILE")
+        .ok()
+        .or_else(|| std::env::var("HOME").ok());
+    if let Some(ref home) = home_opt {
+        let quick_folders = [
+            ("Desktop", "Desktop"),
+            ("Documents", "Documents"),
+            ("Downloads", "Downloads"),
+            ("Pictures", "Pictures"),
+        ];
+        for (label, sub) in quick_folders {
+            let p = Path::new(home).join(sub);
+            if p.is_dir() {
+                let s = p.to_string_lossy().to_string();
+                quick_access.push(serde_json::json!({
+                    "name": label,
+                    "path": s,
+                    "is_drive": false,
+                    "is_quick_access": true,
+                    "is_shared": is_shared_fn(&s)
+                }));
+            }
+        }
+    }
+
+    let req_trimmed = requested_path.trim();
+    if req_trimmed.is_empty() {
         let mut entries: Vec<serde_json::Value> = drives_raw
             .into_iter()
             .map(|d| {
@@ -570,51 +631,46 @@ pub async fn browse_folders_handler(
                 })
             })
             .collect();
+        entries.extend(quick_access.iter().cloned());
 
-        // Add user quick-access folders (Desktop, Documents, Downloads, Pictures)
-        let home_opt = std::env::var("USERPROFILE").ok().or_else(|| std::env::var("HOME").ok());
-        if let Some(home) = home_opt {
-            let quick_folders = [
-                ("Desktop", "Desktop"),
-                ("Documents", "Documents"),
-                ("Downloads", "Downloads"),
-                ("Pictures", "Pictures"),
-            ];
-            for (label, sub) in quick_folders {
-                let p = Path::new(&home).join(sub);
-                if p.is_dir() {
-                    let s = p.to_string_lossy().to_string();
-                    entries.push(serde_json::json!({
-                        "name": label,
-                        "path": s,
-                        "is_drive": false,
-                        "is_quick_access": true,
-                        "is_shared": is_shared_fn(&s)
-                    }));
-                }
-            }
-        }
-
-        return Json(serde_json::json!({
+        return serde_json::json!({
             "status": "ok",
+            "engine": "pure_rust_std_fs",
+            "path": "",
             "current_path": "",
             "parent_path": "",
             "drives": physical_drives,
-            "directories": entries
-        }));
+            "quick_access": quick_access,
+            "directories": entries,
+            "cancelled": false
+        });
     }
 
-    let dir_path = Path::new(requested_path);
+    let mut target_dir_buf = Path::new(req_trimmed).to_path_buf();
+    let mut created_folder_path: Option<String> = None;
+
+    if let Some(sub_name) = create_subfolder {
+        let sub_trimmed = sub_name.trim();
+        if is_safe_single_folder_name(sub_trimmed) && target_dir_buf.is_dir() {
+            let candidate = target_dir_buf.join(sub_trimmed);
+            if std::fs::create_dir_all(&candidate).is_ok() {
+                created_folder_path = Some(candidate.to_string_lossy().to_string());
+                target_dir_buf = candidate;
+            }
+        }
+    }
+
+    let resolved_path_str = target_dir_buf.to_string_lossy().to_string();
     let is_drive_root = physical_drives.iter().any(|d| {
         let d_trimmed = d.trim_end_matches(['\\', '/']);
-        let req_trimmed = requested_path.trim_end_matches(['\\', '/']);
-        d_trimmed.eq_ignore_ascii_case(req_trimmed)
+        let r_trimmed = resolved_path_str.trim_end_matches(['\\', '/']);
+        d_trimmed.eq_ignore_ascii_case(r_trimmed)
     });
 
     let parent_path = if is_drive_root {
         String::new()
     } else {
-        dir_path
+        target_dir_buf
             .parent()
             .map(|p| {
                 let s = p.to_string_lossy().to_string();
@@ -627,11 +683,13 @@ pub async fn browse_folders_handler(
             .unwrap_or_default()
     };
 
-    let dir_path_buf = dir_path.to_path_buf();
+    let dir_path_buf = target_dir_buf.clone();
     let shared_folders_clone = shared_folders.clone();
     let dirs: Vec<serde_json::Value> = tokio::task::spawn_blocking(move || {
         let is_shared = |candidate: &str| -> bool {
-            let Some(norm_c) = quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(candidate) else {
+            let Some(norm_c) =
+                quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(candidate)
+            else {
                 return false;
             };
             shared_folders_clone.iter().any(|f| {
@@ -656,7 +714,8 @@ pub async fn browse_folders_handler(
                         {
                             continue;
                         }
-                        let full = entry.path().to_string_lossy().to_string();
+                        let full_path = entry.path();
+                        let full = full_path.to_string_lossy().to_string();
                         dirs.push(serde_json::json!({
                             "name": name,
                             "path": full,
@@ -673,106 +732,89 @@ pub async fn browse_folders_handler(
             let nb = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
             na.to_ascii_lowercase().cmp(&nb.to_ascii_lowercase())
         });
-        dirs.truncate(150);
+        dirs.truncate(200);
         dirs
     })
     .await
     .unwrap_or_default();
 
-    Json(serde_json::json!({
+    serde_json::json!({
         "status": "ok",
-        "current_path": requested_path,
+        "engine": "pure_rust_std_fs",
+        "path": resolved_path_str,
+        "current_path": resolved_path_str,
         "parent_path": parent_path,
+        "created_folder": created_folder_path,
         "drives": physical_drives,
-        "directories": dirs
-    }))
-}
-
-/// POST /api/fs/pick-folder - Triggers native operating system folder selection dialog.
-pub async fn pick_folder_dialog_handler() -> impl IntoResponse {
-    let result: Option<String> = tokio::task::spawn_blocking(|| -> Option<String> {
-        #[cfg(windows)]
-        {
-            use std::process::Command;
-            use std::os::windows::process::CommandExt;
-
-            let script = r#"
-Add-Type -AssemblyName System.Windows.Forms
-$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = "Select a folder for QuorumRAG"
-$dialog.ShowNewFolderButton = $true
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-    [Console]::Out.Write($dialog.SelectedPath)
-}
-"#;
-            // 0x08000000 = CREATE_NO_WINDOW
-            let output = Command::new("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command", script])
-                .creation_flags(0x08000000)
-                .output();
-
-            match output {
-                Ok(out) if out.status.success() => {
-                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if path.is_empty() {
-                        None
-                    } else {
-                        Some(path)
-                    }
-                }
-                _ => None,
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use std::process::Command;
-            let output = Command::new("osascript")
-                .args(["-e", "POSIX path of (choose folder with prompt \"Select a folder for QuorumRAG\")"])
-                .output();
-            match output {
-                Ok(out) if out.status.success() => {
-                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if path.is_empty() { None } else { Some(path) }
-                }
-                _ => None,
-            }
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            use std::process::Command;
-            let output = Command::new("zenity")
-                .args(["--file-selection", "--directory", "--title=Select a folder for QuorumRAG"])
-                .output();
-            match output {
-                Ok(out) if out.status.success() => {
-                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if path.is_empty() { None } else { Some(path) }
-                }
-                _ => None,
-            }
-        }
-        #[cfg(not(any(windows, unix)))]
-        {
-            None::<String>
-        }
+        "quick_access": quick_access,
+        "directories": dirs,
+        "cancelled": false
     })
-    .await
-    .unwrap_or(None);
+}
 
-    match result {
-        Some(path) => Json(serde_json::json!({
-            "status": "ok",
-            "path": path,
-            "cancelled": false
-        }))
-        .into_response(),
-        None => Json(serde_json::json!({
-            "status": "cancelled",
-            "path": "",
-            "cancelled": true
-        }))
-        .into_response(),
-    }
+/// GET /api/fs/browse-folders?path=... (and /api/mesh/browse-folders) - Lists real directories on physical drives and quick-access user folders in Pure Rust.
+pub async fn browse_folders_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let requested_path = params.get("path").map(|s| s.trim()).unwrap_or("");
+    let create_subfolder = params.get("create_subfolder").map(|s| s.as_str());
+    Json(pure_rust_browse_directory(requested_path, create_subfolder).await)
+}
+
+/// POST /api/fs/pick-folder - Pure Rust folder selection & directory browser endpoint.
+/// Operates 100% in Pure Rust (`std::fs`) without spawning Windows Explorer or OS shell subprocesses.
+pub async fn pick_folder_dialog_handler(
+    Query(params): Query<HashMap<String, String>>,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let body_val = body.map(|b| b.0).unwrap_or_else(|| serde_json::json!({}));
+
+    let requested_path = body_val
+        .get("path")
+        .or_else(|| body_val.get("current_path"))
+        .or_else(|| body_val.get("folder_path"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .or_else(|| params.get("path").map(|s| s.trim().to_string()))
+        .unwrap_or_default();
+
+    let create_subfolder = body_val
+        .get("create_subfolder")
+        .or_else(|| body_val.get("new_folder"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .or_else(|| params.get("create_subfolder").map(|s| s.trim().to_string()));
+
+    let effective_path = if requested_path.is_empty() {
+        std::env::current_dir()
+            .ok()
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_string_lossy().to_string())
+            .or_else(|| {
+                std::env::var("USERPROFILE")
+                    .ok()
+                    .or_else(|| std::env::var("HOME").ok())
+                    .map(|h| {
+                        let docs = Path::new(&h).join("Documents");
+                        if docs.is_dir() {
+                            docs.to_string_lossy().to_string()
+                        } else {
+                            h
+                        }
+                    })
+            })
+            .or_else(|| {
+                quorum_ingest::IngestConfig::discover_physical_drives()
+                    .first()
+                    .map(|d| d.to_string_lossy().to_string())
+            })
+            .unwrap_or_default()
+    } else {
+        requested_path
+    };
+
+    Json(pure_rust_browse_directory(&effective_path, create_subfolder.as_deref()).await)
+        .into_response()
 }
 
 /// GET /api/dlp/status - Returns HIPAA PHI/PII DLP policy and live audit telemetry.

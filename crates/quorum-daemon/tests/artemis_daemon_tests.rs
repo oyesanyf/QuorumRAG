@@ -803,3 +803,104 @@ async fn test_artemis_collect_multi_format_directory_and_live_when_enabled() {
         "Live OS forensic collection must index real telemetry chunks"
     );
 }
+
+#[tokio::test]
+async fn test_pure_rust_folder_picker_and_browse_folders_endpoints() {
+    let (app, _state, temp_dir) = setup_artemis_test_app().await;
+
+    let sub_a = temp_dir.path().join("alpha_case");
+    let sub_b = temp_dir.path().join("bravo_case");
+    std::fs::create_dir_all(&sub_a).unwrap();
+    std::fs::create_dir_all(&sub_b).unwrap();
+
+    // 1. GET /api/fs/browse-folders?path= returns drives and quick_access in Pure Rust
+    let root_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fs/browse-folders?path=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root_res.status(), StatusCode::OK);
+    let root_json = read_body_json(root_res).await;
+    assert_eq!(root_json["status"], "ok");
+    assert_eq!(root_json["engine"], "pure_rust_std_fs");
+    assert!(root_json["drives"].is_array());
+    assert!(root_json["quick_access"].is_array());
+
+    // 2. POST /api/fs/pick-folder with target path lists subdirectories in Pure Rust without spawning OS Explorer
+    let pick_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fs/pick-folder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": temp_dir.path().to_string_lossy().to_string()
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pick_res.status(), StatusCode::OK);
+    let pick_json = read_body_json(pick_res).await;
+    assert_eq!(pick_json["status"], "ok");
+    assert_eq!(pick_json["engine"], "pure_rust_std_fs");
+    assert_eq!(pick_json["cancelled"], false);
+    let dirs = pick_json["directories"].as_array().expect("directories array");
+    let dir_names: Vec<&str> = dirs
+        .iter()
+        .filter_map(|d| d.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(dir_names.contains(&"alpha_case"));
+    assert!(dir_names.contains(&"bravo_case"));
+
+    // 3. POST /api/fs/pick-folder with create_subfolder creates and navigates into subfolder in Pure Rust
+    let create_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fs/pick-folder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": temp_dir.path().to_string_lossy().to_string(),
+                        "create_subfolder": "charlie_dfir_dump"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_res.status(), StatusCode::OK);
+    let create_json = read_body_json(create_res).await;
+    assert_eq!(create_json["status"], "ok");
+    let created_path = create_json["path"].as_str().unwrap_or("");
+    assert!(created_path.ends_with("charlie_dfir_dump"));
+    assert!(temp_dir.path().join("charlie_dfir_dump").is_dir());
+
+    // 4. Verify UI assets served by daemon contain Pure Rust in-UI folder picker and zero Windows Explorer dialogs
+    let html = quorum_ui::get_index_html();
+    let (js_bytes, _) = quorum_ui::get_asset("app.js").expect("app.js must be embedded");
+    let js = String::from_utf8_lossy(&js_bytes);
+    assert!(
+        html.contains(r#"id="modal-pure-rust-folder-picker""#)
+            && js.contains("window.openPureRustFolderPicker = async function"),
+        "All folder openers must open the in-UI Pure Rust Folder Picker Modal"
+    );
+    assert!(
+        !html.contains("Browse with Windows Explorer...")
+            && !js.contains("Browse with Windows Explorer..."),
+        "UI must never prompt to open a separate Windows Explorer window"
+    );
+}

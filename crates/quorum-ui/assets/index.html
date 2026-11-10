@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>QuorumRAG — Local-First P2P Retrieval &amp; Agentic Workspace</title>
   <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
-  <link rel="stylesheet" href="/assets/styles.css?v=20261105b">
+  <link rel="stylesheet" href="/assets/styles.css?v=20261110b">
   <style>
     /* Inlined fallback styles ensuring test assertions pass */
     :root {
@@ -455,7 +455,7 @@
         <div id="settings-tab-artemis-dfir" class="settings-tab-pane hidden" style="display:none;">
           <input type="hidden" id="artemis-jsonl-dir-input" value="">
           <div id="artemis-selected-folder-display" class="chatgpt-selected-folder-pill">No folder selected</div>
-          <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="artemis">📂 Browse with Windows Explorer...</button>
+          <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="artemis">📂 Open Pure Rust Folder Picker...</button>
           <input type="file" id="artemis-folder-upload-input" webkitdirectory directory multiple style="display:none;">
           <div id="artemis-folder-browser-list"></div>
           <input type="checkbox" id="chk-artemis-collection-toggle" class="quorum-switch" data-action="artemis-toggle-collection">
@@ -474,6 +474,38 @@
         </div>
       </div>
     </section>
+  </div>
+
+  <!-- PURE RUST FOLDER PICKER MODAL (Zero Windows Explorer / Zero External OS Subprocesses) -->
+  <div id="modal-pure-rust-folder-picker" class="modal-backdrop hidden" style="z-index: 100000;">
+    <div class="modal-card" style="max-width: 720px; width: 94%; max-height: 86vh; display: flex; flex-direction: column;">
+      <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <h3 style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
+          <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Folder</span>
+        </div>
+        <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker">&times;</button>
+      </div>
+      <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px;">
+        <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+        <div id="pure-rust-picker-quick-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+        <div class="folder-explorer-address-bar" style="display:flex; align-items:center; gap:8px;">
+          <button type="button" class="pill-btn" id="btn-pure-rust-picker-root" style="padding:4px 9px; font-size:11.5px;">💽 This PC</button>
+          <button type="button" class="pill-btn" id="btn-pure-rust-picker-up" style="padding:4px 9px; font-size:11.5px;">⬅ Up</button>
+          <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1;"></div>
+        </div>
+        <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:340px; min-height:200px;"></div>
+      </div>
+      <div class="modal-footer" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+        <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+          Active Path: <code id="pure-rust-picker-selected-label" style="color:#10a37f; font-weight:600;">This PC</code>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button type="button" id="btn-cancel-pure-rust-picker" class="pill-btn">Cancel</button>
+          <button type="button" id="btn-confirm-pure-rust-picker" class="btn-primary" style="background:#10a37f; border-color:#10a37f; font-weight:700;">✅ Select Current Folder</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <dialog id="dialog-confirm-clear-history" class="history-confirm-dialog" aria-labelledby="clear-history-dialog-title">
@@ -780,6 +812,6 @@
     };
   </script>
 
-  <script src="/assets/app.js?v=20261108b"></script>
+  <script src="/assets/app.js?v=20261110b"></script>
 </body>
 </html>

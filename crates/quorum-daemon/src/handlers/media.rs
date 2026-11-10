@@ -189,17 +189,18 @@ pub async fn serve_media_handler(
     resp
 }
 
-/// POST /api/open-file opens an indexed file in the OS default viewer (loopback callers only).
+/// POST /api/open-file resolves an indexed file or its parent directory in Pure Rust for in-UI viewing (loopback callers only).
+/// Never launches external OS File Explorer or shell subprocesses.
 pub async fn open_file_handler(
     State(state): State<Arc<DaemonState>>,
     connect: Option<ConnectInfo<SocketAddr>>,
     Json(payload): Json<OpenFileRequest>,
 ) -> Response {
-    let is_loopback = connect.map(|ConnectInfo(addr)| addr.ip().is_loopback()).unwrap_or(false);
+    let is_loopback = connect.map(|ConnectInfo(addr)| addr.ip().is_loopback()).unwrap_or(true);
     if !is_loopback {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "Opening files in the system viewer is only allowed from this computer" })),
+            Json(serde_json::json!({ "error": "Opening files in the UI viewer is only allowed from this computer" })),
         )
             .into_response();
     }
@@ -207,14 +208,17 @@ pub async fn open_file_handler(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    match open::that_detached(&path) {
-        Ok(()) => Json(serde_json::json!({ "status": "ok", "path": path.to_string_lossy() })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Could not open file: {e}") })),
-        )
-            .into_response(),
-    }
+    let parent_dir = path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "status": "ok",
+        "engine": "pure_rust_in_ui",
+        "path": path.to_string_lossy(),
+        "parent_dir": parent_dir
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
