@@ -449,8 +449,8 @@
     </aside>
 
     <!-- Right Content Area -->
-    <section class="chatgpt-settings-main" style="display:flex; flex-direction:column; height:100%; overflow:hidden; padding:0;">
-      <div id="settings-content-container" class="chatgpt-settings-content custom-scroll" style="flex:1; min-height:0; width:100%; max-width:none; overflow-y:auto; padding:36px 40px 32px 40px; box-sizing:border-box;">
+    <section class="chatgpt-settings-main" style="display:flex; flex-direction:column; height:100%; min-inline-size:0; overflow:hidden; padding:0;">
+      <div id="settings-content-container" class="chatgpt-settings-content custom-scroll" style="flex:1; min-height:0; min-inline-size:0; width:100%; max-width:none; display:block; overflow-x:hidden; overflow-y:auto; padding:36px 40px 88px 40px; box-sizing:border-box;">
         <!-- Artemis DFIR & Forensics Settings Tab Container (Initial / Static Markup) -->
         <div id="settings-tab-artemis-dfir" class="settings-tab-pane hidden" style="display:none;">
           <input type="hidden" id="artemis-jsonl-dir-input" value="">
@@ -478,7 +478,7 @@
 
   <!-- PURE RUST FOLDER PICKER MODAL (Zero Windows Explorer / Zero External OS Subprocesses) -->
   <div id="modal-pure-rust-folder-picker" class="modal-backdrop hidden" style="z-index: 100000;">
-    <div class="modal-card" style="max-width: 720px; width: 94%; max-height: 86vh; display: flex; flex-direction: column;">
+    <div class="modal-card" style="max-width: 740px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
       <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           <h3 style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
@@ -486,18 +486,25 @@
         </div>
         <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker">&times;</button>
       </div>
-      <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px;">
+      <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
         <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
         <div id="pure-rust-picker-quick-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
         <div class="folder-explorer-address-bar" style="display:flex; align-items:center; gap:8px;">
           <button type="button" class="pill-btn" id="btn-pure-rust-picker-root" style="padding:4px 9px; font-size:11.5px;">💽 This PC</button>
           <button type="button" class="pill-btn" id="btn-pure-rust-picker-up" style="padding:4px 9px; font-size:11.5px;">⬅ Up</button>
-          <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1;"></div>
+          <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1; min-inline-size:0;"></div>
         </div>
-        <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:340px; min-height:200px;"></div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <input type="search" id="pure-rust-picker-filter-input" class="settings-input" placeholder="🔍 Filter folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
+          <div style="display:flex; gap:6px; align-items:center;">
+            <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
+            <button type="button" class="pill-btn" id="btn-pure-rust-picker-create-folder" style="padding:5px 10px; font-size:12px; font-weight:600;">+ Create Subfolder</button>
+          </div>
+        </div>
+        <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:320px; min-height:200px;"></div>
       </div>
       <div class="modal-footer" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-        <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+        <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; min-inline-size:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
           Active Path: <code id="pure-rust-picker-selected-label" style="color:#10a37f; font-weight:600;">This PC</code>
         </div>
         <div style="display:flex; gap:8px;">
@@ -812,6 +819,6 @@
     };
   </script>
 
-  <script src="/assets/app.js?v=20261110c"></script>
+  <script src="/assets/app.js?v=20261110d"></script>
 </body>
 </html>
