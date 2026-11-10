@@ -341,7 +341,7 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
         let mut responses = Vec::new();
         let primary_deadline = tokio::time::Instant::now() + timeout;
         let mut active_deadline = primary_deadline;
-        let mut _got_non_empty = false;
+        let mut got_non_empty = false;
 
         loop {
             if futures.is_empty() {
@@ -377,13 +377,17 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
                     if responses.len() >= max_peer_responses || pending_ids.is_empty() {
                         break;
                     }
-                    if chunks_count > 0 {
-                        _got_non_empty = true;
-                        let max_straggler_grace = Duration::from_millis(300);
-                        let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
-                        if straggler_deadline < active_deadline {
-                            active_deadline = straggler_deadline;
-                        }
+                    let max_straggler_grace = if chunks_count > 0 {
+                        got_non_empty = true;
+                        Duration::from_millis(120)
+                    } else if !got_non_empty {
+                        Duration::from_millis(200)
+                    } else {
+                        Duration::from_millis(120)
+                    };
+                    let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
+                    if straggler_deadline < active_deadline {
+                        active_deadline = straggler_deadline;
                     }
                 }
                 _ => break,
@@ -634,7 +638,7 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
 
         let primary_deadline = tokio::time::Instant::now() + timeout;
         let mut active_deadline = primary_deadline;
-        let mut _got_non_empty_peer = false;
+        let mut got_non_empty_peer = false;
         let mut responses = Vec::new();
 
         loop {
@@ -678,16 +682,20 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                         break;
                     }
 
-                    // 2. Once responses have arrived with matching chunks, activate straggler grace.
-                    // Straggler grace must only activate when got_non_empty_peer is true (chunks_len > 0).
-                    // Never reduce the remaining search deadline when chunks_len == 0 and no other peer has returned hits.
-                    if chunks_len > 0 {
-                        _got_non_empty_peer = true;
-                        let max_straggler_grace = Duration::from_millis(300);
-                        let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
-                        if straggler_deadline < active_deadline {
-                            active_deadline = straggler_deadline;
-                        }
+                    // 2. Once responses have arrived, activate adaptive two-tier straggler grace:
+                    // If non-empty chunks arrive, clamp straggler grace to 120ms.
+                    // If empty chunks arrive and no prior peer returned hits, clamp grace to 200ms.
+                    let max_straggler_grace = if chunks_len > 0 {
+                        got_non_empty_peer = true;
+                        Duration::from_millis(120)
+                    } else if !got_non_empty_peer {
+                        Duration::from_millis(200)
+                    } else {
+                        Duration::from_millis(120)
+                    };
+                    let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
+                    if straggler_deadline < active_deadline {
+                        active_deadline = straggler_deadline;
                     }
                 }
                 Ok(Some(Ok((peer_str, Err(err), rtt_ms)))) => {
