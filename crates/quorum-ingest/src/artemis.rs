@@ -918,92 +918,112 @@ fn category_enabled(allowed_categories: &[String], target: ForensicTelemetryType
     })
 }
 
-/// Collects genuine live OS forensic telemetry across all allowlisted defensive categories:
+/// Collects genuine live OS forensic telemetry concurrently across all allowlisted defensive categories:
 /// - `process_execution`: Running processes (`sysinfo::System`) across Windows, macOS, and Linux
 /// - `network_connection`: Active TCP/UDP sockets (`netstat -ano` on Windows, `/proc/net/tcp` on Linux, `netstat -anv` on macOS)
 /// - `registry_persistence`: Windows `Run` / `RunOnce` persistence keys (`reg query`) or Unix cron/rc persistence
 /// - `prefetch_amcache_execution`: Windows `C:\Windows\Prefetch\*.pf` & `Amcache.hve` execution artifacts
 /// - `service_daemon`: Windows Services (`HKLM\SYSTEM\CurrentControlSet\Services`), macOS `LaunchDaemons`, Linux `systemd` units
 /// - `system_event_log`: Windows Event Logs (`wevtutil qe System` / `Application`), Linux `syslog`/`journald`, macOS `system.log`
+///
+/// All 6 category collectors execute concurrently via `std::thread::scope` so subprocess queries (`netstat`, `reg`, `wevtutil`)
+/// and filesystem/process table scans overlap across CPU cores with zero sequential bottlenecks.
 pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTelemetryRecord> {
-    let mut records = Vec::new();
     let host = sysinfo::System::host_name().unwrap_or_else(|| "localhost".to_string());
     let os_platform = std::env::consts::OS.to_string();
     let os_version = sysinfo::System::long_os_version().or_else(sysinfo::System::os_version);
     let now_unix = Utc::now().timestamp();
 
-    // 1. ProcessExecution (`process_execution`)
-    if category_enabled(allowed_categories, ForensicTelemetryType::ProcessExecution) {
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_all();
-        for (pid, process) in sys.processes() {
-            let cmd = process.cmd().join(" ");
-            let exe = process
-                .exe()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| process.name().to_string());
-            let user = process
-                .user_id()
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "system".to_string());
+    let host_ref = host.as_str();
+    let os_platform_ref = os_platform.as_str();
+    let os_version_ref = os_version.as_deref();
 
-            let val = serde_json::json!({
-                "telemetry_type": "process_execution",
-                "Computer": host,
-                "os_platform": os_platform,
-                "os_version": os_version,
-                "CommandLine": if cmd.is_empty() { exe.clone() } else { cmd },
-                "Image": exe,
-                "ProcessId": pid.as_u32(),
-                "SubjectUserName": user,
-                "collected_unix_secs": now_unix,
-                "Channel": "Security",
-                "source_path": format!("artemis://{}/live/process/{}", os_platform, pid.as_u32()),
-            });
-            if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some(&os_platform)) {
-                records.push(rec);
+    std::thread::scope(|s| {
+        // 1. ProcessExecution (`process_execution`)
+        let h_proc = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
+            let mut out = Vec::new();
+            if !category_enabled(allowed_categories, ForensicTelemetryType::ProcessExecution) {
+                return out;
             }
-        }
-    }
+            let mut sys = sysinfo::System::new_all();
+            sys.refresh_all();
+            for (pid, process) in sys.processes() {
+                let cmd = process.cmd().join(" ");
+                let exe = process
+                    .exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| process.name().to_string());
+                let user = process
+                    .user_id()
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| "system".to_string());
 
-    // 2. NetworkConnection (`network_connection`)
-    if category_enabled(allowed_categories, ForensicTelemetryType::NetworkConnection) {
-        #[cfg(target_os = "windows")]
-        if let Some(netstat_out) = run_hidden_os_command("netstat", &["-ano"]) {
-            for (idx, line) in netstat_out.lines().enumerate().take(120) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 && (parts[0].eq_ignore_ascii_case("TCP") || parts[0].eq_ignore_ascii_case("UDP")) {
-                    let proto = parts[0].to_ascii_uppercase();
-                    let local_addr = parts[1];
-                    let remote_addr = parts[2];
-                    let (state, pid_str) = if proto == "TCP" && parts.len() >= 5 {
-                        (parts[3], parts[4])
-                    } else {
-                        ("STATELESS", parts[3])
-                    };
-                    let pid = pid_str.parse::<u64>().unwrap_or(0);
-                    let val = serde_json::json!({
-                        "telemetry_type": "network_connection",
-                        "Computer": host,
-                        "os_platform": "windows",
-                        "os_version": os_version,
-                        "Protocol": proto,
-                        "SourceIp": local_addr,
-                        "DestinationIp": remote_addr,
-                        "State": state,
-                        "ProcessId": pid,
-                        "collected_unix_secs": now_unix,
-                        "source_path": format!("artemis://windows/live/netstat/{}", idx),
-                    });
-                    if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
-                        records.push(rec);
+                let val = serde_json::json!({
+                    "telemetry_type": "process_execution",
+                    "Computer": host_ref,
+                    "os_platform": os_platform_ref,
+                    "os_version": os_version_ref,
+                    "CommandLine": if cmd.is_empty() { exe.clone() } else { cmd },
+                    "Image": exe,
+                    "ProcessId": pid.as_u32(),
+                    "SubjectUserName": user,
+                    "collected_unix_secs": now_unix,
+                    "Channel": "Security",
+                    "source_path": format!("artemis://{}/live/process/{}", os_platform_ref, pid.as_u32()),
+                });
+                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some(os_platform_ref))
+                {
+                    out.push(rec);
+                }
+            }
+            out
+        });
+
+        // 2. NetworkConnection (`network_connection`)
+        let h_net = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
+            let mut out = Vec::new();
+            if !category_enabled(allowed_categories, ForensicTelemetryType::NetworkConnection) {
+                return out;
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(netstat_out) = run_hidden_os_command("netstat", &["-ano"]) {
+                for (idx, line) in netstat_out.lines().enumerate().take(120) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4
+                        && (parts[0].eq_ignore_ascii_case("TCP")
+                            || parts[0].eq_ignore_ascii_case("UDP"))
+                    {
+                        let proto = parts[0].to_ascii_uppercase();
+                        let local_addr = parts[1];
+                        let remote_addr = parts[2];
+                        let (state, pid_str) = if proto == "TCP" && parts.len() >= 5 {
+                            (parts[3], parts[4])
+                        } else {
+                            ("STATELESS", parts[3])
+                        };
+                        let pid = pid_str.parse::<u64>().unwrap_or(0);
+                        let val = serde_json::json!({
+                            "telemetry_type": "network_connection",
+                            "Computer": host_ref,
+                            "os_platform": "windows",
+                            "os_version": os_version_ref,
+                            "Protocol": proto,
+                            "SourceIp": local_addr,
+                            "DestinationIp": remote_addr,
+                            "State": state,
+                            "ProcessId": pid,
+                            "collected_unix_secs": now_unix,
+                            "source_path": format!("artemis://windows/live/netstat/{}", idx),
+                        });
+                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows"))
+                        {
+                            out.push(rec);
+                        }
                     }
                 }
             }
-        }
 
-        #[cfg(target_os = "linux")]
-        {
+            #[cfg(target_os = "linux")]
             if let Ok(tcp_content) = std::fs::read_to_string("/proc/net/tcp") {
                 for (idx, line) in tcp_content.lines().skip(1).enumerate().take(80) {
                     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -1012,7 +1032,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                         let rem_hex = parts[2];
                         let val = serde_json::json!({
                             "telemetry_type": "network_connection",
-                            "Computer": host,
+                            "Computer": host_ref,
                             "os_platform": "linux",
                             "Protocol": "TCP",
                             "SourceIp": local_hex,
@@ -1020,295 +1040,527 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                             "collected_unix_secs": now_unix,
                             "source_path": format!("artemis://linux/proc/net/tcp/{}", idx),
                         });
-                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("linux")) {
-                            records.push(rec);
+                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("linux"))
+                        {
+                            out.push(rec);
                         }
                     }
                 }
             }
-        }
 
-        #[cfg(target_os = "macos")]
-        if let Some(netstat_out) = run_hidden_os_command("netstat", &["-anv"]) {
-            for (idx, line) in netstat_out.lines().enumerate().take(80) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 && (parts[0].starts_with("tcp") || parts[0].starts_with("udp")) {
-                    let val = serde_json::json!({
-                        "telemetry_type": "network_connection",
-                        "Computer": host,
-                        "os_platform": "macos",
-                        "Protocol": parts[0],
-                        "SourceIp": parts[3],
-                        "DestinationIp": parts[4],
-                        "collected_unix_secs": now_unix,
-                        "source_path": format!("artemis://macos/live/netstat/{}", idx),
-                    });
-                    if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("macos")) {
-                        records.push(rec);
+            #[cfg(target_os = "macos")]
+            if let Some(netstat_out) = run_hidden_os_command("netstat", &["-anv"]) {
+                for (idx, line) in netstat_out.lines().enumerate().take(80) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 5
+                        && (parts[0].starts_with("tcp") || parts[0].starts_with("udp"))
+                    {
+                        let val = serde_json::json!({
+                            "telemetry_type": "network_connection",
+                            "Computer": host_ref,
+                            "os_platform": "macos",
+                            "Protocol": parts[0],
+                            "SourceIp": parts[3],
+                            "DestinationIp": parts[4],
+                            "collected_unix_secs": now_unix,
+                            "source_path": format!("artemis://macos/live/netstat/{}", idx),
+                        });
+                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("macos"))
+                        {
+                            out.push(rec);
+                        }
                     }
                 }
             }
-        }
-    }
 
-    // 3. RegistryPersistence (`registry_persistence`)
-    if category_enabled(allowed_categories, ForensicTelemetryType::RegistryPersistence) {
-        #[cfg(target_os = "windows")]
-        {
-            let run_keys = [
-                r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
-                r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce",
-            ];
-            for key_path in run_keys {
-                if let Some(reg_out) = run_hidden_os_command("reg", &["query", key_path]) {
-                    for line in reg_out.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() || trimmed.starts_with("HKEY_") {
-                            continue;
+            out
+        });
+
+        // 3. RegistryPersistence (`registry_persistence`)
+        let h_reg = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
+            let mut out = Vec::new();
+            if !category_enabled(allowed_categories, ForensicTelemetryType::RegistryPersistence) {
+                return out;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let run_keys = [
+                    r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+                    r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                ];
+                std::thread::scope(|reg_scope| {
+                    let mut handles = Vec::with_capacity(run_keys.len());
+                    for key_path in run_keys {
+                        handles.push(reg_scope.spawn(move || {
+                            let mut key_recs = Vec::new();
+                            if let Some(reg_out) = run_hidden_os_command("reg", &["query", key_path])
+                            {
+                                for line in reg_out.lines() {
+                                    let trimmed = line.trim();
+                                    if trimmed.is_empty() || trimmed.starts_with("HKEY_") {
+                                        continue;
+                                    }
+                                    for reg_type in ["REG_SZ", "REG_EXPAND_SZ", "REG_DWORD"] {
+                                        if let Some(pos) = trimmed.find(reg_type) {
+                                            let value_name = trimmed[..pos].trim();
+                                            let value_data =
+                                                trimmed[pos + reg_type.len()..].trim();
+                                            let val = serde_json::json!({
+                                                "telemetry_type": "registry_persistence",
+                                                "Computer": host_ref,
+                                                "os_platform": "windows",
+                                                "os_version": os_version_ref,
+                                                "Key": key_path,
+                                                "ValueName": value_name,
+                                                "ValueData": value_data,
+                                                "collected_unix_secs": now_unix,
+                                                "source_path": format!("artemis://windows/registry/run/{}", value_name.replace(' ', "_")),
+                                            });
+                                            if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(
+                                                val,
+                                                Some("windows"),
+                                            ) {
+                                                key_recs.push(rec);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            key_recs
+                        }));
+                    }
+                    for h in handles {
+                        if let Ok(recs) = h.join() {
+                            out.extend(recs);
                         }
-                        for reg_type in ["REG_SZ", "REG_EXPAND_SZ", "REG_DWORD"] {
+                    }
+                });
+            }
+            out
+        });
+
+        // 4. PrefetchAmcacheExecution (`prefetch_amcache_execution`)
+        let h_pf = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
+            let mut out = Vec::new();
+            if !category_enabled(
+                allowed_categories,
+                ForensicTelemetryType::PrefetchAmcacheExecution,
+            ) {
+                return out;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let prefetch_dir = std::path::Path::new(r"C:\Windows\Prefetch");
+                if let Ok(entries) = std::fs::read_dir(prefetch_dir) {
+                    for entry in entries.flatten().take(60) {
+                        let path = entry.path();
+                        if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("pf")) {
+                            out.extend(parse_prefetch_file(&path, host_ref, os_version_ref, now_unix));
+                        }
+                    }
+                }
+            }
+            out
+        });
+
+        // 5. ServiceDaemon (`service_daemon`)
+        let h_svc = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
+            let mut out = Vec::new();
+            if !category_enabled(allowed_categories, ForensicTelemetryType::ServiceDaemon) {
+                return out;
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(reg_out) = run_hidden_os_command(
+                "reg",
+                &[
+                    "query",
+                    r"HKLM\SYSTEM\CurrentControlSet\Services",
+                    "/s",
+                    "/v",
+                    "ImagePath",
+                ],
+            ) {
+                let mut current_svc = String::new();
+                let mut svc_count = 0usize;
+                for line in reg_out.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with(r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\")
+                    {
+                        current_svc = trimmed
+                            .trim_start_matches(
+                                r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\",
+                            )
+                            .to_string();
+                    } else if !current_svc.is_empty() && trimmed.starts_with("ImagePath") {
+                        for reg_type in ["REG_EXPAND_SZ", "REG_SZ"] {
                             if let Some(pos) = trimmed.find(reg_type) {
-                                let value_name = trimmed[..pos].trim();
-                                let value_data = trimmed[pos + reg_type.len()..].trim();
+                                let bin_path = trimmed[pos + reg_type.len()..].trim();
                                 let val = serde_json::json!({
-                                    "telemetry_type": "registry_persistence",
-                                    "Computer": host,
+                                    "telemetry_type": "service_daemon",
+                                    "Computer": host_ref,
                                     "os_platform": "windows",
-                                    "os_version": os_version,
-                                    "Key": key_path,
-                                    "ValueName": value_name,
-                                    "ValueData": value_data,
+                                    "os_version": os_version_ref,
+                                    "ServiceName": current_svc,
+                                    "BinaryPath": bin_path,
                                     "collected_unix_secs": now_unix,
-                                    "source_path": format!("artemis://windows/registry/run/{}", value_name.replace(' ', "_")),
+                                    "source_path": format!("artemis://windows/services/{}", current_svc),
                                 });
-                                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
-                                    records.push(rec);
+                                if let Ok(rec) =
+                                    ArtemisTelemetryRecord::from_json_value(val, Some("windows"))
+                                {
+                                    out.push(rec);
+                                    svc_count += 1;
                                 }
                                 break;
                             }
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. PrefetchAmcacheExecution (`prefetch_amcache_execution`)
-    if category_enabled(allowed_categories, ForensicTelemetryType::PrefetchAmcacheExecution) {
-        #[cfg(target_os = "windows")]
-        {
-            let prefetch_dir = std::path::Path::new(r"C:\Windows\Prefetch");
-            if let Ok(entries) = std::fs::read_dir(prefetch_dir) {
-                for entry in entries.flatten().take(60) {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("pf")) {
-                        let fname = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let exe_name = fname.split('-').next().unwrap_or(&fname).to_string();
-                        let mtime = entry
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(now_unix);
-                        let val = serde_json::json!({
-                            "telemetry_type": "prefetch_amcache_execution",
-                            "Computer": host,
-                            "os_platform": "windows",
-                            "os_version": os_version,
-                            "ExecutableName": exe_name,
-                            "RunCount": 1,
-                            "path": path.to_string_lossy().to_string(),
-                            "collected_unix_secs": mtime,
-                            "source_path": format!("artemis://windows/prefetch/{}", fname),
-                        });
-                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
-                            records.push(rec);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 5. ServiceDaemon (`service_daemon`)
-    if category_enabled(allowed_categories, ForensicTelemetryType::ServiceDaemon) {
-        #[cfg(target_os = "windows")]
-        if let Some(reg_out) = run_hidden_os_command(
-            "reg",
-            &["query", r"HKLM\SYSTEM\CurrentControlSet\Services", "/s", "/v", "ImagePath"],
-        ) {
-            let mut current_svc = String::new();
-            let mut svc_count = 0usize;
-            for line in reg_out.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with(r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\") {
-                    current_svc = trimmed
-                        .trim_start_matches(r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\")
-                        .to_string();
-                } else if !current_svc.is_empty() && trimmed.starts_with("ImagePath") {
-                    for reg_type in ["REG_EXPAND_SZ", "REG_SZ"] {
-                        if let Some(pos) = trimmed.find(reg_type) {
-                            let bin_path = trimmed[pos + reg_type.len()..].trim();
-                            let val = serde_json::json!({
-                                "telemetry_type": "service_daemon",
-                                "Computer": host,
-                                "os_platform": "windows",
-                                "os_version": os_version,
-                                "ServiceName": current_svc,
-                                "BinaryPath": bin_path,
-                                "collected_unix_secs": now_unix,
-                                "source_path": format!("artemis://windows/services/{}", current_svc),
-                            });
-                            if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
-                                records.push(rec);
-                                svc_count += 1;
-                            }
+                        if svc_count >= 60 {
                             break;
                         }
                     }
-                    if svc_count >= 60 {
-                        break;
-                    }
                 }
             }
-        }
 
-        #[cfg(target_os = "macos")]
-        {
+            #[cfg(target_os = "macos")]
             for dir_str in ["/Library/LaunchDaemons", "/System/Library/LaunchDaemons"] {
                 if let Ok(entries) = std::fs::read_dir(dir_str) {
                     for entry in entries.flatten().take(40) {
                         let path = entry.path();
-                        if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("plist")) {
-                            let label = path
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let val = serde_json::json!({
-                                "telemetry_type": "service_daemon",
-                                "Computer": host,
-                                "os_platform": "macos",
-                                "Label": label,
-                                "Program": path.to_string_lossy().to_string(),
-                                "collected_unix_secs": now_unix,
-                                "source_path": format!("artemis://macos/launchd/{}", label),
-                            });
-                            if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("macos")) {
-                                records.push(rec);
-                            }
+                        if path
+                            .extension()
+                            .map_or(false, |e| e.eq_ignore_ascii_case("plist"))
+                        {
+                            out.extend(parse_plist_file(&path, host_ref, now_unix));
                         }
                     }
                 }
             }
-        }
 
-        #[cfg(target_os = "linux")]
-        {
+            #[cfg(target_os = "linux")]
             for dir_str in ["/etc/systemd/system", "/lib/systemd/system"] {
                 if let Ok(entries) = std::fs::read_dir(dir_str) {
                     for entry in entries.flatten().take(40) {
                         let path = entry.path();
-                        if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("service")) {
-                            let svc_name = path
-                                .file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let content = std::fs::read_to_string(&path).unwrap_or_default();
-                            let exec_start = content
-                                .lines()
-                                .find_map(|l| l.strip_prefix("ExecStart="))
-                                .unwrap_or("")
-                                .to_string();
-                            let val = serde_json::json!({
-                                "telemetry_type": "service_daemon",
-                                "Computer": host,
-                                "os_platform": "linux",
-                                "ServiceName": svc_name,
-                                "BinaryPath": exec_start,
-                                "collected_unix_secs": now_unix,
-                                "source_path": format!("artemis://linux/systemd/{}", svc_name),
-                            });
-                            if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("linux")) {
-                                records.push(rec);
-                            }
+                        if path
+                            .extension()
+                            .map_or(false, |e| e.eq_ignore_ascii_case("service"))
+                        {
+                            out.extend(parse_systemd_service_file(&path, host_ref, now_unix));
                         }
+                    }
+                }
+            }
+
+            out
+        });
+
+        // 6. SystemEventLog (`system_event_log`)
+        let h_evt = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
+            let mut out = Vec::new();
+            if !category_enabled(allowed_categories, ForensicTelemetryType::SystemEventLog) {
+                return out;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let channels = ["System", "Application"];
+                std::thread::scope(|evt_scope| {
+                    let mut handles = Vec::with_capacity(channels.len());
+                    for channel in channels {
+                        handles.push(evt_scope.spawn(move || {
+                            let mut ch_recs = Vec::new();
+                            if let Some(evtx_out) = run_hidden_os_command(
+                                "wevtutil",
+                                &["qe", channel, "/c:15", "/rd:true", "/f:Text"],
+                            ) {
+                                for (idx, block) in evtx_out.split("Event[").skip(1).enumerate() {
+                                    let mut event_id = 0u64;
+                                    let mut desc_lines = Vec::new();
+                                    let mut in_desc = false;
+                                    for line in block.lines() {
+                                        let trimmed = line.trim();
+                                        if let Some(rest) = trimmed.strip_prefix("Event ID:") {
+                                            event_id = rest.trim().parse::<u64>().unwrap_or(0);
+                                        } else if trimmed.starts_with("Description:") {
+                                            in_desc = true;
+                                        } else if in_desc && !trimmed.is_empty() {
+                                            desc_lines.push(trimmed);
+                                        }
+                                    }
+                                    let msg = if desc_lines.is_empty() {
+                                        block.lines().take(6).collect::<Vec<_>>().join(" ")
+                                    } else {
+                                        desc_lines.join(" ")
+                                    };
+                                    let val = serde_json::json!({
+                                        "telemetry_type": "system_event_log",
+                                        "Computer": host_ref,
+                                        "os_platform": "windows",
+                                        "os_version": os_version_ref,
+                                        "Channel": channel,
+                                        "EventID": event_id,
+                                        "Message": msg,
+                                        "collected_unix_secs": now_unix,
+                                        "source_path": format!("artemis://windows/eventlog/{}/{}_{}", channel.to_ascii_lowercase(), event_id, idx),
+                                    });
+                                    if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(
+                                        val,
+                                        Some("windows"),
+                                    ) {
+                                        ch_recs.push(rec);
+                                    }
+                                }
+                            }
+                            ch_recs
+                        }));
+                    }
+                    for h in handles {
+                        if let Ok(recs) = h.join() {
+                            out.extend(recs);
+                        }
+                    }
+                });
+            }
+            out
+        });
+
+        let mut records = Vec::new();
+        for handle in [h_proc, h_net, h_reg, h_pf, h_svc, h_evt] {
+            if let Ok(part) = handle.join() {
+                records.extend(part);
+            }
+        }
+        records
+    })
+}
+
+/// Parses a Windows Prefetch (`.pf`) file header (SCCA uncompressed or MAM LZXPRESS compressed)
+/// into a structured `PrefetchAmcacheExecution` record.
+fn parse_prefetch_file(
+    path: &std::path::Path,
+    host: &str,
+    os_version: Option<&str>,
+    now_unix: i64,
+) -> Vec<ArtemisTelemetryRecord> {
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut exe_name = fname.split('-').next().unwrap_or(&fname).to_string();
+    let mut run_count = 1u64;
+    let mut format_sig = "PF_FILENAME";
+
+    if let Ok(mut f) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut buf = [0u8; 256];
+        if let Ok(n) = f.read(&mut buf) {
+            if n >= 8 && &buf[4..8] == b"SCCA" {
+                format_sig = "SCCA_UNCOMPRESSED";
+                if n >= 0x4C {
+                    let utf16_slice = &buf[0x10..0x4C];
+                    let u16s: Vec<u16> = utf16_slice
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .take_while(|&ch| ch != 0)
+                        .collect();
+                    let decoded = String::from_utf16_lossy(&u16s).trim().to_string();
+                    if !decoded.is_empty() {
+                        exe_name = decoded;
+                    }
+                }
+                if n >= 0x9C {
+                    let rc = u32::from_le_bytes([buf[0x98], buf[0x99], buf[0x9A], buf[0x9B]]) as u64;
+                    if rc > 0 && rc < 1_000_000 {
+                        run_count = rc;
+                    }
+                }
+            } else if n >= 8 && &buf[0..3] == b"MAM" {
+                format_sig = "MAM_COMPRESSED";
+            }
+        }
+    }
+
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(now_unix);
+
+    let val = serde_json::json!({
+        "telemetry_type": "prefetch_amcache_execution",
+        "Computer": host,
+        "os_platform": "windows",
+        "os_version": os_version,
+        "ExecutableName": exe_name,
+        "RunCount": run_count,
+        "PrefetchFormat": format_sig,
+        "path": path.to_string_lossy().to_string(),
+        "collected_unix_secs": mtime,
+        "source_path": format!("artemis://windows/prefetch/{}", fname),
+    });
+    ArtemisTelemetryRecord::from_json_value(val, Some("windows"))
+        .into_iter()
+        .collect()
+}
+
+/// Parses a Windows Event Log (`.evtx`) binary archive (`ElfFile\0` header) into a structured
+/// `SystemEventLog` record.
+fn parse_evtx_file(path: &std::path::Path, host: &str, now_unix: i64) -> Vec<ArtemisTelemetryRecord> {
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let channel = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Security".to_string());
+    let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    let mut chunk_count = 0u64;
+    let mut next_record_id = 0u64;
+    if let Ok(mut f) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut hdr = [0u8; 64];
+        if let Ok(n) = f.read(&mut hdr) {
+            if n >= 32 && &hdr[0..8] == b"ElfFile\0" {
+                let last_chunk = u64::from_le_bytes([
+                    hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
+                ]);
+                next_record_id = u64::from_le_bytes([
+                    hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31],
+                ]);
+                chunk_count = last_chunk.saturating_add(1);
+            }
+        }
+    }
+
+    let val = serde_json::json!({
+        "telemetry_type": "system_event_log",
+        "Computer": host,
+        "os_platform": "windows",
+        "Channel": channel,
+        "EventID": 4688,
+        "ChunkCount": chunk_count,
+        "NextRecordId": next_record_id,
+        "Message": format!(
+            "Imported Windows Event Log binary archive {} ({} bytes, chunks={}, next_record_id={})",
+            fname, file_len, chunk_count, next_record_id
+        ),
+        "collected_unix_secs": now_unix,
+        "source_path": format!("artemis://windows/eventlog/{}", fname),
+    });
+    ArtemisTelemetryRecord::from_json_value(val, Some("windows"))
+        .into_iter()
+        .collect()
+}
+
+/// Parses a macOS LaunchDaemon / LaunchAgent `.plist` into a structured `ServiceDaemon` record.
+fn parse_plist_file(
+    path: &std::path::Path,
+    host: &str,
+    now_unix: i64,
+) -> Vec<ArtemisTelemetryRecord> {
+    let mut label = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut program = path.to_string_lossy().to_string();
+
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Some(pos) = content.find("<key>Label</key>") {
+            let rest = &content[pos + "<key>Label</key>".len()..];
+            if let (Some(s_start), Some(s_end)) = (rest.find("<string>"), rest.find("</string>")) {
+                if s_start + 8 <= s_end {
+                    let extracted = rest[s_start + 8..s_end].trim();
+                    if !extracted.is_empty() {
+                        label = extracted.to_string();
+                    }
+                }
+            }
+        }
+        if let Some(pos) = content.find("<key>Program</key>") {
+            let rest = &content[pos + "<key>Program</key>".len()..];
+            if let (Some(s_start), Some(s_end)) = (rest.find("<string>"), rest.find("</string>")) {
+                if s_start + 8 <= s_end {
+                    let extracted = rest[s_start + 8..s_end].trim();
+                    if !extracted.is_empty() {
+                        program = extracted.to_string();
                     }
                 }
             }
         }
     }
 
-    // 6. SystemEventLog (`system_event_log`)
-    if category_enabled(allowed_categories, ForensicTelemetryType::SystemEventLog) {
-        #[cfg(target_os = "windows")]
-        {
-            for channel in ["System", "Application"] {
-                if let Some(evtx_out) = run_hidden_os_command(
-                    "wevtutil",
-                    &["qe", channel, "/c:15", "/rd:true", "/f:Text"],
-                ) {
-                    for (idx, block) in evtx_out.split("Event[").skip(1).enumerate() {
-                        let mut event_id = 0u64;
-                        let mut desc_lines = Vec::new();
-                        let mut in_desc = false;
-                        for line in block.lines() {
-                            let trimmed = line.trim();
-                            if let Some(rest) = trimmed.strip_prefix("Event ID:") {
-                                event_id = rest.trim().parse::<u64>().unwrap_or(0);
-                            } else if trimmed.starts_with("Description:") {
-                                in_desc = true;
-                            } else if in_desc && !trimmed.is_empty() {
-                                desc_lines.push(trimmed);
-                            }
-                        }
-                        let msg = if desc_lines.is_empty() {
-                            block.lines().take(6).collect::<Vec<_>>().join(" ")
-                        } else {
-                            desc_lines.join(" ")
-                        };
-                        let val = serde_json::json!({
-                            "telemetry_type": "system_event_log",
-                            "Computer": host,
-                            "os_platform": "windows",
-                            "os_version": os_version,
-                            "Channel": channel,
-                            "EventID": event_id,
-                            "Message": msg,
-                            "collected_unix_secs": now_unix,
-                            "source_path": format!("artemis://windows/eventlog/{}/{}_{}", channel.to_ascii_lowercase(), event_id, idx),
-                        });
-                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
-                            records.push(rec);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let val = serde_json::json!({
+        "telemetry_type": "service_daemon",
+        "Computer": host,
+        "os_platform": "macos",
+        "Label": label,
+        "Program": program,
+        "collected_unix_secs": now_unix,
+        "source_path": format!("artemis://macos/launchd/{}", label),
+    });
+    ArtemisTelemetryRecord::from_json_value(val, Some("macos"))
+        .into_iter()
+        .collect()
+}
 
-    records
+/// Parses a Linux systemd `.service` unit file into a structured `ServiceDaemon` record.
+fn parse_systemd_service_file(
+    path: &std::path::Path,
+    host: &str,
+    now_unix: i64,
+) -> Vec<ArtemisTelemetryRecord> {
+    let svc_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let exec_start = content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ExecStart="))
+        .unwrap_or("")
+        .to_string();
+    let val = serde_json::json!({
+        "telemetry_type": "service_daemon",
+        "Computer": host,
+        "os_platform": "linux",
+        "ServiceName": svc_name,
+        "BinaryPath": exec_start,
+        "collected_unix_secs": now_unix,
+        "source_path": format!("artemis://linux/systemd/{}", svc_name),
+    });
+    ArtemisTelemetryRecord::from_json_value(val, Some("linux"))
+        .into_iter()
+        .collect()
 }
 
 /// Recursively collects and parses forensic artifacts from a directory on disk (`max_depth = 16`, skipping symlinks),
 /// supporting `.jsonl`, `.json`, `.pf` (Windows Prefetch), `.evtx` (Windows Event Log), `.plist` (macOS LaunchDaemon),
-/// and `.service` (Linux systemd) forensic files.
+/// and `.service` (Linux systemd) forensic files in parallel across all CPU cores using `rayon`.
 pub fn collect_forensic_directory(dir: &std::path::Path) -> Vec<ArtemisTelemetryRecord> {
-    let mut records = Vec::new();
-    collect_forensic_directory_bounded(dir, 0, 16, &mut records);
-    records
+    use rayon::prelude::*;
+
+    let mut file_paths = Vec::new();
+    collect_forensic_file_paths_bounded(dir, 0, 16, &mut file_paths);
+
+    let host = sysinfo::System::host_name().unwrap_or_else(|| "localhost".to_string());
+    let now_unix = Utc::now().timestamp();
+
+    file_paths
+        .par_iter()
+        .flat_map_iter(|path| parse_forensic_file_path(path, &host, now_unix))
+        .collect()
 }
 
-fn collect_forensic_directory_bounded(
+fn collect_forensic_file_paths_bounded(
     dir: &std::path::Path,
     depth: usize,
     max_depth: usize,
-    out: &mut Vec<ArtemisTelemetryRecord>,
+    out: &mut Vec<std::path::PathBuf>,
 ) {
     if depth > max_depth {
         return;
@@ -1316,8 +1568,6 @@ fn collect_forensic_directory_bounded(
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let host = sysinfo::System::host_name().unwrap_or_else(|| "localhost".to_string());
-    let now_unix = Utc::now().timestamp();
 
     for entry in entries.flatten() {
         if entry.file_type().map_or(false, |ft| ft.is_symlink()) {
@@ -1343,156 +1593,92 @@ fn collect_forensic_directory_bounded(
                 continue;
             }
             if depth < max_depth {
-                collect_forensic_directory_bounded(&path, depth + 1, max_depth, out);
+                collect_forensic_file_paths_bounded(&path, depth + 1, max_depth, out);
             }
             continue;
         }
-        if !path.is_file() {
-            continue;
+        if path.is_file() {
+            out.push(path);
         }
-        let ext = path
-            .extension()
-            .map(|e| e.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        match ext.as_str() {
-            "jsonl" => {
-                if let Ok(file) = std::fs::File::open(&path) {
-                    if let Ok(recs) = parse_artemis_jsonl(file) {
-                        out.extend(recs);
-                    }
+    }
+}
+
+fn parse_forensic_file_path(
+    path: &std::path::Path,
+    host: &str,
+    now_unix: i64,
+) -> Vec<ArtemisTelemetryRecord> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    match ext.as_str() {
+        "jsonl" => {
+            if let Ok(file) = std::fs::File::open(path) {
+                if let Ok(recs) = parse_artemis_jsonl(file) {
+                    out.extend(recs);
                 }
             }
-            "json" => {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    let trimmed = content.trim();
-                    let is_forensic_record = |rec: &ArtemisTelemetryRecord| {
-                        let v = &rec.raw_json;
-                        [
-                            "telemetry_type",
-                            "artifact_type",
-                            "EventID",
-                            "event_id",
-                            "Channel",
-                            "channel",
-                            "CommandLine",
-                            "command_line",
-                            "cmdline",
-                            "ProcessId",
-                            "pid",
-                            "DestinationIp",
-                            "dest_ip",
-                            "ServiceName",
-                            "service_name",
-                            "ExecutableName",
-                            "Key",
-                            "RunCount",
-                        ]
-                        .iter()
-                        .any(|k| v.get(*k).is_some())
-                    };
-                    if trimmed.starts_with('[') {
-                        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(trimmed) {
-                            for val in arr {
-                                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, None) {
-                                    if is_forensic_record(&rec) {
-                                        out.push(rec);
-                                    }
+        }
+        "json" => {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let trimmed = content.trim();
+                let is_forensic_record = |rec: &ArtemisTelemetryRecord| {
+                    let v = &rec.raw_json;
+                    [
+                        "telemetry_type",
+                        "artifact_type",
+                        "EventID",
+                        "event_id",
+                        "Channel",
+                        "channel",
+                        "CommandLine",
+                        "command_line",
+                        "cmdline",
+                        "ProcessId",
+                        "pid",
+                        "DestinationIp",
+                        "dest_ip",
+                        "ServiceName",
+                        "service_name",
+                        "ExecutableName",
+                        "Key",
+                        "RunCount",
+                    ]
+                    .iter()
+                    .any(|k| v.get(*k).is_some())
+                };
+                if trimmed.starts_with('[') {
+                    if let Ok(arr) = serde_json::from_str::<Vec<Value>>(trimmed) {
+                        for val in arr {
+                            if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, None) {
+                                if is_forensic_record(&rec) {
+                                    out.push(rec);
                                 }
                             }
                         }
-                    } else if let Ok(recs) = parse_artemis_jsonl_str(trimmed) {
-                        out.extend(recs.into_iter().filter(is_forensic_record));
                     }
+                } else if let Ok(recs) = parse_artemis_jsonl_str(trimmed) {
+                    out.extend(recs.into_iter().filter(is_forensic_record));
                 }
             }
-            "pf" => {
-                let fname = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let exe_name = fname.split('-').next().unwrap_or(&fname).to_string();
-                let val = serde_json::json!({
-                    "telemetry_type": "prefetch_amcache_execution",
-                    "Computer": host,
-                    "os_platform": "windows",
-                    "ExecutableName": exe_name,
-                    "RunCount": 1,
-                    "path": path.to_string_lossy().to_string(),
-                    "collected_unix_secs": now_unix,
-                    "source_path": format!("artemis://windows/prefetch/{}", fname),
-                });
-                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
-                    out.push(rec);
-                }
-            }
-            "evtx" => {
-                let fname = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let channel = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Security".to_string());
-                let val = serde_json::json!({
-                    "telemetry_type": "system_event_log",
-                    "Computer": host,
-                    "os_platform": "windows",
-                    "Channel": channel,
-                    "EventID": 4688,
-                    "Message": format!("Imported Windows Event Log binary archive {} ({} bytes)", fname, entry.metadata().map(|m| m.len()).unwrap_or(0)),
-                    "collected_unix_secs": now_unix,
-                    "source_path": format!("artemis://windows/eventlog/{}", fname),
-                });
-                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
-                    out.push(rec);
-                }
-            }
-            "plist" => {
-                let label = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let val = serde_json::json!({
-                    "telemetry_type": "service_daemon",
-                    "Computer": host,
-                    "os_platform": "macos",
-                    "Label": label,
-                    "Program": path.to_string_lossy().to_string(),
-                    "collected_unix_secs": now_unix,
-                    "source_path": format!("artemis://macos/launchd/{}", label),
-                });
-                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("macos")) {
-                    out.push(rec);
-                }
-            }
-            "service" => {
-                let svc_name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let content = std::fs::read_to_string(&path).unwrap_or_default();
-                let exec_start = content
-                    .lines()
-                    .find_map(|l| l.strip_prefix("ExecStart="))
-                    .unwrap_or("")
-                    .to_string();
-                let val = serde_json::json!({
-                    "telemetry_type": "service_daemon",
-                    "Computer": host,
-                    "os_platform": "linux",
-                    "ServiceName": svc_name,
-                    "BinaryPath": exec_start,
-                    "collected_unix_secs": now_unix,
-                    "source_path": format!("artemis://linux/systemd/{}", svc_name),
-                });
-                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("linux")) {
-                    out.push(rec);
-                }
-            }
-            _ => {}
         }
+        "pf" => {
+            out.extend(parse_prefetch_file(path, host, None, now_unix));
+        }
+        "evtx" => {
+            out.extend(parse_evtx_file(path, host, now_unix));
+        }
+        "plist" => {
+            out.extend(parse_plist_file(path, host, now_unix));
+        }
+        "service" => {
+            out.extend(parse_systemd_service_file(path, host, now_unix));
+        }
+        _ => {}
     }
+    out
 }
 
 #[cfg(test)]
