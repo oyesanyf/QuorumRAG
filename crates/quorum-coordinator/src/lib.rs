@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod agentic;
 pub mod answer_orchestrator;
+pub mod artemis_airgap;
 pub mod bounty_runner;
 pub mod cache;
 pub mod config;
@@ -8,6 +9,7 @@ pub mod coordinator;
 pub mod crypto;
 pub mod dlp_mesh;
 pub mod error;
+pub mod forensic_normalizer;
 pub mod fusion;
 pub mod hardware;
 pub mod langextract;
@@ -85,3 +87,11 @@ pub use marketplace_engine::{
 };
 
 pub use bounty_runner::{BountyMatchResult, BountyRunner};
+pub use artemis_airgap::{
+    contains_artemis_query, default_allowed_categories, is_airgap_restricted_chunk,
+    is_airgap_restricted_chunk_dto, is_artemis_uri, percent_decode_ascii_lossy,
+    prohibited_categories, ArtemisDfirSettings,
+};
+pub use forensic_normalizer::{
+    is_internal_private_ip, ArtifactCategoryGate, ForensicStructuralNormalizer, NormalizerPreview,
+};

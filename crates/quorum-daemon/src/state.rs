@@ -407,6 +407,7 @@ pub struct ChatSessionRegistry {
     history_db: Arc<RwLock<Option<Arc<crate::chat_history_db::ChatHistoryStore>>>>,
     pub(crate) p2p_watcher_runtime: Arc<RwLock<Option<Arc<crate::p2p_watcher::P2pWatcherRuntime>>>>,
     pub(crate) marketplace_db: Arc<RwLock<Option<Arc<crate::handlers::marketplace::MarketplaceStore>>>>,
+    pub(crate) fs_watcher_handle: Arc<RwLock<Option<Arc<quorum_ingest::WatcherHandle>>>>,
 }
 
 impl ChatSessionRegistry {
@@ -416,6 +417,7 @@ impl ChatSessionRegistry {
             history_db: Arc::new(RwLock::new(None)),
             p2p_watcher_runtime: Arc::new(RwLock::new(None)),
             marketplace_db: Arc::new(RwLock::new(None)),
+            fs_watcher_handle: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -484,6 +486,50 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    /// Attaches the real-time OS `WatcherHandle` configured at daemon startup.
+    pub fn set_fs_watcher(&self, handle: Arc<quorum_ingest::WatcherHandle>) {
+        if let Ok(mut guard) = self.sessions.fs_watcher_handle.write() {
+            *guard = Some(handle);
+        }
+    }
+
+    /// Returns the active real-time OS `WatcherHandle` if initialized.
+    pub fn fs_watcher(&self) -> Option<Arc<quorum_ingest::WatcherHandle>> {
+        self.sessions
+            .fs_watcher_handle
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    /// Dynamically registers directories with the live OS `FilesystemWatcher` and immediately
+    /// triggers (or priority-queues) reindexing on `paths`.
+    pub async fn watch_and_index_paths(&self, paths: Vec<PathBuf>) -> Option<uuid::Uuid> {
+        let clean_paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| !p.as_os_str().is_empty() && p.exists())
+            .collect();
+        if clean_paths.is_empty() {
+            return None;
+        }
+        if let Some(watcher) = self.fs_watcher() {
+            for p in &clean_paths {
+                let dir_to_watch = if p.is_dir() {
+                    Some(p.as_path())
+                } else {
+                    p.parent()
+                };
+                if let Some(d) = dir_to_watch {
+                    if d.exists() {
+                        let _ = watcher.watch_path(d);
+                    }
+                }
+            }
+        }
+        self.reindex_worker.add_watch_paths(&clean_paths);
+        self.reindex_worker.trigger_paths(clean_paths).await.ok()
+    }
+
     /// Attaches an explicit `P2pWatcherRuntime` configured at daemon startup.
     pub fn set_p2p_watcher(&self, runtime: Arc<crate::p2p_watcher::P2pWatcherRuntime>) {
         if let Ok(mut guard) = self.sessions.p2p_watcher_runtime.write() {

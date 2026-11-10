@@ -18,8 +18,10 @@ use std::path::{Path, PathBuf};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
+pub mod forensics;
 pub mod marketplace;
 pub mod rlm;
+pub use forensics::*;
 pub use marketplace::*;
 pub use quorum_types::{DocumentFormat, IngestedParentDocument, RegexMatchSpan};
 pub use rlm::*;

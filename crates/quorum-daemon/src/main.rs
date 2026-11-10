@@ -603,9 +603,158 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         error!("Failed to initialize SQLite chat history database: {}", e);
     }
 
+    // Ensure `<data_dir>/uploaded_documents` exists and is watched
+    let uploaded_docs_dir = cli.data_dir.join("uploaded_documents");
+    let _ = std::fs::create_dir_all(&uploaded_docs_dir);
+
+    // Collect initial real-time watch directories (user roots + uploaded_documents + shared_folders + opt_in_folders + expanded workspace slices)
+    let mut initial_watch_dirs = quorum_ingest::IngestConfig::discover_user_document_roots();
+    if uploaded_docs_dir.exists() && !initial_watch_dirs.contains(&uploaded_docs_dir) {
+        initial_watch_dirs.push(uploaded_docs_dir.clone());
+    }
+    if let Ok(guard) = quorum_coordinator::global_mesh_dlp_controller().settings.read() {
+        for folder in &guard.mesh.shared_folders {
+            if folder.enabled {
+                let p = std::path::PathBuf::from(&folder.path);
+                if p.exists() && !initial_watch_dirs.contains(&p) {
+                    initial_watch_dirs.push(p);
+                }
+            }
+        }
+    }
+    if let Ok(store) = app_state.marketplace_store() {
+        if let Ok(cfg) = store.get_config() {
+            for f in &cfg.opt_in_folders {
+                let p = std::path::PathBuf::from(f);
+                if p.exists() && !initial_watch_dirs.contains(&p) {
+                    initial_watch_dirs.push(p);
+                }
+            }
+        }
+    }
+    for expanded in quorum_ingest::ReindexWorker::expand_drive_roots(&ingest_config.watch_paths) {
+        if expanded.is_dir() && !initial_watch_dirs.contains(&expanded) {
+            initial_watch_dirs.push(expanded);
+        }
+    }
+    reindex_worker.add_watch_paths(&initial_watch_dirs);
+
+    // Start real-time OS FilesystemWatcher (`ReadDirectoryChangesW` / `inotify` / `FSEvents`)
+    let mut rt_watcher_cfg = ingest_config.clone();
+    rt_watcher_cfg.debounce_duration_ms = 200;
+    rt_watcher_cfg.watch_paths = initial_watch_dirs
+        .iter()
+        .filter(|p| {
+            p.exists()
+                && p.is_dir()
+                && p.parent().is_some()
+                && p.to_string_lossy().len() > 3
+        })
+        .cloned()
+        .collect();
+    match quorum_ingest::FilesystemWatcher::new(rt_watcher_cfg).start_watching() {
+        Ok((mut watcher_rx, watcher_handle)) => {
+            let handle_arc = Arc::new(watcher_handle);
+            app_state.set_fs_watcher(Arc::clone(&handle_arc));
+            let watcher_state = Arc::clone(&app_state);
+            let watcher_shutdown = Arc::clone(&shutdown_notify);
+            let excluded_data_dir = cli.data_dir.clone();
+            let allowed_uploads_dir = uploaded_docs_dir.clone();
+
+            tokio::spawn(async move {
+                let is_internal_noise = |p: &std::path::Path| -> bool {
+                    if p.starts_with(&excluded_data_dir) && !p.starts_with(&allowed_uploads_dir) {
+                        return true;
+                    }
+                    let s = p.to_string_lossy().to_ascii_lowercase();
+                    s.contains("\\target\\")
+                        || s.contains("/target/")
+                        || s.contains("\\.git\\")
+                        || s.contains("/.git/")
+                        || s.contains("\\node_modules\\")
+                        || s.contains("/node_modules/")
+                        || s.contains(".lance")
+                        || s.contains(".tantivy")
+                        || s.ends_with(".db-wal")
+                        || s.ends_with(".db-shm")
+                        || s.ends_with(".db-journal")
+                        || s.ends_with("dedup_catalog.json")
+                        || s.ends_with(".tmp")
+                };
+
+                loop {
+                    let first_evt = tokio::select! {
+                        _ = watcher_shutdown.notified() => break,
+                        evt = watcher_rx.recv() => match evt {
+                            Some(e) => e,
+                            None => break,
+                        }
+                    };
+
+                    let mut batch_events = vec![first_evt];
+                    let coalesce_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
+                    while let Ok(Some(next_evt)) = tokio::time::timeout_at(coalesce_deadline, watcher_rx.recv()).await {
+                        batch_events.push(next_evt);
+                        if batch_events.len() >= 256 {
+                            break;
+                        }
+                    }
+
+                    let mut paths_to_index: Vec<std::path::PathBuf> = Vec::new();
+                    let mut paths_to_remove: Vec<String> = Vec::new();
+
+                    for evt in batch_events {
+                        match evt {
+                            quorum_ingest::WatcherEvent::Create(p)
+                            | quorum_ingest::WatcherEvent::Modify(p) => {
+                                if !is_internal_noise(&p) && p.exists() && !paths_to_index.contains(&p) {
+                                    paths_to_index.push(p);
+                                }
+                            }
+                            quorum_ingest::WatcherEvent::Rename { from, to } => {
+                                if !is_internal_noise(&from) {
+                                    paths_to_remove.push(from.to_string_lossy().to_string());
+                                }
+                                if !is_internal_noise(&to) && to.exists() && !paths_to_index.contains(&to) {
+                                    paths_to_index.push(to);
+                                }
+                            }
+                            quorum_ingest::WatcherEvent::Remove(p) => {
+                                if !is_internal_noise(&p) {
+                                    paths_to_remove.push(p.to_string_lossy().to_string());
+                                }
+                            }
+                            quorum_ingest::WatcherEvent::QueueOverflow { root, .. } => {
+                                if !root.as_os_str().is_empty() && root.exists() && !paths_to_index.contains(&root) {
+                                    paths_to_index.push(root);
+                                }
+                            }
+                        }
+                    }
+
+                    if !paths_to_remove.is_empty() {
+                        let _ = watcher_state.storage.delete_by_file_paths(&paths_to_remove).await;
+                    }
+                    if !paths_to_index.is_empty() {
+                        info!(
+                            changed_count = paths_to_index.len(),
+                            sample = %paths_to_index[0].display(),
+                            "Real-time OS FilesystemWatcher detected disk write; triggering immediate indexing"
+                        );
+                        let _ = watcher_state.watch_and_index_paths(paths_to_index).await;
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            error!("Failed to start real-time OS FilesystemWatcher: {}", e);
+        }
+    }
+
     // Continuously run background crawl & incremental ingestion unconditionally
     let bg_worker = Arc::clone(&reindex_worker);
     let bg_storage = Arc::clone(&storage);
+    let bg_state = Arc::clone(&app_state);
     let bg_data_dir = cli.data_dir.clone();
     let bg_default_paths = ingest_config.watch_paths.clone();
     let bg_shutdown = Arc::clone(&shutdown_notify);
@@ -647,6 +796,10 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 _ => 5,
             }
         });
+        let up_dir = bg_data_dir.join("uploaded_documents");
+        if up_dir.exists() && !priority_user_roots.contains(&up_dir) {
+            priority_user_roots.insert(0, up_dir);
+        }
         if !priority_user_roots.is_empty() {
             let fast_opts = quorum_ingest::ReindexOptions {
                 target_paths: priority_user_roots,
@@ -661,6 +814,11 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         }
         loop {
             let mut target_paths = bg_default_paths.clone();
+            for dyn_p in bg_worker.dynamic_watch_paths() {
+                if !target_paths.contains(&dyn_p) {
+                    target_paths.push(dyn_p);
+                }
+            }
             if let Ok(guard) = quorum_coordinator::global_mesh_dlp_controller()
                 .settings
                 .read()
@@ -669,6 +827,16 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                     if folder.enabled {
                         let p = std::path::PathBuf::from(&folder.path);
                         if !target_paths.contains(&p) {
+                            target_paths.push(p);
+                        }
+                    }
+                }
+            }
+            if let Ok(store) = bg_state.marketplace_store() {
+                if let Ok(cfg) = store.get_config() {
+                    for folder in &cfg.opt_in_folders {
+                        let p = std::path::PathBuf::from(folder);
+                        if p.exists() && !target_paths.contains(&p) {
                             target_paths.push(p);
                         }
                     }

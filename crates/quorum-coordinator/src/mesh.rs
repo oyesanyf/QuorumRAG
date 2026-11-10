@@ -459,6 +459,11 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
         request: &FederatedQueryRequest,
         timeout: Duration,
     ) -> Result<(Vec<FederatedQueryResponse>, quorum_types::FederatedPeerDiagnostics), CoordinatorError> {
+        if crate::artemis_airgap::contains_artemis_query(&request.query_text) {
+            let mut diagnostics = quorum_types::FederatedPeerDiagnostics::new(0, Vec::new());
+            diagnostics.summary_reason = Some("Suppressed outbound query referencing local-only artemis:// URI".to_string());
+            return Ok((Vec::new(), diagnostics));
+        }
         let mut peers = self
             .handle
             .connected_peers()
@@ -840,6 +845,19 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             };
         }
 
+        // 1b. Reject incoming queries targeting airgapped artemis forensic records
+        if crate::artemis_airgap::contains_artemis_query(&req.query_text) {
+            tracing::warn!(
+                "Rejecting inbound P2P mesh query referencing airgapped artemis:// from peer: {}",
+                req.sender_peer_id
+            );
+            return FederatedQueryResponse {
+                query_id: req.query_id,
+                responder_peer_id: self.local_peer_id.clone(),
+                chunks: Vec::new(),
+            };
+        }
+
         // 2. Validate sender_pubkey derives to claimed sender_peer_id
         match quorum_network::derive_peer_id_from_pubkey(&req.sender_pubkey) {
             Ok(derived_id) => {
@@ -1047,6 +1065,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 }
             }
         }
+
+        scored.retain(|c| !crate::artemis_airgap::is_airgap_restricted_chunk(&c.chunk));
 
         let candidate_dtos: Vec<CandidateChunkDto> = scored
             .iter()

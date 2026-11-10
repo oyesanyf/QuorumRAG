@@ -30,10 +30,27 @@ pub async fn start_reindex_handler(
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<ReindexRequest>,
 ) -> impl IntoResponse {
+    let target_paths = payload
+        .target_paths
+        .unwrap_or_else(|| state.reindex_worker.all_watch_paths());
+
+    if let Some(watcher) = state.fs_watcher() {
+        for p in &target_paths {
+            let dir_to_watch = if p.is_dir() {
+                Some(p.as_path())
+            } else {
+                p.parent()
+            };
+            if let Some(d) = dir_to_watch {
+                if d.exists() {
+                    let _ = watcher.watch_path(d);
+                }
+            }
+        }
+    }
+
     let options = ReindexOptions {
-        target_paths: payload
-            .target_paths
-            .unwrap_or_else(|| state.ingest_config.watch_paths.clone()),
+        target_paths: target_paths.clone(),
         full_rebuild: payload.full_rebuild.unwrap_or(false),
         force_reembed: payload.force_reembed.unwrap_or(false),
         batch_size: payload.batch_size.unwrap_or(64),
@@ -57,14 +74,25 @@ pub async fn start_reindex_handler(
             })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "status": "error",
-                "message": e.to_string()
-            })),
-        )
-            .into_response(),
+        Err(_) => match state.reindex_worker.trigger_paths(target_paths).await {
+            Ok(task_id) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "queued_priority",
+                    "task_id": task_id.to_string(),
+                    "message": "Target paths injected at front of active reindex queue"
+                })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": e.to_string()
+                })),
+            )
+                .into_response(),
+        },
     }
 }
 
@@ -74,14 +102,15 @@ pub async fn reindex_status_handler(
 ) -> impl IntoResponse {
     let total_stored_chunks = state.storage.count().await.unwrap_or(0);
     let watched_paths: Vec<String> = state
-        .ingest_config
-        .watch_paths
+        .reindex_worker
+        .all_watch_paths()
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
     match state.reindex_worker.get_progress().await {
-        Some(progress) => {
+        Some(mut progress) => {
+            progress.files_total_estimated = progress.files_total_estimated.max(progress.files_scanned);
             let mut val = serde_json::to_value(&progress).unwrap_or_default();
             if let Some(obj) = val.as_object_mut() {
                 let pct = if progress.files_total_estimated > 0 {
@@ -324,6 +353,23 @@ pub async fn add_documents_handler(
         }
     }
 
+    // Register newly added files/directories with the live OS FilesystemWatcher so future writes trigger instant reindex
+    if let Some(watcher) = state.fs_watcher() {
+        for p in &target_paths {
+            let dir_to_watch = if p.is_dir() {
+                Some(p.as_path())
+            } else {
+                p.parent()
+            };
+            if let Some(d) = dir_to_watch {
+                if d.exists() {
+                    let _ = watcher.watch_path(d);
+                }
+            }
+        }
+    }
+    state.reindex_worker.add_watch_paths(&target_paths);
+
     let options = ReindexOptions {
         target_paths: target_paths.clone(),
         full_rebuild: false,
@@ -336,7 +382,7 @@ pub async fn add_documents_handler(
     let indexed_chunks_delta = match state.reindex_worker.run_reindex_sync(options.clone()).await {
         Ok(prog) => prog.chunks_newly_embedded + prog.chunks_reused_from_cache,
         Err(_) => {
-            let _ = state.reindex_worker.start_reindex(options).await;
+            let _ = state.reindex_worker.trigger_paths(target_paths.clone()).await;
             0
         }
     };

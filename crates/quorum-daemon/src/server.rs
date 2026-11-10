@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::handlers::{cache, chat, drift, export, health, history, langextract, marketplace, media, mesh, reindex, settings};
+use crate::handlers::{artemis, cache, chat, drift, export, health, history, langextract, marketplace, media, mesh, reindex, settings};
 use crate::state::DaemonState;
 
 /// Constructs the complete Axum 0.7 web server Router.
@@ -117,6 +117,17 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         .route("/api/v1/marketplace/issue-cert", post(marketplace::marketplace_test_issue_cert_handler))
         .route("/api/v1/marketplace/test/execute-transaction", post(marketplace::marketplace_test_execute_transaction_handler))
         .route("/api/v1/marketplace/issue-nonce", post(marketplace::marketplace_issue_nonce_handler))
+ 
+        // Artemis DFIR & Forensics Local-Only Endpoints (Disabled by Default)
+        .route("/api/v1/artemis/status", get(artemis::artemis_status_handler))
+        .route(
+            "/api/v1/artemis/config",
+            get(artemis::artemis_get_config_handler)
+                .post(artemis::artemis_update_config_handler)
+                .put(artemis::artemis_update_config_handler),
+        )
+        .route("/api/v1/artemis/collect", post(artemis::artemis_collect_handler))
+        .route("/api/v1/artemis/preview-normalizer", post(artemis::artemis_preview_normalizer_handler))
 
         // Health & Models Telemetry
         .route("/api/health", get(health::health_handler))

@@ -2727,6 +2727,48 @@ function secureRandomIndex(n) {
   });
   btnCloseReindex.addEventListener('click', () => modalReindex.classList.add('hidden'));
 
+  function updateReindexSelectedBadge(folderPath) {
+    const inp = document.getElementById('reindex-target-path');
+    const badge = document.getElementById('reindex-selected-folder-badge');
+    const clearBtn = document.getElementById('btn-clear-reindex-folder');
+    const clean = (folderPath || '').trim();
+    if (inp) inp.value = clean;
+    if (badge) {
+      badge.textContent = clean ? `📁 Selected: ${clean}` : '💽 All Watched Drives & Folders';
+    }
+    if (clearBtn) {
+      clearBtn.classList.toggle('hidden', !clean);
+    }
+  }
+
+  const btnBrowseReindexFolder = document.getElementById('btn-browse-reindex-folder');
+  if (btnBrowseReindexFolder) {
+    btnBrowseReindexFolder.addEventListener('click', async (e) => {
+      e.preventDefault();
+      try {
+        const resp = await fetch('/api/fs/pick-folder', { method: 'POST' });
+        const data = await resp.json();
+        if (data.status === 'ok' && data.path) {
+          updateReindexSelectedBadge(data.path);
+          await window.quorumBrowseDir(data.path);
+          showSettingsToast('✓ Target folder selected: ' + data.path);
+        }
+      } catch (err) {
+        showSettingsToast('Native folder picker failed: ' + err.message);
+      }
+    });
+  }
+
+  const btnClearReindexFolder = document.getElementById('btn-clear-reindex-folder');
+  if (btnClearReindexFolder) {
+    btnClearReindexFolder.addEventListener('click', (e) => {
+      e.preventDefault();
+      updateReindexSelectedBadge('');
+      renderReindexExplorer();
+      showSettingsToast('Target reset to All Watched Drives & Folders');
+    });
+  }
+
   if (modalReindex) {
     modalReindex.addEventListener('click', async (e) => {
       const actionEl = e.target.closest('[data-action]');
@@ -2745,8 +2787,7 @@ function secureRandomIndex(n) {
       } else if (action === 'reindex-pick-folder') {
         e.preventDefault();
         e.stopPropagation();
-        const inp = document.getElementById('reindex-target-path');
-        if (inp && folderPath) inp.value = folderPath;
+        if (folderPath) updateReindexSelectedBadge(folderPath);
         renderReindexExplorer();
         showSettingsToast('Target reindex folder set: ' + folderPath);
       } else if (action === 'trigger-native-folder-picker') {
@@ -2757,8 +2798,7 @@ function secureRandomIndex(n) {
           const data = await resp.json();
           if (data.status === 'ok' && data.path) {
             const chosen = data.path;
-            const inp = document.getElementById('reindex-target-path');
-            if (inp) inp.value = chosen;
+            updateReindexSelectedBadge(chosen);
             await window.quorumBrowseDir(chosen);
             showSettingsToast('✓ Target folder set: ' + chosen);
           }
@@ -2811,15 +2851,19 @@ function secureRandomIndex(n) {
   const liveIndexerCard = document.getElementById('live-indexer-card');
   const topIndexProgressPill = document.getElementById('top-index-progress-pill');
   if (liveIndexerCard) {
-    liveIndexerCard.addEventListener('click', () => {
+    liveIndexerCard.addEventListener('click', async () => {
       modalReindex.classList.remove('hidden');
       checkReindexStatus();
+      await fetchBrowseFolders(currentBrowsePath);
+      renderReindexExplorer();
     });
   }
   if (topIndexProgressPill) {
-    topIndexProgressPill.addEventListener('click', () => {
+    topIndexProgressPill.addEventListener('click', async () => {
       modalReindex.classList.remove('hidden');
       checkReindexStatus();
+      await fetchBrowseFolders(currentBrowsePath);
+      renderReindexExplorer();
     });
   }
 
@@ -2837,7 +2881,7 @@ function secureRandomIndex(n) {
       const data = await r.json();
       const phase = data.phase || 'scanning_filesystem';
       const scanned = Number(data.files_scanned || 0);
-      const totalEst = Number(data.files_total_estimated || 0);
+      const totalEst = Math.max(scanned, Number(data.files_total_estimated || 0));
       const indexed = Number(data.files_indexed || 0);
       const skipped = Number(data.files_skipped_unmodified || 0);
       const newChunks = Number(data.chunks_newly_embedded || 0);
@@ -3177,6 +3221,9 @@ function secureRandomIndex(n) {
   }
 
   let cachedMarketplaceStatus = null;
+  let cachedArtemisStatus = null;
+  let cachedArtemisConfig = null;
+  let artemisSelectedDir = '';
 
   async function fetchMarketplaceData() {
     try {
@@ -3192,6 +3239,25 @@ function secureRandomIndex(n) {
     }
   }
 
+  async function fetchArtemisData() {
+    try {
+      const [statusRes, configRes] = await Promise.allSettled([
+        fetch('/api/v1/artemis/status'),
+        fetch('/api/v1/artemis/config')
+      ]);
+      if (statusRes.status === 'fulfilled' && statusRes.value.ok) {
+        cachedArtemisStatus = await statusRes.value.json();
+      }
+      if (configRes.status === 'fulfilled' && configRes.value.ok) {
+        cachedArtemisConfig = await configRes.value.json();
+      }
+      return { status: cachedArtemisStatus, config: cachedArtemisConfig };
+    } catch (e) {
+      console.error('Error fetching Artemis DFIR status:', e);
+      return null;
+    }
+  }
+
   async function openSettingsView(tab = 'general') {
     activeSettingsTab = tab;
     const mktModal = document.getElementById('modal-marketplace');
@@ -3201,11 +3267,12 @@ function secureRandomIndex(n) {
     highlightSettingsNav(tab);
     await Promise.all([
       loadFullSettings(),
-      fetchMarketplaceData()
+      fetchMarketplaceData(),
+      fetchBrowseFolders(currentBrowsePath),
+      fetchArtemisData()
     ]);
-    if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace') {
+    if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace' || tab === 'dlp' || tab === 'artemis-dfir') {
       await fetchMeshData();
-      await fetchBrowseFolders(currentBrowsePath);
     }
     renderSettingsTabContent(activeSettingsTab, settingsSearchInput ? settingsSearchInput.value : '');
   }
@@ -3263,9 +3330,14 @@ function secureRandomIndex(n) {
       if (tab === 'general' || tab === 'marketplace' || tab === 'marketplace-ledger') {
         await fetchMarketplaceData();
       }
+      if (tab === 'artemis-dfir') {
+        await fetchArtemisData();
+      }
+      if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace' || tab === 'general' || tab === 'dlp' || tab === 'artemis-dfir') {
+        await fetchBrowseFolders(currentBrowsePath);
+      }
       if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace') {
         await fetchMeshData();
-        await fetchBrowseFolders(currentBrowsePath);
       }
       renderSettingsTabContent(tab, '');
     });
@@ -3283,7 +3355,8 @@ function secureRandomIndex(n) {
           || ((q.includes('opt') || q.includes('sell') || q.includes('consent') || q.includes('personal') || q.includes('market')) && (tab === 'marketplace' || tab === 'marketplace-ledger'))
           || ((q.includes('ledger') || q.includes('bounty') || q.includes('revenue')) && tab === 'marketplace-ledger')
           || ((q.includes('stream') || q.includes('reindex') || q.includes('drift') || q.includes('diag')) && tab === 'diagnostics')
-          || (q.includes('folder') && (tab === 'marketplace' || tab === 'mesh' || tab === 'storage'))
+          || (q.includes('folder') && (tab === 'marketplace' || tab === 'mesh' || tab === 'storage' || tab === 'artemis-dfir'))
+          || ((q.includes('artemis') || q.includes('dfir') || q.includes('forensic') || q.includes('telemetry') || q.includes('evtx')) && tab === 'artemis-dfir')
           || (q.includes('share') && tab === 'mesh');
         btn.style.display = match ? 'flex' : 'none';
       });
@@ -3299,6 +3372,9 @@ function secureRandomIndex(n) {
       } else if (q.includes('phi') || q.includes('dlp') || q.includes('redact') || q.includes('hipaa')) {
         activeSettingsTab = 'dlp';
         highlightSettingsNav('dlp');
+      } else if (q.includes('artemis') || q.includes('dfir') || q.includes('forensic') || q.includes('telemetry') || q.includes('evtx')) {
+        activeSettingsTab = 'artemis-dfir';
+        highlightSettingsNav('artemis-dfir');
       } else if (q.includes('mesh') || q.includes('share') || q.includes('peer')) {
         activeSettingsTab = 'mesh';
         highlightSettingsNav('mesh');
@@ -3535,6 +3611,7 @@ function secureRandomIndex(n) {
       })
     });
     await fetchMarketplaceData();
+    checkReindexStatus();
     renderSettingsTabContent(activeSettingsTab, '');
     if (toastMsg) showSettingsToast(toastMsg);
   }
@@ -3544,6 +3621,37 @@ function secureRandomIndex(n) {
     renderSettingsTabContent(activeSettingsTab, '');
     renderReindexExplorer();
     showSettingsToast(pathStr ? ('Browsing ' + pathStr) : 'Showing physical drives');
+  };
+
+  window.quorumIndexFolderImmediate = async function(folderPath) {
+    const clean = (folderPath || '').trim();
+    if (!clean) return;
+    const inp = document.getElementById('new-doc-path-input');
+    if (inp) inp.value = clean;
+    const chkOptIn = document.getElementById('chk-add-doc-optin');
+    showSettingsToast('⏳ Watching & indexing folder immediately: ' + clean);
+    try {
+      const resp = await fetch('/api/documents/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          local_paths: [clean],
+          add_to_opt_in: !!(chkOptIn && chkOptIn.checked)
+        })
+      });
+      const resData = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showSettingsToast('⚠ ' + (resData.error || 'Failed to index folder'));
+        return;
+      }
+      await fetchMarketplaceData();
+      await loadFullSettings();
+      checkReindexStatus();
+      renderSettingsTabContent(activeSettingsTab, '');
+      showSettingsToast(`✓ Watched & indexed folder: ${clean}`);
+    } catch (err) {
+      showSettingsToast('⚠ Folder indexing error: ' + err.message);
+    }
   };
 
   window.quorumShareFolder = async function(pathStr) {
@@ -3563,8 +3671,9 @@ function secureRandomIndex(n) {
     }
     await loadFullSettings();
     await fetchBrowseFolders(currentBrowsePath);
+    checkReindexStatus();
     renderSettingsTabContent('mesh', '');
-    showSettingsToast('✓ Shared folder with Mesh: ' + pathStr.trim());
+    showSettingsToast('✓ Shared & indexing folder: ' + pathStr.trim());
   };
 
   window.quorumRemoveSharedFolder = async function(pathStr) {
@@ -3587,6 +3696,7 @@ function secureRandomIndex(n) {
     });
     await loadFullSettings();
     await fetchBrowseFolders(currentBrowsePath);
+    checkReindexStatus();
     renderSettingsTabContent('mesh', '');
     showSettingsToast(enabled ? ('✓ Enabled Mesh sharing for ' + pathStr) : ('Paused Mesh sharing for ' + pathStr));
   };
@@ -3959,16 +4069,34 @@ function secureRandomIndex(n) {
               showSettingsToast('✓ Selected folder: ' + chosen);
               await window.quorumBrowseDir(chosen);
               if (ctx === 'reindex') {
-                const inp = document.getElementById('reindex-target-path');
-                if (inp) inp.value = chosen;
+                updateReindexSelectedBadge(chosen);
                 renderReindexExplorer();
-              } else if (ctx === 'newdoc') {
-                const inp = document.getElementById('new-doc-path-input');
-                if (inp) inp.value = chosen;
+              } else if (ctx === 'newdoc' || ctx === 'storage') {
+                await window.quorumIndexFolderImmediate(chosen);
               } else if (ctx === 'mesh') {
                 await window.quorumShareFolder(chosen);
               } else if (ctx === 'mkt' || ctx === 'general') {
                 await toggleMarketplaceFolder(chosen, true);
+              } else if (ctx === 'dlp') {
+                const simPathInp = document.getElementById('dlp-sim-path');
+                const simPathBadge = document.getElementById('dlp-sim-path-badge');
+                const fullSimPath = chosen.replace(/[\\/]+$/, '') + '\\clinical_note.txt';
+                if (simPathInp) simPathInp.value = fullSimPath;
+                if (simPathBadge) simPathBadge.textContent = fullSimPath;
+              } else if (ctx === 'artemis') {
+                artemisSelectedDir = chosen;
+                const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
+                const displayPill = document.getElementById('artemis-selected-folder-display');
+                if (hiddenInp) hiddenInp.value = chosen;
+                if (displayPill) {
+                  displayPill.textContent = '📁 Selected: ' + chosen;
+                  displayPill.title = chosen;
+                  displayPill.style.color = '#10a37f';
+                  displayPill.style.background = 'rgba(16,163,127,0.15)';
+                  displayPill.style.borderColor = 'rgba(16,163,127,0.35)';
+                }
+                renderSettingsTabContent('artemis-dfir', '');
+                showSettingsToast('✓ Selected Artemis DFIR folder: ' + chosen);
               }
             } else {
               showSettingsToast('Folder selection cancelled');
@@ -3979,13 +4107,27 @@ function secureRandomIndex(n) {
           break;
         }
 
+        case 'dlp-select-sim-folder': {
+          e.preventDefault();
+          e.stopPropagation();
+          if (folderPath) {
+            const simPathInp = document.getElementById('dlp-sim-path');
+            const simPathBadge = document.getElementById('dlp-sim-path-badge');
+            const fullSimPath = /\.[a-z0-9]{2,5}$/i.test(folderPath)
+              ? folderPath
+              : (folderPath.replace(/[\\/]+$/, '') + '\\clinical_note.txt');
+            if (simPathInp) simPathInp.value = fullSimPath;
+            if (simPathBadge) simPathBadge.textContent = fullSimPath;
+            showSettingsToast('✓ Simulated folder set: ' + fullSimPath);
+          }
+          break;
+        }
+
         case 'newdoc-pick-folder': {
           e.preventDefault();
           e.stopPropagation();
           if (folderPath) {
-            const inp = document.getElementById('new-doc-path-input');
-            if (inp) inp.value = folderPath;
-            showSettingsToast('Selected for indexing: ' + folderPath);
+            await window.quorumIndexFolderImmediate(folderPath);
           }
           break;
         }
@@ -3994,10 +4136,280 @@ function secureRandomIndex(n) {
           e.preventDefault();
           e.stopPropagation();
           if (folderPath) {
-            const inp = document.getElementById('reindex-target-path');
-            if (inp) inp.value = folderPath;
+            updateReindexSelectedBadge(folderPath);
             renderReindexExplorer();
             showSettingsToast('Target reindex folder set: ' + folderPath);
+          }
+          break;
+        }
+
+        case 'artemis-pick-folder':
+        case 'artemis-select-folder': {
+          e.preventDefault();
+          e.stopPropagation();
+          const target = folderPath || currentBrowsePath;
+          if (target) {
+            artemisSelectedDir = target;
+            const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
+            const displayPill = document.getElementById('artemis-selected-folder-display');
+            if (hiddenInp) hiddenInp.value = target;
+            if (displayPill) {
+              displayPill.textContent = '📁 Selected: ' + target;
+              displayPill.title = target;
+              displayPill.style.color = '#10a37f';
+              displayPill.style.background = 'rgba(16,163,127,0.15)';
+              displayPill.style.borderColor = 'rgba(16,163,127,0.35)';
+            }
+            renderSettingsTabContent('artemis-dfir', '');
+            showSettingsToast('Target forensic folder set: ' + target);
+          }
+          break;
+        }
+
+        case 'artemis-select-active-folder': {
+          e.preventDefault();
+          e.stopPropagation();
+          const target = (actionEl.dataset.folderPath || currentBrowsePath || '').trim();
+          if (target) {
+            artemisSelectedDir = target;
+            const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
+            const displayPill = document.getElementById('artemis-selected-folder-display');
+            if (hiddenInp) hiddenInp.value = target;
+            if (displayPill) {
+              displayPill.textContent = '📁 Selected: ' + target;
+              displayPill.title = target;
+              displayPill.style.color = '#10a37f';
+              displayPill.style.background = 'rgba(16,163,127,0.15)';
+              displayPill.style.borderColor = 'rgba(16,163,127,0.35)';
+            }
+            renderSettingsTabContent('artemis-dfir', '');
+            showSettingsToast('Target forensic folder set: ' + target);
+          }
+          break;
+        }
+
+        case 'artemis-clear-selected-folder': {
+          e.preventDefault();
+          e.stopPropagation();
+          artemisSelectedDir = '';
+          const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
+          const displayPill = document.getElementById('artemis-selected-folder-display');
+          if (hiddenInp) hiddenInp.value = '';
+          if (displayPill) {
+            displayPill.textContent = 'No folder selected';
+            displayPill.title = 'No folder selected';
+            displayPill.style.color = 'var(--text-muted)';
+            displayPill.style.background = 'rgba(255,255,255,0.06)';
+            displayPill.style.borderColor = 'var(--border-color)';
+          }
+          renderSettingsTabContent('artemis-dfir', '');
+          showSettingsToast('Cleared selected folder. Target set to Live OS Telemetry.');
+          break;
+        }
+
+        case 'artemis-toggle-collection': {
+          const isChecked = actionEl.checked;
+          try {
+            const resp = await fetch('/api/v1/artemis/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ local_collection_enabled: isChecked })
+            });
+            if (resp.ok) {
+              await fetchArtemisData();
+              renderSettingsTabContent('artemis-dfir', '');
+              showSettingsToast(isChecked ? '✓ Local Artemis DFIR collection enabled' : 'Local collection disabled');
+            } else {
+              showSettingsToast('Failed to update collection toggle');
+            }
+          } catch (err) {
+            showSettingsToast('Network error: ' + err.message);
+          }
+          break;
+        }
+
+        case 'artemis-toggle-harvest': {
+          const isChecked = actionEl.checked;
+          try {
+            const resp = await fetch('/api/v1/artemis/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ marketplace_harvest_enabled: isChecked })
+            });
+            if (resp.ok) {
+              await fetchArtemisData();
+              renderSettingsTabContent('artemis-dfir', '');
+              showSettingsToast(isChecked ? '✓ Artemis training data harvesting enabled' : 'Harvesting disabled');
+            } else {
+              showSettingsToast('Failed to update harvest toggle');
+            }
+          } catch (err) {
+            showSettingsToast('Network error: ' + err.message);
+          }
+          break;
+        }
+
+        case 'artemis-toggle-redact': {
+          const isChecked = actionEl.checked;
+          try {
+            await fetch('/api/v1/artemis/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ redact_secrets: isChecked })
+            });
+            await fetchArtemisData();
+            showSettingsToast(isChecked ? 'Secret redaction active' : 'Secret redaction disabled');
+          } catch (_) {}
+          break;
+        }
+
+        case 'artemis-toggle-normalize': {
+          const isChecked = actionEl.checked;
+          try {
+            await fetch('/api/v1/artemis/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ normalize_for_harvest: isChecked })
+            });
+            await fetchArtemisData();
+            showSettingsToast(isChecked ? 'Structural normalization active' : 'Normalization disabled');
+          } catch (_) {}
+          break;
+        }
+
+        case 'artemis-toggle-category': {
+          const cat = actionEl.dataset.category;
+          if (!cat) break;
+          const art = cachedArtemisStatus || {};
+          let curCats = Array.isArray(art.allowed_artifact_categories) ? [...art.allowed_artifact_categories] : [];
+          if (actionEl.checked) {
+            if (!curCats.includes(cat)) curCats.push(cat);
+          } else {
+            curCats = curCats.filter(c => c !== cat);
+          }
+          try {
+            const resp = await fetch('/api/v1/artemis/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ allowed_artifact_categories: curCats })
+            });
+            if (resp.ok) {
+              await fetchArtemisData();
+              showSettingsToast(`Updated artifact category: ${cat}`);
+            }
+          } catch (err) {
+            showSettingsToast('Error updating categories: ' + err.message);
+          }
+          break;
+        }
+
+        case 'trigger-artemis-collect': {
+          e.preventDefault();
+          const targetPath = (artemisSelectedDir || '').trim();
+          const resultBox = document.getElementById('artemis-collect-result-box');
+          const resultText = document.getElementById('artemis-collect-result-text');
+          const btn = actionEl;
+          if (resultBox) resultBox.classList.remove('hidden');
+          if (resultText) resultText.textContent = 'Running Artemis forensic ingestion...';
+          if (btn) btn.disabled = true;
+
+          const payload = {
+            source_type: targetPath ? 'folder' : 'live'
+          };
+          if (targetPath) {
+            payload.target_path = targetPath;
+          }
+
+          try {
+            const resp = await fetch('/api/v1/artemis/collect', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              const errMsg = data.error || ('Collection rejected (HTTP ' + resp.status + ')');
+              if (resultText) resultText.textContent = '⚠ ' + errMsg;
+              showSettingsToast('⚠ Artemis collection failed: ' + errMsg);
+            } else {
+              const msg = `✓ Completed: ${data.records_parsed || 0} records parsed, ${data.chunks_indexed || 0} chunks indexed into local storage (${data.elapsed_ms || 0}ms)`;
+              if (resultText) resultText.textContent = msg;
+              showSettingsToast(msg);
+              await fetchArtemisData();
+            }
+          } catch (err) {
+            if (resultText) resultText.textContent = '⚠ Network error: ' + err.message;
+            showSettingsToast('Collection error: ' + err.message);
+          } finally {
+            if (btn) btn.disabled = false;
+          }
+          break;
+        }
+
+        case 'test-artemis-preview': {
+          e.preventDefault();
+          const inp = document.getElementById('artemis-preview-input');
+          const saltInp = document.getElementById('artemis-preview-salt');
+          const text = inp ? inp.value.trim() : '';
+          const salt = saltInp ? saltInp.value.trim() : 'session-preview-salt-1';
+          if (!text) {
+            showSettingsToast('Please enter sample forensic telemetry first');
+            return;
+          }
+          const btn = actionEl;
+          if (btn) btn.disabled = true;
+          try {
+            const resp = await fetch('/api/v1/artemis/preview-normalizer', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sample_text: text, session_salt: salt })
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              showSettingsToast('⚠ Normalizer error: ' + (data.error || resp.status));
+            } else {
+              const prev = data.preview || data;
+              const resCont = document.getElementById('artemis-preview-result-container');
+              const metricTotal = document.getElementById('artemis-metric-total');
+              const metricUsers = document.getElementById('artemis-metric-users');
+              const metricHosts = document.getElementById('artemis-metric-hosts');
+              const metricIps = document.getElementById('artemis-metric-ips');
+              const metricShares = document.getElementById('artemis-metric-shares');
+              const mappingsTbody = document.getElementById('artemis-preview-mappings-tbody');
+              const normTextEl = document.getElementById('artemis-preview-normalized-text');
+
+              if (resCont) resCont.style.display = 'block';
+              if (metricTotal) metricTotal.textContent = `Total Replacements: ${prev.total_replacements || data.total_replacements || 0}`;
+              if (metricUsers) metricUsers.textContent = `Users: ${prev.usernames_replaced || 0}`;
+              if (metricHosts) metricHosts.textContent = `Hosts: ${prev.hostnames_replaced || 0}`;
+              if (metricIps) metricIps.textContent = `IPs: ${prev.ips_replaced || 0}`;
+              if (metricShares) metricShares.textContent = `SMB Shares: ${prev.smb_shares_replaced || 0}`;
+
+              if (mappingsTbody) {
+                const maps = prev.pseudonym_mappings || data.pseudonym_mappings || {};
+                const entries = Object.entries(maps);
+                if (entries.length === 0) {
+                  mappingsTbody.innerHTML = '<tr><td colspan="2" style="opacity:0.7;">No identifiers replaced in sample text.</td></tr>';
+                } else {
+                  mappingsTbody.innerHTML = entries.map(([orig, pseudo]) => `
+                    <tr>
+                      <td><code>${escapeHtml(orig)}</code></td>
+                      <td><code>${escapeHtml(pseudo)}</code></td>
+                    </tr>
+                  `).join('');
+                }
+              }
+
+              if (normTextEl) {
+                normTextEl.textContent = prev.normalized_text || data.normalized || '';
+              }
+
+              showSettingsToast(`✓ Pseudonymized ${prev.total_replacements || data.total_replacements || 0} identifier(s)`);
+            }
+          } catch (err) {
+            showSettingsToast('Preview error: ' + err.message);
+          } finally {
+            if (btn) btn.disabled = false;
           }
           break;
         }
@@ -4023,12 +4435,7 @@ function secureRandomIndex(n) {
         case 'select-shared-pill':
           e.preventDefault();
           if (folderPath) {
-            const input = document.getElementById('new-shared-folder-input');
-            if (input) {
-              input.value = folderPath;
-              input.focus();
-            }
-            await window.quorumBrowseDir(folderPath);
+            await window.quorumShareFolder(folderPath);
           }
           break;
 
@@ -4764,6 +5171,7 @@ function secureRandomIndex(n) {
             return;
           }
           await fetchMarketplaceData();
+          checkReindexStatus();
           renderSettingsTabContent(activeSettingsTab, '');
           showSettingsToast(`✓ Added & indexed: ${pathVal}`);
           break;
@@ -4927,11 +5335,32 @@ function secureRandomIndex(n) {
               break;
             }
             await fetchMarketplaceData();
+            checkReindexStatus();
             renderSettingsTabContent(activeSettingsTab, '');
             showSettingsToast(`✓ Added & indexed ${resData.added_count || files.length} new document(s)`);
           } catch (err) {
             showSettingsToast('⚠ Upload failed: ' + err.message);
           }
+          break;
+        }
+
+        case 'artemis-upload-folder': {
+          const files = changeEl.files ? Array.from(changeEl.files) : [];
+          if (files.length === 0) break;
+          const folderName = files[0].webkitRelativePath ? files[0].webkitRelativePath.split('/')[0] : 'Uploaded Forensic Folder';
+          artemisSelectedDir = folderName;
+          const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
+          const displayPill = document.getElementById('artemis-selected-folder-display');
+          if (hiddenInp) hiddenInp.value = folderName;
+          if (displayPill) {
+            displayPill.textContent = `📁 Folder Upload: ${folderName} (${files.length} files)`;
+            displayPill.title = folderName;
+            displayPill.style.color = '#10a37f';
+            displayPill.style.background = 'rgba(16,163,127,0.15)';
+            displayPill.style.borderColor = 'rgba(16,163,127,0.35)';
+          }
+          renderSettingsTabContent('artemis-dfir', '');
+          showSettingsToast(`Selected ${files.length} forensic file(s) from "${folderName}"`);
           break;
         }
       }
@@ -5227,13 +5656,16 @@ function secureRandomIndex(n) {
             ${selectedFoldersHtml}
           </div>
 
-          <div style="display:flex; gap:8px; margin-top:10px; margin-bottom:12px; flex-wrap:wrap;">
-            <input type="text" id="mkt-folder-input" class="settings-input" style="flex:1; min-width:240px;" placeholder="Or enter any custom folder path to Opt-In (e.g. D:\\Research or C:\\Projects)..." value="${escapeHtml(currentBrowsePath || '')}">
-            <button type="button" class="pill-btn" data-action="mkt-add-input-folder" style="background:var(--accent); color:#fff; border-color:var(--accent);">+ Add Custom Folder Path</button>
+          <input type="hidden" id="mkt-folder-input" value="${escapeHtml(currentBrowsePath || '')}">
+          <div style="display:flex; gap:8px; margin-top:10px; margin-bottom:12px; flex-wrap:wrap; align-items:center;">
+            <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="mkt" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">
+              📂 Browse &amp; Select Folder (OS Dialog)...
+            </button>
+            ${currentBrowsePath ? `<button type="button" class="pill-btn" data-action="mkt-toggle-folder" data-folder-path="${escapeHtml(currentBrowsePath)}" style="border-color:#10a37f; color:#10a37f; font-weight:600;">+ Select Active Folder (${escapeHtml(currentBrowsePath)})</button>` : ''}
           </div>
 
           <div>
-            <div style="font-size:13px; font-weight:700; margin-bottom:4px;">💽 Browse Physical Drives &amp; Folders (Windows File Explorer):</div>
+            <div style="font-size:13px; font-weight:700; margin-bottom:4px;">💽 Click Any Drive or Folder Below to Select for Opt-In:</div>
             ${renderWindowsFileExplorerHtml({
               contextId: 'mkt',
               currentPath: currentBrowsePath,
@@ -5250,37 +5682,40 @@ function secureRandomIndex(n) {
           </div>
         </div>
 
-        <!-- STEP 3: ADD NEW DOCUMENTS (UPLOAD FILES OR INDEX LOCAL DOCUMENT PATH) -->
-        <div class="settings-section-heading">Step 3: Add New Documents (Upload Files or Index Document Path)</div>
+        <!-- STEP 3: ADD NEW DOCUMENTS OR FOLDERS (CLICK TO SELECT — NO TYPING REQUIRED) -->
+        <div class="settings-section-heading">Step 3: Add New Documents or Folders (Click to Select &amp; Index Immediately)</div>
         <div class="settings-card">
           <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
             <div>
-              <div style="font-weight:700; font-size:14.5px;">📄 Add New Documents to QuorumRAG Index &amp; Opt-In Scope</div>
+              <div style="font-weight:700; font-size:14.5px;">📄 Click to Upload Documents or Select Any Folder to Watch &amp; Index</div>
               <div style="font-size:12.5px; color:var(--text-muted); margin-top:2px;">
-                Upload new files (<code>.pdf, .docx, .doc, .txt, .md, .csv, .json, .png, .jpg</code>) via native file picker or index any local document path.
+                Select files (<code>.pdf, .docx, .doc, .txt, .md, .csv, .json, .png, .jpg</code>) or click any folder below — indexing and real-time file watching begin immediately.
               </div>
             </div>
-            <div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
               <input type="file" id="add-new-docs-file-input" multiple accept=".pdf,.docx,.doc,.txt,.md,.csv,.json,.png,.jpg,.jpeg" style="display:none;" data-change-action="upload-new-documents">
+              <input type="file" id="add-new-folder-file-input" webkitdirectory directory multiple style="display:none;" data-change-action="upload-new-documents">
               <button type="button" class="pill-btn" data-action="trigger-file-click" data-target-id="add-new-docs-file-input" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">
-                📄 + Upload New Documents
+                📄 + Select &amp; Upload Documents
+              </button>
+              <button type="button" class="pill-btn" data-action="trigger-file-click" data-target-id="add-new-folder-file-input" style="font-weight:600;">
+                📁 + Upload Entire Folder
+              </button>
+              <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="newdoc" style="border-color:#10a37f; color:#10a37f; font-weight:600;">
+                📂 + Browse &amp; Select Local Folder...
               </button>
             </div>
           </div>
 
+          <input type="hidden" id="new-doc-path-input" value="">
           <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; margin-bottom:10px;">
             <input type="checkbox" id="chk-add-doc-optin" checked style="width:16px; height:16px; accent-color:#10a37f; cursor:pointer;">
-            <span>Also include newly added documents in my Opt-In scope (<code>opt_in_folders</code>)</span>
+            <span>Also include newly selected folders/documents in my Opt-In scope (<code>opt_in_folders</code>)</span>
           </label>
 
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <input type="text" id="new-doc-path-input" class="settings-input" style="flex:1; min-width:240px;" placeholder="Or enter a local document or folder path to index (e.g. D:\\Docs\\Paper.pdf)...">
-            <button type="button" class="pill-btn" data-action="add-new-doc-path">+ Add &amp; Index Document Path</button>
-          </div>
-
-          <div style="margin-top:12px;">
+          <div style="margin-top:8px;">
             <div style="font-size:12.5px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">
-              Or browse and click a folder on your computer to index:
+              Or click any folder below to watch &amp; index it immediately:
             </div>
             ${renderWindowsFileExplorerHtml({
               contextId: 'newdoc',
@@ -5288,11 +5723,11 @@ function secureRandomIndex(n) {
               parentPath: currentBrowseParentPath,
               drives: cachedDrives,
               directories: cachedBrowseDirs,
-              selectedSet: new Set(),
+              selectedSet: new Set((rt.watched_paths || []).map(p => String(p || '').toLowerCase())),
               selectAction: 'newdoc-pick-folder',
-              selectButtonText: 'Use Folder',
+              selectButtonText: '+ Watch & Index Folder',
               activePathAction: 'newdoc-pick-folder',
-              activePathButtonText: 'Use Active Folder for Indexing',
+              activePathButtonText: '+ Watch & Index Active Folder',
               allowNativeDialog: true
             })}
           </div>
@@ -6344,10 +6779,11 @@ function secureRandomIndex(n) {
 
           <div style="margin-bottom:14px;">${foldersListHtml}</div>
 
-          <!-- Add Folder by Path -->
-          <div style="display:flex; gap:8px; margin-bottom:14px;">
-            <input type="text" id="new-shared-folder-input" class="settings-input" style="flex:1;" placeholder="Enter folder path to share with Mesh (e.g. D:\\harfile\\QuorumRAG\\docs)" data-keydown-action="share-folder-enter">
-            <button type="button" class="btn-primary" style="cursor:pointer;" data-action="share-input-folder">+ Share Folder with Mesh</button>
+          <!-- Click to Select Folder to Share -->
+          <input type="hidden" id="new-shared-folder-input" value="">
+          <div style="display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; align-items:center;">
+            <button type="button" class="btn-primary" style="cursor:pointer;" data-action="trigger-native-folder-picker" data-context="mesh">📂 Browse &amp; Select Folder to Share (OS Dialog)...</button>
+            ${currentBrowsePath ? `<button type="button" class="pill-btn" style="cursor:pointer; border-color:#10a37f; color:#10a37f; font-weight:600;" data-action="share-folder" data-folder-path="${escapeHtml(currentBrowsePath)}">+ Share Active Folder (${escapeHtml(currentBrowsePath)})</button>` : ''}
           </div>
 
           <!-- Interactive Windows File Explorer for Mesh Sharing -->
@@ -6574,8 +7010,13 @@ function secureRandomIndex(n) {
             <button class="btn-primary" data-action="run-dlp-test">Run Live DLP Inspection</button>
           </div>
           <div style="margin-bottom:8px;">
-            <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:4px;">Simulated Source File Path:</label>
-            <input type="text" id="dlp-sim-path" class="settings-input" style="width:100%;" value="D:\\harfile\\QuorumRAG\\docs\\clinical_note.txt">
+            <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:4px;">Simulated Source Folder / File (Click to Select — No Typing Required):</label>
+            <input type="hidden" id="dlp-sim-path" value="D:\\harfile\\QuorumRAG\\docs\\clinical_note.txt">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <span id="dlp-sim-path-badge" class="status-pill healthy" style="font-size:12px; padding:4px 10px;">📁 <code id="dlp-sim-path-text">D:\harfile\QuorumRAG\docs\clinical_note.txt</code></span>
+              <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="dlp" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">📂 Browse &amp; Select Folder...</button>
+              ${(mesh.shared_folders || []).map(sf => `<button type="button" class="pill-btn" data-action="dlp-select-sim-folder" data-folder-path="${escapeHtml(sf.path)}" style="font-size:11.5px;">📁 ${escapeHtml(sf.path)}</button>`).join('')}
+            </div>
           </div>
           <div>
             <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:4px;">Sample Payload Containing HIPAA PHI &amp; PII:</label>
@@ -6604,6 +7045,328 @@ function secureRandomIndex(n) {
               ${eventsHtml || '<tr><td colspan="5" style="padding:10px; font-size:12px; color:var(--text-muted); text-align:center;">No Mesh DLP interceptions recorded yet. Click "Run Live DLP Inspection" above to test!</td></tr>'}
             </tbody>
           </table>
+        </div>
+        </div>
+      `;
+    } else if (tab === 'artemis-dfir') {
+      const art = cachedArtemisStatus || {
+        collection_enabled: false,
+        marketplace_harvest_enabled: false,
+        airgap_enforced: true,
+        current_platform: 'windows',
+        allowed_artifact_categories: [
+          'process_execution', 'network_connection', 'registry_persistence',
+          'system_event_log', 'prefetch_amcache_execution', 'service_daemon'
+        ],
+        prohibited_artifact_categories: [
+          'browser_cookies', 'browser_history_oauth', 'credential_store', 'shell_history_raw'
+        ],
+        redact_secrets: true,
+        normalize_for_harvest: true,
+        total_collected_records: 0
+      };
+
+      const artCfg = cachedArtemisConfig || {};
+      const isCollectionEnabled = artCfg.local_collection_enabled !== undefined ? !!artCfg.local_collection_enabled : !!art.collection_enabled;
+      const isHarvestEnabled = artCfg.marketplace_harvest_enabled !== undefined ? !!artCfg.marketplace_harvest_enabled : !!art.marketplace_harvest_enabled;
+      const isRedactEnabled = artCfg.redact_secrets !== undefined ? !!artCfg.redact_secrets : (art.redact_secrets !== false);
+      const isNormalizeEnabled = artCfg.normalize_for_harvest !== undefined ? !!artCfg.normalize_for_harvest : (art.normalize_for_harvest !== false);
+
+      const activeAllowedCats = new Set((artCfg.allowed_artifact_categories || art.allowed_artifact_categories || [
+        'process_execution', 'network_connection', 'registry_persistence',
+        'system_event_log', 'prefetch_amcache_execution', 'service_daemon'
+      ]).map(c => String(c).toLowerCase()));
+
+      const defensiveCategories = [
+        { id: 'process_execution', name: 'Process Execution', desc: 'Process creation trees, parent PID, command lines, image paths, and token users.' },
+        { id: 'network_connection', name: 'Network Connection', desc: 'Active network sockets, listening ports, remote IPs, protocols, and state transitions.' },
+        { id: 'registry_persistence', name: 'Registry Persistence', desc: 'Auto-start Run keys, Windows service registrations, and IFEO debugger hooks.' },
+        { id: 'system_event_log', name: 'System Event Logs', desc: 'Structured EVTX security channels, Linux auditd/journald, and macOS Unified Logs.' },
+        { id: 'prefetch_amcache_execution', name: 'Prefetch & Amcache Execution', desc: 'Execution evidence, run counts, hash references, and last execution timestamps.' },
+        { id: 'service_daemon', name: 'Services & Daemons', desc: 'Systemd units, macOS launchd plists, and Windows background service manifests.' }
+      ];
+
+      const prohibitedCategories = [
+        { id: 'browser_cookies', name: 'Browser Cookies', desc: 'Session tokens, authentication cookies, and session state keys.' },
+        { id: 'browser_history_oauth', name: 'Browser History & OAuth Tokens', desc: 'Browsing URLs, OAuth callback authorization codes, and personal web history.' },
+        { id: 'credential_store', name: 'Credential Store & Vaults', desc: 'LSASS memory dumps, Windows DPAPI vaults, macOS Keychain, and Linux shadow.' },
+        { id: 'shell_history_raw', name: 'Raw Shell History', desc: 'Unsanitized .bash_history and PSReadLine history containing raw interactive secrets.' }
+      ];
+
+      const defensiveRowsHtml = defensiveCategories.map(cat => `
+        <div class="settings-row" style="padding:10px 14px; border-bottom:1px solid var(--border-subtle, rgba(255,255,255,0.06));">
+          <div class="settings-row-info">
+            <label for="chk-artemis-cat-${cat.id}" class="settings-row-label" style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+              <span>${cat.name}</span>
+              <span style="font-size:10.5px; padding:2px 7px; border-radius:999px; background:rgba(16,163,127,0.18); color:#10a37f; font-weight:700;">✅ ALLOWLISTED</span>
+            </label>
+            <div class="settings-row-desc">${cat.desc} (<code>${cat.id}</code>)</div>
+          </div>
+          <input id="chk-artemis-cat-${cat.id}" type="checkbox" class="quorum-switch" ${activeAllowedCats.has(cat.id.toLowerCase()) ? 'checked' : ''} data-action="artemis-toggle-category" data-category="${cat.id}">
+        </div>
+      `).join('');
+
+      const prohibitedRowsHtml = prohibitedCategories.map(cat => `
+        <div class="settings-row" style="padding:10px 14px; border-bottom:1px solid var(--border-subtle, rgba(255,255,255,0.06)); background:rgba(239,68,68,0.03);">
+          <div class="settings-row-info">
+            <div class="settings-row-label" style="display:flex; align-items:center; gap:8px; opacity:0.85;">
+              <span>${cat.name}</span>
+              <span style="font-size:10.5px; padding:2px 7px; border-radius:999px; background:rgba(239,68,68,0.2); color:#f87171; font-weight:700;">🚫 PROHIBITED</span>
+            </div>
+            <div class="settings-row-desc" style="color:#ef4444; opacity:0.85;">Permanently disabled: ${cat.desc} (<code>${cat.id}</code>)</div>
+          </div>
+          <input type="checkbox" class="quorum-switch" disabled title="Prohibited category cannot be enabled" style="opacity:0.35; cursor:not-allowed;">
+        </div>
+      `).join('');
+
+      const curSelectedDir = artemisSelectedDir || '';
+
+      settingsContent.innerHTML = `
+        <div class="settings-centered-container">
+        <div id="settings-tab-artemis-dfir">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
+            <div>
+              <h2 class="settings-page-title">🛡️ Artemis DFIR &amp; Forensics (Local-Only)</h2>
+              <p class="settings-page-subtitle">
+                Cross-platform forensic telemetry parsing (Windows EVTX/Registry/Prefetch, macOS Unified Logs, Linux journald/auditd) with strict local-only airgapping, secret redaction, and keyed BLAKE3 structural normalization.
+              </p>
+            </div>
+            <span id="artemis-airgap-pill" style="font-size:11.5px; font-weight:700; padding:5px 12px; border-radius:999px; background:rgba(16,163,127,0.18); color:#10a37f; border:1px solid rgba(16,163,127,0.4); display:inline-flex; align-items:center; gap:6px;">
+              <span>🔒</span><span>P2P MESH AIRGAP ACTIVE</span>
+            </span>
+          </div>
+
+          <!-- 1. AIRGAP ISOLATION NOTICE CARD -->
+          <div class="settings-card" style="border-left:4px solid #10a37f; background:rgba(16,163,127,0.04);">
+            <div class="settings-card-title" style="color:#10a37f; display:flex; align-items:center; gap:8px;">
+              <span>🔒 Host Airgap &amp; Zero-Mesh Isolation Guarantee</span>
+            </div>
+            <div style="font-size:12.5px; color:var(--text-secondary, #ccc); line-height:1.6; margin-top:6px;">
+              <p style="margin:0 0 8px 0;">
+                Forensic telemetry collected or imported through Artemis is strictly confined to this local node (<code>access_tier: 3</code>, <code>artemis_dfir: true</code>, <code>mesh_sharable: false</code>).
+              </p>
+              <ul style="margin:0; padding-left:18px;">
+                <li><strong>Inbound &amp; Outbound Drop Filter:</strong> All P2P mesh network scatter-gather routines unconditionally drop and reject any query, chunk, or trajectory referencing <code>artemis://</code> paths.</li>
+                <li><strong>Local Storage Isolation:</strong> Chunks are stored in local LanceDB vector tables and Tantivy full-text indices with isolation tags preventing peer synchronization.</li>
+                <li><strong>Zero Secret Leakage:</strong> Pre-index Shannon entropy filter ($H &gt; 4.20$) and regex scrubbers sanitize command lines and environment variables before storage.</li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- 2. MASTER SWITCHES (DEFAULT: OFF) -->
+          <div class="settings-card">
+            <div class="settings-card-title">
+              <span>⚙️ Master Telemetry Controls (Disabled by Default)</span>
+            </div>
+
+            <!-- Master Toggle 1: Local Collection -->
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label for="chk-artemis-collection-toggle" class="settings-row-label">Local Forensic Telemetry Collection</label>
+                <div class="settings-row-desc">
+                  Collects running process trees, network sockets, and system event logs directly from the host operating system (${art.current_platform || 'Windows'}). Disabled by default.
+                </div>
+              </div>
+              <input id="chk-artemis-collection-toggle" type="checkbox" class="quorum-switch" ${isCollectionEnabled ? 'checked' : ''} data-action="artemis-toggle-collection">
+            </div>
+
+            <!-- Master Toggle 2: Marketplace Harvest -->
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label for="chk-artemis-harvest-toggle" class="settings-row-label">Marketplace Training Data Harvesting</label>
+                <div class="settings-row-desc">
+                  Permits sanitized forensic telemetry trajectories to be included in sovereign AI training data harvests. Requires keyed BLAKE3 structural normalization and strict category allowlisting. Disabled by default.
+                </div>
+              </div>
+              <input id="chk-artemis-harvest-toggle" type="checkbox" class="quorum-switch" ${isHarvestEnabled ? 'checked' : ''} data-action="artemis-toggle-harvest">
+            </div>
+
+            <!-- Pre-Index Secret Redaction -->
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label for="chk-artemis-redact-secrets" class="settings-row-label">Pre-Index Secret &amp; High-Entropy Redaction</label>
+                <div class="settings-row-desc">
+                  Automatically detects and scrubs API tokens, private keys, connection strings, and high-entropy CLI arguments ($H &gt; 4.20$).
+                </div>
+              </div>
+              <input id="chk-artemis-redact-secrets" type="checkbox" class="quorum-switch" ${isRedactEnabled ? 'checked' : ''} data-action="artemis-toggle-redact">
+            </div>
+
+            <!-- Keyed BLAKE3 Structural Normalizer -->
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label for="chk-artemis-normalize-harvest" class="settings-row-label">Keyed BLAKE3 Structural Normalization for Staging</label>
+                <div class="settings-row-desc">
+                  Replaces usernames, hostnames, SIDs, internal IPs, and SMB shares with session-scoped BLAKE3 pseudonyms before staging batches.
+                </div>
+              </div>
+              <input id="chk-artemis-normalize-harvest" type="checkbox" class="quorum-switch" ${isNormalizeEnabled ? 'checked' : ''} data-action="artemis-toggle-normalize">
+            </div>
+          </div>
+
+          <!-- 3. CATEGORY ALLOWLIST & PROHIBITED MATRIX -->
+          <div class="settings-card">
+            <div class="settings-card-title">
+              <span>📋 Artifact Category Allowlist &amp; Prohibited Matrix</span>
+            </div>
+            <div style="font-size:12.5px; color:var(--text-muted); margin-bottom:12px;">
+              Only defensive execution, network, and system telemetry categories are eligible for indexing and marketplace harvesting. Personal data, browser sessions, and credential vaults are permanently locked and rejected.
+            </div>
+
+            <div style="border:1px solid var(--border-subtle, rgba(255,255,255,0.08)); border-radius:8px; overflow:hidden;">
+              ${defensiveRowsHtml}
+              ${prohibitedRowsHtml}
+            </div>
+          </div>
+
+          <!-- 4. CLICK-TO-SELECT FOLDER IMPORT & INGESTION (MANDATORY INVARIANT COMPLIANCE) -->
+          <div class="settings-card">
+            <div class="settings-card-title">
+              <span>📁 Artemis .jsonl Dump Directory Selection (Click-to-Select)</span>
+            </div>
+            <div style="font-size:12.5px; color:var(--text-muted); margin-bottom:12px;">
+              Click any drive or folder below, or use the Windows Explorer picker to select a directory containing Artemis <code>.jsonl</code> dumps for parsing and local vector indexing. Zero text typing required.
+            </div>
+
+            <!-- Hidden internal state storage conforming to user invariant -->
+            <input type="hidden" id="artemis-jsonl-dir-input" value="${escapeHtml(curSelectedDir)}">
+
+            <!-- Selected folder visual pill display conforming to user invariant -->
+            <div style="margin-bottom:12px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+              <span style="font-size:13px; font-weight:700;">Selected Folder:</span>
+              <div id="artemis-selected-folder-display" class="chatgpt-selected-folder-pill" style="display:inline-flex; align-items:center; gap:8px; padding:6px 14px; border-radius:999px; background:${curSelectedDir ? 'rgba(16,163,127,0.15)' : 'rgba(255,255,255,0.06)'}; color:${curSelectedDir ? '#10a37f' : 'var(--text-muted)'}; border:1px solid ${curSelectedDir ? 'rgba(16,163,127,0.35)' : 'var(--border-color)'}; font-size:12.5px; font-weight:600;">
+                ${curSelectedDir ? `📁 Selected: ${escapeHtml(curSelectedDir)}` : 'No folder selected'}
+              </div>
+              ${curSelectedDir ? `
+                <button type="button" class="pill-btn-danger" data-action="artemis-clear-selected-folder" id="btn-artemis-clear-folder" style="padding:4px 10px; font-size:11.5px;">
+                  ✕ Clear Selected Folder
+                </button>
+              ` : ''}
+            </div>
+
+            <!-- Action buttons for click-to-select folder UX -->
+            <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:14px;">
+              <!-- 1. Native OS Folder Picker Button -->
+              <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="artemis" style="background:var(--accent, #6366f1); color:#fff; border-color:var(--accent, #6366f1); font-weight:600;">
+                📂 Browse with Windows Explorer...
+              </button>
+
+              <!-- 2. Hidden Upload Folder Picker Input & Trigger Button -->
+              <input type="file" id="artemis-folder-upload-input" webkitdirectory directory multiple style="display:none;" data-change-action="artemis-upload-folder">
+              <button type="button" class="pill-btn" data-action="trigger-file-click" data-target-id="artemis-folder-upload-input" style="font-weight:600;">
+                📁 Upload Entire Forensic Folder
+              </button>
+
+              ${currentBrowsePath ? `
+                <button type="button" class="pill-btn" data-action="artemis-select-active-folder" data-folder-path="${escapeHtml(currentBrowsePath)}" style="border-color:#10a37f; color:#10a37f; font-weight:600;">
+                  + Select Active Folder (${escapeHtml(currentBrowsePath)})
+                </button>
+              ` : ''}
+            </div>
+
+            <!-- 3. Interactive Click-to-Select Folder Browser Container -->
+            <div>
+              <div style="font-size:12.5px; font-weight:700; margin-bottom:6px; color:var(--text-muted);">
+                💽 Or click any physical drive or folder below to select:
+              </div>
+              <div id="artemis-folder-browser-list">
+                ${renderWindowsFileExplorerHtml({
+                  contextId: 'artemis',
+                  currentPath: currentBrowsePath,
+                  parentPath: currentBrowseParentPath,
+                  drives: cachedDrives,
+                  directories: cachedBrowseDirs,
+                  selectedSet: new Set(curSelectedDir ? [curSelectedDir.toLowerCase()] : []),
+                  selectAction: 'artemis-pick-folder',
+                  selectButtonText: '+ Select Forensic Folder',
+                  activePathAction: 'artemis-pick-folder',
+                  activePathButtonText: '+ Select Active Folder for Artemis',
+                  allowNativeDialog: true
+                })}
+              </div>
+            </div>
+          </div>
+
+          <!-- 5. MANUAL COLLECTION EXECUTION -->
+          <div class="settings-card">
+            <div class="settings-card-title">
+              <span>⚡ On-Demand Forensic Telemetry Collection</span>
+            </div>
+            <div style="font-size:12.5px; color:var(--text-muted); margin-bottom:12px;">
+              Trigger immediate ingestion from the currently selected folder or collect live host processes and system event logs into local LanceDB &amp; Tantivy storage.
+            </div>
+
+            <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+              <button type="button" id="btn-artemis-collect" class="btn-primary" data-action="trigger-artemis-collect" style="padding:8px 18px; font-weight:700; background:#10a37f; border-color:#10a37f; display:inline-flex; align-items:center; gap:6px;">
+                <span>⚡</span>
+                <span>${curSelectedDir ? 'Ingest Selected Folder (.jsonl)' : 'Collect Live OS Telemetry'}</span>
+              </button>
+              <span style="font-size:12px; color:var(--text-muted);">
+                Target: <code>${escapeHtml(curSelectedDir || 'Live Host Telemetry (' + (art.current_platform || 'Windows') + ')')}</code>
+              </span>
+            </div>
+
+            <div id="artemis-collect-result-box" class="progress-box hidden" style="margin-top:12px;">
+              <div id="artemis-collect-result-text" class="progress-status">Ready</div>
+            </div>
+          </div>
+
+          <!-- 6. LIVE KEYED BLAKE3 STRUCTURAL NORMALIZER PREVIEW -->
+          <div class="settings-card">
+            <div class="settings-card-title">
+              <span>🔬 Live Structural Normalizer Preview (Keyed BLAKE3 Pseudonymization)</span>
+            </div>
+            <div style="font-size:12.5px; color:var(--text-muted); margin-bottom:12px;">
+              Demonstrates topology-preserving structural pseudonymization. Replaces host-specific accounts, SIDs, hostnames, internal IPv4/IPv6 addresses, and SMB shares with deterministic, session-scoped keyed BLAKE3 pseudonyms.
+            </div>
+
+            <div style="margin-bottom:10px;">
+              <label for="artemis-preview-input" style="font-size:12.5px; font-weight:600; display:block; margin-bottom:4px;">
+                Sample Telemetry / Forensic Command Line:
+              </label>
+              <textarea id="artemis-preview-input" class="prompt-textarea" style="width:100%; min-height:85px; font-family:monospace; font-size:12px; padding:10px; border-radius:8px; border:1px solid var(--border-color); background:rgba(0,0,0,0.3); color:var(--text-primary); box-sizing:border-box;" placeholder="Enter forensic telemetry or command line snippet...">powershell.exe -ExecutionPolicy Bypass -Command "net use \\\\CORP-DC01.local\\admin$ /user:DOMAIN\\Administrator Password123!; Invoke-Mimikatz; ping 10.240.12.5; whoami /user /fo csv; set COMPUTERNAME=SRV-SEC-09; sid S-1-5-21-1234567890-1234567890-1234567890-1001"</textarea>
+            </div>
+
+            <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+              <div style="display:flex; align-items:center; gap:8px;">
+                <label for="artemis-preview-salt" style="font-size:12px; font-weight:600;">Session Salt:</label>
+                <input type="text" id="artemis-preview-salt" class="settings-input" style="width:180px; font-size:12px; padding:4px 8px;" value="session-preview-salt-1" placeholder="Session Salt">
+              </div>
+              <button type="button" id="btn-artemis-preview" class="btn-primary" data-action="test-artemis-preview" style="padding:6px 14px; font-size:12.5px; font-weight:600; background:#6366f1; border-color:#6366f1;">
+                🔬 Run Live Normalizer Preview
+              </button>
+            </div>
+
+            <div id="artemis-preview-result-container" style="display:none; margin-top:12px;">
+              <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
+                <span id="artemis-metric-total" style="font-size:11.5px; font-weight:700; padding:3px 10px; border-radius:999px; background:rgba(99,102,241,0.2); color:#818cf8;">Total Replacements: 0</span>
+                <span id="artemis-metric-users" style="font-size:11.5px; padding:3px 10px; border-radius:999px; background:rgba(16,163,127,0.15); color:#10a37f;">Users: 0</span>
+                <span id="artemis-metric-hosts" style="font-size:11.5px; padding:3px 10px; border-radius:999px; background:rgba(16,163,127,0.15); color:#10a37f;">Hosts: 0</span>
+                <span id="artemis-metric-ips" style="font-size:11.5px; padding:3px 10px; border-radius:999px; background:rgba(16,163,127,0.15); color:#10a37f;">IPs: 0</span>
+                <span id="artemis-metric-shares" style="font-size:11.5px; padding:3px 10px; border-radius:999px; background:rgba(16,163,127,0.15); color:#10a37f;">SMB Shares: 0</span>
+              </div>
+
+              <div style="margin-bottom:10px;">
+                <div style="font-size:12px; font-weight:700; margin-bottom:4px;">Pseudonym Mappings (Keyed BLAKE3):</div>
+                <table class="report-table" style="width:100%; font-size:12px;">
+                  <thead>
+                    <tr>
+                      <th style="text-align:left;">Original Identifier</th>
+                      <th style="text-align:left;">Keyed BLAKE3 Pseudonym</th>
+                    </tr>
+                  </thead>
+                  <tbody id="artemis-preview-mappings-tbody">
+                    <tr><td colspan="2" style="opacity:0.7;">No replacements made.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div>
+                <div style="font-size:12px; font-weight:700; margin-bottom:4px;">Normalized Output:</div>
+                <pre id="artemis-preview-normalized-text" style="background:rgba(0,0,0,0.45); padding:10px; border-radius:8px; font-family:monospace; font-size:11.5px; white-space:pre-wrap; border:1px solid var(--border-color); max-height:180px; overflow-y:auto; margin:0;"></pre>
+              </div>
+            </div>
+          </div>
         </div>
         </div>
       `;
@@ -7038,10 +7801,10 @@ function secureRandomIndex(n) {
                 drives: cachedDrives,
                 directories: cachedBrowseDirs,
                 selectedSet: new Set((rt.watched_paths || []).map(p => String(p || '').toLowerCase())),
-                selectAction: 'storage-browse-dir',
-                selectButtonText: 'Explore',
-                activePathAction: '',
-                activePathButtonText: '',
+                selectAction: 'newdoc-pick-folder',
+                selectButtonText: '+ Watch & Index Folder',
+                activePathAction: 'newdoc-pick-folder',
+                activePathButtonText: '+ Watch & Index Active Folder',
                 allowNativeDialog: true
               })}
             </div>
