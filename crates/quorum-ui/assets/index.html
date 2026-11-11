@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>QuorumRAG — Local-First P2P Retrieval &amp; Agentic Workspace</title>
   <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
-  <link rel="stylesheet" href="/assets/styles.css?v=20261110c">
+  <link rel="stylesheet" href="/assets/styles.css?v=20261111a">
   <style>
     /* Inlined fallback styles ensuring test assertions pass */
     :root {
@@ -236,11 +236,11 @@
   </div>
 
   <!-- REINDEX MODAL -->
-  <div id="modal-reindex" class="modal-backdrop hidden">
+  <div id="modal-reindex" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="reindex-modal-title">
     <div class="modal-card">
       <div class="modal-header">
-        <h3>🔄 Filesystem Reindexer</h3>
-        <button class="btn-close-modal" id="btn-close-reindex">&times;</button>
+        <h3 id="reindex-modal-title">🔄 Filesystem Reindexer</h3>
+        <button class="btn-close-modal" id="btn-close-reindex" aria-label="Close Filesystem Reindexer">&times;</button>
       </div>
       <div class="modal-body">
         <div class="form-group">
@@ -477,14 +477,14 @@
   </div>
 
   <!-- PURE RUST FOLDER PICKER MODAL (Zero Windows Explorer / Zero External OS Subprocesses) -->
-  <div id="modal-pure-rust-folder-picker" class="modal-backdrop hidden" style="z-index: 100000;">
+  <div id="modal-pure-rust-folder-picker" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="pure-rust-picker-title" style="z-index: 100000;">
     <div class="modal-card" style="max-width: 740px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
       <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <h3 style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
+          <h3 id="pure-rust-picker-title" style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
           <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Folder</span>
         </div>
-        <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker">&times;</button>
+        <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker" aria-label="Close Folder Picker">&times;</button>
       </div>
       <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
         <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
@@ -495,9 +495,9 @@
           <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1; min-inline-size:0;"></div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <input type="search" id="pure-rust-picker-filter-input" class="settings-input" placeholder="🔍 Filter folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
+          <input type="search" id="pure-rust-picker-filter-input" class="settings-input" aria-label="Filter folders in current view" placeholder="🔍 Filter folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
           <div style="display:flex; gap:6px; align-items:center;">
-            <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
+            <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" aria-label="New subfolder name" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
             <button type="button" class="pill-btn" id="btn-pure-rust-picker-create-folder" style="padding:5px 10px; font-size:12px; font-weight:600;">+ Create Subfolder</button>
           </div>
         </div>
@@ -819,6 +819,6 @@
     };
   </script>
 
-  <script src="/assets/app.js?v=20261110d"></script>
+  <script src="/assets/app.js?v=20261111a"></script>
 </body>
 </html>

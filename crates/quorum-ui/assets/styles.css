@@ -1109,7 +1109,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 100;
+  z-index: 1000;
   backdrop-filter: blur(2px);
 }
 
@@ -1118,9 +1118,17 @@ body {
   border: 1px solid var(--border-color);
   border-radius: 12px;
   width: 90%;
-  max-width: 520px;
+  max-width: 560px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
   box-shadow: 0 8px 32px rgba(0,0,0,0.5);
   overflow: hidden;
+}
+
+#modal-reindex .modal-card {
+  max-width: 740px;
+  width: 94%;
 }
 
 .modal-header {
@@ -1146,6 +1154,10 @@ body {
 
 .modal-body {
   padding: 20px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .modal-desc {

@@ -370,20 +370,27 @@ pub async fn add_documents_handler(
     }
     state.reindex_worker.add_watch_paths(&target_paths);
 
-    let options = ReindexOptions {
-        target_paths: target_paths.clone(),
-        full_rebuild: false,
-        force_reembed: false,
-        batch_size: 32,
-        num_threads: 4,
-        dry_run: false,
-    };
-
-    let indexed_chunks_delta = match state.reindex_worker.run_reindex_sync(options.clone()).await {
-        Ok(prog) => prog.chunks_newly_embedded + prog.chunks_reused_from_cache,
-        Err(_) => {
-            let _ = state.reindex_worker.trigger_paths(target_paths.clone()).await;
-            0
+    let has_directory_target = target_paths.iter().any(|p| p.is_dir());
+    let indexed_chunks_delta = if has_directory_target {
+        // Directory / drive selections dispatch immediately onto the priority background
+        // reindex worker so selecting a large folder or physical drive never blocks the UI.
+        let _ = state.reindex_worker.trigger_paths(target_paths.clone()).await;
+        0
+    } else {
+        let options = ReindexOptions {
+            target_paths: target_paths.clone(),
+            full_rebuild: false,
+            force_reembed: false,
+            batch_size: 32,
+            num_threads: 4,
+            dry_run: false,
+        };
+        match state.reindex_worker.run_reindex_sync(options).await {
+            Ok(prog) => prog.chunks_newly_embedded + prog.chunks_reused_from_cache,
+            Err(_) => {
+                let _ = state.reindex_worker.trigger_paths(target_paths.clone()).await;
+                0
+            }
         }
     };
 

@@ -133,4 +133,28 @@ fn test_every_folder_selector_under_settings_is_click_to_select_not_text_input()
             && js.contains(r#"id="artemis-last-collection-badge""#),
         "Artemis DFIR Settings must expose live collected records and timestamp status badges"
     );
+
+    // 7. Service-mode Session-0 resilience, checkbox toggle preservation, POSIX/UNC/Windows breadcrumbs & dialog accessibility
+    assert!(
+        js.contains("candidate.cancelled !== true")
+            && js.contains("/api/fs/browse-folders?"),
+        "loadPureRustPickerDirectory must fall back cleanly to /api/fs/browse-folders when /api/fs/pick-folder returns cancelled in Windows Service mode"
+    );
+    assert!(
+        js.contains("function preventIfNotCheckbox(")
+            && js.contains("resolveCleanQuickAccess"),
+        "Folder row checkboxes must preserve native check state via preventIfNotCheckbox and strip service-account systemprofile paths"
+    );
+    assert!(
+        js.contains("raw.startsWith('/')"),
+        "buildPathBreadcrumbs must support POSIX / paths alongside Windows drive and UNC paths"
+    );
+    assert!(
+        js.contains("z-index:250000") && js.contains("aria-live"),
+        "#quorum-settings-toast must render above #modal-pure-rust-folder-picker with polite live-region announcements"
+    );
+    assert!(
+        html.contains(r#"id="modal-pure-rust-folder-picker" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="pure-rust-picker-title""#),
+        "#modal-pure-rust-folder-picker must expose accessible dialog semantics (role=\"dialog\", aria-modal=\"true\", aria-labelledby)"
+    );
 }
