@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g. 0.6.3)'
+        description: 'Release version (e.g. 0.6.4)'
         required: false
-        default: '0.6.3'
+        default: '0.6.4'
 
 permissions: read-all
 
@@ -65,7 +65,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           $env:PATH = "$env:USERPROFILE\.dotnet\tools;C:\ProgramData\chocolatey\bin;$env:PATH"
-          $ver = if ($env:REF_NAME -like "quorumrag-v*") { $env:REF_NAME.Substring(11) } elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "0.6.3" }
+          $ver = if ($env:REF_NAME -like "quorumrag-v*") { $env:REF_NAME.Substring(11) } elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "0.6.4" }
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1 -Version $ver -SkipDefenderScan
           $msi = "deploy\windows\QuorumRAG-$ver-x86_64.msi"
           $zip = "deploy\windows\QuorumRAG-$ver-windows-x86_64.zip"
@@ -104,8 +104,36 @@ jobs:
 
       - name: Install System Build & Packaging Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y rpm dpkg-dev protobuf-compiler cmake pkg-config libssl-dev clang
+          set -euo pipefail
+          MISSING_APT=()
+          command -v rpmbuild >/dev/null 2>&1 || MISSING_APT+=(rpm)
+          command -v dpkg-deb >/dev/null 2>&1 || MISSING_APT+=(dpkg-dev)
+          command -v pkg-config >/dev/null 2>&1 || MISSING_APT+=(pkg-config)
+          pkg-config --exists openssl || MISSING_APT+=(libssl-dev)
+          if [ "${#MISSING_APT[@]}" -gt 0 ]; then
+            sudo apt-get update -o Acquire::Retries=3 || true
+            sudo apt-get install -y --fix-missing "${MISSING_APT[@]}"
+          fi
+          if ! command -v cmake >/dev/null 2>&1; then
+            curl -fsSL "https://github.com/Kitware/CMake/releases/download/v3.31.5/cmake-3.31.5-linux-x86_64.tar.gz" -o /tmp/cmake.tar.gz
+            echo "2984e70515ff60c5e4a41922b5d715a8168a696a89721e3b114e36f453244f72  /tmp/cmake.tar.gz" | sha256sum -c -
+            sudo tar -xzf /tmp/cmake.tar.gz -C /usr/local --strip-components=1
+            rm -f /tmp/cmake.tar.gz
+          fi
+          if ! command -v protoc >/dev/null 2>&1; then
+            curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip" -o /tmp/protoc.zip
+            echo "3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a  /tmp/protoc.zip" | sha256sum -c -
+            sudo python3 -m zipfile -e /tmp/protoc.zip /usr/local
+            sudo chmod 755 /usr/local/bin/protoc
+            rm -f /tmp/protoc.zip
+          fi
+          if ! command -v clang >/dev/null 2>&1; then
+            CAND_CLANG=$(ls -1 /usr/bin/clang-[0-9]* /usr/lib/llvm-*/bin/clang 2>/dev/null | head -n 1 || true)
+            if [ -n "${CAND_CLANG}" ]; then
+              sudo ln -sf "${CAND_CLANG}" /usr/local/bin/clang
+            fi
+          fi
+          echo "Verified Linux x64 build tools: $(rpmbuild --version), $(dpkg-deb --version | head -n1), $(cmake --version | head -n1), $(protoc --version)"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -121,7 +149,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.3}"
+          VERSION="${INPUT_VERSION:-0.6.4}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag
           ./target/release/quorumrag --version
@@ -156,8 +184,36 @@ jobs:
 
       - name: Install System Build & Packaging Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y rpm dpkg-dev protobuf-compiler cmake pkg-config libssl-dev clang
+          set -euo pipefail
+          MISSING_APT=()
+          command -v rpmbuild >/dev/null 2>&1 || MISSING_APT+=(rpm)
+          command -v dpkg-deb >/dev/null 2>&1 || MISSING_APT+=(dpkg-dev)
+          command -v pkg-config >/dev/null 2>&1 || MISSING_APT+=(pkg-config)
+          pkg-config --exists openssl || MISSING_APT+=(libssl-dev)
+          if [ "${#MISSING_APT[@]}" -gt 0 ]; then
+            sudo apt-get update -o Acquire::Retries=3 || true
+            sudo apt-get install -y --fix-missing "${MISSING_APT[@]}"
+          fi
+          if ! command -v cmake >/dev/null 2>&1; then
+            curl -fsSL "https://github.com/Kitware/CMake/releases/download/v3.31.5/cmake-3.31.5-linux-aarch64.tar.gz" -o /tmp/cmake.tar.gz
+            echo "eb92af175ea91e3706ff62484088c3a3774ef3e1a8c399111785dd5f47010164  /tmp/cmake.tar.gz" | sha256sum -c -
+            sudo tar -xzf /tmp/cmake.tar.gz -C /usr/local --strip-components=1
+            rm -f /tmp/cmake.tar.gz
+          fi
+          if ! command -v protoc >/dev/null 2>&1; then
+            curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-aarch_64.zip" -o /tmp/protoc.zip
+            echo "6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32  /tmp/protoc.zip" | sha256sum -c -
+            sudo python3 -m zipfile -e /tmp/protoc.zip /usr/local
+            sudo chmod 755 /usr/local/bin/protoc
+            rm -f /tmp/protoc.zip
+          fi
+          if ! command -v clang >/dev/null 2>&1; then
+            CAND_CLANG=$(ls -1 /usr/bin/clang-[0-9]* /usr/lib/llvm-*/bin/clang 2>/dev/null | head -n 1 || true)
+            if [ -n "${CAND_CLANG}" ]; then
+              sudo ln -sf "${CAND_CLANG}" /usr/local/bin/clang
+            fi
+          fi
+          echo "Verified Linux ARM64 build tools: $(rpmbuild --version), $(dpkg-deb --version | head -n1), $(cmake --version | head -n1), $(protoc --version)"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -173,7 +229,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.3}"
+          VERSION="${INPUT_VERSION:-0.6.4}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag
           ./target/release/quorumrag --version
@@ -233,7 +289,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.3}"
+          VERSION="${INPUT_VERSION:-0.6.4}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag --target aarch64-apple-darwin
           cargo build --release -p quorum-daemon --bin quorumrag --target x86_64-apple-darwin
@@ -287,7 +343,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.3}"
+          VERSION="${INPUT_VERSION:-0.6.4}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           mkdir -p release_assets
           find dist/ -type f \( -name "*.msi" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg" -o -name "*.dmg" -o -name "*.tar.gz" \) -exec cp -f {} release_assets/ \;
@@ -330,13 +386,13 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.3}"
+          VERSION="${INPUT_VERSION:-0.6.4}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           TAG_NAME="quorumrag-v${VERSION}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then TAG_NAME="${REF_NAME}"; fi
           echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
           echo "release_name=QuorumRAG v${VERSION} (Windows MSI, Linux DEB/RPM, macOS Universal PKG/DMG)" >> "${GITHUB_OUTPUT}"
-          python3 -c "import cryptography" 2>/dev/null || (sudo apt-get update && sudo apt-get install -y python3-cryptography) || python3 -m pip install --break-system-packages cryptography
+          python3 -c "import cryptography" 2>/dev/null || python3 -m pip install --break-system-packages cryptography || (sudo apt-get update && sudo apt-get install -y python3-cryptography)
           python3 scripts/witness_ci_pipeline.py keygen --out-dir .witness --policy-template policy/witness/witness-policy-template.json
           python3 scripts/witness_ci_pipeline.py run --step unit-tests --outfile .witness/unit-tests.att.json --key .witness/witness-ci-private.pem --materials "Cargo.lock,Cargo.toml" -- echo "QuorumRAG unit and adversarial tests verified"
           python3 scripts/witness_ci_pipeline.py run --step security-scan --outfile .witness/security-scan.att.json --key .witness/witness-ci-private.pem --materials "Cargo.lock,Cargo.toml" -- echo "QuorumRAG Zero-Touch PATH and security invariants verified"
