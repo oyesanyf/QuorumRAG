@@ -122,9 +122,9 @@ pub async fn get_settings_handler(State(state): State<Arc<DaemonState>>) -> impl
         .collect();
 
     let watched_paths: Vec<String> = state
-        .ingest_config
-        .watch_paths
-        .iter()
+        .reindex_worker
+        .all_watch_paths()
+        .into_iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
@@ -542,6 +542,120 @@ fn is_safe_single_folder_name(name: &str) -> bool {
     matches!(components.next(), Some(std::path::Component::Normal(_))) && components.next().is_none()
 }
 
+/// Pure Rust helper that detects non-interactive OS service/system profile directories
+/// (e.g. Windows `LocalSystem` `C:\Windows\System32` or `systemprofile`, macOS `/var/root`)
+/// so folder pickers and Quick Access always surface real user directories across Windows, Linux, and macOS.
+fn is_service_or_system_profile_path(path_str: &str) -> bool {
+    let norm = path_str.trim().replace('/', "\\").to_ascii_lowercase();
+    if norm.is_empty() {
+        return true;
+    }
+    norm.contains("\\systemprofile")
+        || norm.contains("\\serviceprofiles\\")
+        || norm.contains("\\windows\\system32")
+        || norm.contains("\\windows\\syswow64")
+        || norm.ends_with("\\windows")
+        || norm.contains("\\users\\default")
+        || norm.contains("\\users\\all users")
+        || norm.contains("\\default user")
+        || norm == "\\var\\root"
+        || norm.starts_with("\\var\\root\\")
+}
+
+/// Pure Rust discovery of real interactive user home directories across Windows (`C:\Users\*`),
+/// macOS (`/Users/*`), and Linux (`/home/*`), even when the daemon runs as `LocalSystem`, `systemd`, or `launchd`.
+fn discover_interactive_user_homes() -> Vec<std::path::PathBuf> {
+    let mut homes: Vec<std::path::PathBuf> = Vec::new();
+    let mut push_unique = |candidate: std::path::PathBuf| {
+        let s = candidate.to_string_lossy().to_string();
+        if is_service_or_system_profile_path(&s) || !candidate.is_dir() {
+            return;
+        }
+        if !homes
+            .iter()
+            .any(|existing| existing.to_string_lossy().eq_ignore_ascii_case(&s))
+        {
+            homes.push(candidate);
+        }
+    };
+
+    if let Some(env_home) = std::env::var("USERPROFILE")
+        .ok()
+        .or_else(|| std::env::var("HOME").ok())
+    {
+        let trimmed = env_home.trim();
+        if !trimmed.is_empty() && trimmed != "/root" {
+            push_unique(Path::new(trimmed).to_path_buf());
+        }
+    }
+
+    let candidate_roots = [r"C:\Users", "/Users", "/home"];
+    let skip_names = [
+        "public",
+        "default",
+        "default user",
+        "all users",
+        "shared",
+        "guest",
+        "lost+found",
+        "wdagutilityaccount",
+        "defaultapppool",
+    ];
+
+    for root in candidate_roots {
+        let root_path = Path::new(root);
+        if !root_path.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(root_path) {
+            let mut discovered: Vec<std::path::PathBuf> = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let lower = name.to_ascii_lowercase();
+                if name.starts_with('.') || skip_names.iter().any(|s| *s == lower) {
+                    continue;
+                }
+                if path.join("Documents").is_dir()
+                    || path.join("Desktop").is_dir()
+                    || path.join("Downloads").is_dir()
+                {
+                    discovered.push(path);
+                }
+            }
+            discovered.sort_by(|a, b| {
+                a.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .cmp(
+                        &b.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_ascii_lowercase(),
+                    )
+            });
+            for d in discovered {
+                push_unique(d);
+            }
+        }
+    }
+
+    if homes.is_empty() {
+        if let Ok(env_home) = std::env::var("HOME") {
+            let p = Path::new(env_home.trim()).to_path_buf();
+            if p.is_dir() && !is_service_or_system_profile_path(&env_home) {
+                homes.push(p);
+            }
+        }
+    }
+
+    homes
+}
+
 /// Pure Rust directory enumeration and folder picker engine (`std::fs::read_dir` + physical drive discovery).
 /// Never spawns external OS dialogs (`powershell`, `explorer.exe`, `osascript`, or `zenity`).
 async fn pure_rust_browse_directory(
@@ -577,24 +691,52 @@ async fn pure_rust_browse_directory(
         .map(|d| d.to_string_lossy().to_string())
         .collect();
 
-    // Build Pure Rust quick-access folder list so it is always available in the UI
+    // Build Pure Rust quick-access folder list from real interactive user profiles (never system32/systemprofile)
     let mut quick_access: Vec<serde_json::Value> = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd.is_dir() {
-            let s = cwd.to_string_lossy().to_string();
+    let mut push_quick = |label: String, path_buf: std::path::PathBuf| {
+        if !path_buf.is_dir() {
+            return;
+        }
+        let s = path_buf.to_string_lossy().to_string();
+        if is_service_or_system_profile_path(&s) {
+            return;
+        }
+        let already = quick_access.iter().any(|item| {
+            item.get("path")
+                .and_then(|v| v.as_str())
+                .map(|existing| existing.eq_ignore_ascii_case(&s))
+                .unwrap_or(false)
+        });
+        if !already {
             quick_access.push(serde_json::json!({
-                "name": "Workspace",
+                "name": label,
                 "path": s,
                 "is_drive": false,
                 "is_quick_access": true,
                 "is_shared": is_shared_fn(&s)
             }));
         }
+    };
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_str = cwd.to_string_lossy().to_string();
+        if cwd.is_dir() && !is_service_or_system_profile_path(&cwd_str) {
+            push_quick("Workspace".to_string(), cwd);
+        }
     }
-    let home_opt = std::env::var("USERPROFILE")
-        .ok()
-        .or_else(|| std::env::var("HOME").ok());
-    if let Some(ref home) = home_opt {
+
+    let interactive_homes = discover_interactive_user_homes();
+    let multi_user = interactive_homes.len() > 1;
+    for (idx, home) in interactive_homes.iter().enumerate() {
+        let uname = home
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let suffix = if idx > 0 && multi_user && !uname.is_empty() {
+            format!(" ({})", uname)
+        } else {
+            String::new()
+        };
         let quick_folders = [
             ("Desktop", "Desktop"),
             ("Documents", "Documents"),
@@ -602,17 +744,12 @@ async fn pure_rust_browse_directory(
             ("Pictures", "Pictures"),
         ];
         for (label, sub) in quick_folders {
-            let p = Path::new(home).join(sub);
-            if p.is_dir() {
-                let s = p.to_string_lossy().to_string();
-                quick_access.push(serde_json::json!({
-                    "name": label,
-                    "path": s,
-                    "is_drive": false,
-                    "is_quick_access": true,
-                    "is_shared": is_shared_fn(&s)
-                }));
-            }
+            push_quick(format!("{}{}", label, suffix), home.join(sub));
+        }
+        let onedrive = home.join("OneDrive");
+        if onedrive.is_dir() {
+            push_quick(format!("OneDrive Docs{}", suffix), onedrive.join("Documents"));
+            push_quick(format!("OneDrive Desktop{}", suffix), onedrive.join("Desktop"));
         }
     }
 
@@ -732,7 +869,7 @@ async fn pure_rust_browse_directory(
             let nb = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
             na.to_ascii_lowercase().cmp(&nb.to_ascii_lowercase())
         });
-        dirs.truncate(200);
+        dirs.truncate(1000);
         dirs
     })
     .await
@@ -796,20 +933,17 @@ pub async fn pick_folder_dialog_handler(
     } else if requested_path.is_empty() {
         std::env::current_dir()
             .ok()
-            .filter(|p| p.is_dir())
+            .filter(|p| p.is_dir() && !is_service_or_system_profile_path(&p.to_string_lossy()))
             .map(|p| p.to_string_lossy().to_string())
             .or_else(|| {
-                std::env::var("USERPROFILE")
-                    .ok()
-                    .or_else(|| std::env::var("HOME").ok())
-                    .map(|h| {
-                        let docs = Path::new(&h).join("Documents");
-                        if docs.is_dir() {
-                            docs.to_string_lossy().to_string()
-                        } else {
-                            h
-                        }
-                    })
+                discover_interactive_user_homes().into_iter().next().map(|h| {
+                    let docs = h.join("Documents");
+                    if docs.is_dir() {
+                        docs.to_string_lossy().to_string()
+                    } else {
+                        h.to_string_lossy().to_string()
+                    }
+                })
             })
             .or_else(|| {
                 quorum_ingest::IngestConfig::discover_physical_drives()
@@ -1152,5 +1286,31 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .ends_with("pure_rust_created"));
+    }
+
+    #[tokio::test]
+    async fn test_service_profile_exclusion_and_interactive_user_discovery() {
+        assert!(is_service_or_system_profile_path(
+            r"C:\WINDOWS\system32\config\systemprofile\Documents"
+        ));
+        assert!(is_service_or_system_profile_path(r"C:\Windows\System32"));
+        assert!(is_service_or_system_profile_path(r"C:\Users\Default\Desktop"));
+        assert!(is_service_or_system_profile_path("/var/root/Documents"));
+        assert!(!is_service_or_system_profile_path(
+            r"C:\Users\alice\Documents"
+        ));
+        assert!(!is_service_or_system_profile_path("/Users/alice/Documents"));
+        assert!(!is_service_or_system_profile_path("/home/alice/Documents"));
+
+        let browse_root = pure_rust_browse_directory("", None).await;
+        if let Some(qa_arr) = browse_root["quick_access"].as_array() {
+            for qa in qa_arr {
+                let p = qa["path"].as_str().unwrap_or("");
+                assert!(
+                    !is_service_or_system_profile_path(p),
+                    "Quick Access must never expose non-interactive service profile path: {p}"
+                );
+            }
+        }
     }
 }

@@ -2756,7 +2756,7 @@ function secureRandomIndex(n) {
   if (btnBrowseReindexFolder) {
     btnBrowseReindexFolder.addEventListener('click', async (e) => {
       e.preventDefault();
-      await window.openPureRustFolderPicker('reindex', currentBrowsePath);
+      await window.openPureRustFolderPicker('reindex', currentBrowsePath, btnBrowseReindexFolder);
     });
   }
 
@@ -2770,8 +2770,18 @@ function secureRandomIndex(n) {
     });
   }
 
+  function preventIfNotCheckbox(ev, el) {
+    if (!el || el.tagName !== 'INPUT' || el.type !== 'checkbox') {
+      ev.preventDefault();
+    }
+  }
+
   if (modalReindex) {
     modalReindex.addEventListener('click', async (e) => {
+      if (e.target === modalReindex) {
+        modalReindex.classList.add('hidden');
+        return;
+      }
       const actionEl = e.target.closest('[data-action]');
       if (!actionEl) return;
       const action = actionEl.dataset.action;
@@ -2786,15 +2796,24 @@ function secureRandomIndex(n) {
         e.preventDefault();
         await window.quorumBrowseDir('');
       } else if (action === 'reindex-pick-folder') {
-        e.preventDefault();
+        preventIfNotCheckbox(e, actionEl);
         e.stopPropagation();
-        if (folderPath) updateReindexSelectedBadge(folderPath);
-        renderReindexExplorer();
-        showSettingsToast('Target reindex folder set: ' + folderPath);
+        const curInp = document.getElementById('reindex-target-path');
+        const curVal = curInp ? curInp.value.trim() : '';
+        const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+        if (folderPath && isRowToggle && curVal && curVal.toLowerCase() === folderPath.toLowerCase()) {
+          updateReindexSelectedBadge('');
+          renderReindexExplorer();
+          showSettingsToast('Target reset to All Watched Drives & Folders');
+        } else if (folderPath) {
+          updateReindexSelectedBadge(folderPath);
+          renderReindexExplorer();
+          showSettingsToast('✓ Target reindex folder set: ' + folderPath);
+        }
       } else if (action === 'trigger-native-folder-picker') {
         e.preventDefault();
         e.stopPropagation();
-        await window.openPureRustFolderPicker('reindex', currentBrowsePath);
+        await window.openPureRustFolderPicker('reindex', currentBrowsePath, actionEl);
       }
     });
   }
@@ -3289,7 +3308,7 @@ function secureRandomIndex(n) {
     });
   }
 
-  // Keyboard shortcuts: Ctrl+, for Settings, Ctrl+Shift+S for Sidebar toggle, Esc to close Settings
+  // Keyboard shortcuts: Ctrl+, for Settings, Ctrl+Shift+S for Sidebar toggle, layered Esc to close topmost modal/overlay
   document.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === ',') {
       e.preventDefault();
@@ -3305,8 +3324,25 @@ function secureRandomIndex(n) {
       } else if (sidebar) {
         sidebar.classList.toggle('collapsed');
       }
-    } else if (e.key === 'Escape' && settingsView && !settingsView.classList.contains('hidden')) {
-      closeSettingsView();
+    } else if (e.key === 'Escape') {
+      const pickerModal = document.getElementById('modal-pure-rust-folder-picker');
+      if (pickerModal && !pickerModal.classList.contains('hidden')) {
+        e.preventDefault();
+        e.stopPropagation();
+        closePureRustPickerModal();
+        return;
+      }
+      for (const mid of ['modal-reindex', 'modal-drift', 'modal-recache', 'modal-marketplace']) {
+        const m = document.getElementById(mid);
+        if (m && !m.classList.contains('hidden')) {
+          e.preventDefault();
+          m.classList.add('hidden');
+          return;
+        }
+      }
+      if (settingsView && !settingsView.classList.contains('hidden')) {
+        closeSettingsView();
+      }
     }
   });
 
@@ -3392,8 +3428,98 @@ function secureRandomIndex(n) {
     }
   }
 
-  let cachedDrives = ['D:\\', 'C:\\'];
+  const IS_POSIX_CLIENT = typeof navigator !== 'undefined' && !/Win/i.test(navigator.platform || navigator.userAgent || '');
+  let cachedDrives = IS_POSIX_CLIENT ? ['/'] : ['C:\\'];
   let cachedQuickAccess = [];
+  let pureRustPickerInvokerEl = null;
+  let pendingOptInConsentChecked = null;
+  let pendingMktJurisdiction = null;
+  let pendingMktPriceCents = null;
+  let addDocIncludeOptIn = true;
+  let dlpSelectedSimFolder = '';
+  let dlpSelectedSimPath = IS_POSIX_CLIENT ? '/tmp/clinical_note.txt' : 'D:\\harfile\\QuorumRAG\\docs\\clinical_note.txt';
+
+  let clientWatchedFolders = (() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem('quorumrag_watched_folders') || '[]');
+      return Array.isArray(raw) ? raw.filter(p => typeof p === 'string' && p.trim()) : [];
+    } catch (_) {
+      return [];
+    }
+  })();
+
+  function saveClientWatchedFolders() {
+    try {
+      localStorage.setItem('quorumrag_watched_folders', JSON.stringify(clientWatchedFolders));
+    } catch (_) {}
+  }
+
+  function getCombinedWatchedPaths(rtWatched) {
+    const out = [];
+    const seen = new Set();
+    for (const p of [...(Array.isArray(rtWatched) ? rtWatched : []), ...clientWatchedFolders]) {
+      const clean = String(p || '').trim();
+      if (!clean) continue;
+      const key = clean.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(clean);
+      }
+    }
+    return out;
+  }
+
+  function isServiceProfilePathJs(pathStr) {
+    const norm = String(pathStr || '').trim().replace(/\//g, '\\').toLowerCase();
+    if (!norm) return true;
+    return norm.includes('\\systemprofile')
+      || norm.includes('\\serviceprofiles\\')
+      || norm.includes('\\windows\\system32')
+      || norm.includes('\\windows\\syswow64')
+      || norm.endsWith('\\windows')
+      || norm.includes('\\users\\default')
+      || norm.includes('\\users\\all users')
+      || norm === '\\var\\root'
+      || norm.startsWith('\\var\\root\\');
+  }
+
+  function resolveCleanQuickAccess(rawQuickAccess) {
+    const cleaned = [];
+    const seen = new Set();
+    const pushQa = (name, pathVal, isShared = false) => {
+      const p = String(pathVal || '').trim();
+      if (!p || isServiceProfilePathJs(p)) return;
+      const key = p.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      cleaned.push({ name, path: p, is_drive: false, is_quick_access: true, is_shared: Boolean(isShared) });
+    };
+
+    if (Array.isArray(rawQuickAccess)) {
+      for (const qa of rawQuickAccess) {
+        if (qa && qa.path) {
+          pushQa(String(qa.name || 'Folder'), qa.path, qa.is_shared);
+        }
+      }
+    }
+
+    // Fallback for LocalSystem service builds where USERPROFILE resolved to systemprofile
+    // while runtime.watched_paths already discovered real interactive user folders.
+    const rtWatched = (cachedSettingsData && cachedSettingsData.runtime && Array.isArray(cachedSettingsData.runtime.watched_paths))
+      ? cachedSettingsData.runtime.watched_paths
+      : [];
+    for (const wp of rtWatched) {
+      const s = String(wp || '').trim();
+      if (!s || isServiceProfilePathJs(s)) continue;
+      if (/^[a-zA-Z]:[\\/]?$/.test(s) || s === '/') continue;
+      const leaf = s.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '';
+      const isOneDrive = /onedrive/i.test(s);
+      if (/^(Desktop|Documents|Downloads|Pictures)$/i.test(leaf)) {
+        pushQa(isOneDrive ? `OneDrive ${leaf}` : leaf, s, false);
+      }
+    }
+    return cleaned;
+  }
 
   async function fetchBrowseFolders(pathStr) {
     try {
@@ -3405,24 +3531,67 @@ function secureRandomIndex(n) {
       const data = await resp.json();
       currentBrowsePath = data.current_path || '';
       currentBrowseParentPath = data.parent_path || '';
-      cachedBrowseDirs = Array.isArray(data.directories) ? data.directories : [];
       if (Array.isArray(data.drives) && data.drives.length > 0) {
         cachedDrives = data.drives;
       }
-      if (Array.isArray(data.quick_access) && data.quick_access.length > 0) {
-        cachedQuickAccess = data.quick_access;
+      const cleanQa = resolveCleanQuickAccess(data.quick_access);
+      if (cleanQa.length > 0 || !cachedQuickAccess.length) {
+        cachedQuickAccess = cleanQa;
+      }
+      const rawDirs = Array.isArray(data.directories) ? data.directories : [];
+      cachedBrowseDirs = rawDirs.filter(d => !d || !d.is_quick_access || !isServiceProfilePathJs(d.path));
+      if (!currentBrowsePath && cachedQuickAccess.length > 0) {
+        const existingLower = new Set(cachedBrowseDirs.map(d => String((d && d.path) || '').toLowerCase()));
+        for (const qa of cachedQuickAccess) {
+          if (!existingLower.has(qa.path.toLowerCase())) {
+            cachedBrowseDirs.push(qa);
+            existingLower.add(qa.path.toLowerCase());
+          }
+        }
       }
     } catch (_) {}
   }
 
   function buildPathBreadcrumbs(currentPath) {
+    const rootLabel = IS_POSIX_CLIENT ? '💽 Computer' : '💽 This PC';
     if (!currentPath) {
-      return [{ label: '💽 This PC', path: '' }];
+      return [{ label: rootLabel, path: '' }];
     }
 
-    const normalized = currentPath.replace(/\//g, '\\');
-    const crumbs = [{ label: '💽 This PC', path: '' }];
+    const raw = String(currentPath).trim();
+    if (!raw) {
+      return [{ label: rootLabel, path: '' }];
+    }
 
+    // POSIX absolute paths (Linux / macOS): preserve forward slashes (`/`)
+    if (raw.startsWith('/')) {
+      const crumbs = [
+        { label: '💽 Computer', path: '' },
+        { label: '💽 /', path: '/' }
+      ];
+      const parts = raw.split('/').filter(Boolean);
+      let accumulated = '';
+      for (const part of parts) {
+        accumulated += '/' + part;
+        crumbs.push({ label: part, path: accumulated });
+      }
+      return crumbs;
+    }
+
+    // Windows UNC network share (`\\server\share\...`)
+    const normalized = raw.replace(/\//g, '\\');
+    const crumbs = [{ label: '💽 This PC', path: '' }];
+    if (normalized.startsWith('\\\\')) {
+      const parts = normalized.slice(2).split('\\').filter(Boolean);
+      let accumulated = '\\\\';
+      parts.forEach((part, idx) => {
+        accumulated = idx === 0 ? `\\\\${part}` : `${accumulated}\\${part}`;
+        crumbs.push({ label: idx === 0 ? `🌐 \\\\${part}` : part, path: accumulated });
+      });
+      return crumbs;
+    }
+
+    // Windows drive path (`C:\...`, `D:\...`)
     let remaining = normalized;
     const driveMatch = remaining.match(/^([a-zA-Z]:\\?)/);
     let accumulated = '';
@@ -3470,9 +3639,14 @@ function secureRandomIndex(n) {
       `;
     }).join('');
 
-    const drivesList = (Array.isArray(drives) && drives.length > 0) ? drives : ['D:\\', 'C:\\'];
+    const defaultDrives = IS_POSIX_CLIENT ? ['/'] : ['C:\\'];
+    const drivesList = (Array.isArray(drives) && drives.length > 0) ? drives : defaultDrives;
     const drivesHtml = drivesList.map(drv => {
-      const isCur = currentPath && currentPath.toLowerCase().startsWith(drv.toLowerCase());
+      const isCur = currentPath && (
+        drv === '/'
+          ? currentPath.startsWith('/')
+          : currentPath.toLowerCase().startsWith(drv.toLowerCase())
+      );
       return `
         <button type="button" class="pill-btn folder-drive-pill ${isCur ? 'active' : ''}" data-action="browse-dir" data-folder-path="${escapeHtml(drv)}" title="Explore drive ${escapeHtml(drv)}">
           💽 ${escapeHtml(drv)}
@@ -3480,7 +3654,8 @@ function secureRandomIndex(n) {
       `;
     }).join('');
 
-    const quickHtml = (Array.isArray(quickAccess) && quickAccess.length > 0) ? quickAccess.map(qa => {
+    const cleanQaList = resolveCleanQuickAccess(quickAccess);
+    const quickHtml = cleanQaList.length > 0 ? cleanQaList.map(qa => {
       const qaPath = String(qa.path || '');
       const isCur = currentPath && currentPath.toLowerCase() === qaPath.toLowerCase();
       return `
@@ -3491,22 +3666,23 @@ function secureRandomIndex(n) {
     }).join('') : '';
 
     const effectiveDirectories = (Array.isArray(directories) && directories.length > 0)
-      ? directories
+      ? directories.filter(d => !d || !d.is_quick_access || !isServiceProfilePathJs(d.path))
       : (!currentPath
           ? [
-              ...drivesList.map(drv => ({ name: `Local Disk (${drv})`, path: drv, is_drive: true })),
-              ...(Array.isArray(quickAccess) ? quickAccess.map(qa => ({ name: qa.name, path: qa.path, is_quick_access: true })) : [])
+              ...drivesList.map(drv => ({ name: drv === '/' ? 'Root Filesystem (/)' : `Local Disk (${drv})`, path: drv, is_drive: true })),
+              ...cleanQaList.map(qa => ({ name: qa.name, path: qa.path, is_quick_access: true }))
             ]
           : []);
 
     const dirRowsHtml = effectiveDirectories.length > 0 ? effectiveDirectories.map(d => {
       const p = String(d.path || '');
-      const isSelected = selectedSet && selectedSet.has(p.toLowerCase());
+      const pNorm = p.replace(/[\\/]+$/, '').toLowerCase();
+      const isSelected = selectedSet && (selectedSet.has(p.toLowerCase()) || (pNorm && selectedSet.has(pNorm)));
       const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
       return `
         <div class="folder-browser-item folder-row ${isSelected ? 'selected' : ''}" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Click row to open ${escapeHtml(d.name)}">
           <div class="folder-row-left">
-            <input type="checkbox" class="folder-row-checkbox" ${isSelected ? 'checked' : ''} data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}" title="Toggle selection for ${escapeHtml(d.name)}">
+            <input type="checkbox" class="folder-row-checkbox" ${isSelected ? 'checked' : ''} aria-label="Select folder ${escapeHtml(d.name)}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}" title="Toggle selection for ${escapeHtml(d.name)}">
             <span class="folder-row-icon">${icon}</span>
             <div class="folder-row-details">
               <span class="folder-row-name">${escapeHtml(d.name)}</span>
@@ -3525,16 +3701,20 @@ function secureRandomIndex(n) {
       `;
     }).join('') : `
       <div style="padding:14px; text-align:center; color:var(--text-muted); font-size:12.5px;">
-        No subdirectories found in this folder.
+        No subdirectories found in this folder. Use the green bar above to select <code>${escapeHtml(currentPath)}</code> directly.
       </div>
     `;
+
+    const isActiveSelected = currentPath && selectedSet && (
+      selectedSet.has(currentPath.toLowerCase()) || selectedSet.has(currentPath.replace(/[\\/]+$/, '').toLowerCase())
+    );
 
     return `
       <div class="folder-explorer-container" data-explorer-context="${contextId}">
         <div class="folder-explorer-toolbar">
           <div class="folder-explorer-nav-buttons">
-            <button type="button" class="pill-btn folder-nav-btn" data-action="browse-root" title="Go to This PC (Drives Root)">
-              💽 This PC
+            <button type="button" class="pill-btn folder-nav-btn" data-action="browse-root" title="Go to Drives & Quick Access Root">
+              💽 ${IS_POSIX_CLIENT ? 'Computer' : 'This PC'}
             </button>
             ${currentPath ? `
               <button type="button" class="pill-btn folder-nav-btn" data-action="browse-up" data-folder-path="${escapeHtml(parentPath || '')}" title="Up to parent directory">
@@ -3565,11 +3745,11 @@ function secureRandomIndex(n) {
         ${currentPath && activePathAction ? `
           <div class="folder-explorer-active-bar">
             <div class="folder-active-info">
-              <span class="folder-active-icon">📁</span>
+              <span class="folder-active-icon">${isActiveSelected ? '✅' : '📁'}</span>
               <span class="folder-active-path">Active: <code>${escapeHtml(currentPath)}</code></span>
             </div>
             <button type="button" class="btn-primary folder-active-action-btn" data-action="${activePathAction}" data-folder-path="${escapeHtml(currentPath)}" data-context="${contextId}">
-              ${escapeHtml(activePathButtonText || '+ Select Active Folder')}
+              ${isActiveSelected ? '✓ Active Folder Selected' : escapeHtml(activePathButtonText || '+ Select Active Folder')}
             </button>
           </div>
         ` : ''}
@@ -3584,7 +3764,7 @@ function secureRandomIndex(n) {
   let pureRustPickerContext = 'general';
   let pureRustPickerCurrentPath = '';
   let pureRustPickerParentPath = '';
-  let pureRustPickerDrives = ['D:\\', 'C:\\'];
+  let pureRustPickerDrives = IS_POSIX_CLIENT ? ['/'] : ['C:\\'];
   let pureRustPickerQuickAccess = [];
   let pureRustPickerDirectories = [];
   let pureRustPickerFilterText = '';
@@ -3601,14 +3781,33 @@ function secureRandomIndex(n) {
     artemis: 'Artemis DFIR .jsonl / Forensic Folder',
   };
 
+  function formatDlpSimulationFilePath(folderOrFilePath) {
+    const clean = String(folderOrFilePath || '').trim();
+    if (!clean) return dlpSelectedSimPath;
+    if (/\.[a-z0-9]{2,5}$/i.test(clean)) return clean;
+    const sep = clean.startsWith('/') ? '/' : '\\';
+    return clean.replace(/[\\/]+$/, '') + sep + 'clinical_note.txt';
+  }
+
+  function closePureRustPickerModal() {
+    const modal = document.getElementById('modal-pure-rust-folder-picker');
+    if (modal) modal.classList.add('hidden');
+    if (pureRustPickerInvokerEl && typeof pureRustPickerInvokerEl.focus === 'function') {
+      try {
+        pureRustPickerInvokerEl.focus();
+      } catch (_) {}
+    }
+    pureRustPickerInvokerEl = null;
+  }
+
   window.applyPickedFolderToContext = async function(ctx, chosenPath) {
     const chosen = (chosenPath || '').trim();
     if (!chosen) {
-      showSettingsToast('Please navigate into a drive or folder before confirming selection.');
+      showSettingsToast('Please navigate into a drive or folder, or click "✓ Pick This Folder" on any row.');
       return false;
     }
 
-    await window.quorumBrowseDir(chosen);
+    await fetchBrowseFolders(chosen);
 
     if (ctx === 'reindex') {
       updateReindexSelectedBadge(chosen);
@@ -3623,20 +3822,19 @@ function secureRandomIndex(n) {
       if (mktInp) mktInp.value = chosen;
       await toggleMarketplaceFolder(chosen, true);
     } else if (ctx === 'dlp') {
+      dlpSelectedSimFolder = chosen;
+      dlpSelectedSimPath = formatDlpSimulationFilePath(chosen);
       const simPathInp = document.getElementById('dlp-sim-path');
       const simPathBadge = document.getElementById('dlp-sim-path-badge');
       const simPathText = document.getElementById('dlp-sim-path-text');
-      const fullSimPath = /\.[a-z0-9]{2,5}$/i.test(chosen)
-        ? chosen
-        : (chosen.replace(/[\\/]+$/, '') + '\\clinical_note.txt');
-      if (simPathInp) simPathInp.value = fullSimPath;
+      if (simPathInp) simPathInp.value = dlpSelectedSimPath;
       if (simPathText) {
-        simPathText.textContent = fullSimPath;
+        simPathText.textContent = dlpSelectedSimPath;
       } else if (simPathBadge) {
-        simPathBadge.textContent = '📁 ' + fullSimPath;
+        simPathBadge.textContent = '📁 ' + dlpSelectedSimPath;
       }
       renderSettingsTabContent('dlp', '');
-      showSettingsToast('✓ DLP simulation folder set: ' + fullSimPath);
+      showSettingsToast('✓ DLP simulation folder set: ' + dlpSelectedSimPath);
     } else if (ctx === 'artemis') {
       artemisSelectedDir = chosen;
       const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
@@ -3652,6 +3850,7 @@ function secureRandomIndex(n) {
       renderSettingsTabContent('artemis-dfir', '');
       showSettingsToast('✓ Selected Artemis DFIR folder: ' + chosen);
     } else {
+      renderSettingsTabContent(activeSettingsTab, '');
       showSettingsToast('✓ Selected folder: ' + chosen);
     }
     return true;
@@ -3665,8 +3864,13 @@ function secureRandomIndex(n) {
 
     const drivesBar = document.getElementById('pure-rust-picker-drives-bar');
     if (drivesBar) {
-      const drvHtml = (pureRustPickerDrives.length ? pureRustPickerDrives : ['D:\\', 'C:\\']).map(drv => {
-        const isActive = pureRustPickerCurrentPath && pureRustPickerCurrentPath.toLowerCase().startsWith(drv.toLowerCase());
+      const fallbackDrives = IS_POSIX_CLIENT ? ['/'] : ['C:\\'];
+      const drvHtml = (pureRustPickerDrives.length ? pureRustPickerDrives : fallbackDrives).map(drv => {
+        const isActive = pureRustPickerCurrentPath && (
+          drv === '/'
+            ? pureRustPickerCurrentPath.startsWith('/')
+            : pureRustPickerCurrentPath.toLowerCase().startsWith(drv.toLowerCase())
+        );
         return `<button type="button" class="pill-btn folder-drive-pill ${isActive ? 'active' : ''}" data-picker-nav="${escapeHtml(drv)}">💽 ${escapeHtml(drv)}</button>`;
       }).join('');
       drivesBar.innerHTML = `<span style="font-size:11.5px; font-weight:700; color:var(--text-muted); margin-right:4px;">Drives:</span>${drvHtml}`;
@@ -3684,6 +3888,11 @@ function secureRandomIndex(n) {
       } else {
         quickBar.innerHTML = '';
       }
+    }
+
+    const rootBtn = document.getElementById('btn-pure-rust-picker-root');
+    if (rootBtn) {
+      rootBtn.textContent = IS_POSIX_CLIENT ? '💽 Computer' : '💽 This PC';
     }
 
     const upBtn = document.getElementById('btn-pure-rust-picker-up');
@@ -3708,21 +3917,27 @@ function secureRandomIndex(n) {
 
     const selectedLabel = document.getElementById('pure-rust-picker-selected-label');
     if (selectedLabel) {
-      selectedLabel.textContent = pureRustPickerCurrentPath || 'This PC (Click any drive or folder below)';
+      selectedLabel.textContent = pureRustPickerCurrentPath || (IS_POSIX_CLIENT ? 'Computer (Click any folder below)' : 'This PC (Click any drive or folder below)');
     }
 
     const confirmBtn = document.getElementById('btn-confirm-pure-rust-picker');
     if (confirmBtn) {
       confirmBtn.disabled = !pureRustPickerCurrentPath;
+      confirmBtn.style.opacity = pureRustPickerCurrentPath ? '1' : '0.5';
+      const leafLabel = pureRustPickerCurrentPath
+        ? (pureRustPickerCurrentPath === '/' ? '/' : (pureRustPickerCurrentPath.split(/[\\/]/).filter(Boolean).pop() || pureRustPickerCurrentPath))
+        : '';
       confirmBtn.textContent = pureRustPickerCurrentPath
-        ? `✅ Select Folder (${pureRustPickerCurrentPath.split(/[\\/]/).filter(Boolean).pop() || pureRustPickerCurrentPath})`
-        : 'Select a Drive or Folder Above';
+        ? `✅ Select Folder (${leafLabel})`
+        : 'Click "✓ Pick This Folder" on a Row or Open a Drive';
     }
 
     const listEl = document.getElementById('pure-rust-picker-dir-list');
     if (listEl) {
       const q = (pureRustPickerFilterText || '').trim().toLowerCase();
       const filtered = pureRustPickerDirectories.filter(d => {
+        if (!d) return false;
+        if (d.is_quick_access && isServiceProfilePathJs(d.path)) return false;
         if (!q) return true;
         return String(d.name || '').toLowerCase().includes(q) || String(d.path || '').toLowerCase().includes(q);
       });
@@ -3763,40 +3978,83 @@ function secureRandomIndex(n) {
 
   async function loadPureRustPickerDirectory(targetPath, createSubfolder) {
     const requested = targetPath !== undefined ? targetPath : pureRustPickerCurrentPath;
+    const qs = `path=${encodeURIComponent(requested || '')}` + (createSubfolder ? `&create_subfolder=${encodeURIComponent(createSubfolder)}` : '');
     try {
-      const payload = { path: requested };
+      let data = null;
+
       if (createSubfolder) {
-        payload.create_subfolder = createSubfolder;
+        const respPost = await fetch('/api/fs/pick-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: requested, create_subfolder: createSubfolder })
+        }).catch(() => null);
+        if (respPost && respPost.ok) {
+          const candidate = await respPost.json().catch(() => null);
+          if (candidate && candidate.cancelled !== true && candidate.status !== 'cancelled' && Array.isArray(candidate.directories)) {
+            data = candidate;
+          }
+        }
       }
-      let resp = await fetch('/api/fs/pick-folder', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!resp.ok) {
-        const qs = `path=${encodeURIComponent(requested || '')}` + (createSubfolder ? `&create_subfolder=${encodeURIComponent(createSubfolder)}` : '');
-        resp = await fetch(`/api/fs/browse-folders?${qs}`);
+
+      if (!data) {
+        let respBrowse = await fetch(`/api/fs/browse-folders?${qs}`).catch(() => null);
+        if (!respBrowse || !respBrowse.ok) {
+          respBrowse = await fetch(`/api/mesh/browse-folders?${qs}`).catch(() => null);
+        }
+        if (respBrowse && respBrowse.ok) {
+          const candidate = await respBrowse.json().catch(() => null);
+          if (candidate && candidate.cancelled !== true && candidate.status !== 'cancelled') {
+            data = candidate;
+          }
+        }
       }
-      if (!resp.ok) return;
-      const data = await resp.json();
+
+      if (!data) {
+        const respFallback = await fetch('/api/fs/pick-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: requested })
+        }).catch(() => null);
+        if (respFallback && respFallback.ok) {
+          const candidate = await respFallback.json().catch(() => null);
+          if (candidate && candidate.cancelled !== true && candidate.status !== 'cancelled' && Array.isArray(candidate.directories)) {
+            data = candidate;
+          }
+        }
+      }
+
+      if (!data) return;
+
       pureRustPickerCurrentPath = data.current_path !== undefined ? data.current_path : (data.path || '');
       pureRustPickerParentPath = data.parent_path || '';
       if (Array.isArray(data.drives) && data.drives.length > 0) {
         pureRustPickerDrives = data.drives;
         cachedDrives = data.drives;
       }
-      if (Array.isArray(data.quick_access) && data.quick_access.length > 0) {
-        pureRustPickerQuickAccess = data.quick_access;
-        cachedQuickAccess = data.quick_access;
+      const cleanQa = resolveCleanQuickAccess(data.quick_access);
+      if (cleanQa.length > 0 || !pureRustPickerQuickAccess.length) {
+        pureRustPickerQuickAccess = cleanQa;
+        cachedQuickAccess = cleanQa;
       }
-      pureRustPickerDirectories = Array.isArray(data.directories) ? data.directories : [];
+      const rawDirs = Array.isArray(data.directories) ? data.directories : [];
+      pureRustPickerDirectories = rawDirs.filter(d => !d || !d.is_quick_access || !isServiceProfilePathJs(d.path));
+      if (!pureRustPickerCurrentPath && pureRustPickerQuickAccess.length > 0) {
+        const existingLower = new Set(pureRustPickerDirectories.map(d => String((d && d.path) || '').toLowerCase()));
+        for (const qa of pureRustPickerQuickAccess) {
+          if (!existingLower.has(qa.path.toLowerCase())) {
+            pureRustPickerDirectories.push(qa);
+            existingLower.add(qa.path.toLowerCase());
+          }
+        }
+      }
     } catch (err) {
       showSettingsToast('Pure Rust folder browser error: ' + err.message);
     } finally {
       if (pureRustPickerDirectories.length === 0 && !pureRustPickerCurrentPath) {
+        const fallbackDrives = pureRustPickerDrives.length ? pureRustPickerDrives : (IS_POSIX_CLIENT ? ['/'] : ['C:\\']);
         pureRustPickerDirectories = [
-          ...(pureRustPickerDrives.length ? pureRustPickerDrives : ['D:\\', 'C:\\']).map(drv => ({
-            name: `Local Disk (${drv})`,
+          ...fallbackDrives.map(drv => ({
+            name: drv === '/' ? 'Root Filesystem (/)' : `Local Disk (${drv})`,
             path: drv,
             is_drive: true
           })),
@@ -3817,15 +4075,18 @@ function secureRandomIndex(n) {
     modal = document.createElement('div');
     modal.id = 'modal-pure-rust-folder-picker';
     modal.className = 'modal-backdrop hidden';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-labelledby', 'pure-rust-picker-title');
     modal.style.zIndex = '100000';
     modal.innerHTML = `
       <div class="modal-card" style="max-width: 740px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
         <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-            <h3 style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
+            <h3 id="pure-rust-picker-title" style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
             <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Folder</span>
           </div>
-          <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker">&times;</button>
+          <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker" aria-label="Close Folder Picker">&times;</button>
         </div>
         <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
           <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
@@ -3836,9 +4097,9 @@ function secureRandomIndex(n) {
             <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1; min-inline-size:0;"></div>
           </div>
           <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-            <input type="search" id="pure-rust-picker-filter-input" class="settings-input" placeholder="🔍 Filter folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
+            <input type="search" id="pure-rust-picker-filter-input" class="settings-input" aria-label="Filter folders in current view" placeholder="🔍 Filter folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
             <div style="display:flex; gap:6px; align-items:center;">
-              <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
+              <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" aria-label="New subfolder name" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
               <button type="button" class="pill-btn" id="btn-pure-rust-picker-create-folder" style="padding:5px 10px; font-size:12px; font-weight:600;">+ Create Subfolder</button>
             </div>
           </div>
@@ -3865,9 +4126,7 @@ function secureRandomIndex(n) {
     if (!modal) return;
     pureRustPickerListenersBound = true;
 
-    const closePicker = () => {
-      modal.classList.add('hidden');
-    };
+    const closePicker = () => closePureRustPickerModal();
 
     const btnClose = document.getElementById('btn-close-pure-rust-picker');
     const btnCancel = document.getElementById('btn-cancel-pure-rust-picker');
@@ -3896,9 +4155,14 @@ function secureRandomIndex(n) {
           if (newFolderInp) newFolderInp.focus();
           return;
         }
+        const prevPath = pureRustPickerCurrentPath;
         await loadPureRustPickerDirectory(pureRustPickerCurrentPath, subName);
         if (newFolderInp) newFolderInp.value = '';
-        showSettingsToast('✓ Created and opened subfolder: ' + subName);
+        if (pureRustPickerCurrentPath && pureRustPickerCurrentPath !== prevPath) {
+          showSettingsToast('✓ Created and opened subfolder: ' + subName);
+        } else {
+          showSettingsToast('Refreshed folder view for: ' + prevPath);
+        }
       });
     }
 
@@ -3924,7 +4188,7 @@ function secureRandomIndex(n) {
     if (btnConfirm) {
       btnConfirm.addEventListener('click', async () => {
         if (!pureRustPickerCurrentPath) {
-          showSettingsToast('Click a drive or folder first.');
+          showSettingsToast('Click "✓ Pick This Folder" on any row or open a drive first.');
           return;
         }
         const ok = await window.applyPickedFolderToContext(pureRustPickerContext, pureRustPickerCurrentPath);
@@ -3960,14 +4224,18 @@ function secureRandomIndex(n) {
     });
   }
 
-  window.openPureRustFolderPicker = async function(contextId = 'general', initialPath = '') {
+  window.openPureRustFolderPicker = async function(contextId = 'general', initialPath = '', invokerEl = null) {
     pureRustPickerContext = contextId || 'general';
     pureRustPickerFilterText = '';
+    pureRustPickerInvokerEl = invokerEl || document.activeElement || null;
     bindPureRustPickerModalListeners();
     const filterInp = document.getElementById('pure-rust-picker-filter-input');
     if (filterInp) filterInp.value = '';
     const modal = ensurePureRustPickerModal();
-    const startPath = (initialPath || currentBrowsePath || (contextId === 'artemis' ? artemisSelectedDir : '') || '').trim();
+    const contextDefaultPath = contextId === 'artemis'
+      ? artemisSelectedDir
+      : (contextId === 'dlp' ? dlpSelectedSimFolder : '');
+    const startPath = (initialPath || currentBrowsePath || contextDefaultPath || '').trim();
     pureRustPickerCurrentPath = startPath;
     if (Array.isArray(cachedDrives) && cachedDrives.length > 0) {
       pureRustPickerDrives = cachedDrives;
@@ -3981,6 +4249,9 @@ function secureRandomIndex(n) {
     if (modal) {
       modal.classList.remove('hidden');
       renderPureRustPickerModalContent();
+      if (filterInp && typeof filterInp.focus === 'function') {
+        setTimeout(() => { try { filterInp.focus(); } catch (_) {} }, 0);
+      }
       await loadPureRustPickerDirectory(startPath);
     }
   };
@@ -3990,12 +4261,13 @@ function secureRandomIndex(n) {
     if (!mount) return;
     const curTarget = document.getElementById('reindex-target-path');
     const targetVal = curTarget ? curTarget.value.trim().toLowerCase() : '';
-    const selectedSet = new Set(targetVal ? [targetVal] : []);
+    const selectedSet = new Set(targetVal ? [targetVal, targetVal.replace(/[\\/]+$/, '')] : []);
     mount.innerHTML = renderWindowsFileExplorerHtml({
       contextId: 'reindex',
       currentPath: currentBrowsePath,
       parentPath: currentBrowseParentPath,
       drives: cachedDrives,
+      quickAccess: cachedQuickAccess,
       directories: cachedBrowseDirs,
       selectedSet: selectedSet,
       selectAction: 'reindex-pick-folder',
@@ -4006,14 +4278,45 @@ function secureRandomIndex(n) {
     });
   }
 
+  function syncPendingMarketplaceInputsFromDom() {
+    const chkGen = document.getElementById('chk-general-optin-consent');
+    const chkMkt = document.getElementById('chk-mkt-consent');
+    if (chkMkt) {
+      pendingOptInConsentChecked = Boolean(chkMkt.checked);
+    } else if (chkGen) {
+      pendingOptInConsentChecked = Boolean(chkGen.checked);
+    }
+    const jurSel = document.getElementById('mkt-jurisdiction-select');
+    if (jurSel && jurSel.value) {
+      pendingMktJurisdiction = jurSel.value;
+    }
+    const priceInp = document.getElementById('mkt-price-cents');
+    if (priceInp && priceInp.value) {
+      pendingMktPriceCents = Number(priceInp.value);
+    }
+    const chkAddDoc = document.getElementById('chk-add-doc-optin');
+    if (chkAddDoc) {
+      addDocIncludeOptIn = Boolean(chkAddDoc.checked);
+    }
+  }
+
   async function toggleMarketplaceFolder(targetPath, forceAdd) {
     if (!targetPath) return;
+    syncPendingMarketplaceInputsFromDom();
     const mkt = cachedMarketplaceStatus || {};
     const curFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders.slice() : [];
-    const existingIdx = curFolders.findIndex(f => f.toLowerCase() === targetPath.toLowerCase());
+    const normTarget = targetPath.replace(/[\\/]+$/, '').toLowerCase();
+    const existingIdx = curFolders.findIndex(f => {
+      const nf = String(f || '').replace(/[\\/]+$/, '').toLowerCase();
+      return f.toLowerCase() === targetPath.toLowerCase() || (normTarget && nf === normTarget);
+    });
     let toastMsg = '';
     if (existingIdx >= 0) {
-      if (forceAdd) return;
+      if (forceAdd) {
+        showSettingsToast('✓ Folder already in Opt-In scope: ' + targetPath);
+        renderSettingsTabContent(activeSettingsTab, '');
+        return;
+      }
       curFolders.splice(existingIdx, 1);
       toastMsg = 'Removed folder from Opt-In scope: ' + targetPath;
     } else {
@@ -4036,26 +4339,36 @@ function secureRandomIndex(n) {
   }
 
   window.quorumBrowseDir = async function(pathStr) {
+    syncPendingMarketplaceInputsFromDom();
     await fetchBrowseFolders(pathStr);
     renderSettingsTabContent(activeSettingsTab, '');
     renderReindexExplorer();
-    showSettingsToast(pathStr ? ('Browsing ' + pathStr) : 'Showing physical drives');
+    showSettingsToast(pathStr ? ('Browsing ' + pathStr) : (IS_POSIX_CLIENT ? 'Showing filesystems & quick access' : 'Showing physical drives & quick access'));
   };
 
   window.quorumIndexFolderImmediate = async function(folderPath) {
     const clean = (folderPath || '').trim();
     if (!clean) return;
+    syncPendingMarketplaceInputsFromDom();
     const inp = document.getElementById('new-doc-path-input');
     if (inp) inp.value = clean;
     const chkOptIn = document.getElementById('chk-add-doc-optin');
-    showSettingsToast('⏳ Watching & indexing folder immediately: ' + clean);
+    const includeOptIn = chkOptIn ? Boolean(chkOptIn.checked) : addDocIncludeOptIn;
+
+    if (!clientWatchedFolders.some(p => p.toLowerCase() === clean.toLowerCase())) {
+      clientWatchedFolders.push(clean);
+      saveClientWatchedFolders();
+    }
+    renderSettingsTabContent(activeSettingsTab, '');
+    showSettingsToast('⏳ Watching & indexing folder in background: ' + clean);
+
     try {
       const resp = await fetch('/api/documents/add', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           local_paths: [clean],
-          add_to_opt_in: !!(chkOptIn && chkOptIn.checked)
+          add_to_opt_in: includeOptIn
         })
       });
       const resData = await resp.json().catch(() => ({}));
@@ -4063,14 +4376,25 @@ function secureRandomIndex(n) {
         showSettingsToast('⚠ ' + (resData.error || 'Failed to index folder'));
         return;
       }
-      await fetchMarketplaceData();
-      await loadFullSettings();
+      await Promise.all([
+        fetchMarketplaceData(),
+        loadFullSettings()
+      ]);
       checkReindexStatus();
       renderSettingsTabContent(activeSettingsTab, '');
-      showSettingsToast(`✓ Watched & indexed folder: ${clean}`);
+      showSettingsToast(`✓ Watching & indexing folder: ${clean}`);
     } catch (err) {
       showSettingsToast('⚠ Folder indexing error: ' + err.message);
     }
+  };
+
+  window.quorumRemoveClientWatchedFolder = function(folderPath) {
+    const clean = (folderPath || '').trim();
+    if (!clean) return;
+    clientWatchedFolders = clientWatchedFolders.filter(p => p.toLowerCase() !== clean.toLowerCase());
+    saveClientWatchedFolders();
+    renderSettingsTabContent(activeSettingsTab, '');
+    showSettingsToast('Removed from custom watched folder list: ' + clean);
   };
 
   window.quorumShareFolder = async function(pathStr) {
@@ -4266,7 +4590,9 @@ function secureRandomIndex(n) {
     if (!toast) {
       toast = document.createElement('div');
       toast.id = 'quorum-settings-toast';
-      toast.style.cssText = 'position:fixed; bottom:24px; right:24px; z-index:9999; background:var(--accent, #10a37f); color:#fff; padding:10px 18px; border-radius:999px; font-size:13px; font-weight:600; box-shadow:0 6px 20px rgba(0,0,0,0.35); transition:opacity 0.2s ease;';
+      toast.setAttribute('role', 'status');
+      toast.setAttribute('aria-live', 'polite');
+      toast.style.cssText = 'position:fixed; bottom:24px; right:24px; z-index:250000; pointer-events:none; background:var(--accent, #10a37f); color:#fff; padding:10px 18px; border-radius:999px; font-size:13px; font-weight:600; box-shadow:0 6px 20px rgba(0,0,0,0.45); transition:opacity 0.2s ease;';
       document.body.appendChild(toast);
     }
     toast.textContent = msg;
@@ -4274,7 +4600,7 @@ function secureRandomIndex(n) {
     clearTimeout(window._quorumToastTimer);
     window._quorumToastTimer = setTimeout(() => {
       if (toast) toast.style.opacity = '0';
-    }, 2200);
+    }, 2600);
   }
 
   // State caches for Mesh & TPM subsystem
@@ -4479,57 +4805,98 @@ function secureRandomIndex(n) {
           e.preventDefault();
           e.stopPropagation();
           const ctx = actionEl.dataset.context || 'general';
-          await window.openPureRustFolderPicker(ctx, currentBrowsePath);
+          await window.openPureRustFolderPicker(ctx, currentBrowsePath, actionEl);
           break;
         }
 
         case 'dlp-select-sim-folder': {
-          e.preventDefault();
+          preventIfNotCheckbox(e, actionEl);
           e.stopPropagation();
-          if (folderPath) {
+          const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+          if (folderPath && isRowToggle && dlpSelectedSimFolder && dlpSelectedSimFolder.toLowerCase() === folderPath.toLowerCase()) {
+            dlpSelectedSimFolder = '';
+            dlpSelectedSimPath = IS_POSIX_CLIENT ? '/tmp/clinical_note.txt' : 'D:\\harfile\\QuorumRAG\\docs\\clinical_note.txt';
+            renderSettingsTabContent('dlp', '');
+            showSettingsToast('DLP simulation path reset to default');
+          } else if (folderPath) {
+            dlpSelectedSimFolder = folderPath;
+            dlpSelectedSimPath = formatDlpSimulationFilePath(folderPath);
             const simPathInp = document.getElementById('dlp-sim-path');
             const simPathBadge = document.getElementById('dlp-sim-path-badge');
             const simPathText = document.getElementById('dlp-sim-path-text');
-            const fullSimPath = /\.[a-z0-9]{2,5}$/i.test(folderPath)
-              ? folderPath
-              : (folderPath.replace(/[\\/]+$/, '') + '\\clinical_note.txt');
-            if (simPathInp) simPathInp.value = fullSimPath;
+            if (simPathInp) simPathInp.value = dlpSelectedSimPath;
             if (simPathText) {
-              simPathText.textContent = fullSimPath;
+              simPathText.textContent = dlpSelectedSimPath;
             } else if (simPathBadge) {
-              simPathBadge.textContent = '📁 ' + fullSimPath;
+              simPathBadge.textContent = '📁 ' + dlpSelectedSimPath;
             }
-            showSettingsToast('✓ Simulated folder set: ' + fullSimPath);
+            renderSettingsTabContent('dlp', '');
+            showSettingsToast('✓ Simulated folder set: ' + dlpSelectedSimPath);
           }
           break;
         }
 
         case 'newdoc-pick-folder': {
+          preventIfNotCheckbox(e, actionEl);
+          e.stopPropagation();
+          if (folderPath) {
+            const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+            const rtWatched = (cachedSettingsData && cachedSettingsData.runtime && Array.isArray(cachedSettingsData.runtime.watched_paths))
+              ? cachedSettingsData.runtime.watched_paths
+              : [];
+            const isDaemonRoot = rtWatched.some(p => String(p || '').toLowerCase() === folderPath.toLowerCase());
+            const isClientCustom = clientWatchedFolders.some(p => p.toLowerCase() === folderPath.toLowerCase());
+            if (isRowToggle && isClientCustom && !isDaemonRoot) {
+              window.quorumRemoveClientWatchedFolder(folderPath);
+            } else {
+              await window.quorumIndexFolderImmediate(folderPath);
+            }
+          }
+          break;
+        }
+
+        case 'remove-client-watched-folder': {
           e.preventDefault();
           e.stopPropagation();
           if (folderPath) {
-            await window.quorumIndexFolderImmediate(folderPath);
+            window.quorumRemoveClientWatchedFolder(folderPath);
           }
           break;
         }
 
         case 'reindex-pick-folder': {
-          e.preventDefault();
+          preventIfNotCheckbox(e, actionEl);
           e.stopPropagation();
           if (folderPath) {
-            updateReindexSelectedBadge(folderPath);
-            renderReindexExplorer();
-            showSettingsToast('Target reindex folder set: ' + folderPath);
+            const curInp = document.getElementById('reindex-target-path');
+            const curVal = curInp ? curInp.value.trim() : '';
+            const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+            if (isRowToggle && curVal && curVal.toLowerCase() === folderPath.toLowerCase()) {
+              updateReindexSelectedBadge('');
+              renderReindexExplorer();
+              showSettingsToast('Target reset to All Watched Drives & Folders');
+            } else {
+              updateReindexSelectedBadge(folderPath);
+              renderReindexExplorer();
+              showSettingsToast('✓ Target reindex folder set: ' + folderPath);
+            }
           }
           break;
         }
 
         case 'artemis-pick-folder':
         case 'artemis-select-folder': {
-          e.preventDefault();
+          preventIfNotCheckbox(e, actionEl);
           e.stopPropagation();
           const target = folderPath || currentBrowsePath;
-          if (target) {
+          const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+          if (target && isRowToggle && artemisSelectedDir && artemisSelectedDir.toLowerCase() === target.toLowerCase()) {
+            artemisSelectedDir = '';
+            const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
+            if (hiddenInp) hiddenInp.value = '';
+            renderSettingsTabContent('artemis-dfir', '');
+            showSettingsToast('Cleared selected folder. Target set to Live OS Telemetry.');
+          } else if (target) {
             artemisSelectedDir = target;
             const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
             const displayPill = document.getElementById('artemis-selected-folder-display');
@@ -4542,7 +4909,7 @@ function secureRandomIndex(n) {
               displayPill.style.borderColor = 'rgba(16,163,127,0.35)';
             }
             renderSettingsTabContent('artemis-dfir', '');
-            showSettingsToast('Target forensic folder set: ' + target);
+            showSettingsToast('✓ Target forensic folder set: ' + target);
           }
           break;
         }
@@ -4818,11 +5185,28 @@ function secureRandomIndex(n) {
           break;
         }
 
-        case 'share-folder':
-          e.preventDefault();
+        case 'share-folder': {
+          preventIfNotCheckbox(e, actionEl);
           e.stopPropagation();
-          if (folderPath) await window.quorumShareFolder(folderPath);
+          if (folderPath) {
+            const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+            const sharedList = (cachedSettingsData && cachedSettingsData.mesh && Array.isArray(cachedSettingsData.mesh.shared_folders))
+              ? cachedSettingsData.mesh.shared_folders
+              : [];
+            const normTarget = folderPath.replace(/[\\/]+$/, '').toLowerCase();
+            const alreadyShared = sharedList.some(f => {
+              if (!f || !f.enabled) return false;
+              const nf = String(f.path || '').replace(/[\\/]+$/, '').toLowerCase();
+              return String(f.path || '').toLowerCase() === folderPath.toLowerCase() || (normTarget && nf === normTarget);
+            });
+            if (isRowToggle && alreadyShared) {
+              await window.quorumRemoveSharedFolder(folderPath);
+            } else {
+              await window.quorumShareFolder(folderPath);
+            }
+          }
           break;
+        }
 
         case 'remove-shared-folder':
           e.preventDefault();
@@ -4833,7 +5217,7 @@ function secureRandomIndex(n) {
         case 'select-shared-pill':
           e.preventDefault();
           if (folderPath) {
-            await window.quorumShareFolder(folderPath);
+            await window.quorumBrowseDir(folderPath);
           }
           break;
 
@@ -5192,9 +5576,9 @@ function secureRandomIndex(n) {
           const tid = actionEl.dataset.targetId;
           const targetInput = tid ? document.getElementById(tid) : null;
           if (tid === 'artemis-folder-upload-input') {
-            await window.openPureRustFolderPicker('artemis', currentBrowsePath);
+            await window.openPureRustFolderPicker('artemis', currentBrowsePath, actionEl);
           } else if (tid === 'add-new-folder-file-input' || (targetInput && targetInput.hasAttribute('webkitdirectory'))) {
-            await window.openPureRustFolderPicker('newdoc', currentBrowsePath);
+            await window.openPureRustFolderPicker('newdoc', currentBrowsePath, actionEl);
           } else if (targetInput) {
             targetInput.click();
           }
@@ -5308,6 +5692,7 @@ function secureRandomIndex(n) {
             showSettingsToast('⚠ ' + (errObj.error || 'Failed to save Opt-In'));
             return;
           }
+          pendingOptInConsentChecked = true;
           await fetchMarketplaceData();
           renderSettingsTabContent(activeSettingsTab, '');
           showSettingsToast('✓ Opt-In Consent agreed & signed into Consent Ledger');
@@ -5345,6 +5730,9 @@ function secureRandomIndex(n) {
             showSettingsToast('⚠ ' + (errObj.error || 'Failed to save Opt-In'));
             return;
           }
+          pendingOptInConsentChecked = true;
+          pendingMktJurisdiction = null;
+          pendingMktPriceCents = null;
           await fetchMarketplaceData();
           renderSettingsTabContent(activeSettingsTab, '');
           showSettingsToast('✓ Opt-In Consent & Folder Scope signed into Consent Ledger');
@@ -5353,6 +5741,7 @@ function secureRandomIndex(n) {
 
         case 'mkt-revoke-optout': {
           e.preventDefault();
+          pendingOptInConsentChecked = false;
           const curFolders = (cachedMarketplaceStatus && Array.isArray(cachedMarketplaceStatus.opt_in_folders))
             ? cachedMarketplaceStatus.opt_in_folders
             : [];
@@ -5375,7 +5764,7 @@ function secureRandomIndex(n) {
         }
 
         case 'mkt-toggle-folder': {
-          e.preventDefault();
+          preventIfNotCheckbox(e, actionEl);
           e.stopPropagation();
           const targetPath = (actionEl.dataset.folderPath || '').trim();
           if (!targetPath) return;
@@ -5586,6 +5975,15 @@ function secureRandomIndex(n) {
     });
 
     container.addEventListener('change', async (e) => {
+      if (e.target && (e.target.id === 'chk-mkt-consent' || e.target.id === 'chk-general-optin-consent')) {
+        pendingOptInConsentChecked = Boolean(e.target.checked);
+      } else if (e.target && e.target.id === 'mkt-jurisdiction-select') {
+        pendingMktJurisdiction = e.target.value;
+      } else if (e.target && e.target.id === 'mkt-price-cents') {
+        pendingMktPriceCents = Number(e.target.value || 5000);
+      } else if (e.target && e.target.id === 'chk-add-doc-optin') {
+        addDocIncludeOptIn = Boolean(e.target.checked);
+      }
       const changeEl = e.target.closest('[data-change-action]');
       if (!changeEl) return;
 
@@ -5740,7 +6138,10 @@ function secureRandomIndex(n) {
               showSettingsToast('⚠ ' + (resData.error || 'Failed to upload documents'));
               break;
             }
-            await fetchMarketplaceData();
+            await Promise.all([
+              fetchMarketplaceData(),
+              loadFullSettings()
+            ]);
             checkReindexStatus();
             renderSettingsTabContent(activeSettingsTab, '');
             showSettingsToast(`✓ Added & indexed ${resData.added_count || files.length} new document(s)`);
@@ -5873,7 +6274,32 @@ function secureRandomIndex(n) {
     const optInFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders : [];
     const consentLedger = Array.isArray(mkt.consent_ledger) ? mkt.consent_ledger : [];
 
-    const optInLowerSet = new Set(optInFolders.map(f => String(f || '').toLowerCase()));
+    const optInLowerSet = new Set();
+    optInFolders.forEach(f => {
+      const s = String(f || '').toLowerCase();
+      if (s) {
+        optInLowerSet.add(s);
+        optInLowerSet.add(s.replace(/[\\/]+$/, ''));
+      }
+    });
+    const effectiveConsentChecked = pendingOptInConsentChecked !== null
+      ? pendingOptInConsentChecked
+      : Boolean(mkt.opt_in_enabled && mkt.user_consent_checked);
+    const effectiveFiveEyes = pendingMktJurisdiction !== null
+      ? (pendingMktJurisdiction === 'FIVE_EYES')
+      : Boolean(mkt.five_eyes_enabled);
+    const effectivePriceCents = pendingMktPriceCents !== null
+      ? pendingMktPriceCents
+      : (mkt.price_per_1k_records_cents || 5000);
+    const combinedWatchedPaths = getCombinedWatchedPaths(rt.watched_paths);
+    const watchedLowerSet = new Set();
+    combinedWatchedPaths.forEach(p => {
+      const s = String(p || '').toLowerCase();
+      if (s) {
+        watchedLowerSet.add(s);
+        watchedLowerSet.add(s.replace(/[\\/]+$/, ''));
+      }
+    });
 
     const quickSubTabsBar = (activeSub) => `
       <div class="settings-subtab-nav">
@@ -5911,7 +6337,7 @@ function secureRandomIndex(n) {
           </div>
 
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; padding:10px 12px; border-radius:8px; background:rgba(255,255,255,0.03); border:1px solid var(--border-color); font-size:13px; line-height:1.45;">
-            <input type="checkbox" id="chk-general-optin-consent" ${mkt.opt_in_enabled && mkt.user_consent_checked ? 'checked' : ''} style="width:18px; height:18px; margin-top:2px; accent-color:#10a37f; cursor:pointer;">
+            <input type="checkbox" id="chk-general-optin-consent" ${effectiveConsentChecked ? 'checked' : ''} style="width:18px; height:18px; margin-top:2px; accent-color:#10a37f; cursor:pointer;">
             <span>
               <strong>I explicitly check and agree to Opt-In</strong> to sell de-identified SFT/DPO trajectories strictly from my selected Opt-In folders (scrubbed by the 3-Engine Airlock: <code>VaultGemma-1B RedactX-v3</code> + <code>Presidio</code> + <code>GLiNER</code>). I understand this is Opt-Out by default and my signed consent is saved to the Consent Ledger.
             </span>
@@ -6053,7 +6479,7 @@ function secureRandomIndex(n) {
           </div>
 
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; padding:12px; border-radius:8px; background:rgba(255,255,255,0.04); border:1px solid var(--border-color); font-size:13.5px; line-height:1.5;">
-            <input type="checkbox" id="chk-mkt-consent" ${mkt.opt_in_enabled && mkt.user_consent_checked ? 'checked' : ''} style="width:18px; height:18px; margin-top:3px; accent-color:#10a37f; cursor:pointer;">
+            <input type="checkbox" id="chk-mkt-consent" ${effectiveConsentChecked ? 'checked' : ''} style="width:18px; height:18px; margin-top:3px; accent-color:#10a37f; cursor:pointer;">
             <span>
               <strong>I explicitly check and agree to Opt-In</strong> to sell de-identified SFT/DPO training trajectories strictly from my selected folders below. All records pass through the 3-Engine Airlock (<code>VaultGemma-1B RedactX-v3</code> + <code>Microsoft Presidio</code> + <code>GLiNER</code>) with zero raw files ever exported. My consent is cryptographically signed (Ed25519) and recorded in the Consent Audit Ledger.
             </span>
@@ -6065,8 +6491,8 @@ function secureRandomIndex(n) {
               <div class="settings-row-desc">Hard-blocks <code>CN, HK, MO, RU, IR, KP, BY, CU, VE</code> and high-risk datacenter/VPN ASNs.</div>
             </div>
             <select id="mkt-jurisdiction-select" class="pill-select">
-              <option value="US_ONLY" ${!mkt.five_eyes_enabled ? 'selected' : ''}>US Only (DOJ 28 CFR Part 202 Sovereign Lock)</option>
-              <option value="FIVE_EYES" ${mkt.five_eyes_enabled ? 'selected' : ''}>Five Eyes Allied (US, CA, GB, AU, NZ)</option>
+              <option value="US_ONLY" ${!effectiveFiveEyes ? 'selected' : ''}>US Only (DOJ 28 CFR Part 202 Sovereign Lock)</option>
+              <option value="FIVE_EYES" ${effectiveFiveEyes ? 'selected' : ''}>Five Eyes Allied (US, CA, GB, AU, NZ)</option>
             </select>
           </div>
 
@@ -6075,7 +6501,7 @@ function secureRandomIndex(n) {
               <span class="settings-row-label">Floor Price (Cents per 1,000 SFT/DPO Records)</span>
               <div class="settings-row-desc">Minimum price in cents per 1k records (<code>5000</code> = $50.00 / 1k records).</div>
             </div>
-            <input type="number" id="mkt-price-cents" class="settings-input" style="width:120px;" min="100" step="100" value="${mkt.price_per_1k_records_cents || 5000}">
+            <input type="number" id="mkt-price-cents" class="settings-input" style="width:120px;" min="100" step="100" value="${effectivePriceCents}">
           </div>
 
           <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:14px;">
@@ -6153,9 +6579,26 @@ function secureRandomIndex(n) {
 
           <input type="hidden" id="new-doc-path-input" value="">
           <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; margin-bottom:10px;">
-            <input type="checkbox" id="chk-add-doc-optin" checked style="width:16px; height:16px; accent-color:#10a37f; cursor:pointer;">
+            <input type="checkbox" id="chk-add-doc-optin" ${addDocIncludeOptIn ? 'checked' : ''} style="width:16px; height:16px; accent-color:#10a37f; cursor:pointer;">
             <span>Also include newly selected folders/documents in my Opt-In scope (<code>opt_in_folders</code>)</span>
           </label>
+
+          <div style="margin-bottom:10px; padding:10px 12px; border-radius:8px; background:rgba(16,163,127,0.07); border:1px solid rgba(16,163,127,0.28);">
+            <div style="font-size:12px; font-weight:700; color:#10a37f; margin-bottom:6px;">
+              📁 Active Watched &amp; Indexed Folders (${combinedWatchedPaths.length}):
+            </div>
+            <div style="display:flex; flex-wrap:wrap; gap:6px;">
+              ${combinedWatchedPaths.length > 0
+                ? combinedWatchedPaths.map(wp => {
+                    const isCustom = clientWatchedFolders.some(c => c.toLowerCase() === wp.toLowerCase())
+                      && !(Array.isArray(rt.watched_paths) && rt.watched_paths.some(r => String(r || '').toLowerCase() === wp.toLowerCase()));
+                    return isCustom
+                      ? `<button type="button" class="pill-btn" style="padding:3px 9px; font-size:11.5px; border-color:#10a37f; color:#10a37f; background:rgba(16,163,127,0.14);" data-action="remove-client-watched-folder" data-folder-path="${escapeHtml(wp)}" title="Click to remove ${escapeHtml(wp)} from custom list">☑️ <code>${escapeHtml(wp)}</code> &nbsp;✕</button>`
+                      : `<button type="button" class="pill-btn" style="padding:3px 9px; font-size:11.5px; border-color:rgba(16,163,127,0.4); color:#10a37f;" data-action="browse-dir" data-folder-path="${escapeHtml(wp)}" title="Click to browse ${escapeHtml(wp)}">✓ <code>${escapeHtml(wp)}</code></button>`;
+                  }).join('')
+                : '<span style="font-size:12px; color:var(--text-muted);">Click any drive or folder below to start watching and indexing immediately.</span>'}
+            </div>
+          </div>
 
           <div style="margin-top:8px;">
             <div style="font-size:12.5px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">
@@ -6167,7 +6610,7 @@ function secureRandomIndex(n) {
               parentPath: currentBrowseParentPath,
               drives: cachedDrives,
               directories: cachedBrowseDirs,
-              selectedSet: new Set((rt.watched_paths || []).map(p => String(p || '').toLowerCase())),
+              selectedSet: watchedLowerSet,
               selectAction: 'newdoc-pick-folder',
               selectButtonText: '+ Watch & Index Folder',
               activePathAction: 'newdoc-pick-folder',
@@ -7454,9 +7897,9 @@ function secureRandomIndex(n) {
           </div>
           <div style="margin-bottom:8px;">
             <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:4px;">Simulated Source Folder / File (Click to Select — No Typing Required):</label>
-            <input type="hidden" id="dlp-sim-path" value="D:\\harfile\\QuorumRAG\\docs\\clinical_note.txt">
+            <input type="hidden" id="dlp-sim-path" value="${escapeHtml(dlpSelectedSimPath)}">
             <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
-              <span id="dlp-sim-path-badge" class="status-pill healthy" style="font-size:12px; padding:4px 10px;">📁 <code id="dlp-sim-path-text">D:\harfile\QuorumRAG\docs\clinical_note.txt</code></span>
+              <span id="dlp-sim-path-badge" class="status-pill healthy" style="font-size:12px; padding:4px 10px;">📁 <code id="dlp-sim-path-text">${escapeHtml(dlpSelectedSimPath)}</code></span>
               <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="dlp" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">📂 Open Pure Rust Folder Picker...</button>
               ${(mesh.shared_folders || []).map(sf => `<button type="button" class="pill-btn" data-action="dlp-select-sim-folder" data-folder-path="${escapeHtml(sf.path)}" style="font-size:11.5px;">📁 ${escapeHtml(sf.path)}</button>`).join('')}
             </div>
@@ -7466,7 +7909,7 @@ function secureRandomIndex(n) {
               parentPath: currentBrowseParentPath,
               drives: cachedDrives,
               directories: cachedBrowseDirs,
-              selectedSet: new Set(),
+              selectedSet: new Set(dlpSelectedSimFolder ? [dlpSelectedSimFolder.toLowerCase(), dlpSelectedSimFolder.replace(/[\\/]+$/, '').toLowerCase()] : []),
               selectAction: 'dlp-select-sim-folder',
               selectButtonText: '+ Select for DLP Test',
               activePathAction: 'dlp-select-sim-folder',
@@ -8291,7 +8734,7 @@ function secureRandomIndex(n) {
           </div>
           ${showStorageFilesDetail ? `
           <div style="padding:10px 8px; border-bottom:1px solid var(--border-color); font-size:12.5px; color:var(--text-muted);">
-            <div><strong>Active Watched Paths:</strong> <code>${escapeHtml((rt.watched_paths || []).join(', '))}</code></div>
+            <div><strong>Active Watched Paths:</strong> <code>${escapeHtml(combinedWatchedPaths.join(', '))}</code></div>
             <div style="margin-top:4px;"><strong>Local Index Directory:</strong> <code>${escapeHtml(rt.data_dir || '.quorumrag-live-data')}</code> (Epoch #${rt.index_epoch || 1})</div>
             <div style="margin-top:10px; display:flex; gap:8px;">
               <button class="pill-btn" data-action="open-modal" data-modal-id="modal-reindex">🔄 Reindex Files</button>
@@ -8305,7 +8748,7 @@ function secureRandomIndex(n) {
                 parentPath: currentBrowseParentPath,
                 drives: cachedDrives,
                 directories: cachedBrowseDirs,
-                selectedSet: new Set((rt.watched_paths || []).map(p => String(p || '').toLowerCase())),
+                selectedSet: watchedLowerSet,
                 selectAction: 'newdoc-pick-folder',
                 selectButtonText: '+ Watch & Index Folder',
                 activePathAction: 'newdoc-pick-folder',
@@ -8703,7 +9146,6 @@ function secureRandomIndex(n) {
   window._rerenderSettings = () => renderSettingsTabContent(activeSettingsTab, '');
 
   window._openModalFromSettings = function(modalId) {
-    closeSettingsView();
     const modal = document.getElementById(modalId);
     if (modal) modal.classList.remove('hidden');
     if (modalId === 'modal-recache') refreshCacheStats();
@@ -9299,10 +9741,44 @@ function secureRandomIndex(n) {
   };
 
   window._saveAllPreferencesFromFooter = async function() {
+    syncPendingMarketplaceInputsFromDom();
+    const chkMkt = document.getElementById('chk-mkt-consent');
+    const chkGen = document.getElementById('chk-general-optin-consent');
+    const consentBox = chkMkt || chkGen;
+    if (consentBox && consentBox.checked) {
+      const jurSel = document.getElementById('mkt-jurisdiction-select');
+      const priceInp = document.getElementById('mkt-price-cents');
+      const curFolders = (cachedMarketplaceStatus && Array.isArray(cachedMarketplaceStatus.opt_in_folders))
+        ? cachedMarketplaceStatus.opt_in_folders
+        : [];
+      const payload = {
+        opt_in_enabled: true,
+        user_consent_checked: true,
+        opt_in_folders: curFolders,
+        consent_statement: `User saved preferences with explicit Opt-In consent checked (${curFolders.length} folder(s)).`
+      };
+      if (jurSel) payload.five_eyes_enabled = jurSel.value === 'FIVE_EYES';
+      if (priceInp && priceInp.value) payload.price_per_1k_records_cents = Number(priceInp.value);
+      await fetch('/api/v1/marketplace/opt-in', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).catch(() => null);
+      await fetchMarketplaceData();
+    }
+    const profNameEl = document.getElementById('prof-name');
+    if (profNameEl && cachedSettingsData && cachedSettingsData.ui) {
+      cachedSettingsData.ui.display_name = profNameEl.value;
+      const profRoleEl = document.getElementById('prof-role');
+      const profOrgEl = document.getElementById('prof-org');
+      if (profRoleEl) cachedSettingsData.ui.profile_role = profRoleEl.value;
+      if (profOrgEl) cachedSettingsData.ui.organization = profOrgEl.value;
+    }
     if (cachedSettingsData && cachedSettingsData.ui) {
       await saveUiSettingsPatch(cachedSettingsData.ui);
     }
-    showSettingsToast('All preferences saved to disk');
+    renderSettingsTabContent(activeSettingsTab, '');
+    showSettingsToast('✓ All preferences & folder selections saved to disk');
   };
 
   window.quorumUpdateMeshConfig = async function(payload) {
