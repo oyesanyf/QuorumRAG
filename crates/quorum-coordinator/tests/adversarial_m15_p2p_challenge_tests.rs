@@ -86,6 +86,7 @@ async fn test_adversarial_max_peer_responses_capping_k_less_than_n() {
             score: 0.90,
             access_tier: 0,
             content: format!("Distinct unique payload A from peer node number {}", i),
+            origin_peer_id: None,
         };
         let chunk2 = CandidateChunkDto {
             chunk_id: format!("chunk_peer_{}_b", i),
@@ -95,6 +96,7 @@ async fn test_adversarial_max_peer_responses_capping_k_less_than_n() {
             score: 0.85,
             access_tier: 0,
             content: format!("Distinct unique payload B from peer node number {}", i),
+            origin_peer_id: None,
         };
 
         mock_disp
@@ -238,6 +240,7 @@ fn test_adversarial_filename_and_peer_disambiguation_three_peers() {
         score: 0.91,
         access_tier: 0,
         content: "Peer Alice independent operational security risk assessments.".to_string(),
+        origin_peer_id: None,
     };
 
     // 3. Peer Bob chunk with identical file name "document.pdf"
@@ -249,6 +252,7 @@ fn test_adversarial_filename_and_peer_disambiguation_three_peers() {
         score: 0.89,
         access_tier: 0,
         content: "Peer Bob cryptographic key management guidelines and protocols.".to_string(),
+        origin_peer_id: None,
     };
 
     // 4. Peer Charlie chunk with identical file name "document.pdf"
@@ -260,6 +264,7 @@ fn test_adversarial_filename_and_peer_disambiguation_three_peers() {
         score: 0.87,
         access_tier: 0,
         content: "Peer Charlie financial audit reconciliation and treasury disclosures.".to_string(),
+        origin_peer_id: None,
     };
 
     let remote_lists = vec![
@@ -322,6 +327,7 @@ fn test_adversarial_filename_and_peer_disambiguation_three_peers() {
         score: 0.80,
         access_tier: 0,
         content: "Peer Alice additional section 2 from document.pdf.".to_string(),
+        origin_peer_id: None,
     };
 
     let remote_lists_with_dup = vec![
@@ -334,6 +340,7 @@ fn test_adversarial_filename_and_peer_disambiguation_three_peers() {
                 score: 0.91,
                 access_tier: 0,
                 content: "Peer Alice independent operational security risk assessments.".to_string(),
+                origin_peer_id: None,
             },
             chunk_alice_2,
         ]),
@@ -346,6 +353,7 @@ fn test_adversarial_filename_and_peer_disambiguation_three_peers() {
                 score: 0.89,
                 access_tier: 0,
                 content: "Peer Bob cryptographic key management guidelines and protocols.".to_string(),
+                origin_peer_id: None,
             },
         ]),
     ];
@@ -377,6 +385,7 @@ async fn test_adversarial_retrieve_mesh_node_federated_entity_search() {
         score: 0.94,
         access_tier: 0,
         content: "ProjectTitanium specifications require 99.999% SLA availability and mutual indemnification terms.".to_string(),
+        origin_peer_id: None,
     };
 
     mock_disp
@@ -492,6 +501,7 @@ async fn test_adversarial_max_peer_responses_zero_fallback() {
             score: 0.85,
             access_tier: 0,
             content: format!("Zero fallback content {}", i),
+            origin_peer_id: None,
         };
         mock_disp
             .add_peer(MockRemotePeer {
@@ -559,6 +569,7 @@ async fn test_federated_mesh_citation_interleaved_when_six_local_docs_and_split_
                     access_tier: 0,
                     content: "Femi Oyesanya — CISSP Certified Principal Security Architect and Data Scientist."
                         .to_string(),
+                        origin_peer_id: None,
                 },
                 CandidateChunkDto {
                     chunk_id: "rem_resume_doc:1".to_string(),
@@ -569,6 +580,7 @@ async fn test_federated_mesh_citation_interleaved_when_six_local_docs_and_split_
                     access_tier: 0,
                     content: "Education: Master of Management Information Systems from University of Illinois Springfield (1992) and Bachelor of Arts in Business Administration from Alabama A&M University."
                         .to_string(),
+                        origin_peer_id: None,
                 },
             ],
         })

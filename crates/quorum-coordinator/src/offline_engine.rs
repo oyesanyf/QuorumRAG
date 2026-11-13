@@ -111,19 +111,38 @@ impl ForensicQueryIntent {
             || ql.contains("binary")
             || ql.contains("pid");
 
+        let has_q_word = |target: &str| -> bool {
+            ql.split(|c: char| !c.is_alphanumeric())
+                .any(|w| w == target)
+        };
+        let has_ipv4_port_53 = ql.split_whitespace().any(|tok| {
+            let clean = tok.trim_matches(|c: char| matches!(c, '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ';'));
+            if let Some(host_part) = clean.strip_suffix(":53") {
+                host_part.contains('.') && host_part.chars().any(|c| c.is_ascii_digit())
+            } else {
+                false
+            }
+        });
+
         // 0. Host DNS Telemetry & Network Protocol Forensics (Sysmon 22, DNS-Client 3006/3008/3020, Port 53)
-        if ql.contains("dns")
+        if has_q_word("dns")
+            || has_q_word("dnscache")
+            || has_q_word("5353")
+            || has_q_word("5355")
             || ql.contains("port 53")
             || ql.contains("port:53")
-            || ql.contains(":53")
             || ql.contains("udp 53")
-            || ql.contains("853")
-            || ql.contains("5353")
-            || ql.contains("5355")
+            || ql.contains("tcp 53")
+            || ql.contains("udp/53")
+            || ql.contains("tcp/53")
+            || ql.contains("port 853")
+            || ql.contains("port:853")
+            || ql.contains("tcp 853")
+            || has_ipv4_port_53
             || ql.contains("sysmon 22")
             || ql.contains("event 22")
+            || ql.contains("event id 22")
             || ql.contains("event_id 22")
-            || ql.contains("dnscache")
             || ql.contains("dns-client")
             || ql.contains("dns client")
             || ql.contains("domain query")
@@ -131,9 +150,10 @@ impl ForensicQueryIntent {
             || ql.contains("dns traffic")
             || ql.contains("dns query")
             || (mentions_proc
-                && (ql.contains("dns")
-                    || ql.contains("domain")
-                    || ql.contains("lookup")
+                && (has_q_word("dns")
+                    || has_q_word("domain")
+                    || has_q_word("domains")
+                    || has_q_word("lookup")
                     || ql.contains("resolv")))
         {
             return Some(Self::DnsTraffic);
@@ -474,10 +494,86 @@ impl DeterministicOfflineSynthesisEngine {
         false
     }
 
+    /// Normalizes inline ChatGPT / LLM export markup tags such as
+    /// `entity["book","Women, Race & Class","Angela Davis 1981"]` -> `Women, Race & Class`
+    /// and strips `**:::`, `:::`, and `:contentReference[...]` markers.
+    pub fn normalize_inline_markup_artifacts(input: &str) -> String {
+        let mut s = input
+            .replace("**:::", "")
+            .replace(":::**", "")
+            .replace(":::", "");
+
+        while let Some(start) = s.find("entity[\"") {
+            let rest = &s[start + 7..]; // starts at first `"`
+            if let Some(end_rel) = rest.find("\"]") {
+                let inside = &rest[..end_rel + 1]; // includes closing `"`
+                let mut fields: Vec<String> = Vec::new();
+                let mut cur = String::new();
+                let mut in_quotes = false;
+                let mut escaped = false;
+                for ch in inside.chars() {
+                    if escaped {
+                        cur.push(ch);
+                        escaped = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escaped = true;
+                        continue;
+                    }
+                    if ch == '"' {
+                        if in_quotes {
+                            fields.push(cur.clone());
+                            cur.clear();
+                            in_quotes = false;
+                        } else {
+                            in_quotes = true;
+                        }
+                    } else if in_quotes {
+                        cur.push(ch);
+                    }
+                }
+                let replacement = fields
+                    .get(1)
+                    .or_else(|| fields.first())
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_default();
+                let span_end = start + 7 + end_rel + 2;
+                s.replace_range(start..span_end, &replacement);
+            } else {
+                break;
+            }
+        }
+
+        while let Some(start) = s.find(":contentReference[") {
+            let rest = &s[start..];
+            if let Some(close_bracket) = rest.find(']') {
+                let mut span_end = start + close_bracket + 1;
+                if s[span_end..].starts_with('{') {
+                    if let Some(close_brace) = s[span_end..].find('}') {
+                        span_end += close_brace + 1;
+                    }
+                }
+                s.replace_range(start..span_end, "");
+            } else {
+                break;
+            }
+        }
+
+        s
+    }
+
     /// Cleans raw extracted document chunk text by stripping `[PDF Metadata]`, `[Page X]` markers,
     /// legacy `.doc` OLE/SmartTag noise, ChatGPT download boilerplate, and collapsing broken single-word-per-line PDF extraction.
     pub fn clean_chunk_text(raw: &str) -> String {
-        let trimmed_raw = raw.trim();
+        let mut trimmed_raw = raw.trim();
+        while trimmed_raw.starts_with("=== [Entity Cluster") {
+            if let Some(nl) = trimmed_raw.find('\n') {
+                trimmed_raw = trimmed_raw[nl + 1..].trim();
+            } else {
+                break;
+            }
+        }
         if trimmed_raw.starts_with("Artemis DFIR ")
             || trimmed_raw.starts_with("DnsQuery [")
             || trimmed_raw.contains("DnsQuery [")
@@ -488,7 +584,15 @@ impl DeterministicOfflineSynthesisEngine {
             || trimmed_raw.starts_with("ServiceDaemon [")
             || trimmed_raw.starts_with("NetworkConnection [")
         {
-            let mut s = trimmed_raw.split_whitespace().collect::<Vec<_>>().join(" ");
+            // Strip any raw pretty-printed JSON payload appended from parent-document storage
+            let summary_only = if let Some(json_pos) = trimmed_raw.find("\n\n{") {
+                &trimmed_raw[..json_pos]
+            } else if let Some(json_pos) = trimmed_raw.find("\n{\n") {
+                &trimmed_raw[..json_pos]
+            } else {
+                trimmed_raw
+            };
+            let mut s = summary_only.split_whitespace().collect::<Vec<_>>().join(" ");
             if !s.ends_with('.') && !s.ends_with('!') && !s.ends_with('?') {
                 s.push('.');
             }
@@ -512,8 +616,9 @@ impl DeterministicOfflineSynthesisEngine {
                 .chars()
                 .filter(|&ch| !('\u{E000}'..='\u{F8FF}').contains(&ch))
                 .collect();
-            let mut trimmed = pua_stripped.trim();
-            if trimmed.is_empty() {
+            let markup_normalized = Self::normalize_inline_markup_artifacts(&pua_stripped);
+            let mut trimmed = markup_normalized.trim();
+            if trimmed.is_empty() || trimmed.starts_with("=== [Entity Cluster") {
                 continue;
             }
             // Strip leading `[Document: "..." | Author: ... | Kind: ... | File: ...]`, `[File: ...]`,
@@ -598,6 +703,16 @@ impl DeterministicOfflineSynthesisEngine {
                 || lower.contains("your sacred dissertation-style preface")
                 || lower.contains("let me know if you’d like a pdf version")
                 || lower.contains("let me know if you'd like a pdf version")
+                || lower.starts_with("hi! it looks like you mentioned")
+                || lower.contains("could you clarify what you mean?")
+                || lower.contains("feel free to upload it so i can")
+                || lower.contains("i don't have direct access to your previously uploaded")
+                || lower.contains("i do not have direct access to your previously uploaded")
+                || lower.starts_with("or, if you want it to feel a little warmer")
+                || lower.starts_with("i actually like the last one because")
+                || lower.starts_with("would you like me to ")
+                || lower.starts_with("if you'd like, i can ")
+                || lower.starts_with("if you’d like, i can ")
                 || lower.contains("urn:schemas-microsoft-com")
                 || lower.contains("folhlink")
                 || lower.contains("accent6=\"accent6\"")
@@ -654,25 +769,45 @@ impl DeterministicOfflineSynthesisEngine {
         let joined = cleaned_lines.join("\n");
         let chars: Vec<char> = joined.chars().collect();
         let mut start_idx = 0;
-        // Strip leading broken lowercase word fragments at the start of a chunk
+        // Strip leading mid-sentence broken fragments at the start of a byte-sliced chunk
         if let Some(&first_ch) = chars.first() {
             if first_ch.is_alphabetic() && first_ch.is_lowercase() {
-                let mut first_word_end = 0;
-                while first_word_end < chars.len() && !chars[first_word_end].is_whitespace() {
-                    first_word_end += 1;
-                }
-                if first_word_end > 0 && first_word_end < 4 {
-                    let mut next_start = first_word_end;
-                    while next_start < chars.len() && chars[next_start].is_whitespace() {
-                        next_start += 1;
-                    }
-                    if next_start < chars.len() {
-                        let mut next_word_end = next_start;
-                        while next_word_end < chars.len() && !chars[next_word_end].is_whitespace() {
-                            next_word_end += 1;
+                let mut advanced_to_sentence = false;
+                let scan_limit = chars.len().min(200);
+                for idx in 0..scan_limit.saturating_sub(2) {
+                    if matches!(chars[idx], '.' | '!' | '?') && chars[idx + 1].is_whitespace() {
+                        let mut next_cap = idx + 1;
+                        while next_cap < chars.len() && chars[next_cap].is_whitespace() {
+                            next_cap += 1;
                         }
-                        if next_word_end - next_start > 1 {
-                            start_idx = next_start;
+                        if next_cap < chars.len()
+                            && chars[next_cap].is_uppercase()
+                            && chars.len().saturating_sub(next_cap) >= 60
+                        {
+                            start_idx = next_cap;
+                            advanced_to_sentence = true;
+                            break;
+                        }
+                    }
+                }
+                if !advanced_to_sentence {
+                    let mut first_word_end = 0;
+                    while first_word_end < chars.len() && !chars[first_word_end].is_whitespace() {
+                        first_word_end += 1;
+                    }
+                    if first_word_end > 0 && first_word_end < 4 {
+                        let mut next_start = first_word_end;
+                        while next_start < chars.len() && chars[next_start].is_whitespace() {
+                            next_start += 1;
+                        }
+                        if next_start < chars.len() {
+                            let mut next_word_end = next_start;
+                            while next_word_end < chars.len() && !chars[next_word_end].is_whitespace() {
+                                next_word_end += 1;
+                            }
+                            if next_word_end - next_start > 1 {
+                                start_idx = next_start;
+                            }
                         }
                     }
                 }
@@ -832,9 +967,9 @@ impl DeterministicOfflineSynthesisEngine {
                     cut -= 1;
                 }
                 let candidate = &item.chunk.text_content[..cut];
-                let bounded = if let Some(p) = candidate.rfind(['.', '!', '?', '\n']) {
-                    if p >= candidate.len() / 2 {
-                        &candidate[..=p]
+                let bounded = if let Some(boundary) = Self::last_sentence_boundary(candidate) {
+                    if boundary >= candidate.len() / 2 {
+                        &candidate[..boundary]
                     } else if let Some(ws) = candidate.rfind(char::is_whitespace) {
                         &candidate[..ws]
                     } else {
@@ -1002,6 +1137,7 @@ impl DeterministicOfflineSynthesisEngine {
         const SOURCE_CODE_EXTENSIONS: &[&str] = &[
             ".rs", ".py", ".js", ".ts", ".jsx", ".tsx", ".c", ".cpp", ".h", ".hpp",
             ".cc", ".cs", ".java", ".go", ".kt", ".rb", ".php", ".swift", ".scala",
+            ".pm", ".pl", ".t", ".pod", ".xs", ".r", ".rmd", ".ipynb",
             ".sh", ".bash", ".ps1", ".bat", ".cmd", ".sql", ".css", ".scss", ".less",
             ".vue", ".svelte", ".toml", ".yaml", ".yml", ".lock", ".dat", ".log",
             ".tmp", ".bak", ".wbk",
@@ -1209,7 +1345,7 @@ impl DeterministicOfflineSynthesisEngine {
         };
 
         // Proper-noun anchors the user capitalised mid-sentence ("how much rent does Casey Ringgold pay").
-        let proper_terms: Vec<String> = prompt_eff
+        let mut proper_terms: Vec<String> = prompt_eff
             .split_whitespace()
             .enumerate()
             .filter_map(|(i, raw)| {
@@ -1234,6 +1370,13 @@ impl DeterministicOfflineSynthesisEngine {
                 }
                 acc
             });
+        if proper_terms.is_empty()
+            && (prompt_lower.starts_with("who is ")
+                || prompt_lower.starts_with("who was ")
+                || prompt_lower.starts_with("who are "))
+        {
+            proper_terms = prompt_only_entities.clone();
+        }
 
         // Stitch multi-chunk parent documents upfront when enabled so multi-chunk resumes/reports
         // (both local and remote mesh peers) combine header + education/body sections BEFORE whole-word quorum filtering!
@@ -1430,8 +1573,11 @@ impl DeterministicOfflineSynthesisEngine {
                     || (is_artemis_chunk && forensic_intent.is_some() && total_hits >= 1)
                     || (total_hits >= required_query_hits && entity_hits >= required_entity_hits)
                     || (!proper_terms.is_empty() && proper_hits == proper_terms.len())
-                    || (scored.source_peer != "local" && total_hits >= 1 && forensic_intent.is_none())
-                    || (is_image_chunk && total_hits >= 1 && forensic_intent.is_none())
+                    || (scored.source_peer != "local"
+                        && total_hits >= 1
+                        && entity_hits >= required_entity_hits
+                        && forensic_intent.is_none())
+                    || (is_image_chunk && total_hits >= 1 && entity_hits >= required_entity_hits && forensic_intent.is_none())
             };
 
             if is_relevant {
@@ -1630,7 +1776,6 @@ impl DeterministicOfflineSynthesisEngine {
             if has_direct_prompt_match {
                 scored_matches.retain(|(scored, _, _, _)| {
                     count_prompt_matches(scored) >= req_prompt_hits
-                        || scored.source_peer != "local"
                 });
             }
         }
@@ -1960,9 +2105,12 @@ impl DeterministicOfflineSynthesisEngine {
 
             // 2. Deterministic offline fallback (used in unit tests or if local Ollama daemon is unreachable)
             let prefix = Self::format_question_restated_prefix(prompt_eff);
+            let specific_clusters =
+                crate::answer_orchestrator::distinct_specific_entity_clusters(&matched_chunk_refs);
+            let is_multi_persona = specific_clusters.len() >= 2 && forensic_intent.is_none();
 
             let mut body_paragraphs: Vec<String> = Vec::new();
-            for (idx, c) in matched_chunk_refs.iter().enumerate().take(6) {
+            for (idx, c) in matched_chunk_refs.iter().enumerate().take(10) {
                 let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
                 // Strip residual artifacts, ChatGPT export markers, and dividers
                 let mut chunk_lines: Vec<String> = Vec::new();
@@ -2007,14 +2155,14 @@ impl DeterministicOfflineSynthesisEngine {
                     if trim_chunk.len() < 35 && matched_chunks.len() > 1 && matched_chunks.iter().any(|other| other.chunk.text_content.trim().len() > 100) {
                         continue;
                     }
-                    let excerpt = Self::truncate_to_sentence_boundary(trim_chunk, 800);
+                    let excerpt = Self::truncate_to_sentence_boundary(trim_chunk, 1400);
                     body_paragraphs.push(format!("{} **[{}]**", excerpt.trim(), idx + 1));
                 }
             }
 
             let mut answer_parts: Vec<String> = Vec::new();
 
-            // Synthesize affirmative restated opening grounded in top chunk
+            // Synthesize affirmative restated opening grounded in top chunk (or general multi-persona disambiguation opening)
             if !prefix.is_empty() && !matched_chunks.is_empty() {
                 let top_chunk = &matched_chunks[0];
                 let file_name = std::path::Path::new(&top_chunk.chunk.file_path)
@@ -2126,35 +2274,25 @@ impl DeterministicOfflineSynthesisEngine {
                 // Prefer the subject's role as stated in the documents themselves, e.g.
                 // "between Angela Davis (landlord) and ..." -> "Angela Davis is the landlord ...".
                 // Never glue an unrelated first line (such as a document title) onto "X is a".
-                let subject_name = prefix.trim_end().strip_suffix(" is").map(|s| s.trim().to_string());
-                let has_scholar_cluster = matched_chunk_refs.iter().any(|c| {
-                    let t = c.chunk.text_content.to_ascii_lowercase();
-                    let f = c.chunk.file_path.to_ascii_lowercase();
-                    t.contains("women, race & class")
-                        || t.contains("women, race and class")
-                        || t.contains("1981")
-                        || t.contains("critical theory")
-                        || t.contains("philosophy")
-                        || f.contains("women_race")
-                });
-                let has_lessor_cluster = matched_chunk_refs.iter().any(|c| {
-                    let t = c.chunk.text_content.to_ascii_lowercase();
-                    let f = c.chunk.file_path.to_ascii_lowercase();
-                    t.contains("landlord")
-                        || t.contains("lease")
-                        || t.contains("lessor")
-                        || t.contains("new orleans")
-                        || t.contains("breure")
-                        || f.contains("lease")
-                });
-                let has_ministry_cluster = matched_chunk_refs.iter().any(|c| {
-                    let t = c.chunk.text_content.to_ascii_lowercase();
-                    t.contains("unity minister") || t.contains("steward") || t.contains("reverend")
-                });
-                let is_multi_persona = (has_scholar_cluster as usize) + (has_lessor_cluster as usize) + (has_ministry_cluster as usize) >= 2;
+                let subject_name = prefix
+                    .trim_end()
+                    .strip_suffix(" is")
+                    .or_else(|| prefix.trim_end().strip_suffix(" was"))
+                    .map(|s| s.trim().to_string());
 
-                let role_opening = if is_multi_persona && subject_name.as_deref().map_or(false, |s| s.eq_ignore_ascii_case("Angela Davis")) {
-                    Some("Based on the retrieved documents, the name **Angela Davis** refers to multiple distinct individuals across different contexts: an author and scholar associated with academic works (such as *Women, Race & Class*, 1981), and a residential property manager and lessor in New Orleans associated with residential lease agreements. Under strict corpus grounding, these distinct personas are detailed in the dedicated sections below **[1]**.".to_string())
+                let role_opening = if is_multi_persona {
+                    let subj_label = subject_name
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(prompt_eff);
+                    let cluster_summary = specific_clusters.join("; ");
+                    let all_cites = (1..=matched_chunk_refs.len().min(8))
+                        .map(|n| format!("**[{n}]**"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Some(format!(
+                        "The retrieved documents across your federated corpus reference multiple distinct individuals or contexts sharing the name **{subj_label}** ({cluster_summary}). Under strict corpus grounding—without conflating distinct identities or backfilling unverified outside biographical claims—each distinct identity and its grounded records are detailed separately in the dedicated sections below {all_cites}."
+                    ))
                 } else {
                     subject_name.as_deref().and_then(|subj| {
                         Self::subject_role_from_chunks(subj, &matched_chunk_refs).map(|(role, cites)| {
@@ -2186,16 +2324,28 @@ impl DeterministicOfflineSynthesisEngine {
                     .or_else(|| prefix.trim_end().strip_suffix(" was"))
                     .map(|s| s.trim().to_string());
 
-                // Preserve substantive body paragraphs (executive summaries, work history, education)
-                answer_parts.extend(body_paragraphs);
+                if is_multi_persona {
+                    if let Some(sections) = crate::answer_orchestrator::render_disambiguated_multi_cluster_report(
+                        prompt_eff,
+                        fallback_subject.as_deref(),
+                        &matched_chunk_refs,
+                    ) {
+                        answer_parts.push(sections);
+                    } else {
+                        answer_parts.extend(body_paragraphs);
+                    }
+                } else {
+                    // Preserve substantive body paragraphs (executive summaries, work history, education)
+                    answer_parts.extend(body_paragraphs);
 
-                // Append structured grounded sections if facts or key passages were extracted
-                if let Some(sections) = crate::answer_orchestrator::render_grounded_sections(
-                    prompt_eff,
-                    fallback_subject.as_deref(),
-                    &matched_chunk_refs,
-                ) {
-                    answer_parts.push(sections);
+                    // Append structured grounded sections if facts or key passages were extracted
+                    if let Some(sections) = crate::answer_orchestrator::render_grounded_sections(
+                        prompt_eff,
+                        fallback_subject.as_deref(),
+                        &matched_chunk_refs,
+                    ) {
+                        answer_parts.push(sections);
+                    }
                 }
             } else {
                 answer_parts.extend(body_paragraphs);
@@ -2234,6 +2384,7 @@ impl DeterministicOfflineSynthesisEngine {
         } else {
             let fallback = if let Some(fi) = forensic_intent {
                 let cat_desc = match fi {
+                    ForensicQueryIntent::DnsTraffic => "live host DNS query, socket, and resolver cache records",
                     ForensicQueryIntent::NetworkInternet => "active internet/network socket connections",
                     ForensicQueryIntent::AntivirusBlocked => "antivirus / CodeIntegrity blocked process events",
                     ForensicQueryIntent::ProcessExecution => "live process execution records",
@@ -2557,7 +2708,30 @@ impl DeterministicOfflineSynthesisEngine {
                 return format!("{} **[1]**", clean_sum);
             }
 
-            // 3e. Standard indefinite article insertion with proper phonetic a/an
+            // 3e. Safe role/identity noun phrase check before gluing `<Subject> is a <clean_sum>`
+            const ROLE_OR_IDENTITY_STARTERS: &[&str] = &[
+                "scholar", "author", "professor", "activist", "engineer", "architect", "landlord",
+                "lessor", "minister", "physician", "doctor", "cardiologist", "director", "manager",
+                "researcher", "attorney", "lawyer", "consultant", "developer", "scientist", "analyst",
+                "founder", "executive", "american", "british", "canadian", "senior", "principal",
+                "certified", "cissp-certified", "experienced", "seasoned", "distinguished", "landmark",
+                "software", "cybersecurity", "security", "cloud", "systems", "distributed", "clinical",
+            ];
+            if let Some(subj) = subject_name {
+                let subj_low = subj.trim().to_ascii_lowercase();
+                if ROLE_OR_IDENTITY_STARTERS.contains(&first_word) {
+                    let article = Self::choose_indefinite_article(first_word);
+                    return format!("{}{} {} **[1]**", prefix, article, clean_sum);
+                } else if !subj_low.is_empty() && lower_sum.contains(&subj_low) {
+                    return format!("{} **[1]**", clean_sum);
+                } else {
+                    return format!(
+                        "{} is documented in the retrieved records as follows: {} **[1]**",
+                        subj.trim(),
+                        clean_sum
+                    );
+                }
+            }
             let article = Self::choose_indefinite_article(first_word);
             return format!("{}{} {} **[1]**", prefix, article, clean_sum);
         }
@@ -2931,10 +3105,24 @@ impl DeterministicOfflineSynthesisEngine {
                 let end = rest
                     .find(|c: char| c == ',' || c == '\n' || c == '\r' || c.is_whitespace())
                     .unwrap_or(rest.len());
-                let v = rest[..end].trim();
+                let v = rest[..end]
+                    .trim()
+                    .trim_end_matches('.')
+                    .trim_end_matches(']');
                 if !v.is_empty() {
                     return Some(v.to_string());
                 }
+            }
+        }
+        let colon_pat = format!("{}: ", key);
+        if let Some(start) = text.find(&colon_pat) {
+            let rest = &text[start + colon_pat.len()..];
+            let end = rest
+                .find(|c: char| c == '|' || c == '\n' || c == '\r')
+                .unwrap_or(rest.len());
+            let v = rest[..end].trim().trim_end_matches('.');
+            if !v.is_empty() {
+                return Some(v.to_string());
             }
         }
         None
@@ -3184,13 +3372,13 @@ impl DeterministicOfflineSynthesisEngine {
                 out.push_str(&format!(
                     "| {} | `{}` | `{}` | `{} / {}` | `{}` | `{}` | `{}` |\n",
                     idx + 1,
-                    proc_name,
-                    pid,
-                    proto,
-                    port,
-                    domain,
-                    results,
-                    c.chunk.file_path
+                    proc_name.replace('|', "\\|"),
+                    pid.replace('|', "\\|"),
+                    proto.replace('|', "\\|"),
+                    port.replace('|', "\\|"),
+                    domain.replace('|', "\\|"),
+                    results.replace('|', "\\|"),
+                    c.chunk.file_path.replace('|', "\\|")
                 ));
             }
         }
@@ -6734,7 +6922,7 @@ impl DeterministicOfflineSynthesisEngine {
             4. MULTI-FILE SYNTHESIS & INLINE CITATIONS: You are given excerpts from MULTIPLE distinct files (`[1]`, `[2]`, `[3]`, `[4]`, etc.). Look across ALL provided documents and cite multiple document numbers inline using simple bracketed numbers (`[1]`, `[2]`, `[3]`, `[4]`, etc.) referencing grounded sources throughout your response. Never write XML tags like `<document>` or `<Document Index=...>`.\n\
             5. CLEAN STRUCTURE: Organize your response into thorough, flowing paragraphs and `###` section headings where helpful (after the opening paragraph). Never include line numbers `(Lines X-Y)`.\n\
             6. CROSS-CITATION ENTITY & ACCOUNT CONSOLIDATION: When multiple source documents mention the exact same bank account number (even with minor formatting or payee variations such as `#1569837451` vs `1569837451 F A Breure`), monetary fee (`$195` vs `$195.00`), street address, phone number, email, or legal rule, state that shared account number, fee, or rule ONCE in a single unified clause noting any payee or tenant qualifiers and citing all relevant documents together (e.g. `Chase Bank account #1569837451 (also listed under F A Breure) [3], [5]`). Never write the same account number, fee amount, or rule twice in a compound sentence or across paragraphs.\n\
-            7. STRICT ENTITY & HOMONYM DISAMBIGUATION: When the retrieved passages describe multiple distinct individuals or organizations sharing the same name (such as distinct persons named 'Angela Davis' across academic literature, real estate lease agreements, and religious ministries), you MUST explicitly state upfront in your opening paragraph that the documents reference distinct individuals with this name. You MUST organize the response with dedicated `###` headed sections for each distinct identity or context (e.g. `### Academic & Critical Theory Works (1981)`, `### New Orleans Residential Property Management & Lease Agreement`). Under NO circumstances may you conflate these distinct personas or backfill biographical facts from pretraining (e.g. NEVER state 'Born as Angela Yvonne Davis' or invent birthplaces/dates not present in the grounded source excerpts). Produce an exhaustive, deeply detailed account (>800 words across multiple paragraphs) exploring every concrete fact in the documents.";
+            7. STRICT GENERAL ENTITY & HOMONYM DISAMBIGUATION (ZERO PRETRAINING BACKFILL): Whenever the Reference Excerpts describe individuals or entities sharing the same name across incompatible professions, locations, time periods, or domain clusters (for example, an academic author/scholar vs. a residential property landlord/lessor vs. a religious minister, or a clinician vs. a software engineer), NEVER merge or blend them into one unified biography! Instead: (a) state upfront in your opening paragraph that the retrieved corpus documents reference multiple distinct individuals or contexts sharing that name; (b) organize your response into separate, clearly titled `###` Markdown sections for each distinct identity/domain cluster; (c) rely 100% on facts literally stated inside each cluster's excerpts and NEVER backfill unstated middle names, birthplaces, birthdates, universities, or outside historical facts from pretraining weights; and (d) make each section exhaustive, thorough, and richly detailed (producing >900 words across multiple well-structured paragraphs when multiple rich excerpts are present) covering every concrete date, title, address, party, financial term, and passage with accurate `[N]` citations.";
         format!("{}{}", base_system, voice_directive)
     }
 
@@ -7077,6 +7265,10 @@ impl DeterministicOfflineSynthesisEngine {
             }
         }
 
+        let active_specific_clusters =
+            crate::answer_orchestrator::distinct_specific_entity_clusters(active_excerpts);
+        let has_multi_domain_homonyms = active_specific_clusters.len() >= 2;
+
         // Expand evidence window proportionally with num_ctx
         let total_evidence_chars = if num_ctx >= 32768 {
             64_000usize
@@ -7086,7 +7278,7 @@ impl DeterministicOfflineSynthesisEngine {
             12_000usize
         };
         let excerpt_count = active_excerpts.len().max(1);
-        let per_excerpt_chars = (total_evidence_chars / excerpt_count).clamp(1000, 8000);
+        let per_excerpt_chars = (total_evidence_chars / excerpt_count).clamp(1200, 9000);
         let context_blocks = active_excerpts
             .iter()
             .map(|c| {
@@ -7112,12 +7304,24 @@ impl DeterministicOfflineSynthesisEngine {
                     .and_then(|n| n.to_str())
                     .unwrap_or(canon_path);
                 let file_name = if !c.source_peer.is_empty() && !c.source_peer.eq_ignore_ascii_case("local") {
-                    let short_peer: String = c.source_peer.chars().take(8).collect();
-                    format!("{} (Peer: {})", canon_name_base, short_peer)
+                    let short_peer: String = c.source_peer.chars().take(12).collect();
+                    format!("{} (Mesh Peer: {})", canon_name_base, short_peer)
                 } else {
                     canon_name_base.to_string()
                 };
                 let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
+                let cluster_tag = if has_multi_domain_homonyms {
+                    let stored_cluster = serde_json::from_str::<serde_json::Value>(&c.chunk.metadata_json)
+                        .ok()
+                        .and_then(|v| v.get("entity_cluster").and_then(|s| s.as_str()).map(|s| s.to_string()));
+                    let label = stored_cluster.unwrap_or_else(|| {
+                        crate::answer_orchestrator::classify_entity_domain_cluster(&c.chunk.file_path, &cleaned)
+                            .to_string()
+                    });
+                    format!(" | Entity Domain Cluster: {}", label)
+                } else {
+                    String::new()
+                };
                 let compact_text: String = if !prior_answer_text.is_empty() {
                     let win = Self::least_covered_window(&cleaned, &prior_answer_text, per_excerpt_chars);
                     Self::scrub_prior_covered_clauses(&win, &prior_answer_text)
@@ -7133,9 +7337,10 @@ impl DeterministicOfflineSynthesisEngine {
                     None => compact_text,
                 };
                 format!(
-                    "[{}] Source File: {}\n{}",
+                    "[{}] Source File: {}{}\n{}",
                     doc_num,
                     file_name,
+                    cluster_tag,
                     compact_text.trim()
                 )
             })
@@ -7162,6 +7367,12 @@ impl DeterministicOfflineSynthesisEngine {
 
         let opening_directive = if !prior_answer_text.is_empty() {
             "Begin immediately with brand-new facts, properties, dates, or clauses NOT mentioned anywhere in your previous response".to_string()
+        } else if has_multi_domain_homonyms {
+            format!(
+                "MULTI-ENTITY HOMONYM DISAMBIGUATION REQUIRED: The excerpts span {} incompatible domain clusters ({}). Do NOT treat this name as a single blended biography! Begin your opening paragraph by explicitly noting that the retrieved documents reference multiple distinct individuals or contexts sharing this name, then dedicate separate, exhaustive `### <Domain Cluster>` sections to each distinct identity—citing every concrete fact, date, address, counterparty, financial figure, and work strictly from that cluster's excerpts with ZERO outside pretraining biography (never invent middle names, birthplaces, or credentials absent from the text)",
+                active_specific_clusters.len(),
+                active_specific_clusters.join("; ")
+            )
         } else if expected_prefix.trim().is_empty() {
             "Begin your first paragraph immediately with a direct declarative sentence that restates and answers the User Question".to_string()
         } else {

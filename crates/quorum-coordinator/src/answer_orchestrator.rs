@@ -13,7 +13,7 @@
 //!    with all their citations, then rendered as a structured Markdown answer instead of raw
 //!    excerpt dumps.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use quorum_types::ScoredChunk;
 use regex::Regex;
@@ -535,139 +535,413 @@ fn cite_list(cites: &[usize]) -> String {
     cites.iter().map(|c| format!("[{c}]")).collect::<Vec<_>>().join(", ")
 }
 
-/// Classifies a document chunk into an entity domain cluster to disambiguate homonyms.
+/// Classifies a document chunk into a general domain cluster to disambiguate homonyms across any subject.
 pub fn classify_entity_domain_cluster(path: &str, text: &str) -> &'static str {
     let tl = text.to_ascii_lowercase();
     let fl = path.to_ascii_lowercase();
-    if tl.contains("women, race & class")
-        || tl.contains("women, race and class")
-        || tl.contains("1981")
-        || tl.contains("critical theory")
+    if tl.contains("critical theory")
         || tl.contains("philosophy")
-        || fl.contains("women_race")
+        || tl.contains("scholar")
+        || tl.contains("professor")
+        || tl.contains("university press")
+        || tl.contains("first published in")
+        || tl.contains("landmark work")
+        || tl.contains("landmark book")
+        || tl.contains("dissertation")
+        || tl.contains("peer-reviewed")
+        || tl.contains("historiograph")
+        || tl.contains("sociolog")
+        || tl.contains("political activist")
+        || (tl.contains("published in ") && (tl.contains("book") || tl.contains("author") || tl.contains("chapter") || tl.contains("summary")))
+        || (fl.contains("summary") && (tl.contains("written in ") || tl.contains("published in ")))
     {
-        "Academic & Critical Theory Works (1981)"
+        "Academic Scholarship, Published Works & Critical Theory"
     } else if tl.contains("landlord")
-        || tl.contains("lease")
-        || tl.contains("tenant")
-        || tl.contains("new orleans")
-        || tl.contains("castiglione")
-        || tl.contains("d'hemecourt")
-        || tl.contains("breure")
-        || tl.contains("firldeal")
+        || tl.contains("lessor")
+        || tl.contains("lessee")
+        || tl.contains("lease agreement")
+        || tl.contains("dwelling unit")
+        || tl.contains("monthly rent")
+        || tl.contains("security deposit")
+        || tl.contains("subletting")
+        || tl.contains("renters insurance")
+        || (tl.contains("tenant") && tl.contains("lease"))
         || fl.contains("lease")
     {
-        "New Orleans Residential Property Management & Lease Agreement"
-    } else if tl.contains("unity minister") || tl.contains("steward") || tl.contains("reverend") || tl.contains("church") {
-        "Religious Ministry & Stewardship"
+        "Residential Property Leasing & Real Estate Management"
+    } else if tl.contains("minister")
+        || tl.contains("ministry")
+        || tl.contains("reverend")
+        || tl.contains("church")
+        || tl.contains("congregation")
+        || tl.contains("sermon")
+        || tl.contains("spiritual")
+        || tl.contains("divine presence")
+        || tl.contains("steward")
+        || tl.contains("metaphysical")
+        || tl.contains("theolog")
+    {
+        "Religious Ministry, Spiritual Teaching & Organizational Stewardship"
+    } else if tl.contains("cybersecurity")
+        || tl.contains("security architect")
+        || tl.contains("software engineer")
+        || tl.contains("penetration test")
+        || tl.contains("cissp")
+        || tl.contains("cryptograph")
+        || tl.contains("kubernetes")
+        || tl.contains("microservices")
+        || tl.contains("distributed system")
+    {
+        "Software Engineering, Architecture & Cybersecurity"
+    } else if tl.contains("patient")
+        && (tl.contains("diagnosis")
+            || tl.contains("clinical")
+            || tl.contains("hospital")
+            || tl.contains("physician")
+            || tl.contains("medical"))
+    {
+        "Clinical & Healthcare Records"
+    } else if (tl.contains("invoice")
+        || tl.contains("tax return")
+        || tl.contains("form 1099")
+        || tl.contains("form w-2")
+        || tl.contains("balance sheet"))
+        && !tl.contains("lease")
+    {
+        "Corporate Finance, Banking & Tax Records"
     } else {
         "General Document Context"
     }
 }
 
-/// Render grounded facts and key passages as Markdown sections (no opening, no sources block).
-/// Returns `None` when nothing could be grounded, so callers keep their previous behaviour.
-pub fn render_grounded_sections(prompt: &str, subject: Option<&str>, chunks: &[&ScoredChunk]) -> Option<String> {
-    let texts: Vec<(String, String, String)> = chunks
-        .iter()
-        .take(8)
-        .filter(|c| !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(&c.chunk.text_content))
-        .map(|c| {
-            (
-                c.chunk.chunk_id.clone(),
-                c.chunk.file_path.clone(),
-                crate::offline_engine::DeterministicOfflineSynthesisEngine::clean_chunk_text(&c.chunk.text_content),
-            )
-        })
-        .collect();
+/// Returns the distinct specific (non-generic) domain cluster labels present across `chunks`.
+pub fn distinct_specific_entity_clusters(chunks: &[&ScoredChunk]) -> Vec<&'static str> {
+    let mut set: BTreeSet<&'static str> = BTreeSet::new();
+    for c in chunks {
+        if crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(
+            &c.chunk.text_content,
+        ) {
+            continue;
+        }
+        let cleaned = crate::offline_engine::DeterministicOfflineSynthesisEngine::clean_chunk_text(
+            &c.chunk.text_content,
+        );
+        let label = classify_entity_domain_cluster(&c.chunk.file_path, &cleaned);
+        if label != "General Document Context" {
+            set.insert(label);
+        }
+    }
+    set.into_iter().collect()
+}
 
-    if texts.is_empty() {
+/// Renders an exhaustive, cleanly formatted, disambiguated multi-cluster report when retrieved documents
+/// span 2 or more distinct specific entity domain clusters (general homonym disambiguation).
+pub fn render_disambiguated_multi_cluster_report(
+    prompt: &str,
+    subject: Option<&str>,
+    chunks: &[&ScoredChunk],
+) -> Option<String> {
+    let specific = distinct_specific_entity_clusters(chunks);
+    if specific.len() < 2 {
         return None;
     }
 
-    // Check if multiple distinct entity domain clusters exist across texts
-    let mut cluster_map: BTreeMap<&'static str, Vec<(String, String, String)>> = BTreeMap::new();
-    for t in &texts {
-        let label = classify_entity_domain_cluster(&t.1, &t.2);
-        cluster_map.entry(label).or_default().push(t.clone());
+    struct ClusterItem<'a> {
+        global_cite: usize,
+        scored: &'a ScoredChunk,
+        cleaned_text: String,
     }
 
-    if cluster_map.len() > 1 {
-        let mut md = String::new();
-        for (cluster_label, cluster_texts) in cluster_map {
-            let facts = extract_grounded_facts(subject, &cluster_texts);
-            let passages = key_passages(prompt, subject, &cluster_texts, 3);
-            if facts.is_empty() && passages.is_empty() {
-                continue;
-            }
-            md.push_str(&format!("### {}\n", cluster_label));
-            const ORDER: &[&str] = &["Role", "Other parties", "Addresses", "Phone", "Email", "Amounts", "Dates"];
-            let mut grouped: BTreeMap<usize, (&str, Vec<&GroundedFact>)> = BTreeMap::new();
-            for f in &facts {
-                let pos = ORDER.iter().position(|o| *o == f.class).unwrap_or(ORDER.len());
-                grouped.entry(pos).or_insert((f.class, Vec::new())).1.push(f);
-            }
-            if !grouped.is_empty() {
-                for (_, (class, mut items)) in grouped {
-                    items.sort_by(|a, b| b.cites.len().cmp(&a.cites.len()));
-                    let limit = if class == "Amounts" { 6 } else { 5 };
-                    let rendered: Vec<String> = items
-                        .iter()
-                        .take(limit)
-                        .map(|f| format!("{} {}", f.value, cite_list(&f.cites)))
-                        .collect();
-                    md.push_str(&format!("- **{}:** {}\n", class, rendered.join("; ")));
-                }
-            }
-            if !passages.is_empty() {
-                for (s, c) in passages {
-                    md.push_str(&format!("- \"{}\" [{}]\n", s.trim(), c));
-                }
-            }
-            md.push('\n');
+    let mut cluster_map: BTreeMap<&'static str, Vec<ClusterItem<'_>>> = BTreeMap::new();
+    for (idx, &c) in chunks.iter().enumerate().take(16) {
+        if crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(
+            &c.chunk.text_content,
+        ) {
+            continue;
         }
-        let res = md.trim_end().to_string();
-        if res.is_empty() {
-            None
-        } else {
-            Some(res)
+        let cleaned = crate::offline_engine::DeterministicOfflineSynthesisEngine::clean_chunk_text(
+            &c.chunk.text_content,
+        );
+        if cleaned.trim().is_empty() {
+            continue;
         }
-    } else {
-        let facts = extract_grounded_facts(subject, &texts);
-        let passages = key_passages(prompt, subject, &texts, 3);
-        if facts.is_empty() && passages.is_empty() {
-            return None;
+        let label = classify_entity_domain_cluster(&c.chunk.file_path, &cleaned);
+        cluster_map.entry(label).or_default().push(ClusterItem {
+            global_cite: idx + 1,
+            scored: c,
+            cleaned_text: cleaned,
+        });
+    }
+
+    if cluster_map.len() < 2 {
+        return None;
+    }
+
+    // Emit specific domain clusters first in deterministic order, followed by General Document Context if present
+    let mut ordered_labels: Vec<&'static str> = cluster_map
+        .keys()
+        .copied()
+        .filter(|&l| l != "General Document Context")
+        .collect();
+    if cluster_map.contains_key("General Document Context") {
+        ordered_labels.push("General Document Context");
+    }
+
+    let mut md = String::new();
+    for cluster_label in ordered_labels {
+        let Some(items) = cluster_map.get(cluster_label) else {
+            continue;
+        };
+        if items.is_empty() {
+            continue;
         }
 
-        const ORDER: &[&str] = &["Role", "Other parties", "Addresses", "Phone", "Email", "Amounts", "Dates"];
+        let heading = if cluster_label == "General Document Context" {
+            "Additional Grounded Document Records"
+        } else {
+            cluster_label
+        };
+        md.push_str(&format!("### {}\n\n", heading));
+
+        let local_to_global: Vec<usize> = items.iter().map(|it| it.global_cite).collect();
+        let cluster_texts: Vec<(String, String, String)> = items
+            .iter()
+            .map(|it| {
+                (
+                    it.scored.chunk.chunk_id.clone(),
+                    it.scored.chunk.file_path.clone(),
+                    it.cleaned_text.clone(),
+                )
+            })
+            .collect();
+
+        let facts = extract_grounded_facts(subject, &cluster_texts);
+        let passages = key_passages(prompt, subject, &cluster_texts, 4);
+
+        const ORDER: &[&str] = &[
+            "Role",
+            "Other parties",
+            "Addresses",
+            "Phone",
+            "Email",
+            "Amounts",
+            "Dates",
+        ];
         let mut grouped: BTreeMap<usize, (&str, Vec<&GroundedFact>)> = BTreeMap::new();
         for f in &facts {
             let pos = ORDER.iter().position(|o| *o == f.class).unwrap_or(ORDER.len());
             grouped.entry(pos).or_insert((f.class, Vec::new())).1.push(f);
         }
 
-        let mut md = String::new();
         if !grouped.is_empty() {
-            md.push_str("### Key facts from the documents\n");
-            for (_, (class, mut items)) in grouped {
-                items.sort_by(|a, b| b.cites.len().cmp(&a.cites.len()));
-                let limit = if class == "Amounts" { 6 } else { 5 };
-                let rendered: Vec<String> = items
+            for (_, (class, mut fact_items)) in grouped {
+                fact_items.sort_by(|a, b| b.cites.len().cmp(&a.cites.len()));
+                let limit = if class == "Amounts" { 8 } else { 6 };
+                let rendered: Vec<String> = fact_items
                     .iter()
                     .take(limit)
-                    .map(|f| format!("{} {}", f.value, cite_list(&f.cites)))
+                    .map(|f| {
+                        let mapped_cites: Vec<usize> = f
+                            .cites
+                            .iter()
+                            .map(|&lc| {
+                                local_to_global
+                                    .get(lc.saturating_sub(1))
+                                    .copied()
+                                    .unwrap_or(lc)
+                            })
+                            .collect();
+                        format!("{} {}", f.value, cite_list(&mapped_cites))
+                    })
                     .collect();
                 md.push_str(&format!("- **{}:** {}\n", class, rendered.join("; ")));
             }
+            md.push('\n');
         }
-        if !passages.is_empty() {
-            md.push_str("\n### Relevant passages\n");
-            for (s, c) in passages {
-                md.push_str(&format!("- \"{}\" [{}]\n", s.trim(), c));
+
+        if items.len() >= 2 {
+            md.push_str("| Ref | Source Document | Origin Node | Grounded Context Summary |\n");
+            md.push_str("|---|---|---|---|\n");
+            for it in items.iter().take(10) {
+                let doc_name = std::path::Path::new(&it.scored.chunk.file_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&it.scored.chunk.file_path)
+                    .replace('|', "\\|");
+                let origin = if it.scored.is_remote
+                    && !it.scored.source_peer.is_empty()
+                    && !it.scored.source_peer.eq_ignore_ascii_case("local")
+                {
+                    let short_peer: String = it.scored.source_peer.chars().take(12).collect();
+                    format!("Mesh Peer (`{}`)", short_peer)
+                } else {
+                    "Local Host".to_string()
+                };
+                let brief = crate::offline_engine::DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(
+                    &it.cleaned_text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "),
+                    180,
+                )
+                .replace('|', "\\|");
+                md.push_str(&format!(
+                    "| **[{}]** | `{}` | {} | {} |\n",
+                    it.global_cite, doc_name, origin, brief
+                ));
+            }
+            md.push('\n');
+        }
+
+        for it in items.iter().take(8) {
+            let doc_name = std::path::Path::new(&it.scored.chunk.file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&it.scored.chunk.file_path);
+            let origin_badge = if it.scored.is_remote
+                && !it.scored.source_peer.is_empty()
+                && !it.scored.source_peer.eq_ignore_ascii_case("local")
+            {
+                let short_peer: String = it.scored.source_peer.chars().take(12).collect();
+                format!(" *(Mesh Peer `{}`)*", short_peer)
+            } else {
+                String::new()
+            };
+            let clean_lines: Vec<String> = it
+                .cleaned_text
+                .lines()
+                .map(str::trim)
+                .filter(|l| {
+                    !l.is_empty()
+                        && !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_contact_bar_or_header(l)
+                        && !l.chars().all(|ch| ch == '_' || ch == '-' || ch == ' ')
+                })
+                .map(|l| {
+                    if let Some(rest) = l
+                        .strip_prefix('•')
+                        .or_else(|| l.strip_prefix('●'))
+                        .or_else(|| l.strip_prefix('▪'))
+                    {
+                        format!("- {}", rest.trim())
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect();
+            let joined = clean_lines.join("\n");
+            let excerpt = crate::offline_engine::DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(
+                joined.trim(),
+                1600,
+            );
+            if !excerpt.is_empty() {
+                md.push_str(&format!(
+                    "**Source Record `{}`{}:** {}\n\n",
+                    doc_name,
+                    origin_badge,
+                    format!("{} **[{}]**", excerpt.trim(), it.global_cite)
+                ));
             }
         }
-        Some(md.trim_end().to_string())
+
+        if !passages.is_empty() && items.is_empty() {
+            for (s, lc) in passages {
+                let gc = local_to_global
+                    .get(lc.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(lc);
+                md.push_str(&format!("- \"{}\" [{}]\n", s.trim(), gc));
+            }
+            md.push('\n');
+        }
     }
+
+    let res = md.trim_end().to_string();
+    if res.is_empty() {
+        None
+    } else {
+        Some(res)
+    }
+}
+
+/// Render grounded facts and key passages as Markdown sections (no opening, no sources block).
+/// Returns `None` when nothing could be grounded, so callers keep their previous behaviour.
+pub fn render_grounded_sections(prompt: &str, subject: Option<&str>, chunks: &[&ScoredChunk]) -> Option<String> {
+    if let Some(multi_report) = render_disambiguated_multi_cluster_report(prompt, subject, chunks) {
+        return Some(multi_report);
+    }
+
+    let mut local_to_global: Vec<usize> = Vec::new();
+    let mut texts: Vec<(String, String, String)> = Vec::new();
+    for (idx, c) in chunks.iter().enumerate() {
+        if texts.len() >= 10 {
+            break;
+        }
+        if crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(
+            &c.chunk.text_content,
+        ) {
+            continue;
+        }
+        local_to_global.push(idx + 1);
+        texts.push((
+            c.chunk.chunk_id.clone(),
+            c.chunk.file_path.clone(),
+            crate::offline_engine::DeterministicOfflineSynthesisEngine::clean_chunk_text(
+                &c.chunk.text_content,
+            ),
+        ));
+    }
+
+    if texts.is_empty() {
+        return None;
+    }
+
+    let facts = extract_grounded_facts(subject, &texts);
+    let passages = key_passages(prompt, subject, &texts, 4);
+    if facts.is_empty() && passages.is_empty() {
+        return None;
+    }
+
+    const ORDER: &[&str] = &["Role", "Other parties", "Addresses", "Phone", "Email", "Amounts", "Dates"];
+    let mut grouped: BTreeMap<usize, (&str, Vec<&GroundedFact>)> = BTreeMap::new();
+    for f in &facts {
+        let pos = ORDER.iter().position(|o| *o == f.class).unwrap_or(ORDER.len());
+        grouped.entry(pos).or_insert((f.class, Vec::new())).1.push(f);
+    }
+
+    let mut md = String::new();
+    if !grouped.is_empty() {
+        md.push_str("### Key facts from the documents\n");
+        for (_, (class, mut items)) in grouped {
+            items.sort_by(|a, b| b.cites.len().cmp(&a.cites.len()));
+            let limit = if class == "Amounts" { 6 } else { 5 };
+            let rendered: Vec<String> = items
+                .iter()
+                .take(limit)
+                .map(|f| {
+                    let mapped_cites: Vec<usize> = f
+                        .cites
+                        .iter()
+                        .map(|&lc| {
+                            local_to_global
+                                .get(lc.saturating_sub(1))
+                                .copied()
+                                .unwrap_or(lc)
+                        })
+                        .collect();
+                    format!("{} {}", f.value, cite_list(&mapped_cites))
+                })
+                .collect();
+            md.push_str(&format!("- **{}:** {}\n", class, rendered.join("; ")));
+        }
+    }
+    if !passages.is_empty() {
+        md.push_str("\n### Relevant passages\n");
+        for (s, lc) in passages {
+            let gc = local_to_global
+                .get(lc.saturating_sub(1))
+                .copied()
+                .unwrap_or(lc);
+            md.push_str(&format!("- \"{}\" [{}]\n", s.trim(), gc));
+        }
+    }
+    Some(md.trim_end().to_string())
 }
 
 #[cfg(test)]

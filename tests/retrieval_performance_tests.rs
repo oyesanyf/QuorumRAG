@@ -265,6 +265,7 @@ pub async fn benchmark_3_concurrent_federated_fan_out(
             content: "Femi Oyesanya — AI Security Resume Timeline | LinkedIn: linkedin.com/in/femioyesanya".to_string(),
             score: 0.96,
             access_tier: 0,
+            origin_peer_id: None,
         },
         CandidateChunkDto {
             chunk_id: "remote_pdf_doc:1".to_string(),
@@ -274,6 +275,7 @@ pub async fn benchmark_3_concurrent_federated_fan_out(
             content: "Career Timeline: 2022–Present: Principal AI Security Architect — Led LLM & Agentic RAG containment.".to_string(),
             score: 0.91,
             access_tier: 0,
+            origin_peer_id: None,
         },
     ];
 

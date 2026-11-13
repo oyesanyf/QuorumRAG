@@ -191,6 +191,7 @@ async fn test_peer_diagnostics_timed_out_peer() {
                 content: "Slow remote chunk".to_string(),
                 score: 0.95,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         })
         .await;
@@ -292,6 +293,7 @@ async fn test_peer_diagnostics_omitted_when_remote_chunks_cited() {
                 content: "Epsilon remote text from peer echo".to_string(),
                 score: 0.99,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         })
         .await;

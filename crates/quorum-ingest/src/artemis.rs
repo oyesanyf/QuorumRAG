@@ -1532,7 +1532,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                 {
                     return;
                 }
-                let (loc_ip_opt, loc_port_opt) = parse_socket_endpoint_ip(&local_addr);
+                let (_loc_ip_opt, loc_port_opt) = parse_socket_endpoint_ip(&local_addr);
                 let (rem_ip_opt, rem_port_opt) = parse_socket_endpoint_ip(&remote_addr);
                 let loc_port = loc_port_opt.unwrap_or(0);
                 let remote_port = rem_port_opt.unwrap_or(0);
@@ -1755,8 +1755,11 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
             };
 
             candidates.sort_by(|a, b| {
+                let a_std_dns = a.dns_port == 53 || a.dns_port == 853;
+                let b_std_dns = b.dns_port == 53 || b.dns_port == 853;
                 b.is_dns
                     .cmp(&a.is_dns)
+                    .then_with(|| b_std_dns.cmp(&a_std_dns))
                     .then_with(|| b.internet_access.cmp(&a.internet_access))
                     .then_with(|| state_rank(&b.state).cmp(&state_rank(&a.state)))
                     .then_with(|| (!b.proc_name.is_empty()).cmp(&(!a.proc_name.is_empty())))
@@ -2314,7 +2317,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                     let event_unix = chrono::DateTime::parse_from_rfc3339(&event_date)
                                         .map(|dt| dt.timestamp())
                                         .unwrap_or(now_unix);
-                                    let val = serde_json::json!({
+                                    let mut val = serde_json::json!({
                                         "telemetry_type": "system_event_log",
                                         "Computer": host_ref,
                                         "os_platform": "windows",
@@ -2328,17 +2331,21 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                         "ProcessName": process_name,
                                         "Image": image_path,
                                         "ProcessId": parsed_pid,
-                                        "QueryName": query_name,
-                                        "QueryStatus": query_status,
-                                        "QueryResults": query_results,
-                                        "QueryType": query_type,
-                                        "Port": 53,
-                                        "Protocol": "UDP",
                                         "dns_query": is_dns_event,
                                         "Message": msg,
                                         "collected_unix_secs": event_unix,
                                         "source_path": format!("artemis://windows/eventlog/{}", slug),
                                     });
+                                    if is_dns_event {
+                                        if let Some(obj) = val.as_object_mut() {
+                                            obj.insert("QueryName".to_string(), serde_json::json!(query_name));
+                                            obj.insert("QueryStatus".to_string(), serde_json::json!(query_status));
+                                            obj.insert("QueryResults".to_string(), serde_json::json!(query_results));
+                                            obj.insert("QueryType".to_string(), serde_json::json!(query_type));
+                                            obj.insert("Port".to_string(), serde_json::json!(53));
+                                            obj.insert("Protocol".to_string(), serde_json::json!("UDP"));
+                                        }
+                                    }
                                     if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(
                                         val,
                                         Some("windows"),
@@ -2418,16 +2425,17 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
         }
 
         #[cfg(target_os = "windows")]
+        if category_enabled(allowed_categories, ForensicTelemetryType::NetworkConnection)
+            || category_enabled(allowed_categories, ForensicTelemetryType::SystemEventLog)
         {
-            let has_dns_recs = records.iter().any(|r| {
-                r.source_path.contains("/dns/")
-                    || r.raw_json
-                        .get("dns_query")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
+            let has_eventlog_or_port53_dns = records.iter().any(|r| {
+                r.source_path.contains("sysmon_dns")
+                    || r.source_path.contains("dns_client")
+                    || r.raw_json.get("Port").and_then(|v| v.as_u64()) == Some(53)
             });
 
-            if !has_dns_recs {
+            if !has_eventlog_or_port53_dns {
+                let mut dnscache_live_pid = 0u32;
                 // 1. Inspect Dnscache service state & PID via sc.exe queryex
                 if let Some(sc_out) = run_hidden_os_command("sc.exe", &["queryex", "Dnscache"]) {
                     let mut d_pid = 0u32;
@@ -2443,6 +2451,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                         }
                     }
                     if is_running {
+                        dnscache_live_pid = d_pid;
                         let val = serde_json::json!({
                             "record_id": "artemis:live:windows:dns:dnscache_service",
                             "telemetry_type": "service_daemon",
@@ -2460,7 +2469,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                             "dns_service": "DNS",
                             "dns_query": true,
                             "Message": format!("Windows DNS Client Service (Dnscache) is active (STATE: 4 RUNNING, PID: {}, Executable: svchost.exe) handling local asset DNS query resolution and caching.", d_pid),
-                            "collected_unix_secs": now_unix,
+                            "collected_unix_secs": now_unix.saturating_add(2),
                             "source_path": "artemis://windows/live/dns/dnscache_service",
                         });
                         if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
@@ -2511,6 +2520,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                 "Computer": host_ref,
                                 "os_platform": "windows",
                                 "os_version": os_version_ref,
+                                "ProcessId": dnscache_live_pid,
                                 "ProcessName": "svchost.exe (Dnscache)",
                                 "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
                                 "Port": 53,
@@ -2523,7 +2533,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                 "QueryType": q_type.to_string(),
                                 "CacheSection": q_section,
                                 "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Section: {}, Status: {}, Data: '{}')", entry_name, q_type, q_section, q_status, q_data),
-                                "collected_unix_secs": now_unix.saturating_sub(c_idx as i64),
+                                "collected_unix_secs": now_unix.saturating_add(1).saturating_sub(c_idx as i64),
                                 "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
                             });
                             if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
@@ -2546,6 +2556,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                     "Computer": host_ref,
                                     "os_platform": "windows",
                                     "os_version": os_version_ref,
+                                    "ProcessId": dnscache_live_pid,
                                     "ProcessName": "svchost.exe (Dnscache)",
                                     "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
                                     "Port": 53,
@@ -2556,7 +2567,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                     "QueryResults": current_data,
                                     "QueryType": current_type,
                                     "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Data: '{}')", current_name, current_type, current_data),
-                                    "collected_unix_secs": now_unix.saturating_sub(c_idx as i64),
+                                    "collected_unix_secs": now_unix.saturating_add(1).saturating_sub(c_idx as i64),
                                     "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
                                 });
                                 if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
@@ -2584,6 +2595,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                             "Computer": host_ref,
                             "os_platform": "windows",
                             "os_version": os_version_ref,
+                            "ProcessId": dnscache_live_pid,
                             "ProcessName": "svchost.exe (Dnscache)",
                             "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
                             "Port": 53,
@@ -2594,7 +2606,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                             "QueryResults": current_data,
                             "QueryType": current_type,
                             "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Data: '{}')", current_name, current_type, current_data),
-                            "collected_unix_secs": now_unix.saturating_sub(c_idx as i64),
+                            "collected_unix_secs": now_unix.saturating_add(1).saturating_sub(c_idx as i64),
                             "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
                         });
                         if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {

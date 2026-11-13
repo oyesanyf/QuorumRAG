@@ -387,10 +387,13 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     let persistent_peer_id_str = persistent_peer_id.to_string();
 
     // 4. Network Swarm & Query Coordinator (with OsoosiMeshInboundHandler enforcing Shared Folders & PHI DLP)
-    let inbound_obj = Arc::new(quorum_coordinator::OsoosiMeshInboundHandler::new(
-        Arc::clone(&storage) as Arc<dyn quorum_coordinator::StorageSearcher>,
-        persistent_peer_id_str.clone(),
-    ));
+    let inbound_obj = Arc::new(
+        quorum_coordinator::OsoosiMeshInboundHandler::new(
+            Arc::clone(&storage) as Arc<dyn quorum_coordinator::StorageSearcher>,
+            persistent_peer_id_str.clone(),
+        )
+        .with_embedder(Arc::clone(&embedder)),
+    );
     let inbound_handler: Arc<dyn quorum_network::InboundQueryHandler> = inbound_obj.clone();
     let (mesh_dispatcher, swarm_handle): (
         Arc<dyn quorum_coordinator::MeshQueryDispatcher>,
@@ -454,7 +457,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
 
     let mut coord_cfg = quorum_coordinator::CoordinatorConfig::default();
     coord_cfg.max_peer_responses = cli.max_peer_responses;
-    coord_cfg.timeout_ms = 6000;
+    coord_cfg.timeout_ms = 8000;
 
     let mut acl_mgr = quorum_coordinator::PeerAclManager::default();
     let trusted_peers_list = mesh_dlp_controller

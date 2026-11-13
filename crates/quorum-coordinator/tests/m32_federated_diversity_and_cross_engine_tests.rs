@@ -151,6 +151,7 @@ fn test_rrf_combiner_guaranteed_federated_diversity_slots() {
             score: 0.50 - (j as f32 * 0.02),
             access_tier: 0,
             content: format!("Vital remote peer intelligence segment {}", j),
+            origin_peer_id: None,
         });
     }
 
@@ -229,6 +230,9 @@ async fn test_inbound_mesh_handler_reembedding_and_multimodal_parity() {
         top_k: 8,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed, &mut req, AccessTier::Tier0Public);
 

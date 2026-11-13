@@ -79,6 +79,7 @@ fn test_volatile_memory_concurrency_stress() {
                         content: payload.clone(),
                         score: 0.85,
                         access_tier: 1,
+                        origin_peer_id: None,
                     };
 
                     let volatile = dto.to_volatile_remote_chunk(format!("peer-{}", t_idx));
@@ -425,6 +426,9 @@ fn test_federated_query_timestamp_overflow_panic_probe() {
         top_k: 5,
         timestamp: i64::MIN, // Boundary extreme value
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -455,6 +459,9 @@ fn test_federated_query_canonical_signing_tampering_oracle() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0xabu8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
 
     let digest_orig = req.canonical_digest();
@@ -496,6 +503,9 @@ fn test_federated_query_roundtrip_serialization() {
         top_k: 10,
         timestamp: Utc::now().timestamp(),
         signature: [0x55u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
 
     let json = serde_json::to_string(&req).expect("Serialize FederatedQueryRequest");
@@ -517,6 +527,7 @@ fn test_federated_query_roundtrip_serialization() {
                 content: "Paris is the capital of France.".to_string(),
                 score: 0.98,
                 access_tier: 0,
+                origin_peer_id: None,
             },
         ],
     };

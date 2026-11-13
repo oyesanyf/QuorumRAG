@@ -524,12 +524,15 @@ impl AgenticStateGraphRunner {
                             .await;
                     }
 
-                    // Layer 1 Pre-Synthesis Entity Domain Clustering
+                    // Layer 1 Pre-Synthesis Entity Domain Clustering (general across all entities/homonyms)
                     let q_low = graph_state.current_query.to_ascii_lowercase();
-                    let is_person_query = q_low.contains("who is")
+                    let is_entity_or_profile_query = crate::offline_engine::DeterministicOfflineSynthesisEngine::is_profile_or_role_query(&graph_state.current_query)
+                        || q_low.starts_with("who ")
+                        || q_low.contains("who is")
+                        || q_low.contains("who was")
                         || q_low.contains("tell me about")
-                        || q_low.contains("angela davis");
-                    if is_person_query && graph_state.retrieved_chunks.len() > 1 {
+                        || !graph_state.extracted_entities.is_empty();
+                    if is_entity_or_profile_query && graph_state.retrieved_chunks.len() > 1 {
                         let mut clusters: std::collections::BTreeMap<&'static str, Vec<quorum_types::ScoredChunk>> =
                             std::collections::BTreeMap::new();
                         for chunk in &graph_state.retrieved_chunks {
@@ -543,14 +546,13 @@ impl AgenticStateGraphRunner {
                             let mut clustered_chunks = Vec::new();
                             for (idx, (label, mut items)) in clusters.into_iter().enumerate() {
                                 for item in &mut items {
-                                    if !item.chunk.text_content.starts_with("=== [Entity Cluster") {
-                                        item.chunk.text_content = format!(
-                                            "=== [Entity Cluster {}: {}] ===\n{}",
-                                            idx + 1,
-                                            label,
-                                            item.chunk.text_content
-                                        );
+                                    let mut meta_val = serde_json::from_str::<serde_json::Value>(&item.chunk.metadata_json)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                    if let Some(obj) = meta_val.as_object_mut() {
+                                        obj.insert("entity_cluster".to_string(), serde_json::json!(label));
+                                        obj.insert("entity_cluster_index".to_string(), serde_json::json!(idx + 1));
                                     }
+                                    item.chunk.metadata_json = meta_val.to_string();
                                 }
                                 clustered_chunks.extend(items);
                             }

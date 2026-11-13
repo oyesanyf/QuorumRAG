@@ -31,7 +31,8 @@ fn create_remote_candidate(peer: &str, id: usize, score: f32) -> CandidateChunkD
         score,
         access_tier: 0,
         content: format!("Remote peer {} distinct payload segment {:04}", peer, id),
-    }
+    },
+    origin_peer_id: None,
 }
 
 /// 1. Extreme distribution: 50 local chunks vs 1 remote peer chunk.
@@ -197,6 +198,7 @@ fn test_starvation_resistance_when_all_locals_outscore_remotes() {
                 score: 0.99,
                 access_tier: 0,
                 content: format!("Local distinct content line {:04} for candidate retrieval", i),
+                origin_peer_id: None,
             });
         }
 
@@ -421,6 +423,7 @@ fn test_multi_peer_consensus_boost_and_deduplication() {
         score: 0.50,
         access_tier: 0,
         content: content.to_string(),
+        origin_peer_id: None,
     };
 
     let fused = RrfCombiner::fuse_rankings_with_peers(

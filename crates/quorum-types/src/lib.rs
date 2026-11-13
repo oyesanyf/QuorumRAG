@@ -599,7 +599,10 @@ impl FederatedQueryRequest {
         } else {
             Ok(())
         }
-    }
+    },
+    origin_peer_id: None,
+    relay_hops: 0,
+    visited_peers: Vec::new(),
 }
 
 /// Response returned by a peer answering a `FederatedQueryRequest`.
@@ -1150,6 +1153,7 @@ mod tests {
             content: "SUPER_SECRET_PAYLOAD_TOKEN".to_string(),
             score: 0.99,
             access_tier: 2,
+            origin_peer_id: None,
         };
 
         let mut volatile = dto.to_volatile_remote_chunk("peer-x");
@@ -1171,6 +1175,9 @@ mod tests {
             top_k: 10,
             timestamp: Utc::now().timestamp(),
             signature: [0u8; 64],
+            origin_peer_id: None,
+            relay_hops: 0,
+            visited_peers: Vec::new(),
         };
 
         // Fresh within 60s

@@ -577,6 +577,9 @@ impl RlmOrchestrator {
             {
                 continue;
             }
+            if scored.chunk.file_path.to_ascii_lowercase().starts_with("artemis://") {
+                continue;
+            }
             let head = scored.chunk.text_content.trim_start();
             if head.starts_with("[Image Document:") || head.starts_with("[Audio Document:") {
                 continue;
@@ -946,6 +949,9 @@ impl RlmOrchestrator {
             if scored.is_remote
                 || (!scored.source_peer.is_empty() && !scored.source_peer.eq_ignore_ascii_case("local"))
             {
+                continue;
+            }
+            if scored.chunk.file_path.to_ascii_lowercase().starts_with("artemis://") {
                 continue;
             }
             let head = scored.chunk.text_content.trim_start();

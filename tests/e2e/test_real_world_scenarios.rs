@@ -50,6 +50,7 @@ async fn test_scenario_1_multi_node_federated_research_query() {
             content: "Zeroize memory buffers on drop to prevent forensic heap recovery.".to_string(),
             score: 0.94,
             access_tier: 0,
+            origin_peer_id: None,
         }],
     };
 
@@ -66,6 +67,7 @@ async fn test_scenario_1_multi_node_federated_research_query() {
             content: "QUIC and TCP Noise transports for P2P chunk transfer.".to_string(),
             score: 0.70,
             access_tier: 0,
+            origin_peer_id: None,
         }],
     };
 

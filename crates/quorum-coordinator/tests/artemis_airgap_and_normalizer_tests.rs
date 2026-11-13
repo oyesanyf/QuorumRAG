@@ -87,6 +87,7 @@ fn test_is_airgap_restricted_chunk_dto() {
         content: "Clean content".to_string(),
         score: 0.85,
         access_tier: AccessTier::Tier0Public.as_u8(),
+        origin_peer_id: None,
     };
     assert!(!is_airgap_restricted_chunk_dto(&chunk));
 
@@ -195,6 +196,7 @@ fn test_dlp_mesh_filter_and_enforce_outbound_mesh_chunks() {
             content: "Safe public report data".to_string(),
             score: 0.9,
             access_tier: 0,
+            origin_peer_id: None,
         },
         CandidateChunkDto {
             chunk_id: "c2".to_string(),
@@ -204,6 +206,7 @@ fn test_dlp_mesh_filter_and_enforce_outbound_mesh_chunks() {
             content: "Process cmdline execution".to_string(),
             score: 0.95,
             access_tier: 0,
+            origin_peer_id: None,
         },
         CandidateChunkDto {
             chunk_id: "c3".to_string(),
@@ -212,7 +215,8 @@ fn test_dlp_mesh_filter_and_enforce_outbound_mesh_chunks() {
             line_end: 10,
             content: "Restricted tier chunk".to_string(),
             score: 0.92,
-            access_tier: 3, // Tier3Restricted
+            access_tier: 3, // Tier3Restricted,
+            origin_peer_id: None,
         },
     ];
 

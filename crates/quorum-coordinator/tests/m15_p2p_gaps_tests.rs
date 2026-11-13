@@ -76,6 +76,7 @@ fn test_peer_and_filename_disambiguation() {
         score: 0.90,
         access_tier: 0,
         content: "Peer A exclusive addendum to agreement.".to_string(),
+        origin_peer_id: None,
     };
 
     let chunk_b = CandidateChunkDto {
@@ -86,6 +87,7 @@ fn test_peer_and_filename_disambiguation() {
         score: 0.88,
         access_tier: 0,
         content: "Peer B specialized commercial riders.".to_string(),
+        origin_peer_id: None,
     };
 
     let remote_lists = vec![
@@ -126,6 +128,7 @@ async fn test_max_peer_responses_capping() {
             score: 0.85,
             access_tier: 0,
             content: format!("Content from peer {}", i),
+            origin_peer_id: None,
         };
         mock_disp.add_peer(MockRemotePeer {
             peer_id,
@@ -198,6 +201,9 @@ async fn test_persistent_peer_id_spoofing_gate() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed, &mut req_valid, AccessTier::Tier0Public);
 
@@ -214,6 +220,9 @@ async fn test_persistent_peer_id_spoofing_gate() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed, &mut req_spoofed, AccessTier::Tier0Public);
 

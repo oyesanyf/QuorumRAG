@@ -25,6 +25,7 @@ impl InboundQueryHandler for TestQueryHandler {
                 content: format!("Content in response to: {}", req.query_text),
                 score: 0.95,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         }
     }
@@ -79,6 +80,9 @@ async fn test_dual_node_point_to_point_cbor_query() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
 
     let response = handle_a

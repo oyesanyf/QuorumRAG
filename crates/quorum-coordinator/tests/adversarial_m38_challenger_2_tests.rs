@@ -49,7 +49,10 @@ fn make_test_request() -> FederatedQueryRequest {
         top_k: 10,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
-    }
+    },
+    origin_peer_id: None,
+    relay_hops: 0,
+    visited_peers: Vec::new(),
 }
 
 fn make_chunk(id: &str, file_path: &str, text: &str, start: u32, end: u32, score: f32) -> ScoredChunk {
@@ -128,6 +131,7 @@ async fn test_adversarial_mesh_zero_responsive_ten_hanging_peers_scatter_gather(
                 access_tier: 0,
                 score: 0.99,
                 content: "Stale data that should never be returned".to_string(),
+                origin_peer_id: None,
             }],
         });
     }
@@ -175,6 +179,7 @@ async fn test_adversarial_mesh_one_responsive_five_dead_peers_immediate_return()
                 content: "Authoritative candidate content from honest peer".to_string(),
                 score: 0.92,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         })
         .await;
@@ -247,6 +252,7 @@ async fn test_adversarial_mesh_saturated_response_threshold_immediate_break() {
                     content: format!("Batch document {} content", i),
                     score: 0.85,
                     access_tier: 0,
+                    origin_peer_id: None,
                 }],
             })
             .await;

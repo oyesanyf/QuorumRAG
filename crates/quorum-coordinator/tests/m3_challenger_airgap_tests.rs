@@ -122,7 +122,10 @@ fn make_signed_request(
         signature: [0u8; 64],
     };
     sign_request(seed, &mut req, tier);
-    req
+    req,
+    origin_peer_id: None,
+    relay_hops: 0,
+    visited_peers: Vec::new(),
 }
 
 /// EMPIRICAL TEST 1: Inbound Query Gauntlet
@@ -270,6 +273,7 @@ fn test_adversarial_candidate_chunks_isolation_wide_open_share() {
             content: "Benign documentation text".to_string(),
             score: 0.95,
             access_tier: AccessTier::Tier0Public.as_u8(),
+            origin_peer_id: None,
         },
         // Artemis URI with Tier 0 (MUST BE BLOCKED)
         CandidateChunkDto {
@@ -280,6 +284,7 @@ fn test_adversarial_candidate_chunks_isolation_wide_open_share() {
             content: "cmdline: net user evil /add".to_string(),
             score: 0.99,
             access_tier: AccessTier::Tier0Public.as_u8(),
+            origin_peer_id: None,
         },
         // Artemis URI uppercase with Tier 0 (MUST BE BLOCKED)
         CandidateChunkDto {
@@ -290,6 +295,7 @@ fn test_adversarial_candidate_chunks_isolation_wide_open_share() {
             content: "sudo execution telemetry".to_string(),
             score: 0.92,
             access_tier: AccessTier::Tier0Public.as_u8(),
+            origin_peer_id: None,
         },
         // Tier3Restricted with benign path (MUST BE BLOCKED)
         CandidateChunkDto {
@@ -300,6 +306,7 @@ fn test_adversarial_candidate_chunks_isolation_wide_open_share() {
             content: "Top secret internal notes".to_string(),
             score: 0.91,
             access_tier: AccessTier::Tier3Restricted.as_u8(),
+            origin_peer_id: None,
         },
         // Tier 4 (above Tier 3) with benign path (MUST BE BLOCKED)
         CandidateChunkDto {
@@ -310,6 +317,7 @@ fn test_adversarial_candidate_chunks_isolation_wide_open_share() {
             content: "Super secret tier 4".to_string(),
             score: 0.90,
             access_tier: 4,
+            origin_peer_id: None,
         },
     ];
 
@@ -543,6 +551,7 @@ fn test_adversarial_byzantine_peer_response_dropping() {
         content: "leaked".to_string(),
         score: 0.99,
         access_tier: 0,
+        origin_peer_id: None,
     };
     assert!(
         is_airgap_restricted_chunk_dto(&byzantine_dto_artemis),
@@ -557,6 +566,7 @@ fn test_adversarial_byzantine_peer_response_dropping() {
         content: "leaked restricted tier".to_string(),
         score: 0.99,
         access_tier: AccessTier::Tier3Restricted.as_u8(),
+        origin_peer_id: None,
     };
     assert!(
         is_airgap_restricted_chunk_dto(&byzantine_dto_tier3),
@@ -717,6 +727,7 @@ fn test_adversarial_airgap_restriction_matrix() {
             content: "content".to_string(),
             score: 0.5,
             access_tier: tier,
+            origin_peer_id: None,
         };
         assert!(
             is_airgap_restricted_chunk_dto(&dto),
@@ -735,6 +746,7 @@ fn test_adversarial_airgap_restriction_matrix() {
             content: "content".to_string(),
             score: 0.5,
             access_tier: tier,
+            origin_peer_id: None,
         };
         assert!(
             !is_airgap_restricted_chunk_dto(&dto),
@@ -753,6 +765,7 @@ fn test_adversarial_airgap_restriction_matrix() {
             content: "content".to_string(),
             score: 0.5,
             access_tier: tier,
+            origin_peer_id: None,
         };
         assert!(
             is_airgap_restricted_chunk_dto(&dto),
