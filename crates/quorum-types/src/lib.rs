@@ -599,10 +599,7 @@ impl FederatedQueryRequest {
         } else {
             Ok(())
         }
-    },
-    origin_peer_id: None,
-    relay_hops: 0,
-    visited_peers: Vec::new(),
+    }
 }
 
 /// Response returned by a peer answering a `FederatedQueryRequest`.

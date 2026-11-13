@@ -115,12 +115,12 @@ fn create_signed_test_request(query: &str) -> FederatedQueryRequest {
         top_k: 10,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&[0x42u8; 32], &mut req, AccessTier::Tier0Public);
-    req,
-    origin_peer_id: None,
-    relay_hops: 0,
-    visited_peers: Vec::new(),
+    req
 }
 
 // ============================================================================
