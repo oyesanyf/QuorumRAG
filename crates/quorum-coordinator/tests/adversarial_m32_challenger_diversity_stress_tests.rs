@@ -31,8 +31,8 @@ fn create_remote_candidate(peer: &str, id: usize, score: f32) -> CandidateChunkD
         score,
         access_tier: 0,
         content: format!("Remote peer {} distinct payload segment {:04}", peer, id),
-    },
-    origin_peer_id: None,
+        origin_peer_id: None,
+    }
 }
 
 /// 1. Extreme distribution: 50 local chunks vs 1 remote peer chunk.

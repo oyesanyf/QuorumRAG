@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g. 0.6.6)'
+        description: 'Release version (e.g. 0.6.7)'
         required: false
-        default: '0.6.6'
+        default: '0.6.7'
 
 permissions: read-all
 
@@ -65,7 +65,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           $env:PATH = "$env:USERPROFILE\.dotnet\tools;C:\ProgramData\chocolatey\bin;$env:PATH"
-          $ver = if ($env:REF_NAME -like "quorumrag-v*") { $env:REF_NAME.Substring(11) } elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "0.6.6" }
+          $ver = if ($env:REF_NAME -like "quorumrag-v*") { $env:REF_NAME.Substring(11) } elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "0.6.7" }
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1 -Version $ver -SkipDefenderScan
           $msi = "deploy\windows\QuorumRAG-$ver-x86_64.msi"
           $zip = "deploy\windows\QuorumRAG-$ver-windows-x86_64.zip"
@@ -144,7 +144,7 @@ jobs:
           workspaces: .
           key: quorumrag-linux-x64
 
-      - name: Verify Workspace Compilation & v0.6.6 Regression Suites
+      - name: Verify Workspace Compilation & v0.6.7 Regression Suites
         run: |
           cargo check --workspace --all-targets
           cargo test -p quorum-types --lib
@@ -156,7 +156,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.6}"
+          VERSION="${INPUT_VERSION:-0.6.7}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag
           ./target/release/quorumrag --version
@@ -236,7 +236,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.6}"
+          VERSION="${INPUT_VERSION:-0.6.7}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag
           ./target/release/quorumrag --version
@@ -296,7 +296,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.6}"
+          VERSION="${INPUT_VERSION:-0.6.7}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag --target aarch64-apple-darwin
           cargo build --release -p quorum-daemon --bin quorumrag --target x86_64-apple-darwin
@@ -350,7 +350,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.6}"
+          VERSION="${INPUT_VERSION:-0.6.7}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           mkdir -p release_assets
           find dist/ -type f \( -name "*.msi" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg" -o -name "*.dmg" -o -name "*.tar.gz" \) -exec cp -f {} release_assets/ \;
@@ -393,7 +393,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.6}"
+          VERSION="${INPUT_VERSION:-0.6.7}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           TAG_NAME="quorumrag-v${VERSION}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then TAG_NAME="${REF_NAME}"; fi

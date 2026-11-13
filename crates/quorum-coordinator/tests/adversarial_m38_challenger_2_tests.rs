@@ -49,10 +49,10 @@ fn make_test_request() -> FederatedQueryRequest {
         top_k: 10,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
-    },
-    origin_peer_id: None,
-    relay_hops: 0,
-    visited_peers: Vec::new(),
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
+    }
 }
 
 fn make_chunk(id: &str, file_path: &str, text: &str, start: u32, end: u32, score: f32) -> ScoredChunk {

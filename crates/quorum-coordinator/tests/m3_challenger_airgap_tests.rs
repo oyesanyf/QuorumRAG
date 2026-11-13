@@ -120,12 +120,12 @@ fn make_signed_request(
         top_k: 10,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(seed, &mut req, tier);
-    req,
-    origin_peer_id: None,
-    relay_hops: 0,
-    visited_peers: Vec::new(),
+    req
 }
 
 /// EMPIRICAL TEST 1: Inbound Query Gauntlet
