@@ -1768,10 +1768,10 @@ mod tests {
             "artemis://network_connections",
             1,
             10,
-            0,
+            3,
             vec_angela.clone(),
             "Artemis DFIR Live NetworkConnection Telemetry:\nPID 8100 | Process: firefox.exe | Remote: 151.101.1.69:443 | State: ESTABLISHED",
-            Some(3),
+            None,
         )
         .unwrap();
 
@@ -1790,12 +1790,15 @@ mod tests {
             access_tier: 0,
             origin_peer_id: None,
         };
-        let remote_mock = MockMeshDispatcher::new(vec![MockRemotePeer {
-            peer_id: remote_peer_id.to_string(),
-            chunks: vec![distractor],
-            delay_ms: 0,
-            fail: false,
-        }]);
+        let remote_mock = MockMeshDispatcher::new();
+        remote_mock
+            .add_peer(MockRemotePeer {
+                peer_id: remote_peer_id.to_string(),
+                latency: std::time::Duration::from_millis(0),
+                max_access_tier: 3,
+                candidate_chunks: vec![distractor],
+            })
+            .await;
 
         let acl = Arc::new(RwLock::new(PeerAclManager::default()));
         acl.write()
