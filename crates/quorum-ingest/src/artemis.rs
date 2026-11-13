@@ -177,7 +177,7 @@ impl ArtemisTelemetryRecord {
             .get("ingested_unix_secs")
             .and_then(|v| v.as_i64())
             .unwrap_or(now_unix_secs);
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "artemis_dfir": true,
             "mesh_sharable": false,
             "access_tier": 3,
@@ -193,6 +193,36 @@ impl ArtemisTelemetryRecord {
             "collector_name": self.collector_name,
             "collector_version": self.collector_version,
         });
+
+        if let Some(obj) = metadata.as_object_mut() {
+            let meta_keys = [
+                "port",
+                "Port",
+                "protocol",
+                "Protocol",
+                "event_id",
+                "EventID",
+                "channel",
+                "Channel",
+                "process_name",
+                "ProcessName",
+                "pid",
+                "ProcessId",
+                "query_name",
+                "QueryName",
+                "query_results",
+                "QueryResults",
+                "query_status",
+                "QueryStatus",
+                "dns_service",
+                "dns_query",
+            ];
+            for key in meta_keys {
+                if let Some(val) = self.raw_json.get(key) {
+                    obj.insert(key.to_ascii_lowercase(), val.clone());
+                }
+            }
+        }
 
         DocumentChunk::new(
             chunk_id,
@@ -827,15 +857,83 @@ pub fn build_summary_text(
                 .or_else(|| val.get("TimeCreated"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !event_date.is_empty() {
+
+            let is_dns = id == 22
+                || id == 3006
+                || id == 3008
+                || id == 3020
+                || val.get("QueryName").is_some()
+                || val.get("query_name").is_some()
+                || val.get("dns_query").and_then(|v| v.as_bool()).unwrap_or(false)
+                || (ch.contains("Sysmon") && id == 22)
+                || ch.contains("DNS-Client");
+
+            if is_dns {
+                let query_name = val
+                    .get("QueryName")
+                    .or_else(|| val.get("query_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let query_results = val
+                    .get("QueryResults")
+                    .or_else(|| val.get("query_results"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let query_status = val
+                    .get("QueryStatus")
+                    .or_else(|| val.get("query_status"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0");
+                let proc_name = val
+                    .get("ProcessName")
+                    .or_else(|| val.get("process_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let image = val
+                    .get("Image")
+                    .or_else(|| val.get("image"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(proc_name);
+                let pid = val
+                    .get("ProcessId")
+                    .or_else(|| val.get("pid"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let proto = val
+                    .get("Protocol")
+                    .or_else(|| val.get("protocol"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UDP");
+                let port = val
+                    .get("Port")
+                    .or_else(|| val.get("port"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(53);
+                let effective_proc = if !image.is_empty() {
+                    image
+                } else if !proc_name.is_empty() {
+                    proc_name
+                } else {
+                    "unknown process"
+                };
+                let date_str = if event_date.is_empty() {
+                    "recent timestamp"
+                } else {
+                    event_date
+                };
                 format!(
-                    "{}\nSystemEventLog [{}]: date='{}', channel='{}', event_id={}, message='{}'.",
-                    msg, os_platform, event_date, ch, id, msg
+                    "DnsQuery [{}]: process='{}', pid={}, image='{}', protocol='{}', port={}, channel='{}', event_id={}, query_name='{}', query_results='{}', query_status='{}', date='{}'. {}",
+                    os_platform, effective_proc, pid, image, proto, port, ch, id, query_name, query_results, query_status, date_str, msg
+                )
+            } else if !event_date.is_empty() {
+                format!(
+                    "SystemEventLog [{}]: date='{}', channel='{}', event_id={}, message='{}'.",
+                    os_platform, event_date, ch, id, msg
                 )
             } else {
                 format!(
-                    "{}\nSystemEventLog [{}]: channel='{}', event_id={}, message='{}'.",
-                    msg, os_platform, ch, id, msg
+                    "SystemEventLog [{}]: channel='{}', event_id={}, message='{}'.",
+                    os_platform, ch, id, msg
                 )
             }
         }
@@ -889,7 +987,35 @@ pub fn build_summary_text(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            if internet_access && (!proc_name.is_empty() || pid > 0) {
+            let is_dns_socket = val.get("dns_service").is_some()
+                || val.get("dns_query").and_then(|v| v.as_bool()).unwrap_or(false)
+                || local.ends_with(":53")
+                || local.ends_with(":853")
+                || local.ends_with(":5353")
+                || local.ends_with(":5355")
+                || remote.ends_with(":53")
+                || remote.ends_with(":853")
+                || remote.ends_with(":5353")
+                || remote.ends_with(":5355");
+
+            if is_dns_socket {
+                let dns_service = val.get("dns_service").and_then(|v| v.as_str()).unwrap_or("DNS");
+                let dns_port = val.get("Port").or_else(|| val.get("RemotePort")).and_then(|v| v.as_u64()).unwrap_or(53);
+                let label_proc = if proc_name.is_empty() {
+                    if pid > 0 {
+                        format!("PID {}", pid)
+                    } else {
+                        "active process".to_string()
+                    }
+                } else {
+                    proc_name.to_string()
+                };
+                format!(
+                    "DnsQuery [{}] Live Socket on host '{}' — Process '{}' (PID {}, executable '{}') holds {} socket on port {} ({}, service='{}', local='{}', remote='{}').\nNetworkConnection [{}]: process='{}', pid={}, image='{}', protocol='{}', port={}, dns_service='{}', state='{}', local='{}', remote='{}'",
+                    os_platform, host, label_proc, pid, image, proto, dns_port, state, dns_service, local, remote,
+                    os_platform, label_proc, pid, image, proto, dns_port, dns_service, state, local, remote
+                )
+            } else if internet_access && (!proc_name.is_empty() || pid > 0) {
                 let label_proc = if proc_name.is_empty() {
                     format!("PID {}", pid)
                 } else {
@@ -1348,7 +1474,47 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                 scope: &'static str,
                 internet_access: bool,
                 remote_port: u16,
+                is_dns: bool,
+                dns_port: u16,
+                dns_service: &'static str,
             }
+
+            #[cfg(target_os = "windows")]
+            let (dnscache_pid, shared_access_pid) = {
+                let d_pid = run_hidden_os_command("sc.exe", &["queryex", "Dnscache"]).and_then(|out| {
+                    for line in out.lines() {
+                        let trimmed = line.trim();
+                        if let Some(rest) = trimmed.strip_prefix("PID") {
+                            if let Some((_, pstr)) = rest.split_once(':') {
+                                if let Ok(p) = pstr.trim().parse::<u32>() {
+                                    if p > 0 {
+                                        return Some(p);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None
+                });
+                let s_pid = run_hidden_os_command("sc.exe", &["queryex", "SharedAccess"]).and_then(|out| {
+                    for line in out.lines() {
+                        let trimmed = line.trim();
+                        if let Some(rest) = trimmed.strip_prefix("PID") {
+                            if let Some((_, pstr)) = rest.split_once(':') {
+                                if let Ok(p) = pstr.trim().parse::<u32>() {
+                                    if p > 0 {
+                                        return Some(p);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None
+                });
+                (d_pid, s_pid)
+            };
+            #[cfg(not(target_os = "windows"))]
+            let (dnscache_pid, shared_access_pid): (Option<u32>, Option<u32>) = (None, None);
 
             let mut candidates: Vec<RawSocketCandidate> = Vec::new();
             let mut push_socket = |proto: String,
@@ -1366,8 +1532,30 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                 {
                     return;
                 }
+                let (loc_ip_opt, loc_port_opt) = parse_socket_endpoint_ip(&local_addr);
                 let (rem_ip_opt, rem_port_opt) = parse_socket_endpoint_ip(&remote_addr);
+                let loc_port = loc_port_opt.unwrap_or(0);
                 let remote_port = rem_port_opt.unwrap_or(0);
+                let is_dns = loc_port == 53
+                    || loc_port == 853
+                    || loc_port == 5353
+                    || loc_port == 5355
+                    || remote_port == 53
+                    || remote_port == 853
+                    || remote_port == 5353
+                    || remote_port == 5355;
+                let (dns_port, dns_service) = if loc_port == 53 || remote_port == 53 {
+                    (53u16, "DNS")
+                } else if loc_port == 853 || remote_port == 853 {
+                    (853u16, "DoT")
+                } else if loc_port == 5353 || remote_port == 5353 {
+                    (5353u16, "mDNS")
+                } else if loc_port == 5355 || remote_port == 5355 {
+                    (5355u16, "LLMNR")
+                } else {
+                    (0u16, "")
+                };
+
                 let (scope, mut internet_access) = match rem_ip_opt {
                     Some(ip) => classify_ip_connection_scope(ip),
                     None => ("unspecified", false),
@@ -1375,7 +1563,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                 if remote_port == 0 || state.eq_ignore_ascii_case("LISTENING") || state.eq_ignore_ascii_case("LISTEN") {
                     internet_access = false;
                 }
-                let (proc_name, exe_path, cmd_line, proc_start_unix) =
+                let (mut proc_name, mut exe_path, mut cmd_line, proc_start_unix) =
                     if let Some(pm) = proc_map_ref.get(&pid) {
                         (
                             pm.name.clone(),
@@ -1396,6 +1584,24 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                         (String::new(), String::new(), String::new(), 0)
                     };
 
+                if Some(pid) == dnscache_pid {
+                    proc_name = "svchost.exe (Dnscache)".to_string();
+                    if exe_path.is_empty() || exe_path == "svchost.exe" {
+                        exe_path = "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache".to_string();
+                    }
+                    if cmd_line.is_empty() {
+                        cmd_line = "svchost.exe -k NetworkService -p -s Dnscache".to_string();
+                    }
+                } else if Some(pid) == shared_access_pid {
+                    proc_name = "svchost.exe (SharedAccess)".to_string();
+                    if exe_path.is_empty() || exe_path == "svchost.exe" {
+                        exe_path = "C:\\Windows\\System32\\svchost.exe -k netsvcs -p -s SharedAccess".to_string();
+                    }
+                    if cmd_line.is_empty() {
+                        cmd_line = "svchost.exe -k netsvcs -p -s SharedAccess".to_string();
+                    }
+                }
+
                 candidates.push(RawSocketCandidate {
                     proto,
                     local_addr,
@@ -1413,6 +1619,9 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                     },
                     internet_access,
                     remote_port,
+                    is_dns,
+                    dns_port,
+                    dns_service,
                 });
             };
 
@@ -1441,18 +1650,30 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
             #[cfg(target_os = "linux")]
             {
                 let inode_to_pid = build_linux_socket_inode_to_pid_map();
-                if let Ok(tcp_content) = std::fs::read_to_string("/proc/net/tcp") {
-                    for line in tcp_content.lines().skip(1) {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 10 {
-                            let local_dec = decode_proc_net_v4_endpoint(parts[1])
-                                .unwrap_or_else(|| parts[1].to_string());
-                            let rem_dec = decode_proc_net_v4_endpoint(parts[2])
-                                .unwrap_or_else(|| parts[2].to_string());
-                            let state = decode_proc_net_tcp_state(parts[3]).to_string();
-                            let inode = parts[9].parse::<u64>().unwrap_or(0);
-                            let pid = inode_to_pid.get(&inode).copied().unwrap_or(0);
-                            push_socket("TCP".to_string(), local_dec, rem_dec, state, pid, None);
+                let proc_files: &[(&str, &str)] = &[
+                    ("TCP", "/proc/net/tcp"),
+                    ("UDP", "/proc/net/udp"),
+                    ("TCP", "/proc/net/tcp6"),
+                    ("UDP", "/proc/net/udp6"),
+                ];
+                for &(proto, path) in proc_files {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        for line in content.lines().skip(1) {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.len() >= 10 {
+                                let local_dec = decode_proc_net_v4_endpoint(parts[1])
+                                    .unwrap_or_else(|| parts[1].to_string());
+                                let rem_dec = decode_proc_net_v4_endpoint(parts[2])
+                                    .unwrap_or_else(|| parts[2].to_string());
+                                let state = if proto == "UDP" {
+                                    "STATELESS".to_string()
+                                } else {
+                                    decode_proc_net_tcp_state(parts[3]).to_string()
+                                };
+                                let inode = parts[9].parse::<u64>().unwrap_or(0);
+                                let pid = inode_to_pid.get(&inode).copied().unwrap_or(0);
+                                push_socket(proto.to_string(), local_dec, rem_dec, state, pid, None);
+                            }
                         }
                     }
                 }
@@ -1481,6 +1702,15 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                     proto,
                                     loc.to_string(),
                                     rem.to_string(),
+                                    state,
+                                    pid,
+                                    Some(cmd_name),
+                                );
+                            } else {
+                                push_socket(
+                                    proto,
+                                    name_col.to_string(),
+                                    "*:*".to_string(),
                                     state,
                                     pid,
                                     Some(cmd_name),
@@ -1525,8 +1755,9 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
             };
 
             candidates.sort_by(|a, b| {
-                b.internet_access
-                    .cmp(&a.internet_access)
+                b.is_dns
+                    .cmp(&a.is_dns)
+                    .then_with(|| b.internet_access.cmp(&a.internet_access))
                     .then_with(|| state_rank(&b.state).cmp(&state_rank(&a.state)))
                     .then_with(|| (!b.proc_name.is_empty()).cmp(&(!a.proc_name.is_empty())))
                     .then_with(|| b.proc_start_unix.cmp(&a.proc_start_unix))
@@ -1535,6 +1766,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
 
             // Deduplicate identical (pid, remote_addr, state) tuples while keeping bounded rich coverage
             let mut seen_tuples = std::collections::HashSet::new();
+            let mut dns_rank = 0usize;
             let mut ext_rank = 0usize;
             let mut local_rank = 0usize;
 
@@ -1543,7 +1775,40 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                 if !seen_tuples.insert(dedup_key) {
                     continue;
                 }
-                if cand.internet_access {
+                if cand.is_dns {
+                    if dns_rank < 32 {
+                        let rank = dns_rank;
+                        dns_rank += 1;
+                        let val = serde_json::json!({
+                            "record_id": format!("artemis:live:{}:dns:socket:{}", os_platform_ref, rank),
+                            "telemetry_type": "network_connection",
+                            "Computer": host_ref,
+                            "os_platform": os_platform_ref,
+                            "os_version": os_version_ref,
+                            "Protocol": cand.proto,
+                            "SourceIp": cand.local_addr,
+                            "DestinationIp": cand.remote_addr,
+                            "RemotePort": cand.remote_port,
+                            "Port": cand.dns_port,
+                            "State": cand.state,
+                            "ProcessId": cand.pid,
+                            "ProcessName": cand.proc_name,
+                            "Image": cand.exe_path,
+                            "CommandLine": cand.cmd_line,
+                            "ProcessStartTimeUnix": cand.proc_start_unix,
+                            "InternetAccess": cand.internet_access,
+                            "ConnectionScope": if cand.internet_access { "external_internet" } else { cand.scope },
+                            "dns_service": cand.dns_service,
+                            "dns_query": true,
+                            "EventDate": now_rfc3339_ref,
+                            "collected_unix_secs": now_unix.saturating_sub(rank as i64),
+                            "source_path": format!("artemis://{}/live/dns/socket_{}", os_platform_ref, rank),
+                        });
+                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some(os_platform_ref)) {
+                            out.push(rec);
+                        }
+                    }
+                } else if cand.internet_access {
                     if ext_rank >= 48 {
                         continue;
                     }
@@ -1850,6 +2115,14 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                         "Microsoft-Windows-CodeIntegrity/Operational",
                         Some("*[System[(EventID=3077 or EventID=3076 or EventID=3033 or EventID=3089)]]"),
                     ),
+                    (
+                        "Microsoft-Windows-Sysmon/Operational",
+                        Some("*[System[(EventID=22)]]"),
+                    ),
+                    (
+                        "Microsoft-Windows-DNS-Client/Operational",
+                        Some("*[System[(EventID=3006 or EventID=3008 or EventID=3020)]]"),
+                    ),
                     ("System", None),
                     ("Application", None),
                 ];
@@ -1878,6 +2151,12 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                     let mut threat_name = String::new();
                                     let mut blocked_path = String::new();
                                     let mut process_name = String::new();
+                                    let mut image_path = String::new();
+                                    let mut query_name = String::new();
+                                    let mut query_status = String::new();
+                                    let mut query_results = String::new();
+                                    let mut query_type = String::new();
+                                    let mut parsed_pid = 0u64;
                                     let mut action_name = String::new();
                                     let mut desc_lines = Vec::new();
                                     let mut in_desc = false;
@@ -1889,6 +2168,33 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                             event_date = rest.trim().to_string();
                                         } else if let Some(rest) = trimmed.strip_prefix("User Name:") {
                                             user_name = rest.trim().to_string();
+                                        } else if let Some(rest) = trimmed.strip_prefix("Image:") {
+                                            image_path = rest.trim().to_string();
+                                        } else if let Some(rest) = trimmed
+                                            .strip_prefix("ProcessId:")
+                                            .or_else(|| trimmed.strip_prefix("Process ID:"))
+                                        {
+                                            parsed_pid = rest.trim().parse::<u64>().unwrap_or(0);
+                                        } else if let Some(rest) = trimmed
+                                            .strip_prefix("QueryName:")
+                                            .or_else(|| trimmed.strip_prefix("Query Name:"))
+                                        {
+                                            query_name = rest.trim().to_string();
+                                        } else if let Some(rest) = trimmed
+                                            .strip_prefix("QueryStatus:")
+                                            .or_else(|| trimmed.strip_prefix("Query Status:"))
+                                        {
+                                            query_status = rest.trim().to_string();
+                                        } else if let Some(rest) = trimmed
+                                            .strip_prefix("QueryResults:")
+                                            .or_else(|| trimmed.strip_prefix("Query Results:"))
+                                        {
+                                            query_results = rest.trim().to_string();
+                                        } else if let Some(rest) = trimmed
+                                            .strip_prefix("QueryType:")
+                                            .or_else(|| trimmed.strip_prefix("Query Type:"))
+                                        {
+                                            query_type = rest.trim().to_string();
                                         } else if trimmed.starts_with("Description:") {
                                             in_desc = true;
                                         } else if in_desc && !trimmed.is_empty() {
@@ -1913,7 +2219,42 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                     };
                                     let is_defender = channel.contains("Windows Defender");
                                     let is_code_integrity = channel.contains("CodeIntegrity");
-                                    let msg = if is_defender {
+                                    let is_sysmon_dns = (channel.contains("Sysmon") && event_id == 22) || event_id == 22;
+                                    let is_dns_client = channel.contains("DNS-Client") || event_id == 3006 || event_id == 3008 || event_id == 3020;
+                                    let is_dns_event = is_sysmon_dns || is_dns_client;
+
+                                    if process_name.is_empty() && !image_path.is_empty() {
+                                        process_name = image_path
+                                            .split(['\\', '/'])
+                                            .last()
+                                            .unwrap_or(&image_path)
+                                            .to_string();
+                                    }
+                                    if image_path.is_empty() && !process_name.is_empty() {
+                                        image_path = process_name.clone();
+                                    }
+
+                                    let msg = if is_dns_event {
+                                        let eff_proc = if !image_path.is_empty() {
+                                            image_path.as_str()
+                                        } else if !process_name.is_empty() {
+                                            process_name.as_str()
+                                        } else {
+                                            "active process"
+                                        };
+                                        format!(
+                                            "[Forensic Host DNS Query Event] On {} (Event ID {}, Channel: {}), process '{}' (PID {}) issued DNS query for domain '{}' (Status: {}, Results: '{}'). Details: {}",
+                                            if event_date.is_empty() { "recent timestamp" } else { event_date.as_str() },
+                                            event_id,
+                                            channel,
+                                            eff_proc,
+                                            parsed_pid,
+                                            if query_name.is_empty() { "unknown domain" } else { query_name.as_str() },
+                                            if query_status.is_empty() { "0 (SUCCESS)" } else { query_status.as_str() },
+                                            if query_results.is_empty() { "resolved" } else { query_results.as_str() },
+                                            raw_desc
+                                        )
+                                    } else if is_defender {
                                         let rank_label = if idx == 0 {
                                             "Latest Process Blocked by Antivirus (Windows Defender)"
                                         } else {
@@ -1954,7 +2295,11 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                     } else {
                                         raw_desc
                                     };
-                                    let slug = if is_defender {
+                                    let slug = if is_sysmon_dns {
+                                        format!("windows_sysmon_dns_query_event_{}_{}", event_id, idx)
+                                    } else if is_dns_client {
+                                        format!("windows_dns_client_operational_event_{}_{}", event_id, idx)
+                                    } else if is_defender {
                                         format!("windows_defender_antivirus_event_{}_{}", event_id, idx)
                                     } else if is_code_integrity {
                                         format!("windows_codeintegrity_blocked_process_event_{}_{}", event_id, idx)
@@ -1980,6 +2325,16 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                                         "UserName": user_name,
                                         "ThreatName": threat_name,
                                         "BlockedProcessPath": blocked_path,
+                                        "ProcessName": process_name,
+                                        "Image": image_path,
+                                        "ProcessId": parsed_pid,
+                                        "QueryName": query_name,
+                                        "QueryStatus": query_status,
+                                        "QueryResults": query_results,
+                                        "QueryType": query_type,
+                                        "Port": 53,
+                                        "Protocol": "UDP",
+                                        "dns_query": is_dns_event,
                                         "Message": msg,
                                         "collected_unix_secs": event_unix,
                                         "source_path": format!("artemis://windows/eventlog/{}", slug),
@@ -2059,6 +2414,194 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
         for handle in [h_proc, h_net, h_reg, h_pf, h_svc, h_evt] {
             if let Ok(part) = handle.join() {
                 records.extend(part);
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let has_dns_recs = records.iter().any(|r| {
+                r.source_path.contains("/dns/")
+                    || r.raw_json
+                        .get("dns_query")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+            });
+
+            if !has_dns_recs {
+                // 1. Inspect Dnscache service state & PID via sc.exe queryex
+                if let Some(sc_out) = run_hidden_os_command("sc.exe", &["queryex", "Dnscache"]) {
+                    let mut d_pid = 0u32;
+                    let mut is_running = false;
+                    for line in sc_out.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.contains("STATE") && trimmed.contains("RUNNING") {
+                            is_running = true;
+                        } else if let Some(rest) = trimmed.strip_prefix("PID") {
+                            if let Some((_, pstr)) = rest.split_once(':') {
+                                d_pid = pstr.trim().parse::<u32>().unwrap_or(0);
+                            }
+                        }
+                    }
+                    if is_running {
+                        let val = serde_json::json!({
+                            "record_id": "artemis:live:windows:dns:dnscache_service",
+                            "telemetry_type": "service_daemon",
+                            "Computer": host_ref,
+                            "os_platform": "windows",
+                            "os_version": os_version_ref,
+                            "ServiceName": "Dnscache",
+                            "DisplayName": "DNS Client",
+                            "ProcessId": d_pid,
+                            "ProcessName": "svchost.exe (Dnscache)",
+                            "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
+                            "State": "RUNNING",
+                            "Port": 53,
+                            "Protocol": "UDP",
+                            "dns_service": "DNS",
+                            "dns_query": true,
+                            "Message": format!("Windows DNS Client Service (Dnscache) is active (STATE: 4 RUNNING, PID: {}, Executable: svchost.exe) handling local asset DNS query resolution and caching.", d_pid),
+                            "collected_unix_secs": now_unix,
+                            "source_path": "artemis://windows/live/dns/dnscache_service",
+                        });
+                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
+                            records.push(rec);
+                        }
+                    }
+                }
+
+                // 2. Query PowerShell Get-DnsClientCache or ipconfig /displaydns fallback
+                if let Some(cache_out) = run_hidden_os_command(
+                    "powershell",
+                    &[
+                        "-NoProfile",
+                        "-Command",
+                        "Get-DnsClientCache | Select-Object -Property Entry, Type, Status, Section, Data | ConvertTo-Json -Compress",
+                    ],
+                ) {
+                    if let Ok(parsed_json) =
+                        serde_json::from_str::<serde_json::Value>(cache_out.trim())
+                    {
+                        let items = if let Some(arr) = parsed_json.as_array() {
+                            arr.clone()
+                        } else if parsed_json.is_object() {
+                            vec![parsed_json]
+                        } else {
+                            Vec::new()
+                        };
+                        for (c_idx, item) in items.into_iter().take(32).enumerate() {
+                            let entry_name = item
+                                .get("Entry")
+                                .or_else(|| item.get("Name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if entry_name.is_empty() {
+                                continue;
+                            }
+                            let q_type = item.get("Type").and_then(|v| v.as_u64()).unwrap_or(1);
+                            let q_data = item
+                                .get("Data")
+                                .or_else(|| item.get("IPAddress"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let q_status = item.get("Status").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let q_section = item.get("Section").and_then(|v| v.as_u64()).unwrap_or(1);
+                            let val = serde_json::json!({
+                                "record_id": format!("artemis:live:windows:dns:cache:{}", c_idx),
+                                "telemetry_type": "network_connection",
+                                "Computer": host_ref,
+                                "os_platform": "windows",
+                                "os_version": os_version_ref,
+                                "ProcessName": "svchost.exe (Dnscache)",
+                                "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
+                                "Port": 53,
+                                "Protocol": "UDP",
+                                "dns_service": "DNS",
+                                "dns_query": true,
+                                "QueryName": entry_name,
+                                "QueryResults": q_data,
+                                "QueryStatus": q_status.to_string(),
+                                "QueryType": q_type.to_string(),
+                                "CacheSection": q_section,
+                                "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Section: {}, Status: {}, Data: '{}')", entry_name, q_type, q_section, q_status, q_data),
+                                "collected_unix_secs": now_unix.saturating_sub(c_idx as i64),
+                                "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
+                            });
+                            if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
+                                records.push(rec);
+                            }
+                        }
+                    }
+                } else if let Some(ipconfig_out) = run_hidden_os_command("ipconfig", &["/displaydns"]) {
+                    let mut current_name = String::new();
+                    let mut current_type = String::new();
+                    let mut current_data = String::new();
+                    let mut c_idx = 0usize;
+                    for line in ipconfig_out.lines() {
+                        let trimmed = line.trim();
+                        if let Some(rest) = trimmed.strip_prefix("Record Name . . . . . :") {
+                            if !current_name.is_empty() && c_idx < 32 {
+                                let val = serde_json::json!({
+                                    "record_id": format!("artemis:live:windows:dns:cache:{}", c_idx),
+                                    "telemetry_type": "network_connection",
+                                    "Computer": host_ref,
+                                    "os_platform": "windows",
+                                    "os_version": os_version_ref,
+                                    "ProcessName": "svchost.exe (Dnscache)",
+                                    "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
+                                    "Port": 53,
+                                    "Protocol": "UDP",
+                                    "dns_service": "DNS",
+                                    "dns_query": true,
+                                    "QueryName": current_name,
+                                    "QueryResults": current_data,
+                                    "QueryType": current_type,
+                                    "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Data: '{}')", current_name, current_type, current_data),
+                                    "collected_unix_secs": now_unix.saturating_sub(c_idx as i64),
+                                    "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
+                                });
+                                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
+                                    records.push(rec);
+                                }
+                                c_idx += 1;
+                                current_data.clear();
+                                current_type.clear();
+                            }
+                            current_name = rest.trim().to_string();
+                        } else if let Some(rest) = trimmed.strip_prefix("Record Type . . . . . :") {
+                            current_type = rest.trim().to_string();
+                        } else if let Some(rest) = trimmed.strip_prefix("A (Host) Record  . . . :")
+                            .or_else(|| trimmed.strip_prefix("AAAA Record . . . . . :"))
+                            .or_else(|| trimmed.strip_prefix("PTR Record  . . . . . :"))
+                            .or_else(|| trimmed.strip_prefix("CNAME Record  . . . . :"))
+                        {
+                            current_data = rest.trim().to_string();
+                        }
+                    }
+                    if !current_name.is_empty() && c_idx < 32 {
+                        let val = serde_json::json!({
+                            "record_id": format!("artemis:live:windows:dns:cache:{}", c_idx),
+                            "telemetry_type": "network_connection",
+                            "Computer": host_ref,
+                            "os_platform": "windows",
+                            "os_version": os_version_ref,
+                            "ProcessName": "svchost.exe (Dnscache)",
+                            "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
+                            "Port": 53,
+                            "Protocol": "UDP",
+                            "dns_service": "DNS",
+                            "dns_query": true,
+                            "QueryName": current_name,
+                            "QueryResults": current_data,
+                            "QueryType": current_type,
+                            "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Data: '{}')", current_name, current_type, current_data),
+                            "collected_unix_secs": now_unix.saturating_sub(c_idx as i64),
+                            "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
+                        });
+                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
+                            records.push(rec);
+                        }
+                    }
+                }
             }
         }
         records

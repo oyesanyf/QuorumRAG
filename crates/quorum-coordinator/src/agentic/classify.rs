@@ -107,6 +107,15 @@ impl ClassifyIntentNode {
         for (k, v) in consensus.metadata_filters {
             combined_filters.insert(k, v);
         }
+        if let Some(crate::offline_engine::ForensicQueryIntent::DnsTraffic) =
+            crate::offline_engine::ForensicQueryIntent::detect(&state.original_prompt)
+                .or_else(|| crate::offline_engine::ForensicQueryIntent::detect(&lower))
+        {
+            combined_filters.insert("port".to_string(), "53".to_string());
+            combined_filters.insert("protocol".to_string(), "UDP".to_string());
+            combined_filters.insert("event_id".to_string(), "22".to_string());
+            combined_filters.insert("channel".to_string(), "Microsoft-Windows-DNS-Client".to_string());
+        }
         if !combined_filters.is_empty() {
             state.query_metadata_filters = Some(combined_filters);
         }

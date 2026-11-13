@@ -874,7 +874,19 @@ impl RetrieveMeshNode {
                             weighted_hits += 65;
                             content_matched_terms += 4;
                         }
-                        if fi == crate::offline_engine::ForensicQueryIntent::NetworkInternet {
+                        if fi == crate::offline_engine::ForensicQueryIntent::DnsTraffic {
+                            if fi.matches_artemis_chunk(&path_l, &text_l) {
+                                intent_bonus += 1200;
+                                weighted_hits += 100;
+                                content_matched_terms += 5;
+                            }
+                            if path_l.contains("codeintegrity") || text_l.contains("codeintegrity") {
+                                intent_bonus -= 1500;
+                            }
+                            if path_l.contains("windows_defender") || text_l.contains("defender") {
+                                intent_bonus -= 600;
+                            }
+                        } else if fi == crate::offline_engine::ForensicQueryIntent::NetworkInternet {
                             if path_l.contains("/network/internet_")
                                 || text_l.contains("scope='external_internet'")
                                 || text_l.contains("live internet connection")
@@ -1131,7 +1143,7 @@ impl RetrieveMeshNode {
                     let wanted_media = media_prefix
                         .map_or(false, |p| c.chunk.text_content.trim_start().starts_with(p) && crit.weighted_hits > 0);
                     is_forensic_artemis
-                        || c.is_remote
+                        || (c.is_remote && (!any_proper_match || crit.proper_ok) && (!any_prompt_entity_match || crit.prompt_entity_hits >= required_prompt_hits))
                         || wanted_media
                         || (crit.is_relevant
                             && crit.weighted_hits > 0
@@ -1187,7 +1199,15 @@ impl RetrieveMeshNode {
                 volatile.clear();
                 true
             } else if has_any {
-                chunks.retain(|c| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"));
+                chunks.retain(|c| {
+                    let pl = c.chunk.file_path.to_ascii_lowercase();
+                    let tl = c.chunk.text_content.to_ascii_lowercase();
+                    if fi == crate::offline_engine::ForensicQueryIntent::DnsTraffic {
+                        !pl.contains("codeintegrity") && !tl.contains("codeintegrity") && pl.starts_with("artemis://")
+                    } else {
+                        pl.starts_with("artemis://")
+                    }
+                });
                 volatile.clear();
                 true
             } else {

@@ -535,6 +535,36 @@ fn cite_list(cites: &[usize]) -> String {
     cites.iter().map(|c| format!("[{c}]")).collect::<Vec<_>>().join(", ")
 }
 
+/// Classifies a document chunk into an entity domain cluster to disambiguate homonyms.
+pub fn classify_entity_domain_cluster(path: &str, text: &str) -> &'static str {
+    let tl = text.to_ascii_lowercase();
+    let fl = path.to_ascii_lowercase();
+    if tl.contains("women, race & class")
+        || tl.contains("women, race and class")
+        || tl.contains("1981")
+        || tl.contains("critical theory")
+        || tl.contains("philosophy")
+        || fl.contains("women_race")
+    {
+        "Academic & Critical Theory Works (1981)"
+    } else if tl.contains("landlord")
+        || tl.contains("lease")
+        || tl.contains("tenant")
+        || tl.contains("new orleans")
+        || tl.contains("castiglione")
+        || tl.contains("d'hemecourt")
+        || tl.contains("breure")
+        || tl.contains("firldeal")
+        || fl.contains("lease")
+    {
+        "New Orleans Residential Property Management & Lease Agreement"
+    } else if tl.contains("unity minister") || tl.contains("steward") || tl.contains("reverend") || tl.contains("church") {
+        "Religious Ministry & Stewardship"
+    } else {
+        "General Document Context"
+    }
+}
+
 /// Render grounded facts and key passages as Markdown sections (no opening, no sources block).
 /// Returns `None` when nothing could be grounded, so callers keep their previous behaviour.
 pub fn render_grounded_sections(prompt: &str, subject: Option<&str>, chunks: &[&ScoredChunk]) -> Option<String> {
@@ -550,41 +580,94 @@ pub fn render_grounded_sections(prompt: &str, subject: Option<&str>, chunks: &[&
             )
         })
         .collect();
-    let facts = extract_grounded_facts(subject, &texts);
-    let passages = key_passages(prompt, subject, &texts, 3);
-    if facts.is_empty() && passages.is_empty() {
+
+    if texts.is_empty() {
         return None;
     }
 
-    const ORDER: &[&str] = &["Role", "Other parties", "Addresses", "Phone", "Email", "Amounts", "Dates"];
-    let mut grouped: BTreeMap<usize, (&str, Vec<&GroundedFact>)> = BTreeMap::new();
-    for f in &facts {
-        let pos = ORDER.iter().position(|o| *o == f.class).unwrap_or(ORDER.len());
-        grouped.entry(pos).or_insert((f.class, Vec::new())).1.push(f);
+    // Check if multiple distinct entity domain clusters exist across texts
+    let mut cluster_map: BTreeMap<&'static str, Vec<(String, String, String)>> = BTreeMap::new();
+    for t in &texts {
+        let label = classify_entity_domain_cluster(&t.1, &t.2);
+        cluster_map.entry(label).or_default().push(t.clone());
     }
 
-    let mut md = String::new();
-    if !grouped.is_empty() {
-        md.push_str("### Key facts from the documents\n");
-        for (_, (class, mut items)) in grouped {
-            // Facts supported by more documents first; cap list length per class.
-            items.sort_by(|a, b| b.cites.len().cmp(&a.cites.len()));
-            let limit = if class == "Amounts" { 6 } else { 5 };
-            let rendered: Vec<String> = items
-                .iter()
-                .take(limit)
-                .map(|f| format!("{} {}", f.value, cite_list(&f.cites)))
-                .collect();
-            md.push_str(&format!("- **{}:** {}\n", class, rendered.join("; ")));
+    if cluster_map.len() > 1 {
+        let mut md = String::new();
+        for (cluster_label, cluster_texts) in cluster_map {
+            let facts = extract_grounded_facts(subject, &cluster_texts);
+            let passages = key_passages(prompt, subject, &cluster_texts, 3);
+            if facts.is_empty() && passages.is_empty() {
+                continue;
+            }
+            md.push_str(&format!("### {}\n", cluster_label));
+            const ORDER: &[&str] = &["Role", "Other parties", "Addresses", "Phone", "Email", "Amounts", "Dates"];
+            let mut grouped: BTreeMap<usize, (&str, Vec<&GroundedFact>)> = BTreeMap::new();
+            for f in &facts {
+                let pos = ORDER.iter().position(|o| *o == f.class).unwrap_or(ORDER.len());
+                grouped.entry(pos).or_insert((f.class, Vec::new())).1.push(f);
+            }
+            if !grouped.is_empty() {
+                for (_, (class, mut items)) in grouped {
+                    items.sort_by(|a, b| b.cites.len().cmp(&a.cites.len()));
+                    let limit = if class == "Amounts" { 6 } else { 5 };
+                    let rendered: Vec<String> = items
+                        .iter()
+                        .take(limit)
+                        .map(|f| format!("{} {}", f.value, cite_list(&f.cites)))
+                        .collect();
+                    md.push_str(&format!("- **{}:** {}\n", class, rendered.join("; ")));
+                }
+            }
+            if !passages.is_empty() {
+                for (s, c) in passages {
+                    md.push_str(&format!("- \"{}\" [{}]\n", s.trim(), c));
+                }
+            }
+            md.push('\n');
         }
-    }
-    if !passages.is_empty() {
-        md.push_str("\n### Relevant passages\n");
-        for (s, c) in passages {
-            md.push_str(&format!("- \"{}\" [{}]\n", s.trim(), c));
+        let res = md.trim_end().to_string();
+        if res.is_empty() {
+            None
+        } else {
+            Some(res)
         }
+    } else {
+        let facts = extract_grounded_facts(subject, &texts);
+        let passages = key_passages(prompt, subject, &texts, 3);
+        if facts.is_empty() && passages.is_empty() {
+            return None;
+        }
+
+        const ORDER: &[&str] = &["Role", "Other parties", "Addresses", "Phone", "Email", "Amounts", "Dates"];
+        let mut grouped: BTreeMap<usize, (&str, Vec<&GroundedFact>)> = BTreeMap::new();
+        for f in &facts {
+            let pos = ORDER.iter().position(|o| *o == f.class).unwrap_or(ORDER.len());
+            grouped.entry(pos).or_insert((f.class, Vec::new())).1.push(f);
+        }
+
+        let mut md = String::new();
+        if !grouped.is_empty() {
+            md.push_str("### Key facts from the documents\n");
+            for (_, (class, mut items)) in grouped {
+                items.sort_by(|a, b| b.cites.len().cmp(&a.cites.len()));
+                let limit = if class == "Amounts" { 6 } else { 5 };
+                let rendered: Vec<String> = items
+                    .iter()
+                    .take(limit)
+                    .map(|f| format!("{} {}", f.value, cite_list(&f.cites)))
+                    .collect();
+                md.push_str(&format!("- **{}:** {}\n", class, rendered.join("; ")));
+            }
+        }
+        if !passages.is_empty() {
+            md.push_str("\n### Relevant passages\n");
+            for (s, c) in passages {
+                md.push_str(&format!("- \"{}\" [{}]\n", s.trim(), c));
+            }
+        }
+        Some(md.trim_end().to_string())
     }
-    Some(md.trim_end().to_string())
 }
 
 #[cfg(test)]

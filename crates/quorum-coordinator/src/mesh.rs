@@ -947,10 +947,16 @@ impl MeshQueryDispatcher for LocalOnlyDispatcher {
 
 /// Production inbound Mesh query handler enforcing OshoosiClaw Shared Folder ACLs
 /// and Two-Tier HIPAA PHI / PII Data Loss Prevention (`Redact` or `Block`).
+fn seen_query_cache() -> &'static std::sync::RwLock<HashMap<uuid::Uuid, Instant>> {
+    static CACHE: OnceLock<std::sync::RwLock<HashMap<uuid::Uuid, Instant>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
 pub struct OsoosiMeshInboundHandler {
     pub local_storage: Arc<dyn crate::scatter_gather::StorageSearcher>,
     pub local_peer_id: String,
     pub embedder: Option<Arc<dyn quorum_contract::EmbeddingGenerator>>,
+    pub dispatcher: Arc<std::sync::RwLock<Option<Arc<dyn MeshQueryDispatcher>>>>,
 }
 
 impl OsoosiMeshInboundHandler {
@@ -962,6 +968,7 @@ impl OsoosiMeshInboundHandler {
             local_storage,
             local_peer_id: local_peer_id.into(),
             embedder: None,
+            dispatcher: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -973,6 +980,18 @@ impl OsoosiMeshInboundHandler {
         self
     }
 
+    pub fn with_dispatcher(
+        self,
+        dispatcher: Arc<dyn MeshQueryDispatcher>,
+    ) -> Self {
+        *self.dispatcher.write().unwrap_or_else(|e| e.into_inner()) = Some(dispatcher);
+        self
+    }
+
+    pub fn set_dispatcher(&self, dispatcher: Arc<dyn MeshQueryDispatcher>) {
+        *self.dispatcher.write().unwrap_or_else(|e| e.into_inner()) = Some(dispatcher);
+    }
+
     pub fn new_with_embedder(
         local_storage: Arc<dyn crate::scatter_gather::StorageSearcher>,
         local_peer_id: impl Into<String>,
@@ -982,6 +1001,7 @@ impl OsoosiMeshInboundHandler {
             local_storage,
             local_peer_id: local_peer_id.into(),
             embedder: Some(embedder),
+            dispatcher: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 }
@@ -989,6 +1009,38 @@ impl OsoosiMeshInboundHandler {
 #[async_trait::async_trait]
 impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
     async fn handle_query(&self, req: FederatedQueryRequest) -> FederatedQueryResponse {
+        // 0. Deduplicate duplicate query_id within 60s TTL window to prevent replay or relay loops
+        {
+            let now = Instant::now();
+            let mut cache = seen_query_cache().write().unwrap_or_else(|e| e.into_inner());
+            cache.retain(|_, seen_time| now.duration_since(*seen_time) < Duration::from_secs(60));
+            if cache.contains_key(&req.query_id) {
+                tracing::debug!(
+                    "Dropping duplicate mesh query_id {} already processed within 60s TTL",
+                    req.query_id
+                );
+                return FederatedQueryResponse {
+                    query_id: req.query_id,
+                    responder_peer_id: self.local_peer_id.clone(),
+                    chunks: Vec::new(),
+                };
+            }
+            cache.insert(req.query_id, now);
+        }
+
+        // 0b. Loop prevention: do not process query if this node was already visited
+        if req.visited_peers.iter().any(|p| p == &self.local_peer_id) {
+            tracing::warn!(
+                "Dropping mesh query with loop: local peer {} already visited",
+                self.local_peer_id
+            );
+            return FederatedQueryResponse {
+                query_id: req.query_id,
+                responder_peer_id: self.local_peer_id.clone(),
+                chunks: Vec::new(),
+            };
+        }
+
         // 1. Reject malformed payloads: embedding dimension 768, finite floats, text length <= 4096, top_k > 0 (except signed canary ping)
         if req.embedding.len() != 768
             || !req.embedding.iter().all(|f| f.is_finite())
@@ -1229,14 +1281,68 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
 
         scored.retain(|c| !crate::artemis_airgap::is_airgap_restricted_chunk(&c.chunk));
 
-        let candidate_dtos: Vec<CandidateChunkDto> = scored
-            .iter()
-            .map(CandidateChunkDto::from_scored_chunk)
-            .collect();
+        // RLM parent-document expansion up to 10,000 bytes BEFORE outbound DLP inspection
+        let mut candidate_dtos = Vec::with_capacity(scored.len());
+        for c in scored {
+            let mut dto = CandidateChunkDto::from_scored_chunk(&c);
+            dto.origin_peer_id = Some(self.local_peer_id.clone());
+            if let Some((_start, _end, expanded_text, _, _)) = self.local_storage.expand_parent_window(
+                &c.chunk.document_id,
+                &c.chunk.text_content,
+                10000,
+                effective_tier,
+            ) {
+                if !expanded_text.trim().is_empty() {
+                    dto.content = expanded_text;
+                }
+            } else if let Some((_start, _end, expanded_text, _, _)) = self.local_storage.expand_parent_window(
+                &c.chunk.file_path,
+                &c.chunk.text_content,
+                10000,
+                effective_tier,
+            ) {
+                if !expanded_text.trim().is_empty() {
+                    dto.content = expanded_text;
+                }
+            }
+            candidate_dtos.push(dto);
+        }
 
         // Filter strictly to user's shared_folders and enforce PHI/PII Redact or Block
-        let safe_chunks = controller
+        let mut safe_chunks = controller
             .filter_and_enforce_outbound_mesh_chunks(candidate_dtos, &req.sender_peer_id);
+
+        // Loop-free 1-hop federated relay across WAN NAT gateways
+        // If relay_hops == 0, forward to other connected mesh peers (clamping depth <= 1)
+        if req.relay_hops == 0 {
+            let disp_opt = self.dispatcher.read().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(ref disp) = disp_opt {
+                let mut relayed_req = req.clone();
+                let original_origin = req
+                    .origin_peer_id
+                    .clone()
+                    .unwrap_or_else(|| req.sender_peer_id.clone());
+                relayed_req.origin_peer_id = Some(original_origin);
+                relayed_req.relay_hops = 1;
+                relayed_req.visited_peers.push(self.local_peer_id.clone());
+                if !relayed_req.visited_peers.contains(&req.sender_peer_id) {
+                    relayed_req.visited_peers.push(req.sender_peer_id.clone());
+                }
+                if let Ok(relayed_resps) = disp
+                    .query_peers(&relayed_req, Duration::from_millis(1500))
+                    .await
+                {
+                    for resp in relayed_resps {
+                        for mut chunk in resp.chunks {
+                            if chunk.origin_peer_id.is_none() {
+                                chunk.origin_peer_id = Some(resp.responder_peer_id.clone());
+                            }
+                            safe_chunks.push(chunk);
+                        }
+                    }
+                }
+            }
+        }
 
         FederatedQueryResponse {
             query_id: req.query_id,

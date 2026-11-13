@@ -326,6 +326,7 @@ impl StorageEngine {
             .await
             .map_err(|e| StorageError::Tantivy(format!("Tantivy search blocking task failed: {e}")))??;
         prioritize_media_intent(query, &mut hits);
+        prioritize_forensic_intent(query, &mut hits);
         Ok(hits)
     }
 
@@ -412,6 +413,7 @@ impl StorageEngine {
                 .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
         });
         prioritize_media_intent(text, &mut combined);
+        prioritize_forensic_intent(text, &mut combined);
         combined.truncate(top_k);
 
         Ok(combined)
@@ -1005,4 +1007,45 @@ pub(crate) fn prioritize_media_intent(query: &str, hits: &mut Vec<ScoredChunk>) 
         .partition(|h| h.chunk.text_content.trim_start().starts_with(prefix));
     media.extend(rest);
     *hits = media;
+}
+
+/// When the question explicitly asks for DNS telemetry/traffic, prioritize matching DNS records
+/// and filter out unrelated CodeIntegrity/Defender block logs to avoid retrieval drift.
+pub(crate) fn prioritize_forensic_intent(query: &str, hits: &mut Vec<ScoredChunk>) {
+    let p_intent = crate::query_framing::detect_protocol_forensic_intent(query);
+    if p_intent == crate::query_framing::ProtocolIntent::Dns {
+        let (mut dns_hits, mut rest): (Vec<ScoredChunk>, Vec<ScoredChunk>) = std::mem::take(hits)
+            .into_iter()
+            .partition(|h| {
+                let meta = &h.chunk.metadata_json;
+                let text = &h.chunk.text_content;
+                let file = &h.chunk.file_path;
+                let matches_meta = meta.contains("\"port\":53")
+                    || meta.contains("\"port\": 53")
+                    || meta.contains("\"protocol\":\"UDP\"")
+                    || meta.contains("\"protocol\": \"UDP\"")
+                    || meta.contains("\"event_id\":22")
+                    || meta.contains("\"event_id\": 22")
+                    || meta.contains("Microsoft-Windows-DNS-Client")
+                    || meta.contains("dns_query");
+                let matches_text = file.contains("/dns/")
+                    || file.contains("sysmon_dns")
+                    || file.contains("dns_client")
+                    || text.starts_with("DnsQuery [")
+                    || text.contains("port=53")
+                    || text.contains("port 53")
+                    || text.contains("sysmon/operational', event_id=22")
+                    || text.contains("dnscache");
+                let is_unrelated = file.contains("codeintegrity")
+                    || text.contains("CodeIntegrity")
+                    || text.contains("blocked process");
+                (matches_meta || matches_text) && !is_unrelated
+            });
+        rest.retain(|h| {
+            !h.chunk.file_path.contains("codeintegrity")
+                && !h.chunk.text_content.contains("CodeIntegrity")
+        });
+        dns_hits.extend(rest);
+        *hits = dns_hits;
+    }
 }
