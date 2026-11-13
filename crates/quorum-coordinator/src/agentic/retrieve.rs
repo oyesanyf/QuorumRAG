@@ -659,6 +659,8 @@ impl RetrieveMeshNode {
                 || query_lower.contains("background")
                 || query_lower.contains("about");
 
+            let asks_authorship = crate::offline_engine::DeterministicOfflineSynthesisEngine::is_authorship_query(&state.original_prompt);
+
             let asks_image = query_lower.contains("image")
                 || query_lower.contains("photo")
                 || query_lower.contains("picture")
@@ -941,8 +943,7 @@ impl RetrieveMeshNode {
                     }
                 }
 
-                let asks_author_works = crate::offline_engine::DeterministicOfflineSynthesisEngine::is_authorship_query(&state.original_prompt);
-                if asks_profile_or_role && !asks_author_works {
+                if asks_profile_or_role && !asks_authorship {
                     if file_name_l.contains("resume")
                         || path_l.contains("resume")
                         || file_name_l.contains("cv")
@@ -967,10 +968,10 @@ impl RetrieveMeshNode {
                     &c.chunk.file_path,
                     &c.chunk.text_content,
                 );
-                if (asks_author_works || (asks_profile_or_role && has_resume_or_bio)) && is_g28 {
+                if (asks_authorship || (asks_profile_or_role && has_resume_or_bio)) && is_g28 {
                     intent_bonus -= 500;
                 }
-                if asks_author_works {
+                if asks_authorship {
                     if file_name_l.contains("paper") || file_name_l.contains("article") || file_name_l.contains("manuscript") || text_l.contains("abstract") || text_l.contains("introduction") || text_l.contains("methodology") || text_l.contains("references") {
                         intent_bonus += 120;
                     }
