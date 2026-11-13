@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to package (e.g. quorumrag-v0.6.11)'
+        description: 'Release tag to package (e.g. quorumrag-v0.6.12)'
         required: true
-        default: 'quorumrag-v0.6.11'
+        default: 'quorumrag-v0.6.12'
 
 permissions: read-all
 

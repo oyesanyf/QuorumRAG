@@ -407,7 +407,6 @@ impl ForensicQueryIntent {
             Self::DnsTraffic => vec![
                 "system_event_log".to_string(),
                 "network_connection".to_string(),
-                "service_daemon".to_string(),
                 "process_execution".to_string(),
             ],
             Self::NetworkInternet => vec![
@@ -6624,34 +6623,58 @@ impl DeterministicOfflineSynthesisEngine {
 
     /// Triggers silent background installation (`OllamaSetup.exe /VERYSILENT /NORESTART`) if missing and online.
     pub fn trigger_silent_ollama_install() -> bool {
+        if std::env::var("QUORUM_DISABLE_OLLAMA_AUTOINSTALL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+            || std::env::var("CI")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            || std::env::var("GITHUB_ACTIONS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        {
+            return false;
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             use std::process::Command;
+            use std::sync::atomic::{AtomicBool, Ordering};
 
-            let temp_installer = std::env::temp_dir().join("OllamaSetup.exe");
-            if !temp_installer.exists() {
-                let url = "https://ollama.com/download/OllamaSetup.exe";
-                let ps_cmd = format!(
-                    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('{}', '{}')",
-                    url,
-                    temp_installer.to_string_lossy().replace('\'', "''")
-                );
-                let mut dl = Command::new("powershell.exe");
-                dl.creation_flags(0x08000000); // CREATE_NO_WINDOW
-                dl.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &ps_cmd]);
-                if let Ok(mut child) = dl.spawn() {
-                    let _ = child.wait();
-                }
+            static OLLAMA_AUTOINSTALL_TRIGGERED: AtomicBool = AtomicBool::new(false);
+            if OLLAMA_AUTOINSTALL_TRIGGERED.swap(true, Ordering::SeqCst) {
+                return false;
             }
 
-            if temp_installer.exists() {
-                let mut inst = Command::new(&temp_installer);
-                inst.creation_flags(0x08000000); // CREATE_NO_WINDOW
-                inst.args(["/VERYSILENT", "/NORESTART"]);
-                if inst.spawn().is_ok() {
-                    return true;
-                }
+            let temp_installer = std::env::temp_dir().join("OllamaSetup.exe");
+            let escaped_path = temp_installer.to_string_lossy().replace('\'', "''");
+            let ps_cmd = format!(
+                "$ErrorActionPreference = 'SilentlyContinue'; \
+                 $inst = '{}'; \
+                 if (-not (Test-Path $inst)) {{ \
+                     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+                     (New-Object Net.WebClient).DownloadFile('https://ollama.com/download/OllamaSetup.exe', $inst); \
+                 }} \
+                 if (Test-Path $inst) {{ \
+                     Start-Process -FilePath $inst -ArgumentList '/VERYSILENT','/NORESTART' -Wait; \
+                 }}",
+                escaped_path
+            );
+            let mut bg = Command::new("powershell.exe");
+            bg.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            bg.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    &ps_cmd,
+                ]);
+            if bg.spawn().is_ok() {
+                return true;
             }
         }
         false
@@ -7008,9 +7031,30 @@ impl DeterministicOfflineSynthesisEngine {
 
         let hw = crate::hardware::HardwareTelemetry::probe();
         let mut installed_models = Self::probe_installed_ollama_models(&addr, host_port, false);
+        if installed_models.is_empty() {
+            installed_models = Self::probe_installed_ollama_models(&addr, host_port, true);
+        }
         let normalized_req = Self::normalize_requested_model_tag(requested_model_tag);
+        if installed_models.is_empty() {
+            let pull_candidate = if !normalized_req.is_empty() {
+                normalized_req
+            } else {
+                Self::resolve_ollama_model_tag(requested_model_tag, &hw, &installed_models)
+            };
+            if !std::env::var("QUORUM_DISABLE_OLLAMA_AUTOINSTALL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+                && !std::env::var("CI")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+                && !pull_candidate.is_empty()
+                && Self::model_fits_free_memory(&pull_candidate, &hw)
+            {
+                let _ = Self::trigger_background_ollama_pull(&pull_candidate);
+            }
+            return None;
+        }
         if !normalized_req.is_empty()
-            && !installed_models.is_empty()
             && !installed_models
                 .iter()
                 .any(|m| m.eq_ignore_ascii_case(&normalized_req))

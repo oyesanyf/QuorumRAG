@@ -1577,27 +1577,47 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                             || local_addr.starts_with("127.0.0.54:");
                         let matched_resolver = proc_map_ref.values().find(|pm| {
                             let nl = pm.name.to_ascii_lowercase();
+                            let el = pm.exe.to_ascii_lowercase();
                             if prefer_resolved {
-                                nl == "systemd-resolved"
+                                nl.starts_with("systemd-resolve") || el.contains("systemd-resolved")
                             } else {
-                                matches!(
-                                    nl.as_str(),
-                                    "systemd-resolved"
-                                        | "dnsmasq"
-                                        | "unbound"
-                                        | "named"
-                                        | "coredns"
-                                        | "avahi-daemon"
-                                )
+                                nl.starts_with("systemd-resolve")
+                                    || el.contains("systemd-resolved")
+                                    || matches!(
+                                        nl.as_str(),
+                                        "dnsmasq"
+                                            | "unbound"
+                                            | "named"
+                                            | "coredns"
+                                            | "avahi-daemon"
+                                    )
                             }
                         });
                         if let Some(pm) = matched_resolver {
+                            let norm_name = if pm.name.to_ascii_lowercase().starts_with("systemd-resolve") {
+                                "systemd-resolved".to_string()
+                            } else {
+                                pm.name.clone()
+                            };
+                            let norm_exe = if pm.exe.is_empty() || pm.exe.eq_ignore_ascii_case("systemd-resolve") {
+                                norm_name.clone()
+                            } else {
+                                pm.exe.clone()
+                            };
                             (
                                 pm.pid,
-                                pm.name.clone(),
-                                pm.exe.clone(),
+                                norm_name,
+                                norm_exe,
                                 pm.cmd.clone(),
                                 pm.start_time_unix,
+                            )
+                        } else if prefer_resolved {
+                            (
+                                0,
+                                "systemd-resolved".to_string(),
+                                "/lib/systemd/systemd-resolved".to_string(),
+                                "systemd-resolved (127.0.0.53 stub listener)".to_string(),
+                                0,
                             )
                         } else {
                             (0, String::new(), String::new(), String::new(), 0)
@@ -2662,16 +2682,16 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
             if !has_linux_dns {
                 let matched_resolver = proc_map_ref.values().find(|pm| {
                     let nl = pm.name.to_ascii_lowercase();
-                    matches!(
-                        nl.as_str(),
-                        "systemd-resolved"
-                            | "dnsmasq"
-                            | "unbound"
-                            | "named"
-                            | "coredns"
-                            | "avahi-daemon"
-                            | "networkmanager"
-                    )
+                    nl.starts_with("systemd-resolve")
+                        || matches!(
+                            nl.as_str(),
+                            "dnsmasq"
+                                | "unbound"
+                                | "named"
+                                | "coredns"
+                                | "avahi-daemon"
+                                | "networkmanager"
+                        )
                 });
                 let mut nameservers: Vec<String> = Vec::new();
                 if let Ok(resolv_txt) = std::fs::read_to_string("/etc/resolv.conf") {
