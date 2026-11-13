@@ -12,7 +12,6 @@ use crate::state::DaemonState;
 use quorum_coordinator::{AgenticTelemetryEvent, ChatTurnMessage, SynthesisModelFamily};
 use quorum_storage::SearchMode;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 static LAST_FORENSIC_SYNC_BY_SCOPE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
