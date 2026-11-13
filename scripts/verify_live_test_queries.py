@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.11.
+"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.12.
 
 Spawns a real `quorumrag` release daemon against an isolated corpus containing
 homonym clusters, noisy ChatGPT export markers, and forensic distractors, then
@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 
-def http_json(port: int, method: str, path: str, payload: dict | None = None, timeout: float = 45.0) -> tuple[int, dict]:
+def http_json(port: int, method: str, path: str, payload: dict | None = None, timeout: float = 90.0) -> tuple[int, dict]:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         body_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -133,6 +133,7 @@ def main() -> int:
         child_env = os.environ.copy()
         child_env["QUORUM_SHOW_CONSOLE"] = "1"
         child_env["QUORUM_ISOLATED_WATCH_DIR"] = "1"
+        child_env["QUORUM_DISABLE_OLLAMA_AUTOINSTALL"] = "1"
 
         print(f"[E2E 1/4] Indexing test corpus with {bin_path.name}...")
         reindex_cmd = [

@@ -83,12 +83,26 @@ async fn ensure_live_forensics_for_query(state: &Arc<DaemonState>, prompt: &str)
             let _ = state_clone
                 .storage
                 .upsert_parent_document(&rec.to_parent_document(), 3);
-            if let Ok(mut chunk) = rec.to_document_chunk(0) {
-                chunk.vector = state_clone
-                    .embedder
-                    .embed_text(&chunk.text_content)
-                    .unwrap_or_else(|_| vec![0.0f32; state_clone.embedder.dimension()]);
+            if let Ok(chunk) = rec.to_document_chunk(0) {
                 chunks.push(chunk);
+            }
+        }
+        for batch in chunks.chunks_mut(64) {
+            let texts: Vec<&str> = batch.iter().map(|c| c.text_content.as_str()).collect();
+            match state_clone.embedder.embed_batch(&texts) {
+                Ok(vecs) if vecs.len() == batch.len() => {
+                    for (chunk, vec) in batch.iter_mut().zip(vecs.into_iter()) {
+                        chunk.vector = vec;
+                    }
+                }
+                _ => {
+                    for chunk in batch.iter_mut() {
+                        chunk.vector = state_clone
+                            .embedder
+                            .embed_text(&chunk.text_content)
+                            .unwrap_or_else(|_| vec![0.0f32; state_clone.embedder.dimension()]);
+                    }
+                }
             }
         }
         if !chunks.is_empty() {
