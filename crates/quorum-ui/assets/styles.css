@@ -2295,7 +2295,8 @@ input[type="checkbox"][switch]:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: 280px;
+  min-height: 220px;
+  max-height: 360px;
   overflow-y: auto;
   padding-right: 4px;
   scrollbar-gutter: stable;

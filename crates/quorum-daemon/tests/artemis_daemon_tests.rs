@@ -1090,3 +1090,210 @@ async fn test_artemis_retention_pruning_and_rlm_parent_document_inspection() {
     assert!(!grep_hits.is_empty());
     assert_eq!(grep_hits[0].matched_text, "hunt.ps1");
 }
+
+#[tokio::test]
+async fn test_forensic_query_last_process_to_access_internet_and_zero_thesis_contamination() {
+    let (app, state, temp_dir) = setup_artemis_test_app().await;
+
+    // 1. Seed distractor non-forensic documents matching the exact bug report (thesis, resume, EULA, MITRE note)
+    let distractors = [
+        (
+            "doc-thesis",
+            "D:\\Users\\tester\\Documents\\healing_thesis.docx",
+            "Let the thesis do what a thesis must do: rationalized mental-healing frameworks, a clear claim, a defined scope, and Randolph as the living example.",
+        ),
+        (
+            "doc-resume",
+            "D:\\Users\\tester\\Documents\\appsec_resume.pdf",
+            "Application Security Engineer | MultiPlan / Claritev | Built Checkmarx DAST automation and OWASP ZAP configurations. Email: info@saatechnology.com Dates: February 28, 2005.",
+        ),
+        (
+            "doc-eula",
+            "D:\\Users\\tester\\Documents\\software_eula.txt",
+            "ANY OTHER DAMAGES, INCLUDING CONSEQUENTIAL, LOST PROFITS, SPECIAL, INDIRECT OR INCIDENTAL DAMAGES related to the software, services, content on third party Internet sites.",
+        ),
+        (
+            "doc-mitre",
+            "D:\\Users\\tester\\Documents\\mitre_multi_hop_proxy.md",
+            "Adversaries may chain together multiple proxies to disguise the source of malicious traffic and access the internet across hops.",
+        ),
+    ];
+
+    let mut distractor_chunks = Vec::new();
+    for (idx, (doc_id, file_path, text)) in distractors.iter().enumerate() {
+        let vec = state
+            .embedder
+            .embed_text(text)
+            .unwrap_or_else(|_| vec![0.0f32; state.embedder.dimension()]);
+        let chunk = quorum_types::DocumentChunk::new(
+            format!("{doc_id}:{idx}"),
+            (*doc_id).to_string(),
+            (*file_path).to_string(),
+            1,
+            10,
+            0,
+            vec,
+            (*text).to_string(),
+            Some(r#"{"source":"user_corpus"}"#.to_string()),
+        )
+        .expect("valid distractor chunk");
+        distractor_chunks.push(chunk);
+    }
+    state
+        .storage
+        .insert_chunks(&distractor_chunks)
+        .await
+        .expect("insert distractor chunks");
+
+    // 2. Ingest an authoritative Artemis NetworkConnection record with external_internet=true
+    let future_ts = chrono::Utc::now().timestamp() + 3600;
+    let net_jsonl = temp_dir.path().join("live_internet_forensic.jsonl");
+    std::fs::write(
+        &net_jsonl,
+        serde_json::json!({
+            "record_id": "artemis:live:test:net:internet:0",
+            "telemetry_type": "network_connection",
+            "Computer": "WORKSTATION-DFIR",
+            "os_platform": "windows",
+            "Protocol": "TCP",
+            "SourceIp": "192.168.1.42:54321",
+            "DestinationIp": "142.250.190.78:443",
+            "RemotePort": 443,
+            "State": "ESTABLISHED",
+            "ProcessId": 14820,
+            "ProcessName": "chrome.exe",
+            "Image": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "CommandLine": "\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --type=utility --utility-sub-type=network.mojom.NetworkService",
+            "InternetAccess": true,
+            "ConnectionScope": "external_internet",
+            "collected_unix_secs": future_ts,
+            "source_path": "artemis://windows/live/network/internet_test_0"
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let collect_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/artemis/collect")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "source_type": "file",
+                        "target_path": net_jsonl.to_string_lossy().to_string(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_res.status(), StatusCode::OK);
+
+    // 3. Query the exact malformed prompt reported by the user:
+    //    "What is was the last process to access the internet"
+    let query_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "prompt": "What is was the last process to access the internet"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(query_res.status(), StatusCode::OK);
+    let query_json = read_body_json(query_res).await;
+
+    let answer = query_json["synthesis_prompt"]
+        .as_str()
+        .expect("synthesis_prompt string");
+    let answer_lower = answer.to_ascii_lowercase();
+
+    // Must NEVER emit broken restated prefix or unrelated non-forensic corpus passages
+    assert!(
+        !answer.contains("Was The Last Process To Access The Internet is"),
+        "Must never emit garbled restated question prefix, got:\n{answer}"
+    );
+    assert!(
+        !answer_lower.contains("mental-healing"),
+        "Must never leak unrelated thesis chunks into forensic answer, got:\n{answer}"
+    );
+    assert!(
+        !answer_lower.contains("info@saatechnology.com"),
+        "Must never leak unrelated resume/contact chunks into forensic answer, got:\n{answer}"
+    );
+    assert!(
+        !answer_lower.contains("consequential, lost profits"),
+        "Must never leak unrelated EULA chunks into forensic answer, got:\n{answer}"
+    );
+
+    // Must report real Artemis DFIR network/process telemetry and cite exclusively artemis:// URIs
+    assert!(
+        answer.contains("chrome.exe") || answer.contains("142.250.190.78:443"),
+        "Forensic answer must report the external internet process telemetry, got:\n{answer}"
+    );
+    let cited = query_json["sources_cited"]
+        .as_array()
+        .expect("sources_cited array");
+    assert!(
+        !cited.is_empty(),
+        "Forensic answer must include verbatim grounded artemis:// citations"
+    );
+    for c in cited {
+        let fp = c["file_path"].as_str().unwrap_or("");
+        assert!(
+            fp.starts_with("artemis://"),
+            "Every cited source on a host forensic query must be an artemis:// URI, got: {fp}"
+        );
+    }
+
+    // 4. Verify GET /api/fs/browse-folders?path= returns deduplicated quick_access (<= 5) and asset drives at root
+    let browse_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fs/browse-folders?path=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(browse_res.status(), StatusCode::OK);
+    let browse_json = read_body_json(browse_res).await;
+    let qa = browse_json["quick_access"]
+        .as_array()
+        .expect("quick_access array");
+    assert!(
+        qa.len() <= 5,
+        "Quick access shortcuts must be deduplicated to <= 5 core user folders, got {} items: {:?}",
+        qa.len(),
+        qa
+    );
+    let drives = browse_json["drives"].as_array().expect("drives array");
+    assert!(
+        !drives.is_empty(),
+        "Root folder browser must return available drives on the asset"
+    );
+    let root_dirs = browse_json["directories"]
+        .as_array()
+        .expect("directories array at root");
+    assert!(
+        root_dirs
+            .iter()
+            .any(|d| d["is_drive"].as_bool() == Some(true)),
+        "Root browse-folders view must list asset drives for immediate click-to-drill-down"
+    );
+}

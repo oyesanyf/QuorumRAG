@@ -90,9 +90,13 @@ impl RetrieveMeshNode {
             std::collections::HashMap::new();
         let mut stem_deduped: Vec<quorum_types::ScoredChunk> = Vec::with_capacity(chunks.len());
         for c in chunks {
-            let stem = crate::offline_engine::DeterministicOfflineSynthesisEngine::normalize_file_stem(
-                &c.chunk.file_path,
-            );
+            let stem = if c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://") {
+                c.chunk.file_path.to_ascii_lowercase()
+            } else {
+                crate::offline_engine::DeterministicOfflineSynthesisEngine::normalize_file_stem(
+                    &c.chunk.file_path,
+                )
+            };
             let key = (c.source_peer.to_ascii_lowercase(), stem);
             let count = stem_counts.entry(key).or_insert(0);
             if *count < max_per_family {
@@ -127,7 +131,12 @@ impl RetrieveMeshNode {
             state.current_query = corrected_q;
         }
         let q_low = state.current_query.to_ascii_lowercase();
-        let search_query = if q_low.contains("school")
+        let forensic_intent =
+            crate::offline_engine::ForensicQueryIntent::detect(&state.original_prompt)
+                .or_else(|| crate::offline_engine::ForensicQueryIntent::detect(&state.current_query));
+        let search_query = if let Some(fi) = forensic_intent {
+            format!("{} {}", state.current_query, fi.query_expansion_terms())
+        } else if q_low.contains("school")
             || q_low.contains("college")
             || q_low.contains("university")
             || q_low.contains("education")
@@ -151,17 +160,6 @@ impl RetrieveMeshNode {
         {
             format!(
                 "{} professional summary experience work history engineer architect analyst lead consultant manager",
-                state.current_query
-            )
-        } else if q_low.contains("antivirus")
-            || q_low.contains("defender")
-            || q_low.contains("codeintegrity")
-            || q_low.contains("malware")
-            || q_low.contains("trojan")
-            || (q_low.contains("process") && (q_low.contains("block") || q_low.contains("blocked")))
-        {
-            format!(
-                "{} SystemEventLog Windows Defender Antivirus CodeIntegrity blocked process threat event 1117 1116 3077",
                 state.current_query
             )
         } else {
@@ -317,7 +315,8 @@ impl RetrieveMeshNode {
         };
 
         let local_access_tier = {
-            let is_forensic_q = q_low.contains("artemis")
+            let is_forensic_q = forensic_intent.is_some()
+                || q_low.contains("artemis")
                 || q_low.contains("antivirus")
                 || q_low.contains("defender")
                 || q_low.contains("codeintegrity")
@@ -369,13 +368,24 @@ impl RetrieveMeshNode {
                 Vec::new()
             }
         };
+        let forensic_fut = async {
+            if let Some(fi) = forensic_intent {
+                engine
+                    .local_storage
+                    .search_text(fi.target_search_query(), local_access_tier, 64)
+                    .await
+            } else {
+                Vec::new()
+            }
+        };
 
         let (
             (mut chunks, mut volatile, _duration, new_vector_hits),
             entity_hits,
             prompt_hits,
             cue_hits,
-        ) = tokio::join!(primary_fut, entity_fut, prompt_fut, cue_fut);
+            forensic_hits,
+        ) = tokio::join!(primary_fut, entity_fut, prompt_fut, cue_fut, forensic_fut);
 
         let has_entity_matched_remote = !volatile.is_empty()
             && (prelim_entities.is_empty()
@@ -440,33 +450,42 @@ impl RetrieveMeshNode {
             state.cached_vector_hits = new_vector_hits;
         }
 
-        // Merge supplemental results in exact deterministic order (primary -> entity -> prompt -> cue)
+        // Merge supplemental results in exact deterministic order (primary -> forensic -> entity -> prompt -> cue)
         // preserving exact deduplication and RRF scoring
-        if should_run_supplemental {
+        if !forensic_hits.is_empty() || should_run_supplemental {
             let mut seen_ids: std::collections::HashSet<(String, String)> = chunks
                 .iter()
                 .map(|c| (c.source_peer.clone(), c.chunk.chunk_id.clone()))
                 .collect();
 
-            for (idx, mut hit) in entity_hits.into_iter().enumerate() {
-                // Normalize supplemental BM25 scores to [0.0, 1.0] RRF scale (1.0 / (60.0 + rank))
-                hit.score = 1.0 / (60.0 + idx as f32);
+            for (idx, mut hit) in forensic_hits.into_iter().enumerate() {
+                hit.score = 1.0 / (50.0 + idx as f32);
                 if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                     chunks.push(hit);
                 }
             }
 
-            for (idx, mut hit) in prompt_hits.into_iter().enumerate() {
-                hit.score = 1.0 / (60.0 + idx as f32);
-                if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
-                    chunks.push(hit);
+            if should_run_supplemental {
+                for (idx, mut hit) in entity_hits.into_iter().enumerate() {
+                    // Normalize supplemental BM25 scores to [0.0, 1.0] RRF scale (1.0 / (60.0 + rank))
+                    hit.score = 1.0 / (60.0 + idx as f32);
+                    if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
+                        chunks.push(hit);
+                    }
                 }
-            }
 
-            for (idx, mut hit) in cue_hits.into_iter().enumerate() {
-                hit.score = 1.0 / (60.0 + idx as f32);
-                if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
-                    chunks.push(hit);
+                for (idx, mut hit) in prompt_hits.into_iter().enumerate() {
+                    hit.score = 1.0 / (60.0 + idx as f32);
+                    if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
+                        chunks.push(hit);
+                    }
+                }
+
+                for (idx, mut hit) in cue_hits.into_iter().enumerate() {
+                    hit.score = 1.0 / (60.0 + idx as f32);
+                    if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
+                        chunks.push(hit);
+                    }
                 }
             }
         }
@@ -842,16 +861,43 @@ impl RetrieveMeshNode {
                     content_matched_terms += 1;
                 }
 
-                if path_l.starts_with("artemis://")
-                    && (query_lower.contains("antivirus")
-                        || query_lower.contains("defender")
-                        || query_lower.contains("codeintegrity")
-                        || query_lower.contains("malware")
-                        || query_lower.contains("trojan")
-                        || (query_lower.contains("process") && query_lower.contains("block")))
-                {
-                    intent_bonus += 450;
-                    weighted_hits += 40;
+                let matches_forensic_artemis = path_l.starts_with("artemis://")
+                    && forensic_intent.map_or(false, |fi| fi.matches_artemis_chunk(&path_l, &text_l));
+                if let Some(fi) = forensic_intent {
+                    if path_l.starts_with("artemis://") {
+                        intent_bonus += 550;
+                        weighted_hits += 45;
+                        if fi.matches_artemis_chunk(&path_l, &text_l) {
+                            intent_bonus += 750;
+                            weighted_hits += 65;
+                            content_matched_terms += 4;
+                        }
+                        if fi == crate::offline_engine::ForensicQueryIntent::NetworkInternet {
+                            if path_l.contains("/network/internet_")
+                                || text_l.contains("scope='external_internet'")
+                                || text_l.contains("live internet connection")
+                            {
+                                intent_bonus += 550;
+                            }
+                            if text_l.contains("state='established'")
+                                || text_l.contains("(established)")
+                            {
+                                intent_bonus += 180;
+                            }
+                        } else if fi == crate::offline_engine::ForensicQueryIntent::AntivirusBlocked
+                            && (path_l.contains("windows_defender")
+                                || path_l.contains("windows_codeintegrity"))
+                        {
+                            intent_bonus += 350;
+                        }
+                        if path_l.ends_with("_0") {
+                            intent_bonus += 260;
+                        } else if path_l.ends_with("_1") {
+                            intent_bonus += 120;
+                        }
+                    } else {
+                        intent_bonus -= 500;
+                    }
                 }
 
                 // Filter out ChatGPT export artifacts from dominating profile queries
@@ -988,7 +1034,8 @@ impl RetrieveMeshNode {
                 let is_relevant = ((content_matched_terms >= required_query_hits
                     && entity_hits >= required_entity_hits)
                     || (proper_ok && !proper_terms.is_empty() && content_matched_terms >= proper_terms.len()))
-                    || matches_target_doc;
+                    || matches_target_doc
+                    || matches_forensic_artemis;
 
                 intent_bonus += crate::offline_engine::DeterministicOfflineSynthesisEngine::answer_type_cue_score(
                     &state.original_prompt,
@@ -1043,16 +1090,47 @@ impl RetrieveMeshNode {
                 && paired
                     .iter()
                     .any(|(_, crit)| crit.is_relevant && crit.prompt_entity_hits >= required_prompt_hits);
+            let is_who_or_entity_query = !proper_terms.is_empty()
+                || ((asks_profile_or_role
+                    || asks_authorship
+                    || query_lower.contains("who is ")
+                    || query_lower.contains("who was ")
+                    || query_lower.contains("who are ")
+                    || query_lower.contains("tell me about "))
+                    && !entity_terms.is_empty());
             // A question that asks for a modality ("the song ...", "pictures of ...") keeps that media's
             // chunks whenever they lexically match, even if a text document scores higher on entities.
             let media_prefix = quorum_storage::query_framing::media_content_prefix(
                 quorum_storage::query_framing::detect_media_intent(&state.original_prompt),
             );
-            if any_lexical_match {
+
+            // Never allow unrelated vector-similarity screenshots or arbitrary files to survive when
+            // a named entity / who-is query has zero lexical or proper-noun matches in the corpus.
+            if forensic_intent.is_none()
+                && ((!any_lexical_match && (!proper_terms.is_empty() || !entity_terms.is_empty()))
+                    || (is_who_or_entity_query && !proper_terms.is_empty() && !any_proper_match))
+            {
+                paired.retain(|(_, crit)| {
+                    if is_who_or_entity_query && !proper_terms.is_empty() {
+                        crit.proper_ok && crit.weighted_hits > 0
+                    } else {
+                        crit.weighted_hits > 0
+                    }
+                });
+            }
+
+            if any_lexical_match && !paired.is_empty() {
                 paired.retain(|(c, crit)| {
+                    let path_l = c.chunk.file_path.to_ascii_lowercase();
+                    let is_forensic_artemis = path_l.starts_with("artemis://")
+                        && forensic_intent.map_or(false, |fi| {
+                            let tl = c.chunk.text_content.to_ascii_lowercase();
+                            fi.matches_artemis_chunk(&path_l, &tl)
+                        });
                     let wanted_media = media_prefix
                         .map_or(false, |p| c.chunk.text_content.trim_start().starts_with(p) && crit.weighted_hits > 0);
-                    c.is_remote
+                    is_forensic_artemis
+                        || c.is_remote
                         || wanted_media
                         || (crit.is_relevant
                             && crit.weighted_hits > 0
@@ -1073,15 +1151,55 @@ impl RetrieveMeshNode {
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         })
                 });
+            } else if !asks_image && forensic_intent.is_none() && !paired.is_empty() {
+                // Drop ungrounded image/OCR screenshots on non-image queries when no lexical match exists.
+                paired.retain(|(c, crit)| {
+                    let path_l = c.chunk.file_path.to_ascii_lowercase();
+                    let is_img = crate::vision::is_image_chunk_text(&c.chunk.text_content)
+                        || path_l.ends_with(".png")
+                        || path_l.ends_with(".jpg")
+                        || path_l.ends_with(".jpeg")
+                        || path_l.ends_with(".gif")
+                        || path_l.ends_with(".webp");
+                    !is_img || crit.weighted_hits > 0
+                });
             }
 
             chunks = paired.into_iter().map(|(c, _)| c).collect();
         }
 
+        let has_local_artemis_for_forensic = if let Some(fi) = forensic_intent {
+            let has_cat = chunks.iter().any(|c| {
+                let pl = c.chunk.file_path.to_ascii_lowercase();
+                let tl = c.chunk.text_content.to_ascii_lowercase();
+                fi.matches_artemis_chunk(&pl, &tl)
+            });
+            let has_any = chunks
+                .iter()
+                .any(|c| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"));
+            if has_cat {
+                chunks.retain(|c| {
+                    let pl = c.chunk.file_path.to_ascii_lowercase();
+                    let tl = c.chunk.text_content.to_ascii_lowercase();
+                    fi.matches_artemis_chunk(&pl, &tl)
+                });
+                volatile.clear();
+                true
+            } else if has_any {
+                chunks.retain(|c| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"));
+                volatile.clear();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Expand adjacent/body chunks (`{doc_id}:0..=4`) for the top matched local multi-chunk documents
         // BEFORE parent-document stitching so multi-page resumes and timelines merge their full career body
         // even when Chunk 0 initially scored highest via its header/title banner.
-        {
+        if !has_local_artemis_for_forensic {
             let mut seen_local_ids: std::collections::HashSet<String> = chunks
                 .iter()
                 .filter(|c| c.source_peer == "local")
@@ -1152,7 +1270,7 @@ impl RetrieveMeshNode {
 
         // Stitch adjacent chunks (`0..N`) of each matched file BEFORE per-stem capping so multi-chunk
         // resumes and timelines merge their header + body sections into complete passages first!
-        if ui.parent_document_retrieval {
+        if ui.parent_document_retrieval && !has_local_artemis_for_forensic {
             chunks = crate::offline_engine::DeterministicOfflineSynthesisEngine::stitch_parent_document_chunks(chunks);
         }
 
@@ -1164,31 +1282,33 @@ impl RetrieveMeshNode {
         // Snapshot top remote peer chunks (`source_peer != "local"`), prioritizing distinct connected peers first,
         // so federated stitched results from connected computers are interleaved near the top alongside local results.
         let mut preserved_remote: Vec<ScoredChunk> = Vec::new();
-        let mut seen_remote_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for rc in chunks.iter().filter(|c| c.source_peer != "local") {
-            if seen_remote_peers.insert(rc.source_peer.clone()) {
-                preserved_remote.push(rc.clone());
-                if preserved_remote.len() >= 8 {
-                    break;
-                }
-            }
-        }
-        if preserved_remote.len() < 8 {
+        if !has_local_artemis_for_forensic {
+            let mut seen_remote_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
             for rc in chunks.iter().filter(|c| c.source_peer != "local") {
-                if !preserved_remote
-                    .iter()
-                    .any(|p| p.source_peer == rc.source_peer && p.chunk.chunk_id == rc.chunk.chunk_id)
-                {
+                if seen_remote_peers.insert(rc.source_peer.clone()) {
                     preserved_remote.push(rc.clone());
                     if preserved_remote.len() >= 8 {
                         break;
                     }
                 }
             }
-        }
+            if preserved_remote.len() < 8 {
+                for rc in chunks.iter().filter(|c| c.source_peer != "local") {
+                    if !preserved_remote
+                        .iter()
+                        .any(|p| p.source_peer == rc.source_peer && p.chunk.chunk_id == rc.chunk.chunk_id)
+                    {
+                        preserved_remote.push(rc.clone());
+                        if preserved_remote.len() >= 8 {
+                            break;
+                        }
+                    }
+                }
+            }
 
-        // Apply Maximal Marginal Relevance (MMR) candidate diversity selection (default lambda = 0.70)
-        chunks = apply_mmr_selection(chunks, effective_vector, top_k, 0.70);
+            // Apply Maximal Marginal Relevance (MMR) candidate diversity selection (default lambda = 0.70)
+            chunks = apply_mmr_selection(chunks, effective_vector, top_k, 0.70);
+        }
 
         // Requested modality first (stable; other chunks are kept to ground the answer).
         if let Some(prefix) = quorum_storage::query_framing::media_content_prefix(
@@ -1563,6 +1683,113 @@ mod tests {
         assert!(
             answer.contains("Principal AI Security Architect"),
             "Synthesized answer should cite concrete roles from timeline: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_entity_drops_unrelated_screenshot_and_forensic_query_isolates_peers() {
+        let embedder = quorum_contract::DeterministicOfflineEngine::new();
+        let vec_angela = embedder.embed_text("who is Angela Davis").unwrap();
+
+        let unrelated_screenshot = DocumentChunk::new(
+            "shot_r_console:0",
+            "shot_r_console",
+            r"C:\Users\oyesanyf\Pictures\Screenshots\Screenshot 2026-10-25 192839.png",
+            1,
+            10,
+            0,
+            vec_angela.clone(),
+            "Format: PNG (image/png)\nResolution: 776x641 pixels (Aspect Ratio: 1.21:1, Channels: 4, Bit Depth: 8-bit, File Size: 34 KB)\n[OCR Text]\nFile Edit View Misc Packages Windows Help R Console R version 4.6.1",
+            None,
+        )
+        .unwrap();
+
+        let artemis_net = DocumentChunk::new(
+            "artemis://network_connections:0",
+            "artemis_net",
+            "artemis://network_connections",
+            1,
+            10,
+            0,
+            vec_angela.clone(),
+            "Artemis DFIR Live NetworkConnection Telemetry:\nPID 8100 | Process: firefox.exe | Remote: 151.101.1.69:443 | State: ESTABLISHED",
+            Some(3),
+        )
+        .unwrap();
+
+        let local_storage = Arc::new(InMemoryLocalResumeStorage {
+            chunks: vec![unrelated_screenshot, artemis_net],
+        });
+
+        let remote_peer_id = "12D3KooWKHc3PeerDistractor";
+        let distractor = CandidateChunkDto {
+            chunk_id: "remote_best_internet:0".to_string(),
+            document_id: "remote_best_internet".to_string(),
+            file_path: r"C:\Users\Peer\Documents\Best Internet Guy Awards.docx".to_string(),
+            line_start: 1,
+            line_end: 20,
+            access_tier: 0,
+            text_content: "Best Internet Guy Awards certificate for Internet excellence.".to_string(),
+            blake3_hash: [7u8; 32],
+            metadata_json: "{}".to_string(),
+            relevance_score: 0.93,
+            language: "english".to_string(),
+        };
+        let remote_mock = MockMeshDispatcher::new(vec![MockRemotePeer {
+            peer_id: remote_peer_id.to_string(),
+            chunks: vec![distractor],
+            delay_ms: 0,
+            fail: false,
+        }]);
+
+        let acl = Arc::new(RwLock::new(PeerAclManager::default()));
+        acl.write()
+            .await
+            .register_peer_id(remote_peer_id.to_string(), quorum_types::AccessTier::Tier0Public);
+
+        let engine = ScatterGatherEngine::new(
+            local_storage,
+            Arc::new(remote_mock),
+            acl,
+            CoordinatorConfig::default(),
+            [0u8; 32],
+            "local-node".to_string(),
+        );
+
+        // 1. "who is Angela Davis" must drop the unrelated R Console screenshot completely
+        let mut angela_state =
+            AgenticGraphState::new("who is Angela Davis", SynthesisModelFamily::AutoFusion, 3);
+        RetrieveMeshNode::execute(&mut angela_state, &engine, &vec_angela, 0, 10).await;
+        assert!(
+            angela_state.retrieved_chunks.is_empty(),
+            "Expected zero chunks when Angela Davis is absent, got: {:?}",
+            angela_state
+                .retrieved_chunks
+                .iter()
+                .map(|c| &c.chunk.file_path)
+                .collect::<Vec<_>>()
+        );
+
+        // 2. "What is process are accessing the internet" must return artemis:// locally and ZERO remote peer distractors
+        let vec_proc = embedder
+            .embed_text("What is process are accessing the internet")
+            .unwrap();
+        let mut forensic_state = AgenticGraphState::new(
+            "What is process are accessing the internet",
+            SynthesisModelFamily::AutoFusion,
+            3,
+        );
+        RetrieveMeshNode::execute(&mut forensic_state, &engine, &vec_proc, 0, 10).await;
+        assert!(
+            forensic_state
+                .retrieved_chunks
+                .iter()
+                .any(|c| c.chunk.file_path == "artemis://network_connections"),
+            "Expected artemis://network_connections chunk for host internet query"
+        );
+        assert!(
+            !forensic_state.retrieved_chunks.iter().any(|c| c.is_remote),
+            "Host forensic query must suppress outbound P2P peer results like Best Internet Guy Awards.docx"
         );
     }
 }

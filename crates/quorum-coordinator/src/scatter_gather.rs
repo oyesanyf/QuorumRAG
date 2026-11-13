@@ -446,9 +446,22 @@ impl ScatterGatherEngine {
         } else {
             p2p_query_text
         };
+        let suppress_local_forensics_p2p = {
+            let ql = query_text.to_ascii_lowercase();
+            let asks_remote_mesh = ql.contains("peer")
+                || ql.contains("mesh")
+                || ql.contains("remote node")
+                || ql.contains("cluster")
+                || ql.contains("federated");
+            crate::offline_engine::ForensicQueryIntent::detect(query_text).is_some()
+                && !asks_remote_mesh
+        };
         let remote_handle = if p2p_enabled {
             if crate::artemis_airgap::contains_artemis_query(effective_p2p_query) {
                 tracing::info!("Suppressed outbound P2P query referencing local-only artemis:// URI: airgap enforced");
+                None
+            } else if suppress_local_forensics_p2p {
+                tracing::info!("Suppressed outbound P2P query for host-local Artemis DFIR forensic question");
                 None
             } else {
                 controller
@@ -491,7 +504,9 @@ impl ScatterGatherEngine {
         // but local queries on this host may retrieve them when Artemis local collection is enabled or queried.
         let local_access_tier = {
             let ql = query_text.to_ascii_lowercase();
-            let is_forensic_q = ql.contains("artemis")
+            let is_forensic_q = crate::offline_engine::ForensicQueryIntent::detect(query_text).is_some()
+                || crate::offline_engine::ForensicQueryIntent::detect(effective_p2p_query).is_some()
+                || ql.contains("artemis")
                 || ql.contains("antivirus")
                 || ql.contains("defender")
                 || ql.contains("codeintegrity")

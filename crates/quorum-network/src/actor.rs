@@ -87,6 +87,23 @@ impl NetworkSwarmActor {
                             };
                             let _ = reply.send(res);
                         }
+                        Some(NetworkCommand::DialTrusted { addr, reply }) => {
+                            let res = if !crate::transport::is_allowed_trusted_bootstrap_address(&addr) {
+                                let err = std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    format!("dial_trusted to disallowed multiaddr {} rejected by policy", addr),
+                                );
+                                Err(NetworkError::DialError {
+                                    addr: addr.clone(),
+                                    source: Box::new(libp2p::swarm::DialError::Denied {
+                                        cause: libp2p::swarm::ConnectionDenied::new(err),
+                                    }),
+                                })
+                            } else {
+                                self.swarm.dial(addr.clone()).map_err(|e| NetworkError::DialError { addr, source: Box::new(e) })
+                            };
+                            let _ = reply.send(res);
+                        }
                         Some(NetworkCommand::SendQuery { peer_id, request, reply }) => {
                             let req_id = self.swarm.behaviour_mut().request_response.send_request(&peer_id, request);
                             self.pending_requests.insert(req_id, reply);
@@ -194,6 +211,14 @@ impl NetworkSwarmActor {
                 };
 
                 if is_ok {
+                    // Learn our observed external address from verified peers so NAT'd listen addresses are advertised
+                    if !info.observed_addr.is_empty()
+                        && !extract_ipv4(&info.observed_addr)
+                            .map(|ip| ip.is_loopback() || ip.is_unspecified())
+                            .unwrap_or(false)
+                    {
+                        self.swarm.add_external_address(info.observed_addr.clone());
+                    }
                     // Upgrade ephemeral inbound remote port to the peer's advertised TCP listen port on the same IP
                     let mut best_listen_for_ip: Option<Multiaddr> = None;
                     let current_ip = self

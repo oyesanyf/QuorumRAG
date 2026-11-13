@@ -347,6 +347,27 @@ async fn test_mesh_p2p_watcher_status_probe_and_heal_endpoints() {
         .uri("/api/mesh/watcher/heal")
         .body(Body::empty())
         .unwrap();
-    let resp_heal = app.oneshot(req_heal).await.unwrap();
+    let resp_heal = app.clone().oneshot(req_heal).await.unwrap();
     assert_eq!(resp_heal.status(), StatusCode::OK);
+
+    // 4. GET /api/mesh/status exposes WAN/DuckDNS/Tailscale bootstrap targets
+    let req_mesh_status = Request::builder()
+        .uri("/api/mesh/status")
+        .body(Body::empty())
+        .unwrap();
+    let resp_mesh_status = app.oneshot(req_mesh_status).await.unwrap();
+    assert_eq!(resp_mesh_status.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp_mesh_status.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let mesh_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(mesh_json["wan_telemetry"].is_object());
+    let targets = mesh_json["effective_bootstrap_targets"]
+        .as_array()
+        .expect("effective_bootstrap_targets must be an array");
+    assert!(
+        targets.iter().any(|v| v.as_str().map(|s| s.contains(".duckdns.org/tcp/")).unwrap_or(false)),
+        "Auto-DuckDNS bootstrap target must be synthesized by default; got {:?}",
+        targets
+    );
 }

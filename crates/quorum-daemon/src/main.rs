@@ -11,6 +11,7 @@ pub mod p2p_watcher;
 pub mod server;
 pub mod shutdown;
 pub mod state;
+pub mod wan_mesh;
 #[cfg(windows)]
 pub mod win_service;
 
@@ -398,12 +399,35 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         info!("Running in local-only mode (P2P swarm networking disabled).");
         (Arc::new(quorum_coordinator::LocalOnlyDispatcher), None)
     } else {
+        let startup_bootstrap_peers = {
+            let g = mesh_dlp_controller
+                .settings
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            g.mesh
+                .bootstrap_peers
+                .iter()
+                .filter_map(|s| s.trim().parse::<quorum_network::Multiaddr>().ok())
+                .filter(quorum_network::is_allowed_trusted_bootstrap_address)
+                .collect::<Vec<_>>()
+        };
+        let mut tcp_listen_addrs = vec![format!("/ip4/{}/tcp/{}", cli.host, chosen_p2p_port).parse()?];
+        let mut quic_listen_addrs = vec![
+            format!("/ip4/{}/udp/{}/quic-v1", cli.host, chosen_p2p_port).parse()?,
+        ];
+        if cli.host == "0.0.0.0" {
+            if let Ok(ma6) = format!("/ip6/::/tcp/{}", chosen_p2p_port).parse() {
+                tcp_listen_addrs.push(ma6);
+            }
+            if let Ok(ma6q) = format!("/ip6/::/udp/{}/quic-v1", chosen_p2p_port).parse() {
+                quic_listen_addrs.push(ma6q);
+            }
+        }
         let net_config = quorum_network::NetworkConfig {
             ed25519_seed: Some(node_seed),
-            tcp_listen_addrs: vec![format!("/ip4/{}/tcp/{}", cli.host, chosen_p2p_port).parse()?],
-            quic_listen_addrs: vec![
-                format!("/ip4/{}/udp/{}/quic-v1", cli.host, chosen_p2p_port).parse()?,
-            ],
+            tcp_listen_addrs,
+            quic_listen_addrs,
+            bootstrap_peers: startup_bootstrap_peers,
             contract_hash_hex: embedder
                 .contract_hash()
                 .iter()
@@ -561,12 +585,12 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                     .unwrap_or_default();
                 for addr_str in bootstrap_list {
                     if let Ok(ma) = addr_str.parse::<quorum_network::Multiaddr>() {
-                        let _ = dial_handle.dial(ma).await;
+                        let _ = dial_handle.dial_trusted(ma).await;
                     }
                 }
                 for cached_ma in dial_state.p2p_watcher().load_known_peers().multiaddrs {
                     if let Ok(ma) = cached_ma.parse::<quorum_network::Multiaddr>() {
-                        let _ = dial_handle.dial(ma).await;
+                        let _ = dial_handle.dial_trusted(ma).await;
                     }
                 }
 
@@ -592,7 +616,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 for found_ip in p2p_watcher::probe_open_p2p_hosts(arp_candidates, p2p_port).await {
                     let ma_str = format!("/ip4/{}/tcp/{}", found_ip, p2p_port);
                     if let Ok(ma) = ma_str.parse::<quorum_network::Multiaddr>() {
-                        let _ = dial_handle.dial(ma).await;
+                        let _ = dial_handle.dial_trusted(ma).await;
                     }
                 }
 
@@ -632,10 +656,43 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                         if let Ok(Some(found_ip)) = res {
                             let ma_str = format!("/ip4/{}/tcp/{}", found_ip, p2p_port);
                             if let Ok(ma) = ma_str.parse::<quorum_network::Multiaddr>() {
-                                let _ = dial_handle.dial(ma).await;
+                                let _ = dial_handle.dial_trusted(ma).await;
                             }
                         }
                     }
+                }
+
+                // Travel / Cross-Network WAN & Overlay Connectivity:
+                // 1. Best-effort SSDP UPnP IGD port-forwarding for TCP/UDP p2p_port + WAN IP discovery.
+                // 2. Concurrent DuckDNS + Tailscale (100.64.0.0/10) + explicit bootstrap_peers + persisted WAN peer dials.
+                let local_v4s = discover_local_private_ipv4_addresses();
+                if let Some(primary_lan) = local_v4s.first().copied() {
+                    let _ = wan_mesh::try_upnp_igd_map_mesh_ports(primary_lan, p2p_port).await;
+                }
+                let mesh_cfg_snap = {
+                    let ctrl = quorum_coordinator::global_mesh_dlp_controller();
+                    let g = ctrl.settings.read().unwrap_or_else(|e| e.into_inner());
+                    g.mesh.clone()
+                };
+                if mesh_cfg_snap.p2p_enabled {
+                    let known_list = dial_state.p2p_watcher().load_known_peers().multiaddrs;
+                    let wan_targets = wan_mesh::collect_wan_and_overlay_dial_targets(
+                        &mesh_cfg_snap,
+                        &known_list,
+                        &local_v4s,
+                    )
+                    .await;
+                    let mut wan_futs = futures_util::stream::FuturesUnordered::new();
+                    for target_str in wan_targets {
+                        if let Ok(ma) = target_str.parse::<quorum_network::Multiaddr>() {
+                            let h = dial_handle.clone();
+                            wan_futs.push(async move {
+                                let _ = h.dial_trusted(ma).await;
+                            });
+                        }
+                    }
+                    use futures_util::StreamExt;
+                    while wan_futs.next().await.is_some() {}
                 }
 
                 dial_state

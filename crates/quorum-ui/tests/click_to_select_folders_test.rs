@@ -157,4 +157,23 @@ fn test_every_folder_selector_under_settings_is_click_to_select_not_text_input()
         html.contains(r#"id="modal-pure-rust-folder-picker" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="pure-rust-picker-title""#),
         "#modal-pure-rust-folder-picker must expose accessible dialog semantics (role=\"dialog\", aria-modal=\"true\", aria-labelledby)"
     );
+
+    // 8. Clean user-facing "Select Folder" naming (never "Pure Rust") & drive-root drill-down
+    assert!(
+        !html.to_ascii_lowercase().contains("pure rust")
+            && !js.to_ascii_lowercase().contains("pure rust"),
+        "User-facing HTML and JS must never label folder selection as 'Pure Rust' — use 'Select Folder'"
+    );
+    assert!(
+        html.contains("📁 Select Folder")
+            && js.contains("📁 Select Folder")
+            && js.contains("Drives on this asset:"),
+        "Folder selector buttons and modal must say 'Select Folder' and display physical drives on the asset"
+    );
+    assert!(
+        js.contains("const startPath = String(initialPath || '').trim();")
+            && js.contains("canonicalComparePathJs")
+            && js.contains("normalizeQuickAccessCategoryKey"),
+        "Select Folder must open at asset drives root by default and deduplicate quick-access shortcuts"
+    );
 }

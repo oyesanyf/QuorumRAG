@@ -155,6 +155,12 @@ pub fn is_private_or_loopback_ip6(ip: &Ipv6Addr) -> bool {
     false
 }
 
+/// Returns true for CGNAT / Tailscale / overlay VPN IPv4 addresses (`100.64.0.0/10`, RFC 6598).
+pub fn is_tailscale_or_cgnat_ip4(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000
+}
+
 /// Air-gapped offline dial address gate: restricts swarm dialing to loopback and private subnets (RFC1918).
 /// Rejects public WAN addresses and arbitrary internet DNS names.
 pub fn is_allowed_dial_address(addr: &libp2p::Multiaddr) -> bool {
@@ -180,4 +186,92 @@ pub fn is_allowed_dial_address(addr: &libp2p::Multiaddr) -> bool {
         }
     }
     true
+}
+
+/// Trusted cross-network / WAN bootstrap multiaddr validator.
+///
+/// Permits operator-configured bootstrap peers, DuckDNS endpoints (`/dns4/*.duckdns.org`),
+/// Tailscale / overlay VPN addresses (`100.64.0.0/10`, `*.ts.net`), routed public IPs, and
+/// private LAN/loopback addresses while still blocking unspecified/broadcast/multicast/link-local
+/// targets, malformed DNS labels, and port 4001 public IPFS swarm noise.
+pub fn is_allowed_trusted_bootstrap_address(addr: &libp2p::Multiaddr) -> bool {
+    let mut has_host = false;
+    let mut has_port = false;
+
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Ip4(ip) => {
+                if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_link_local() {
+                    return false;
+                }
+                has_host = true;
+            }
+            Protocol::Ip6(ip) => {
+                let seg0 = ip.segments()[0];
+                let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+                if ip.is_unspecified() || ip.is_multicast() || is_link_local {
+                    return false;
+                }
+                has_host = true;
+            }
+            Protocol::Dns(host) | Protocol::Dns4(host) | Protocol::Dns6(host) | Protocol::Dnsaddr(host) => {
+                let host_str = host.as_ref().trim();
+                if host_str.is_empty()
+                    || host_str.len() > 253
+                    || host_str.chars().any(|c| c.is_whitespace() || c.is_control() || c == '/' || c == '\\')
+                {
+                    return false;
+                }
+                has_host = true;
+            }
+            Protocol::Tcp(port) | Protocol::Udp(port) => {
+                if port == 0 || port == 4001 {
+                    return false;
+                }
+                has_port = true;
+            }
+            _ => {}
+        }
+    }
+
+    has_host && has_port
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::Multiaddr;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_trusted_bootstrap_address_allows_duckdns_wan_and_tailscale_while_preserving_airgap_gate() {
+        let duckdns_tcp = Multiaddr::from_str("/dns4/oshoosi.duckdns.org/tcp/3032").unwrap();
+        let duckdns_quic = Multiaddr::from_str("/dns4/oshoosi.duckdns.org/udp/3032/quic-v1").unwrap();
+        let wan_tcp = Multiaddr::from_str("/ip4/73.45.12.9/tcp/3032").unwrap();
+        let wan_ip6_tcp = Multiaddr::from_str("/ip6/2601:2c1:9600:6ddb::ede3/tcp/3032").unwrap();
+        let link_local_ip6 = Multiaddr::from_str("/ip6/fe80::1/tcp/3032").unwrap();
+        let tailscale_tcp = Multiaddr::from_str("/ip4/100.88.12.4/tcp/3032").unwrap();
+        let tailscale_dns = Multiaddr::from_str("/dns4/home-pc.tail1234.ts.net/tcp/3032").unwrap();
+        let ipfs_noise = Multiaddr::from_str("/ip4/73.45.12.9/tcp/4001").unwrap();
+        let unspecified = Multiaddr::from_str("/ip4/0.0.0.0/tcp/3032").unwrap();
+
+        // Untrusted airgap gate keeps blocking WAN/DNS/CGNAT
+        assert!(!is_allowed_dial_address(&duckdns_tcp));
+        assert!(!is_allowed_dial_address(&wan_tcp));
+        assert!(!is_allowed_dial_address(&wan_ip6_tcp));
+        assert!(!is_allowed_dial_address(&tailscale_tcp));
+
+        // Explicit trusted bootstrap gate accepts DuckDNS, WAN (IPv4/IPv6), and Tailscale 100.64.0.0/10
+        assert!(is_tailscale_or_cgnat_ip4(&"100.88.12.4".parse().unwrap()));
+        assert!(!is_tailscale_or_cgnat_ip4(&"100.128.0.1".parse().unwrap()));
+        assert!(is_allowed_trusted_bootstrap_address(&duckdns_tcp));
+        assert!(is_allowed_trusted_bootstrap_address(&duckdns_quic));
+        assert!(is_allowed_trusted_bootstrap_address(&wan_tcp));
+        assert!(is_allowed_trusted_bootstrap_address(&wan_ip6_tcp));
+        assert!(!is_allowed_trusted_bootstrap_address(&link_local_ip6));
+        assert!(is_allowed_trusted_bootstrap_address(&tailscale_tcp));
+        assert!(is_allowed_trusted_bootstrap_address(&tailscale_dns));
+        assert!(!is_allowed_trusted_bootstrap_address(&ipfs_noise));
+        assert!(!is_allowed_trusted_bootstrap_address(&unspecified));
+    }
 }

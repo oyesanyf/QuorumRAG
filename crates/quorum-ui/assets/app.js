@@ -2756,7 +2756,7 @@ function secureRandomIndex(n) {
   if (btnBrowseReindexFolder) {
     btnBrowseReindexFolder.addEventListener('click', async (e) => {
       e.preventDefault();
-      await window.openPureRustFolderPicker('reindex', currentBrowsePath, btnBrowseReindexFolder);
+      await window.openPureRustFolderPicker('reindex', '', btnBrowseReindexFolder);
     });
   }
 
@@ -2813,7 +2813,7 @@ function secureRandomIndex(n) {
       } else if (action === 'trigger-native-folder-picker') {
         e.preventDefault();
         e.stopPropagation();
-        await window.openPureRustFolderPicker('reindex', currentBrowsePath, actionEl);
+        await window.openPureRustFolderPicker('reindex', '', actionEl);
       }
     });
   }
@@ -3483,16 +3483,57 @@ function secureRandomIndex(n) {
       || norm.startsWith('\\var\\root\\');
   }
 
+  function canonicalComparePathJs(pathStr) {
+    const trimmed = String(pathStr || '').trim();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('/')) {
+      const stripped = trimmed.replace(/\/+$/, '');
+      return stripped || '/';
+    }
+    const replaced = trimmed.replace(/\//g, '\\');
+    const stripped = replaced.replace(/\\+$/, '');
+    if (/^[a-zA-Z]:$/.test(stripped)) {
+      return (stripped + '\\').toLowerCase();
+    }
+    return stripped.toLowerCase();
+  }
+
+  function normalizeQuickAccessCategoryKey(labelStr, pathStr) {
+    const rawLabel = String(labelStr || '')
+      .replace(/\([^)]*\)/g, '')
+      .replace(/\bonedrive\b/ig, '')
+      .replace(/\bdocs\b/ig, 'documents')
+      .trim()
+      .toLowerCase();
+    if (/^(desktop|documents|downloads|pictures|workspace)$/.test(rawLabel)) {
+      return rawLabel;
+    }
+    const leaf = String(pathStr || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '';
+    const leafLower = leaf.toLowerCase();
+    if (/^(desktop|documents|downloads|pictures)$/.test(leafLower)) {
+      return leafLower;
+    }
+    return rawLabel || canonicalComparePathJs(pathStr);
+  }
+
   function resolveCleanQuickAccess(rawQuickAccess) {
     const cleaned = [];
-    const seen = new Set();
+    const seenPaths = new Set();
+    const seenCategories = new Set();
     const pushQa = (name, pathVal, isShared = false) => {
+      if (cleaned.length >= 5) return;
       const p = String(pathVal || '').trim();
       if (!p || isServiceProfilePathJs(p)) return;
-      const key = p.toLowerCase();
-      if (seen.has(key)) return;
-      seen.add(key);
-      cleaned.push({ name, path: p, is_drive: false, is_quick_access: true, is_shared: Boolean(isShared) });
+      const pathKey = canonicalComparePathJs(p);
+      if (!pathKey || seenPaths.has(pathKey)) return;
+      const catKey = normalizeQuickAccessCategoryKey(name, p);
+      if (catKey && seenCategories.has(catKey)) return;
+      seenPaths.add(pathKey);
+      if (catKey) seenCategories.add(catKey);
+      const cleanLabel = /^(desktop|documents|downloads|pictures|workspace)$/i.test(catKey)
+        ? catKey.charAt(0).toUpperCase() + catKey.slice(1)
+        : String(name || 'Folder').replace(/\s*\([^)]*\)\s*$/, '').trim();
+      cleaned.push({ name: cleanLabel, path: p, is_drive: false, is_quick_access: true, is_shared: Boolean(isShared) });
     };
 
     if (Array.isArray(rawQuickAccess)) {
@@ -3513,9 +3554,8 @@ function secureRandomIndex(n) {
       if (!s || isServiceProfilePathJs(s)) continue;
       if (/^[a-zA-Z]:[\\/]?$/.test(s) || s === '/') continue;
       const leaf = s.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '';
-      const isOneDrive = /onedrive/i.test(s);
       if (/^(Desktop|Documents|Downloads|Pictures)$/i.test(leaf)) {
-        pushQa(isOneDrive ? `OneDrive ${leaf}` : leaf, s, false);
+        pushQa(leaf, s, false);
       }
     }
     return cleaned;
@@ -3539,15 +3579,28 @@ function secureRandomIndex(n) {
         cachedQuickAccess = cleanQa;
       }
       const rawDirs = Array.isArray(data.directories) ? data.directories : [];
-      cachedBrowseDirs = rawDirs.filter(d => !d || !d.is_quick_access || !isServiceProfilePathJs(d.path));
-      if (!currentBrowsePath && cachedQuickAccess.length > 0) {
-        const existingLower = new Set(cachedBrowseDirs.map(d => String((d && d.path) || '').toLowerCase()));
+      if (!currentBrowsePath) {
+        const driveEntries = rawDirs.filter(d => d && d.is_drive);
+        const baseDrives = driveEntries.length > 0
+          ? driveEntries
+          : (cachedDrives.length ? cachedDrives : (IS_POSIX_CLIENT ? ['/'] : ['C:\\'])).map(drv => ({
+              name: drv,
+              path: drv,
+              is_drive: true,
+              is_quick_access: false
+            }));
+        const existingKeys = new Set(baseDrives.map(d => canonicalComparePathJs(d.path)));
+        const mergedRoot = [...baseDrives];
         for (const qa of cachedQuickAccess) {
-          if (!existingLower.has(qa.path.toLowerCase())) {
-            cachedBrowseDirs.push(qa);
-            existingLower.add(qa.path.toLowerCase());
+          const k = canonicalComparePathJs(qa.path);
+          if (k && !existingKeys.has(k)) {
+            mergedRoot.push(qa);
+            existingKeys.add(k);
           }
         }
+        cachedBrowseDirs = mergedRoot;
+      } else {
+        cachedBrowseDirs = rawDirs.filter(d => d && (!d.is_quick_access || !isServiceProfilePathJs(d.path)));
       }
     } catch (_) {}
   }
@@ -3665,13 +3718,27 @@ function secureRandomIndex(n) {
       `;
     }).join('') : '';
 
-    const effectiveDirectories = (Array.isArray(directories) && directories.length > 0)
-      ? directories.filter(d => !d || !d.is_quick_access || !isServiceProfilePathJs(d.path))
-      : (!currentPath
-          ? [
-              ...drivesList.map(drv => ({ name: drv === '/' ? 'Root Filesystem (/)' : `Local Disk (${drv})`, path: drv, is_drive: true })),
-              ...cleanQaList.map(qa => ({ name: qa.name, path: qa.path, is_quick_access: true }))
-            ]
+    const effectiveDirectories = !currentPath
+      ? (() => {
+          const driveItems = drivesList.map(drv => ({
+            name: drv === '/' ? 'Root Filesystem (/)' : `Drive ${drv}`,
+            path: drv,
+            is_drive: true,
+            is_quick_access: false
+          }));
+          const seenRoot = new Set(driveItems.map(d => canonicalComparePathJs(d.path)));
+          const out = [...driveItems];
+          for (const qa of cleanQaList) {
+            const k = canonicalComparePathJs(qa.path);
+            if (k && !seenRoot.has(k)) {
+              out.push({ name: qa.name, path: qa.path, is_quick_access: true });
+              seenRoot.add(k);
+            }
+          }
+          return out;
+        })()
+      : ((Array.isArray(directories) && directories.length > 0)
+          ? directories.filter(d => d && (!d.is_quick_access || !isServiceProfilePathJs(d.path)))
           : []);
 
     const dirRowsHtml = effectiveDirectories.length > 0 ? effectiveDirectories.map(d => {
@@ -3679,6 +3746,9 @@ function secureRandomIndex(n) {
       const pNorm = p.replace(/[\\/]+$/, '').toLowerCase();
       const isSelected = selectedSet && (selectedSet.has(p.toLowerCase()) || (pNorm && selectedSet.has(pNorm)));
       const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
+      const subLabel = d.is_drive
+        ? `${p} — Click row or "Open →" to drill down into folders`
+        : (p && p !== d.name ? p : '');
       return `
         <div class="folder-browser-item folder-row ${isSelected ? 'selected' : ''}" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Click row to open ${escapeHtml(d.name)}">
           <div class="folder-row-left">
@@ -3686,14 +3756,14 @@ function secureRandomIndex(n) {
             <span class="folder-row-icon">${icon}</span>
             <div class="folder-row-details">
               <span class="folder-row-name">${escapeHtml(d.name)}</span>
-              ${p && p !== d.name ? `<span class="folder-row-path">${escapeHtml(p)}</span>` : ''}
+              ${subLabel ? `<span class="folder-row-path">${escapeHtml(subLabel)}</span>` : ''}
             </div>
           </div>
           <div class="folder-row-actions">
             <button type="button" class="pill-btn folder-select-btn ${isSelected ? 'selected' : ''}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}">
               ${isSelected ? '✓ Selected' : (selectButtonText || '+ Select Folder')}
             </button>
-            <button type="button" class="pill-btn folder-open-btn" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Open folder">
+            <button type="button" class="pill-btn folder-open-btn" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Open and drill down into ${escapeHtml(d.name)}">
               Open →
             </button>
           </div>
@@ -3713,7 +3783,7 @@ function secureRandomIndex(n) {
       <div class="folder-explorer-container" data-explorer-context="${contextId}">
         <div class="folder-explorer-toolbar">
           <div class="folder-explorer-nav-buttons">
-            <button type="button" class="pill-btn folder-nav-btn" data-action="browse-root" title="Go to Drives & Quick Access Root">
+            <button type="button" class="pill-btn folder-nav-btn" data-action="browse-root" title="Show all drives on this asset">
               💽 ${IS_POSIX_CLIENT ? 'Computer' : 'This PC'}
             </button>
             ${currentPath ? `
@@ -3729,8 +3799,8 @@ function secureRandomIndex(n) {
           </div>
 
           ${allowNativeDialog ? `
-            <button type="button" class="pill-btn folder-native-picker-btn" data-action="trigger-native-folder-picker" data-context="${contextId}" title="Open Pure Rust Folder Picker Modal">
-              📂 Open Pure Rust Folder Picker...
+            <button type="button" class="pill-btn folder-native-picker-btn" data-action="trigger-native-folder-picker" data-context="${contextId}" title="Select a drive or folder on this asset">
+              📁 Select Folder
             </button>
           ` : ''}
         </div>
@@ -3803,7 +3873,7 @@ function secureRandomIndex(n) {
   window.applyPickedFolderToContext = async function(ctx, chosenPath) {
     const chosen = (chosenPath || '').trim();
     if (!chosen) {
-      showSettingsToast('Please navigate into a drive or folder, or click "✓ Pick This Folder" on any row.');
+      showSettingsToast('Please click a drive to drill down into folders, or click "✓ Select Folder" on any row.');
       return false;
     }
 
@@ -3871,9 +3941,9 @@ function secureRandomIndex(n) {
             ? pureRustPickerCurrentPath.startsWith('/')
             : pureRustPickerCurrentPath.toLowerCase().startsWith(drv.toLowerCase())
         );
-        return `<button type="button" class="pill-btn folder-drive-pill ${isActive ? 'active' : ''}" data-picker-nav="${escapeHtml(drv)}">💽 ${escapeHtml(drv)}</button>`;
+        return `<button type="button" class="pill-btn folder-drive-pill ${isActive ? 'active' : ''}" data-picker-nav="${escapeHtml(drv)}" title="Open drive ${escapeHtml(drv)}">💽 ${escapeHtml(drv)}</button>`;
       }).join('');
-      drivesBar.innerHTML = `<span style="font-size:11.5px; font-weight:700; color:var(--text-muted); margin-right:4px;">Drives:</span>${drvHtml}`;
+      drivesBar.innerHTML = `<span style="font-size:11.5px; font-weight:700; color:var(--text-muted); margin-right:4px;">Drives on this asset:</span>${drvHtml}`;
     }
 
     const quickBar = document.getElementById('pure-rust-picker-quick-bar');
@@ -3917,7 +3987,7 @@ function secureRandomIndex(n) {
 
     const selectedLabel = document.getElementById('pure-rust-picker-selected-label');
     if (selectedLabel) {
-      selectedLabel.textContent = pureRustPickerCurrentPath || (IS_POSIX_CLIENT ? 'Computer (Click any folder below)' : 'This PC (Click any drive or folder below)');
+      selectedLabel.textContent = pureRustPickerCurrentPath || (IS_POSIX_CLIENT ? 'Drives & Volumes (Click any drive or folder below to drill down)' : 'Drives on this asset (Click any drive below to drill down into folders)');
     }
 
     const confirmBtn = document.getElementById('btn-confirm-pure-rust-picker');
@@ -3929,7 +3999,7 @@ function secureRandomIndex(n) {
         : '';
       confirmBtn.textContent = pureRustPickerCurrentPath
         ? `✅ Select Folder (${leafLabel})`
-        : 'Click "✓ Pick This Folder" on a Row or Open a Drive';
+        : 'Click a Drive to Drill Down or "✓ Select Folder"';
     }
 
     const listEl = document.getElementById('pure-rust-picker-dir-list');
@@ -3945,25 +4015,29 @@ function secureRandomIndex(n) {
       if (filtered.length === 0) {
         listEl.innerHTML = `
           <div style="padding:18px; text-align:center; color:var(--text-muted); font-size:12.5px;">
-            ${q ? 'No subfolders match filter "' + escapeHtml(pureRustPickerFilterText) + '".' : 'No subdirectories in this folder. Click "✅ Select Folder" below to choose this directory, or create a new subfolder above.'}
+            ${q ? 'No drives or subfolders match filter "' + escapeHtml(pureRustPickerFilterText) + '".' : 'No subdirectories in this folder. Click "✅ Select Folder" below to choose this directory, or create a new subfolder above.'}
           </div>
         `;
       } else {
         listEl.innerHTML = filtered.map(d => {
           const p = String(d.path || '');
           const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
+          const displayName = d.is_drive ? (p === '/' ? 'Root Filesystem (/)' : `Drive ${p}`) : String(d.name || p);
+          const subHint = d.is_drive
+            ? `${p} — Click row or "Open →" to drill down into folders`
+            : (p && p !== d.name ? p : '');
           return `
             <div class="folder-browser-item folder-row" data-picker-nav="${escapeHtml(p)}" title="Click to open ${escapeHtml(p)}">
               <div class="folder-row-left">
                 <span class="folder-row-icon">${icon}</span>
                 <div class="folder-row-details">
-                  <span class="folder-row-name">${escapeHtml(d.name)}</span>
-                  ${p && p !== d.name ? `<span class="folder-row-path">${escapeHtml(p)}</span>` : ''}
+                  <span class="folder-row-name">${escapeHtml(displayName)}</span>
+                  ${subHint ? `<span class="folder-row-path">${escapeHtml(subHint)}</span>` : ''}
                 </div>
               </div>
               <div class="folder-row-actions">
                 <button type="button" class="pill-btn folder-select-btn" data-picker-pick="${escapeHtml(p)}" style="border-color:#10a37f; color:#10a37f; font-weight:600;">
-                  ✓ Pick This Folder
+                  ✓ Select Folder
                 </button>
                 <button type="button" class="pill-btn folder-open-btn" data-picker-nav="${escapeHtml(p)}">
                   Open →
@@ -4037,24 +4111,38 @@ function secureRandomIndex(n) {
         cachedQuickAccess = cleanQa;
       }
       const rawDirs = Array.isArray(data.directories) ? data.directories : [];
-      pureRustPickerDirectories = rawDirs.filter(d => !d || !d.is_quick_access || !isServiceProfilePathJs(d.path));
-      if (!pureRustPickerCurrentPath && pureRustPickerQuickAccess.length > 0) {
-        const existingLower = new Set(pureRustPickerDirectories.map(d => String((d && d.path) || '').toLowerCase()));
+      if (!pureRustPickerCurrentPath) {
+        const driveEntries = rawDirs.filter(d => d && d.is_drive);
+        const fallbackDrives = pureRustPickerDrives.length ? pureRustPickerDrives : (IS_POSIX_CLIENT ? ['/'] : ['C:\\']);
+        const baseDrives = driveEntries.length > 0
+          ? driveEntries
+          : fallbackDrives.map(drv => ({
+              name: drv === '/' ? 'Root Filesystem (/)' : `Drive ${drv}`,
+              path: drv,
+              is_drive: true,
+              is_quick_access: false
+            }));
+        const existingKeys = new Set(baseDrives.map(d => canonicalComparePathJs(d.path)));
+        const mergedRoot = [...baseDrives];
         for (const qa of pureRustPickerQuickAccess) {
-          if (!existingLower.has(qa.path.toLowerCase())) {
-            pureRustPickerDirectories.push(qa);
-            existingLower.add(qa.path.toLowerCase());
+          const k = canonicalComparePathJs(qa.path);
+          if (k && !existingKeys.has(k)) {
+            mergedRoot.push(qa);
+            existingKeys.add(k);
           }
         }
+        pureRustPickerDirectories = mergedRoot;
+      } else {
+        pureRustPickerDirectories = rawDirs.filter(d => d && (!d.is_quick_access || !isServiceProfilePathJs(d.path)));
       }
     } catch (err) {
-      showSettingsToast('Pure Rust folder browser error: ' + err.message);
+      showSettingsToast('Folder browser error: ' + err.message);
     } finally {
       if (pureRustPickerDirectories.length === 0 && !pureRustPickerCurrentPath) {
         const fallbackDrives = pureRustPickerDrives.length ? pureRustPickerDrives : (IS_POSIX_CLIENT ? ['/'] : ['C:\\']);
         pureRustPickerDirectories = [
           ...fallbackDrives.map(drv => ({
-            name: drv === '/' ? 'Root Filesystem (/)' : `Local Disk (${drv})`,
+            name: drv === '/' ? 'Root Filesystem (/)' : `Drive ${drv}`,
             path: drv,
             is_drive: true
           })),
@@ -4080,13 +4168,13 @@ function secureRandomIndex(n) {
     modal.setAttribute('aria-labelledby', 'pure-rust-picker-title');
     modal.style.zIndex = '100000';
     modal.innerHTML = `
-      <div class="modal-card" style="max-width: 740px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
+      <div class="modal-card" style="max-width: 760px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
         <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-            <h3 id="pure-rust-picker-title" style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
-            <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Folder</span>
+            <h3 id="pure-rust-picker-title" style="margin:0; font-size:16px;">📁 Select Folder</h3>
+            <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Drive or Folder</span>
           </div>
-          <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker" aria-label="Close Folder Picker">&times;</button>
+          <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Select Folder" aria-label="Close Select Folder">&times;</button>
         </div>
         <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
           <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
@@ -4097,13 +4185,13 @@ function secureRandomIndex(n) {
             <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1; min-inline-size:0;"></div>
           </div>
           <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-            <input type="search" id="pure-rust-picker-filter-input" class="settings-input" aria-label="Filter folders in current view" placeholder="🔍 Filter folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
+            <input type="search" id="pure-rust-picker-filter-input" class="settings-input" aria-label="Filter folders in current view" placeholder="🔍 Filter drives or folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
             <div style="display:flex; gap:6px; align-items:center;">
               <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" aria-label="New subfolder name" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
               <button type="button" class="pill-btn" id="btn-pure-rust-picker-create-folder" style="padding:5px 10px; font-size:12px; font-weight:600;">+ Create Subfolder</button>
             </div>
           </div>
-          <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:320px; min-height:200px;"></div>
+          <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:380px; min-height:240px;"></div>
         </div>
         <div class="modal-footer" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
           <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; min-inline-size:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
@@ -4188,7 +4276,7 @@ function secureRandomIndex(n) {
     if (btnConfirm) {
       btnConfirm.addEventListener('click', async () => {
         if (!pureRustPickerCurrentPath) {
-          showSettingsToast('Click "✓ Pick This Folder" on any row or open a drive first.');
+          showSettingsToast('Click a drive to drill down into folders or click "✓ Select Folder" on any row.');
           return;
         }
         const ok = await window.applyPickedFolderToContext(pureRustPickerContext, pureRustPickerCurrentPath);
@@ -4232,10 +4320,7 @@ function secureRandomIndex(n) {
     const filterInp = document.getElementById('pure-rust-picker-filter-input');
     if (filterInp) filterInp.value = '';
     const modal = ensurePureRustPickerModal();
-    const contextDefaultPath = contextId === 'artemis'
-      ? artemisSelectedDir
-      : (contextId === 'dlp' ? dlpSelectedSimFolder : '');
-    const startPath = (initialPath || currentBrowsePath || contextDefaultPath || '').trim();
+    const startPath = String(initialPath || '').trim();
     pureRustPickerCurrentPath = startPath;
     if (Array.isArray(cachedDrives) && cachedDrives.length > 0) {
       pureRustPickerDrives = cachedDrives;
@@ -4243,7 +4328,21 @@ function secureRandomIndex(n) {
     if (Array.isArray(cachedQuickAccess) && cachedQuickAccess.length > 0) {
       pureRustPickerQuickAccess = cachedQuickAccess;
     }
-    if (Array.isArray(cachedBrowseDirs) && cachedBrowseDirs.length > 0) {
+    if (!startPath) {
+      const fallbackDrives = pureRustPickerDrives.length ? pureRustPickerDrives : (IS_POSIX_CLIENT ? ['/'] : ['C:\\']);
+      pureRustPickerDirectories = [
+        ...fallbackDrives.map(drv => ({
+          name: drv === '/' ? 'Root Filesystem (/)' : `Drive ${drv}`,
+          path: drv,
+          is_drive: true
+        })),
+        ...pureRustPickerQuickAccess.map(qa => ({
+          name: qa.name,
+          path: qa.path,
+          is_quick_access: true
+        }))
+      ];
+    } else if (Array.isArray(cachedBrowseDirs) && cachedBrowseDirs.length > 0) {
       pureRustPickerDirectories = cachedBrowseDirs;
     }
     if (modal) {
@@ -4255,6 +4354,7 @@ function secureRandomIndex(n) {
       await loadPureRustPickerDirectory(startPath);
     }
   };
+  window.openSelectFolderModal = window.openPureRustFolderPicker;
 
   function renderReindexExplorer() {
     const mount = document.getElementById('reindex-folder-explorer-mount');
@@ -4805,7 +4905,7 @@ function secureRandomIndex(n) {
           e.preventDefault();
           e.stopPropagation();
           const ctx = actionEl.dataset.context || 'general';
-          await window.openPureRustFolderPicker(ctx, currentBrowsePath, actionEl);
+          await window.openPureRustFolderPicker(ctx, '', actionEl);
           break;
         }
 
@@ -5576,9 +5676,9 @@ function secureRandomIndex(n) {
           const tid = actionEl.dataset.targetId;
           const targetInput = tid ? document.getElementById(tid) : null;
           if (tid === 'artemis-folder-upload-input') {
-            await window.openPureRustFolderPicker('artemis', currentBrowsePath, actionEl);
+            await window.openPureRustFolderPicker('artemis', '', actionEl);
           } else if (tid === 'add-new-folder-file-input' || (targetInput && targetInput.hasAttribute('webkitdirectory'))) {
-            await window.openPureRustFolderPicker('newdoc', currentBrowsePath, actionEl);
+            await window.openPureRustFolderPicker('newdoc', '', actionEl);
           } else if (targetInput) {
             targetInput.click();
           }
@@ -6529,7 +6629,7 @@ function secureRandomIndex(n) {
           <input type="hidden" id="mkt-folder-input" value="${escapeHtml(currentBrowsePath || '')}">
           <div style="display:flex; gap:8px; margin-top:10px; margin-bottom:12px; flex-wrap:wrap; align-items:center;">
             <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="mkt" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">
-              📂 Open Pure Rust Folder Picker...
+              📁 Select Folder
             </button>
             ${currentBrowsePath ? `<button type="button" class="pill-btn" data-action="mkt-toggle-folder" data-folder-path="${escapeHtml(currentBrowsePath)}" style="border-color:#10a37f; color:#10a37f; font-weight:600;">+ Select Active Folder (${escapeHtml(currentBrowsePath)})</button>` : ''}
           </div>
@@ -6572,7 +6672,7 @@ function secureRandomIndex(n) {
                 📁 + Upload Entire Folder
               </button>
               <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="newdoc" style="border-color:#10a37f; color:#10a37f; font-weight:600;">
-                📂 + Browse &amp; Select Local Folder...
+                📁 Select Folder
               </button>
             </div>
           </div>
@@ -7668,7 +7768,7 @@ function secureRandomIndex(n) {
           <!-- Click to Select Folder to Share -->
           <input type="hidden" id="new-shared-folder-input" value="">
           <div style="display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; align-items:center;">
-            <button type="button" class="btn-primary" style="cursor:pointer;" data-action="trigger-native-folder-picker" data-context="mesh">📂 Open Pure Rust Folder Picker to Share...</button>
+            <button type="button" class="btn-primary" style="cursor:pointer;" data-action="trigger-native-folder-picker" data-context="mesh">📁 Select Folder</button>
             ${currentBrowsePath ? `<button type="button" class="pill-btn" style="cursor:pointer; border-color:#10a37f; color:#10a37f; font-weight:600;" data-action="share-folder" data-folder-path="${escapeHtml(currentBrowsePath)}">+ Share Active Folder (${escapeHtml(currentBrowsePath)})</button>` : ''}
           </div>
 
@@ -7900,7 +8000,7 @@ function secureRandomIndex(n) {
             <input type="hidden" id="dlp-sim-path" value="${escapeHtml(dlpSelectedSimPath)}">
             <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
               <span id="dlp-sim-path-badge" class="status-pill healthy" style="font-size:12px; padding:4px 10px;">📁 <code id="dlp-sim-path-text">${escapeHtml(dlpSelectedSimPath)}</code></span>
-              <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="dlp" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">📂 Open Pure Rust Folder Picker...</button>
+              <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="dlp" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">📁 Select Folder</button>
               ${(mesh.shared_folders || []).map(sf => `<button type="button" class="pill-btn" data-action="dlp-select-sim-folder" data-folder-path="${escapeHtml(sf.path)}" style="font-size:11.5px;">📁 ${escapeHtml(sf.path)}</button>`).join('')}
             </div>
             ${renderWindowsFileExplorerHtml({
@@ -8160,7 +8260,7 @@ function secureRandomIndex(n) {
               <span>📁 Artemis .jsonl Dump Directory Selection (Click-to-Select)</span>
             </div>
             <div style="font-size:12.5px; color:var(--text-muted); margin-bottom:12px;">
-              Click any drive or folder below, or open the Pure Rust Folder Picker to select a directory containing Artemis <code>.jsonl</code> dumps for parsing and local vector indexing. Zero text typing required.
+              Click any drive or folder below, or click "Select Folder" to drill down into drives on this asset and select a directory containing Artemis <code>.jsonl</code> dumps for parsing and local vector indexing. Zero text typing required.
             </div>
 
             <!-- Hidden internal state storage conforming to user invariant -->
@@ -8181,9 +8281,9 @@ function secureRandomIndex(n) {
 
             <!-- Action buttons for click-to-select folder UX -->
             <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:14px;">
-              <!-- 1. Pure Rust Folder Picker Button -->
+              <!-- 1. Select Folder Button -->
               <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="artemis" style="background:var(--accent, #6366f1); color:#fff; border-color:var(--accent, #6366f1); font-weight:600;">
-                📂 Open Pure Rust Folder Picker...
+                📁 Select Folder
               </button>
 
               <!-- 2. Hidden Upload Folder Picker Input & Trigger Button -->

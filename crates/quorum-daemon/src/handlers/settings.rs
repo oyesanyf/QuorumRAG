@@ -230,6 +230,8 @@ pub async fn mesh_status_handler(State(state): State<Arc<DaemonState>>) -> impl 
     };
 
     let epoch_sig = controller.sign_epoch_token(&local_peer_id, mesh.hmac_epoch, "master_core");
+    let wan_tel = crate::wan_mesh::cached_wan_telemetry();
+    let effective_targets = quorum_coordinator::mesh::collect_trusted_bootstrap_multiaddrs(&mesh, &[]);
 
     Json(serde_json::json!({
         "status": "ok",
@@ -242,8 +244,21 @@ pub async fn mesh_status_handler(State(state): State<Arc<DaemonState>>) -> impl 
         "connected_peers": connected_peers,
         "peer_count": if mesh.p2p_enabled { connected_peers.len() } else { 0 },
         "bootstrap_peers": mesh.bootstrap_peers,
+        "effective_bootstrap_targets": effective_targets,
         "duckdns_domain": mesh.duckdns_domain,
         "auto_bootstrap_duckdns": mesh.auto_bootstrap_duckdns,
+        "wan_telemetry": {
+            "external_wan_ip": wan_tel.external_wan_ip,
+            "upnp_gateway": wan_tel.upnp_gateway,
+            "upnp_tcp_mapped": wan_tel.upnp_tcp_mapped,
+            "upnp_udp_mapped": wan_tel.upnp_udp_mapped,
+            "duckdns_fqdn": wan_tel.duckdns_fqdn,
+            "duckdns_resolved_ips": wan_tel.duckdns_resolved_ips,
+            "is_duckdns_host": wan_tel.is_duckdns_host,
+            "tailscale_self_ips": wan_tel.tailscale_self_ips,
+            "tailscale_peer_addrs": wan_tel.tailscale_peer_addrs,
+            "updated_at": wan_tel.updated_at,
+        },
         "hmac_epoch": mesh.hmac_epoch,
         "epoch_signature_preview": epoch_sig,
         "join_gate_mode": mesh.join_gate_mode,
@@ -340,13 +355,15 @@ pub async fn update_mesh_config_handler(
 
     controller.save_to_disk();
 
-    // Dial any newly configured bootstrap multiaddrs
+    // Dial any newly configured bootstrap multiaddrs (including WAN, DuckDNS, and Tailscale trusted peers)
     let mut dialed = Vec::new();
+    let mut dial_errors = Vec::new();
     if let Some(ref handle) = state.swarm_handle {
         for addr_str in peers_to_dial {
             if let Ok(multiaddr) = addr_str.parse::<quorum_network::Multiaddr>() {
-                if handle.dial(multiaddr).await.is_ok() {
-                    dialed.push(addr_str);
+                match handle.dial_trusted(multiaddr).await {
+                    Ok(()) => dialed.push(addr_str),
+                    Err(e) => dial_errors.push(format!("{}: {}", addr_str, e)),
                 }
             }
         }
@@ -362,7 +379,8 @@ pub async fn update_mesh_config_handler(
     Json(serde_json::json!({
         "status": "ok",
         "mesh": updated_mesh,
-        "dialed_peers": dialed
+        "dialed_peers": dialed,
+        "dial_errors": dial_errors
     }))
 }
 
@@ -562,7 +580,27 @@ fn is_service_or_system_profile_path(path_str: &str) -> bool {
         || norm.starts_with("\\var\\root\\")
 }
 
-/// Pure Rust discovery of real interactive user home directories across Windows (`C:\Users\*`),
+fn canonical_fs_compare_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('/') {
+        let stripped = trimmed.trim_end_matches('/');
+        if stripped.is_empty() {
+            "/".to_string()
+        } else {
+            stripped.to_string()
+        }
+    } else {
+        let replaced = trimmed.replace('/', "\\");
+        let stripped = replaced.trim_end_matches('\\');
+        if stripped.len() == 2 && stripped.ends_with(':') {
+            format!("{}\\", stripped.to_ascii_lowercase())
+        } else {
+            stripped.to_ascii_lowercase()
+        }
+    }
+}
+
+/// Discovery of real interactive user home directories across Windows (`C:\Users\*`),
 /// macOS (`/Users/*`), and Linux (`/home/*`), even when the daemon runs as `LocalSystem`, `systemd`, or `launchd`.
 fn discover_interactive_user_homes() -> Vec<std::path::PathBuf> {
     let mut homes: Vec<std::path::PathBuf> = Vec::new();
@@ -571,9 +609,10 @@ fn discover_interactive_user_homes() -> Vec<std::path::PathBuf> {
         if is_service_or_system_profile_path(&s) || !candidate.is_dir() {
             return;
         }
+        let key = canonical_fs_compare_key(&s);
         if !homes
             .iter()
-            .any(|existing| existing.to_string_lossy().eq_ignore_ascii_case(&s))
+            .any(|existing| canonical_fs_compare_key(&existing.to_string_lossy()) == key)
         {
             homes.push(candidate);
         }
@@ -691,21 +730,30 @@ async fn pure_rust_browse_directory(
         .map(|d| d.to_string_lossy().to_string())
         .collect();
 
-    // Build Pure Rust quick-access folder list from real interactive user profiles (never system32/systemprofile)
+    // Build concise, deduplicated quick-access folder list from the primary interactive user profile
+    // (never system32/systemprofile and never flooding the UI with duplicate secondary profile pills).
     let mut quick_access: Vec<serde_json::Value> = Vec::new();
     let mut push_quick = |label: String, path_buf: std::path::PathBuf| {
-        if !path_buf.is_dir() {
+        if !path_buf.is_dir() || quick_access.len() >= 5 {
             return;
         }
         let s = path_buf.to_string_lossy().to_string();
         if is_service_or_system_profile_path(&s) {
             return;
         }
+        let key = canonical_fs_compare_key(&s);
         let already = quick_access.iter().any(|item| {
-            item.get("path")
+            let same_path = item
+                .get("path")
                 .and_then(|v| v.as_str())
-                .map(|existing| existing.eq_ignore_ascii_case(&s))
-                .unwrap_or(false)
+                .map(|existing| canonical_fs_compare_key(existing) == key)
+                .unwrap_or(false);
+            let same_label = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|existing| existing.eq_ignore_ascii_case(&label))
+                .unwrap_or(false);
+            same_path || same_label
         });
         if !already {
             quick_access.push(serde_json::json!({
@@ -718,25 +766,8 @@ async fn pure_rust_browse_directory(
         }
     };
 
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_str = cwd.to_string_lossy().to_string();
-        if cwd.is_dir() && !is_service_or_system_profile_path(&cwd_str) {
-            push_quick("Workspace".to_string(), cwd);
-        }
-    }
-
     let interactive_homes = discover_interactive_user_homes();
-    let multi_user = interactive_homes.len() > 1;
-    for (idx, home) in interactive_homes.iter().enumerate() {
-        let uname = home
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let suffix = if idx > 0 && multi_user && !uname.is_empty() {
-            format!(" ({})", uname)
-        } else {
-            String::new()
-        };
+    if let Some(primary_home) = interactive_homes.first() {
         let quick_folders = [
             ("Desktop", "Desktop"),
             ("Documents", "Documents"),
@@ -744,12 +775,19 @@ async fn pure_rust_browse_directory(
             ("Pictures", "Pictures"),
         ];
         for (label, sub) in quick_folders {
-            push_quick(format!("{}{}", label, suffix), home.join(sub));
+            let candidate = primary_home.join(sub);
+            if candidate.is_dir() {
+                push_quick(label.to_string(), candidate);
+            } else if primary_home.join("OneDrive").join(sub).is_dir() {
+                push_quick(label.to_string(), primary_home.join("OneDrive").join(sub));
+            }
         }
-        let onedrive = home.join("OneDrive");
-        if onedrive.is_dir() {
-            push_quick(format!("OneDrive Docs{}", suffix), onedrive.join("Documents"));
-            push_quick(format!("OneDrive Desktop{}", suffix), onedrive.join("Desktop"));
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_str = cwd.to_string_lossy().to_string();
+        if cwd.is_dir() && !is_service_or_system_profile_path(&cwd_str) {
+            push_quick("Workspace".to_string(), cwd);
         }
     }
 
@@ -845,8 +883,6 @@ async fn pure_rust_browse_directory(
                         let name = entry.file_name().to_string_lossy().to_string();
                         if name.starts_with('$')
                             || name.eq_ignore_ascii_case("System Volume Information")
-                            || name.eq_ignore_ascii_case("target")
-                            || name.eq_ignore_ascii_case("node_modules")
                             || name.eq_ignore_ascii_case(".git")
                         {
                             continue;

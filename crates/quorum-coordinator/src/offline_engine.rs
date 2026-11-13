@@ -33,7 +33,8 @@ fn global_corpus_vocab() -> &'static RwLock<HashMap<String, String>> {
             "sovereign", "dividend", "automation", "artificial", "intelligence",
             "explain", "summarize", "compare", "describe", "analyze", "overview", "background",
             "African", "Church", "Churches", "gang", "violence", "Eastern", "University", "continue",
-            "blocked", "process", "antivirus", "Defender", "CodeIntegrity", "malware", "forensic", "forensics", "continuous",
+            "blocked", "process", "processes", "antivirus", "Defender", "CodeIntegrity", "malware", "forensic", "forensics", "continuous",
+            "internet", "network", "connection", "connections", "socket", "sockets", "outbound", "inbound", "prefetch", "amcache", "registry", "persistence", "netstat", "Artemis", "DFIR",
         ];
         for &w in SEED_WORDS {
             map.insert(w.to_ascii_lowercase(), w.to_string());
@@ -45,6 +46,317 @@ fn global_corpus_vocab() -> &'static RwLock<HashMap<String, String>> {
 /// Active federated peer diagnostics recorded from the most recent scatter-gather retrieval.
 static ACTIVE_PEER_DIAGNOSTICS: RwLock<Option<quorum_types::FederatedPeerDiagnostics>> = RwLock::new(None);
 
+/// Canonical classifier for host DFIR / Artemis forensic queries so retrieval, live OS telemetry sync,
+/// and grounded synthesis handle all defensive telemetry categories consistently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForensicQueryIntent {
+    /// Queries about processes/sockets accessing the internet, outbound/inbound network connections, remote IPs, or open ports.
+    NetworkInternet,
+    /// Queries about antivirus, Windows Defender, CodeIntegrity, malware detections, quarantined threats, or blocked processes.
+    AntivirusBlocked,
+    /// Queries about recently executed/spawned/running processes, PIDs, or command lines on this host.
+    ProcessExecution,
+    /// Queries about Registry Run / RunOnce persistence keys, startup entries, or autoruns.
+    RegistryPersistence,
+    /// Queries about Windows Prefetch (`.pf`), Amcache, or Shimcache execution history.
+    PrefetchExecution,
+    /// Queries about Windows Services, macOS LaunchDaemons/LaunchAgents, or Linux systemd units.
+    ServiceDaemon,
+    /// General Artemis DFIR / OS Event Log / Sysmon / auditd / journald forensic queries.
+    EventLogGeneral,
+}
+
+impl ForensicQueryIntent {
+    /// Detects whether a user query is asking a host forensic / Artemis DFIR question.
+    pub fn detect(query: &str) -> Option<Self> {
+        let ql = query.trim().to_ascii_lowercase();
+        if ql.is_empty() {
+            return None;
+        }
+
+        let explicit_artemis = ql.contains("artemis")
+            || ql.contains("dfir")
+            || ql.contains("this machine")
+            || ql.contains("this computer")
+            || ql.contains("this host")
+            || ql.contains("this asset")
+            || ql.contains("my computer")
+            || ql.contains("my machine");
+
+        // Do not hijack explicit document/corpus questions about resumes, papers, leases, transcripts, or architecture docs
+        if !explicit_artemis
+            && (ql.contains("resume")
+                || ql.contains("cv ")
+                || ql.contains("thesis")
+                || ql.contains("lease")
+                || ql.contains("transcript")
+                || ql.contains("cigna")
+                || ql.contains("agent octopus")
+                || ql.contains("agent_octopus")
+                || ql.contains("oshoosiclaw")
+                || ql.contains("redactx")
+                || ql.contains("vaultgemma")
+                || ql.contains("manuscript")
+                || ql.contains("cover letter"))
+        {
+            return None;
+        }
+
+        let mentions_proc = ql.contains("process")
+            || ql.contains("processes")
+            || ql.contains("program")
+            || ql.contains("executable")
+            || ql.contains("binary")
+            || ql.contains("pid");
+
+        // 1. Network / Internet Access Forensics
+        if ql.contains("access the internet")
+            || ql.contains("accessed the internet")
+            || ql.contains("accessing the internet")
+            || ql.contains("connected to the internet")
+            || ql.contains("connect to the internet")
+            || ql.contains("outbound connection")
+            || ql.contains("outbound network")
+            || ql.contains("network connection")
+            || ql.contains("active connection")
+            || ql.contains("open socket")
+            || ql.contains("listening port")
+            || ql.contains("netstat")
+            || (mentions_proc
+                && (ql.contains("internet")
+                    || ql.contains("outbound")
+                    || ql.contains("socket")
+                    || ql.contains("remote ip")
+                    || ql.contains("destination ip")
+                    || ql.contains("dest ip")
+                    || ql.contains("external ip")
+                    || ql.contains("connected to")
+                    || ql.contains("network")))
+        {
+            return Some(Self::NetworkInternet);
+        }
+
+        // 2. Antivirus / Defender / CodeIntegrity / Blocked Process Forensics
+        if ql.contains("antivirus")
+            || ql.contains("anti-virus")
+            || ql.contains("defender")
+            || ql.contains("codeintegrity")
+            || ql.contains("code integrity")
+            || ql.contains("quarantin")
+            || (mentions_proc
+                && (ql.contains("block")
+                    || ql.contains("blocked")
+                    || ql.contains("malware")
+                    || ql.contains("trojan")
+                    || ql.contains("ransomware")))
+        {
+            return Some(Self::AntivirusBlocked);
+        }
+
+        // 3. Prefetch / Amcache Execution Artifacts
+        if ql.contains("prefetch")
+            || ql.contains("amcache")
+            || ql.contains("shimcache")
+            || ql.contains(".pf")
+        {
+            return Some(Self::PrefetchExecution);
+        }
+
+        // 4. Registry Persistence (`Run` / `RunOnce`)
+        if ql.contains("runonce")
+            || ql.contains("run key")
+            || ql.contains("registry persistence")
+            || ql.contains("autorun")
+            || (ql.contains("registry")
+                && (ql.contains("persistence")
+                    || ql.contains("startup")
+                    || ql.contains("hklm")
+                    || ql.contains("hkcu")))
+        {
+            return Some(Self::RegistryPersistence);
+        }
+
+        // 5. Service / Daemon Forensics
+        if ql.contains("launchdaemon")
+            || ql.contains("launchagent")
+            || ql.contains("windows service")
+            || ql.contains("systemd unit")
+            || ql.contains("service_daemon")
+            || (explicit_artemis && (ql.contains("service") || ql.contains("daemon")))
+        {
+            return Some(Self::ServiceDaemon);
+        }
+
+        // 6. Live / Recent Process Execution Forensics
+        if ql.contains("last process")
+            || ql.contains("latest process")
+            || ql.contains("recent process")
+            || ql.contains("running process")
+            || ql.contains("active process")
+            || ql.contains("processes running")
+            || ql.contains("process execution")
+            || ql.contains("spawned process")
+            || ((ql.contains("which process") || ql.contains("what process"))
+                && (ql.contains("ran")
+                    || ql.contains("running")
+                    || ql.contains("execut")
+                    || ql.contains("spawn")
+                    || ql.contains("start")
+                    || ql.contains("launch")
+                    || ql.contains("pid")
+                    || ql.contains("command line")
+                    || ql.contains("cmdline")))
+        {
+            return Some(Self::ProcessExecution);
+        }
+
+        // 7. General Artemis DFIR / OS Event Logs
+        if ql.contains("artemis")
+            || ql.contains("dfir")
+            || ql.contains("event log")
+            || ql.contains("eventlog")
+            || ql.contains(".evtx")
+            || ql.contains("wevtutil")
+            || ql.contains("sysmon")
+            || ql.contains("auditd")
+            || ql.contains("journald")
+            || ql.contains("forensic")
+            || ql.contains("forensics")
+        {
+            return Some(Self::EventLogGeneral);
+        }
+
+        None
+    }
+
+    /// Supplemental Tantivy lexical query targeting the exact Artemis DFIR category.
+    pub fn target_search_query(self) -> &'static str {
+        match self {
+            Self::NetworkInternet => {
+                "NetworkConnection external_internet internet ESTABLISHED remote process socket"
+            }
+            Self::AntivirusBlocked => {
+                "SystemEventLog windows_defender_antivirus_event windows_codeintegrity_blocked_process_event Defender CodeIntegrity blocked threat"
+            }
+            Self::ProcessExecution => {
+                "ProcessExecution live process image cmdline pid"
+            }
+            Self::RegistryPersistence => {
+                "RegistryPersistence CurrentVersion Run RunOnce key"
+            }
+            Self::PrefetchExecution => {
+                "PrefetchAmcacheExecution prefetch executable run_count"
+            }
+            Self::ServiceDaemon => {
+                "ServiceDaemon service path launchd systemd"
+            }
+            Self::EventLogGeneral => {
+                "artemis DFIR SystemEventLog ProcessExecution NetworkConnection RegistryPersistence PrefetchAmcacheExecution ServiceDaemon"
+            }
+        }
+    }
+
+    /// Query expansion terms appended to `search_query` in `retrieve.rs`.
+    pub fn query_expansion_terms(self) -> &'static str {
+        match self {
+            Self::NetworkInternet => {
+                "Artemis DFIR NetworkConnection external_internet internet ESTABLISHED remote socket process pid"
+            }
+            Self::AntivirusBlocked => {
+                "SystemEventLog Windows Defender Antivirus CodeIntegrity blocked process threat event 1117 1116 3077"
+            }
+            Self::ProcessExecution => {
+                "Artemis DFIR ProcessExecution process image cmdline pid executed"
+            }
+            Self::RegistryPersistence => {
+                "Artemis DFIR RegistryPersistence HKLM HKCU CurrentVersion Run RunOnce"
+            }
+            Self::PrefetchExecution => {
+                "Artemis DFIR PrefetchAmcacheExecution prefetch executable run_count"
+            }
+            Self::ServiceDaemon => {
+                "Artemis DFIR ServiceDaemon service daemon path systemd launchd"
+            }
+            Self::EventLogGeneral => {
+                "Artemis DFIR SystemEventLog ProcessExecution NetworkConnection event_id"
+            }
+        }
+    }
+
+    /// Returns true if an `artemis://` chunk matches this forensic intent category.
+    pub fn matches_artemis_chunk(self, path_lower: &str, text_lower: &str) -> bool {
+        if !path_lower.starts_with("artemis://") {
+            return false;
+        }
+        match self {
+            Self::NetworkInternet => {
+                path_lower.contains("/network/")
+                    || path_lower.contains("/netstat/")
+                    || path_lower.contains("/proc/net/")
+                    || text_lower.contains("networkconnection [")
+                    || text_lower.contains("live internet connection")
+                    || text_lower.contains("network socket [")
+            }
+            Self::AntivirusBlocked => {
+                path_lower.contains("windows_defender")
+                    || path_lower.contains("windows_codeintegrity")
+                    || text_lower.contains("defender")
+                    || text_lower.contains("codeintegrity")
+                    || text_lower.contains("quarantin")
+                    || text_lower.contains("malware")
+                    || text_lower.contains("trojan")
+                    || text_lower.contains("blocked")
+            }
+            Self::ProcessExecution => {
+                path_lower.contains("/process")
+                    || text_lower.contains("processexecution [")
+            }
+            Self::RegistryPersistence => {
+                path_lower.contains("/registry")
+                    || text_lower.contains("registrypersistence [")
+            }
+            Self::PrefetchExecution => {
+                path_lower.contains("/prefetch")
+                    || text_lower.contains("prefetchamcacheexecution [")
+            }
+            Self::ServiceDaemon => {
+                path_lower.contains("/service")
+                    || path_lower.contains("/launchd")
+                    || path_lower.contains("/systemd")
+                    || text_lower.contains("servicedaemon [")
+            }
+            Self::EventLogGeneral => true,
+        }
+    }
+
+    /// Live OS telemetry categories to refresh on-demand in `chat.rs`.
+    pub fn live_categories(self) -> Vec<String> {
+        match self {
+            Self::NetworkInternet => vec![
+                "network_connection".to_string(),
+                "process_execution".to_string(),
+            ],
+            Self::ProcessExecution => vec!["process_execution".to_string()],
+            Self::RegistryPersistence => vec!["registry_persistence".to_string()],
+            Self::PrefetchExecution => vec!["prefetch_amcache_execution".to_string()],
+            Self::ServiceDaemon => vec!["service_daemon".to_string()],
+            Self::AntivirusBlocked | Self::EventLogGeneral => vec![
+                "system_event_log".to_string(),
+                "process_execution".to_string(),
+                "network_connection".to_string(),
+            ],
+        }
+    }
+
+    /// Minimum cache freshness TTL in seconds before re-sampling live OS state.
+    pub fn refresh_ttl_secs(self) -> i64 {
+        match self {
+            Self::NetworkInternet | Self::ProcessExecution => 10,
+            _ => 60,
+        }
+    }
+}
+
 pub struct DeterministicOfflineSynthesisEngine;
 
 impl DeterministicOfflineSynthesisEngine {
@@ -52,12 +364,16 @@ impl DeterministicOfflineSynthesisEngine {
     /// or empty after stripping metadata noise.
     pub fn is_corrupt_or_binary_chunk(raw: &str) -> bool {
         let trimmed_raw = raw.trim();
-        if trimmed_raw.starts_with("SystemEventLog [")
+        if trimmed_raw.starts_with("Artemis DFIR ")
+            || trimmed_raw.starts_with("SystemEventLog [")
             || trimmed_raw.starts_with("ProcessExecution [")
             || trimmed_raw.starts_with("RegistryPersistence [")
             || trimmed_raw.starts_with("PrefetchAmcacheExecution [")
             || trimmed_raw.starts_with("ServiceDaemon [")
             || trimmed_raw.starts_with("NetworkConnection [")
+            || trimmed_raw.contains("\nNetworkConnection [")
+            || trimmed_raw.contains("\nProcessExecution [")
+            || trimmed_raw.contains("\nSystemEventLog [")
         {
             return false;
         }
@@ -156,12 +472,19 @@ impl DeterministicOfflineSynthesisEngine {
             if trimmed.is_empty() {
                 continue;
             }
-            // Strip image indexer structural labels (`[Filename Keywords]: ...`, `[Directory Context]: ...`, `[OCR Text]:`)
+            // Strip image indexer structural labels (`[Filename Keywords]: ...`, `[Directory Context]: ...`, `[OCR Text]`, `Format: ...`, `Resolution: ...`)
             // and any residual OpenXML ZIP manifest lines (`[Content_Types].xml`, `_rels/.rels`, `word/document.xml`)
             let tl_manifest = trimmed.to_ascii_lowercase();
             if trimmed.starts_with("[Filename Keywords]:")
                 || trimmed.starts_with("[Directory Context]:")
-                || trimmed.eq_ignore_ascii_case("[OCR Text]:")
+                || tl_manifest.starts_with("[image document:")
+                || tl_manifest == "[ocr text]"
+                || tl_manifest == "[ocr text]:"
+                || tl_manifest == "[visual description]"
+                || tl_manifest == "[visual description]:"
+                || tl_manifest.starts_with("format: ")
+                || tl_manifest.starts_with("resolution: ")
+                || tl_manifest.starts_with("dimensions: ")
                 || tl_manifest == "[content_types].xml"
                 || tl_manifest == "_rels/.rels"
                 || tl_manifest == "word/document.xml"
@@ -171,7 +494,10 @@ impl DeterministicOfflineSynthesisEngine {
             {
                 continue;
             }
-            if let Some(after_ocr) = trimmed.strip_prefix("[OCR Text]:") {
+            if let Some(after_ocr) = trimmed
+                .strip_prefix("[OCR Text]:")
+                .or_else(|| trimmed.strip_prefix("[OCR Text]"))
+            {
                 trimmed = after_ocr.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -720,6 +1046,9 @@ impl DeterministicOfflineSynthesisEngine {
             return (fallback, Vec::new());
         }
 
+        let forensic_intent = ForensicQueryIntent::detect(&expanded_lower)
+            .or_else(|| ForensicQueryIntent::detect(prompt_eff));
+
         // Extract query terms from expanded_query (includes follow-up coreference expansion)
         let mut query_terms: Vec<String> = expanded_lower
             .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -998,24 +1327,33 @@ impl DeterministicOfflineSynthesisEngine {
                 || path_l.ends_with(".jpeg")
                 || path_l.ends_with(".gif")
                 || path_l.ends_with(".webp");
+            let matches_forensic_artemis = is_artemis_chunk
+                && forensic_intent.map_or(false, |fi| fi.matches_artemis_chunk(&path_l, &text_l));
             let is_relevant = if query_terms.is_empty() {
                 true
             } else {
-                (total_hits >= required_query_hits && entity_hits >= required_entity_hits)
+                matches_forensic_artemis
+                    || (is_artemis_chunk && forensic_intent.is_some() && total_hits >= 1)
+                    || (total_hits >= required_query_hits && entity_hits >= required_entity_hits)
                     || (!proper_terms.is_empty() && proper_hits == proper_terms.len())
-                    || (scored.source_peer != "local" && total_hits >= 1)
-                    || (is_image_chunk && total_hits >= 1)
+                    || (scored.source_peer != "local" && total_hits >= 1 && forensic_intent.is_none())
+                    || (is_image_chunk && total_hits >= 1 && forensic_intent.is_none())
             };
 
             if is_relevant {
                 // Deduplicate chunks with identical normalized content prefix WITHIN the same peer
-                // so duplicate local PDF/DOCX copies don't bloat context, while NEVER dropping remote peer copies!
+                // so duplicate local PDF/DOCX copies don't bloat context, while NEVER dropping remote peer copies
+                // or distinct Artemis DFIR records collected at the same timestamp!
                 let norm_key: String = text_l
                     .chars()
                     .filter(|c| c.is_alphanumeric())
                     .take(120)
                     .collect();
-                let peer_snippet_key = format!("{}::{}", scored.source_peer, norm_key);
+                let peer_snippet_key = if is_artemis_chunk {
+                    format!("{}::{}::{}", scored.source_peer, path_l, norm_key)
+                } else {
+                    format!("{}::{}", scored.source_peer, norm_key)
+                };
                 if norm_key.len() >= 20 && seen_snippets.contains(&peer_snippet_key) {
                     continue;
                 }
@@ -1044,22 +1382,44 @@ impl DeterministicOfflineSynthesisEngine {
                     .count();
 
                 let mut doc_bonus = (file_hits as i32) * 160 + (prompt_entity_hits as i32) * 320;
-                if is_artemis_chunk
-                    && (expanded_lower.contains("antivirus")
-                        || expanded_lower.contains("defender")
-                        || expanded_lower.contains("codeintegrity")
-                        || expanded_lower.contains("malware")
-                        || expanded_lower.contains("trojan")
-                        || (expanded_lower.contains("process") && expanded_lower.contains("block")))
-                {
-                    doc_bonus += 450;
-                    if file_l.contains("/eventlog/windows_defender")
-                        || file_l.contains("/eventlog/windows_codeintegrity")
-                    {
-                        doc_bonus += 350;
-                    }
-                    if file_l.ends_with("_0") {
-                        doc_bonus += 150;
+                if let Some(fi) = forensic_intent {
+                    if is_artemis_chunk {
+                        doc_bonus += 550;
+                        if fi.matches_artemis_chunk(&path_l, &text_l) {
+                            doc_bonus += 700;
+                        }
+                        match fi {
+                            ForensicQueryIntent::NetworkInternet => {
+                                if path_l.contains("/network/internet_")
+                                    || text_l.contains("scope='external_internet'")
+                                    || text_l.contains("live internet connection")
+                                {
+                                    doc_bonus += 550;
+                                }
+                                if text_l.contains("state='established'")
+                                    || text_l.contains("(established)")
+                                {
+                                    doc_bonus += 180;
+                                }
+                            }
+                            ForensicQueryIntent::AntivirusBlocked => {
+                                if path_l.contains("/eventlog/windows_defender")
+                                    || path_l.contains("/eventlog/windows_codeintegrity")
+                                    || file_l.contains("windows_defender")
+                                    || file_l.contains("windows_codeintegrity")
+                                {
+                                    doc_bonus += 350;
+                                }
+                            }
+                            _ => {}
+                        }
+                        if path_l.ends_with("_0") {
+                            doc_bonus += 260;
+                        } else if path_l.ends_with("_1") {
+                            doc_bonus += 120;
+                        }
+                    } else {
+                        doc_bonus -= 600;
                     }
                 }
                 if file_l.ends_with(".docx") || file_l.ends_with(".pdf") || file_l.ends_with(".doc") {
@@ -1079,7 +1439,7 @@ impl DeterministicOfflineSynthesisEngine {
                     || expanded_lower.contains("studied")
                     || expanded_lower.contains("graduated")
                     || expanded_lower.contains("transcript");
-                if asks_education {
+                if asks_education && forensic_intent.is_none() {
                     if !text_l.contains("education")
                         && !text_l.contains("university")
                         && !text_l.contains("college")
@@ -1101,7 +1461,7 @@ impl DeterministicOfflineSynthesisEngine {
                     || expanded_lower.contains("career")
                     || expanded_lower.contains("background");
                 let asks_author_works = Self::is_authorship_query(&expanded_lower);
-                if asks_profile && !asks_author_works
+                if asks_profile && !asks_author_works && forensic_intent.is_none()
                     && (file_l.contains("cv")
                         || file_l.contains("resume")
                         || text_l.contains("professional summary")
@@ -1135,11 +1495,7 @@ impl DeterministicOfflineSynthesisEngine {
         // When the current prompt introduces its own specific entity term (e.g. "does he have cissp"),
         // if any matched chunk contains that specific prompt entity term, filter out chunks that lack it
         // so carry-over context documents (like RedactX) never drown out the target answer documents!
-        let asks_av_or_forensic = expanded_lower.contains("antivirus")
-            || expanded_lower.contains("defender")
-            || expanded_lower.contains("codeintegrity")
-            || expanded_lower.contains("eventlog")
-            || (expanded_lower.contains("process") && expanded_lower.contains("block"));
+        let asks_av_or_forensic = forensic_intent.is_some();
 
         if !prompt_only_entities.is_empty() && !asks_av_or_forensic {
             let req_prompt_hits = if prompt_only_entities.len() == 2 {
@@ -1168,24 +1524,48 @@ impl DeterministicOfflineSynthesisEngine {
             }
         }
 
-        if asks_av_or_forensic {
-            let has_eventlog_av = scored_matches.iter().any(|(c, _, _, _)| {
+        if let Some(fi) = forensic_intent {
+            let has_eventlog_av = fi == ForensicQueryIntent::AntivirusBlocked
+                && scored_matches.iter().any(|(c, _, _, _)| {
+                    let fl = c.chunk.file_path.to_ascii_lowercase();
+                    fl.contains("/eventlog/windows_defender")
+                        || fl.contains("/eventlog/windows_codeintegrity")
+                });
+            let has_category_artemis = scored_matches.iter().any(|(c, _, _, _)| {
                 let fl = c.chunk.file_path.to_ascii_lowercase();
-                fl.contains("/eventlog/windows_defender")
-                    || fl.contains("/eventlog/windows_codeintegrity")
+                let tl = c.chunk.text_content.to_ascii_lowercase();
+                fi.matches_artemis_chunk(&fl, &tl)
             });
+            let has_any_artemis = scored_matches
+                .iter()
+                .any(|(c, _, _, _)| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"));
+
             if has_eventlog_av {
                 scored_matches.retain(|(c, _, _, _)| {
                     let fl = c.chunk.file_path.to_ascii_lowercase();
                     fl.contains("/eventlog/windows_defender")
                         || fl.contains("/eventlog/windows_codeintegrity")
                 });
-            } else if scored_matches
-                .iter()
-                .any(|(c, _, _, _)| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"))
-            {
+            } else if has_category_artemis {
+                scored_matches.retain(|(c, _, _, _)| {
+                    let fl = c.chunk.file_path.to_ascii_lowercase();
+                    let tl = c.chunk.text_content.to_ascii_lowercase();
+                    fi.matches_artemis_chunk(&fl, &tl)
+                });
+            } else if has_any_artemis {
                 scored_matches.retain(|(c, _, _, _)| {
                     c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://")
+                });
+            } else {
+                // Never fabricate host forensic answers out of unrelated thesis, resume, or EULA documents!
+                scored_matches.retain(|(c, _, _, _)| {
+                    let tl = c.chunk.text_content.to_ascii_lowercase();
+                    tl.contains("networkconnection [")
+                        || tl.contains("processexecution [")
+                        || tl.contains("systemeventlog [")
+                        || tl.contains("registrypersistence [")
+                        || tl.contains("prefetchamcacheexecution [")
+                        || tl.contains("servicedaemon [")
                 });
             }
         }
@@ -1216,17 +1596,35 @@ impl DeterministicOfflineSynthesisEngine {
             }
         }
 
-        // Sort by entity hits, then total query term hits, then document quality bonus, then hybrid RRF/vector score
-        scored_matches.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| b.2.cmp(&a.2))
-                .then_with(|| b.3.cmp(&a.3))
-                .then_with(|| {
-                    b.0.score
-                        .partial_cmp(&a.0.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-        });
+        // Sort forensic queries primarily by category/recency bonus and collected timestamp,
+        // and general RAG queries by entity hits, query term hits, document quality bonus, and hybrid RRF score.
+        if forensic_intent.is_some() {
+            scored_matches.sort_by(|a, b| {
+                b.3.cmp(&a.3)
+                    .then_with(|| {
+                        Self::extract_collected_unix_secs(&b.0.chunk)
+                            .cmp(&Self::extract_collected_unix_secs(&a.0.chunk))
+                    })
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| {
+                        b.0.score
+                            .partial_cmp(&a.0.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            });
+        } else {
+            scored_matches.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| b.3.cmp(&a.3))
+                    .then_with(|| {
+                        b.0.score
+                            .partial_cmp(&a.0.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            });
+        }
 
         let ui = crate::dlp_mesh::global_mesh_dlp_controller()
             .settings
@@ -1245,25 +1643,28 @@ impl DeterministicOfflineSynthesisEngine {
         // Keep top N deduplicated RAG chunks for comprehensive multi-paragraph synthesis,
         // prioritizing distinct remote peers first and interleaving matched remote peer chunks (`source_peer != "local"`)
         // right after slot 0 so Ollama chat, fast-model retry, and offline synthesis all cite `(mesh)` peers prominently!
+        // Never interleave remote mesh chunks on local-only Artemis DFIR forensic queries.
         let mut matched_remote_chunks: Vec<ScoredChunk> = Vec::new();
-        let mut seen_remote_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| c.source_peer != "local") {
-            if seen_remote_peers.insert(c.source_peer.clone()) {
-                matched_remote_chunks.push((*c).clone());
-                if matched_remote_chunks.len() >= 4 {
-                    break;
-                }
-            }
-        }
-        if matched_remote_chunks.len() < 4 {
+        if forensic_intent.is_none() {
+            let mut seen_remote_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| c.source_peer != "local") {
-                if !matched_remote_chunks
-                    .iter()
-                    .any(|m| m.source_peer == c.source_peer && m.chunk.chunk_id == c.chunk.chunk_id)
-                {
+                if seen_remote_peers.insert(c.source_peer.clone()) {
                     matched_remote_chunks.push((*c).clone());
                     if matched_remote_chunks.len() >= 4 {
                         break;
+                    }
+                }
+            }
+            if matched_remote_chunks.len() < 4 {
+                for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| c.source_peer != "local") {
+                    if !matched_remote_chunks
+                        .iter()
+                        .any(|m| m.source_peer == c.source_peer && m.chunk.chunk_id == c.chunk.chunk_id)
+                    {
+                        matched_remote_chunks.push((*c).clone());
+                        if matched_remote_chunks.len() >= 4 {
+                            break;
+                        }
                     }
                 }
             }
@@ -1274,7 +1675,7 @@ impl DeterministicOfflineSynthesisEngine {
             .map(|(c, _, _, _)| (*c).clone())
             .collect();
 
-        if asks_av_or_forensic && candidate_chunks.len() > 2 {
+        if forensic_intent == Some(ForensicQueryIntent::AntivirusBlocked) && candidate_chunks.len() > 2 {
             if let Some(ci_pos) = candidate_chunks.iter().position(|c| {
                 let fl = c.chunk.file_path.to_ascii_lowercase();
                 fl.contains("windows_codeintegrity_blocked_process_event_3077")
@@ -1287,43 +1688,47 @@ impl DeterministicOfflineSynthesisEngine {
             }
         }
 
-        // Preserve multimodal image chunks matching the query in candidate_chunks
-        for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| {
-            let path_l = c.chunk.file_path.to_ascii_lowercase();
-            path_l.ends_with(".png")
-                || path_l.ends_with(".jpg")
-                || path_l.ends_with(".jpeg")
-                || path_l.ends_with(".gif")
-                || path_l.ends_with(".webp")
-                || c.chunk.text_content.starts_with("[Image Document:")
-        }) {
-            if !candidate_chunks.iter().any(|existing| existing.chunk.chunk_id == c.chunk.chunk_id) {
-                candidate_chunks.push((*c).clone());
+        // Preserve multimodal image chunks matching the query in candidate_chunks (except for host forensic queries)
+        if forensic_intent.is_none() {
+            for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| {
+                let path_l = c.chunk.file_path.to_ascii_lowercase();
+                path_l.ends_with(".png")
+                    || path_l.ends_with(".jpg")
+                    || path_l.ends_with(".jpeg")
+                    || path_l.ends_with(".gif")
+                    || path_l.ends_with(".webp")
+                    || c.chunk.text_content.starts_with("[Image Document:")
+            }) {
+                if !candidate_chunks.iter().any(|existing| existing.chunk.chunk_id == c.chunk.chunk_id) {
+                    candidate_chunks.push((*c).clone());
+                }
             }
         }
 
-        if ui.parent_document_retrieval {
+        if ui.parent_document_retrieval && forensic_intent.is_none() {
             candidate_chunks = Self::stitch_parent_document_chunks(candidate_chunks);
         }
 
-        let mut remote_insert_cursor = 1usize.min(candidate_chunks.len());
-        for rem in matched_remote_chunks {
-            if let Some(existing_pos) = candidate_chunks
-                .iter()
-                .position(|c| c.source_peer == rem.source_peer && c.chunk.file_path == rem.chunk.file_path)
-            {
-                if existing_pos <= remote_insert_cursor {
-                    remote_insert_cursor = (existing_pos + 1).min(candidate_chunks.len());
-                    continue;
+        if forensic_intent.is_none() {
+            let mut remote_insert_cursor = 1usize.min(candidate_chunks.len());
+            for rem in matched_remote_chunks {
+                if let Some(existing_pos) = candidate_chunks
+                    .iter()
+                    .position(|c| c.source_peer == rem.source_peer && c.chunk.file_path == rem.chunk.file_path)
+                {
+                    if existing_pos <= remote_insert_cursor {
+                        remote_insert_cursor = (existing_pos + 1).min(candidate_chunks.len());
+                        continue;
+                    }
+                    let promoted = candidate_chunks.remove(existing_pos);
+                    let target_idx = remote_insert_cursor.min(candidate_chunks.len());
+                    candidate_chunks.insert(target_idx, promoted);
+                    remote_insert_cursor = (target_idx + 1).min(candidate_chunks.len());
+                } else {
+                    let target_idx = remote_insert_cursor.min(candidate_chunks.len());
+                    candidate_chunks.insert(target_idx, rem);
+                    remote_insert_cursor = (target_idx + 1).min(candidate_chunks.len());
                 }
-                let promoted = candidate_chunks.remove(existing_pos);
-                let target_idx = remote_insert_cursor.min(candidate_chunks.len());
-                candidate_chunks.insert(target_idx, promoted);
-                remote_insert_cursor = (target_idx + 1).min(candidate_chunks.len());
-            } else {
-                let target_idx = remote_insert_cursor.min(candidate_chunks.len());
-                candidate_chunks.insert(target_idx, rem);
-                remote_insert_cursor = (target_idx + 1).min(candidate_chunks.len());
             }
         }
 
@@ -1337,7 +1742,50 @@ impl DeterministicOfflineSynthesisEngine {
         if !matched_chunk_refs.is_empty() {
             let mut citations: Vec<Citation> = Self::build_deduplicated_citations(&matched_chunk_refs);
 
-            // 1. Use the local LLM strictly to orchestrate a natural, direct, citation-backed answer
+            // 1. Deterministic Artemis DFIR fast-path when forensic telemetry chunks matched:
+            // delivers instant, verbatim-grounded host forensic reporting without LLM paraphrasing or contamination.
+            let client_disconnected = telemetry_tx.map(|tx| tx.is_closed()).unwrap_or(false);
+            if client_disconnected {
+                let citations: Vec<Citation> = chunks.iter().map(|c| c.to_citation()).collect();
+                return ("Request cancelled by client.".to_string(), citations);
+            }
+
+            if let Some(fi) = forensic_intent {
+                if matched_chunk_refs
+                    .iter()
+                    .any(|c| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"))
+                {
+                    let clean_answer =
+                        Self::synthesize_artemis_forensic_answer(fi, prompt_eff, &matched_chunk_refs);
+                    let sources_block = Self::format_sources_block(&matched_chunk_refs);
+                    let synthesized_rag = format!("{}{}", clean_answer, sources_block);
+                    if let Some(tx) = telemetry_tx {
+                        for word in synthesized_rag.split_inclusive(' ') {
+                            if tx.is_closed() {
+                                break;
+                            }
+                            if !Self::send_telemetry(
+                                tx,
+                                AgenticTelemetryEvent::TokenDelta {
+                                    delta: word.to_string(),
+                                },
+                            ) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(4));
+                        }
+                    }
+                    crate::rlm_orchestrator::RlmOrchestrator::verify_and_attach_verbatim_grounding(
+                        prompt_eff,
+                        &clean_answer,
+                        &matched_chunk_refs,
+                        &mut citations,
+                    );
+                    return (synthesized_rag, citations);
+                }
+            }
+
+            // 1b. Use the local LLM strictly to orchestrate a natural, direct, citation-backed answer
             // from the retrieved local RAG chunks (never invoked when matched_chunks is empty).
             let effective_question = if is_continuation && query_source_eff != prompt_eff {
                 format!(
@@ -1349,11 +1797,6 @@ impl DeterministicOfflineSynthesisEngine {
             } else {
                 prompt_eff.to_string()
             };
-            let client_disconnected = telemetry_tx.map(|tx| tx.is_closed()).unwrap_or(false);
-            if client_disconnected {
-                let citations: Vec<Citation> = chunks.iter().map(|c| c.to_citation()).collect();
-                return ("Request cancelled by client.".to_string(), citations);
-            }
             let all_artemis_forensic = asks_av_or_forensic
                 && matched_chunk_refs
                     .iter()
@@ -1640,10 +2083,26 @@ impl DeterministicOfflineSynthesisEngine {
             );
             (synthesized_rag, citations)
         } else {
-            let fallback = format!(
-                "No matching documents were found in your local RAG index for **{}**.",
-                prompt
-            );
+            let fallback = if let Some(fi) = forensic_intent {
+                let cat_desc = match fi {
+                    ForensicQueryIntent::NetworkInternet => "active internet/network socket connections",
+                    ForensicQueryIntent::AntivirusBlocked => "antivirus / CodeIntegrity blocked process events",
+                    ForensicQueryIntent::ProcessExecution => "live process execution records",
+                    ForensicQueryIntent::RegistryPersistence => "Registry Run/RunOnce persistence entries",
+                    ForensicQueryIntent::PrefetchExecution => "Prefetch / Amcache execution records",
+                    ForensicQueryIntent::ServiceDaemon => "system service / daemon records",
+                    ForensicQueryIntent::EventLogGeneral => "host forensic event log records",
+                };
+                format!(
+                    "No matching Artemis DFIR telemetry records ({}) or documents were found in your local RAG index for **{}**. Open **Settings → Artemis DFIR** and click **Collect Live OS Telemetry** (or enable Local Collection) to index live host forensic artifacts.",
+                    cat_desc, prompt
+                )
+            } else {
+                format!(
+                    "No matching documents were found in your local RAG index for **{}**.",
+                    prompt
+                )
+            };
             if let Some(tx) = telemetry_tx {
                 for word in fallback.split_inclusive(' ') {
                     if tx.is_closed() {
@@ -1976,9 +2435,36 @@ impl DeterministicOfflineSynthesisEngine {
             return String::new();
         }
         let lower = clean_prompt.to_ascii_lowercase();
-        if Self::is_continuation_query(&lower) {
+        if Self::is_continuation_query(&lower) || ForensicQueryIntent::detect(&lower).is_some() {
             return String::new();
         }
+
+        let is_clause_or_malformed_tail = |raw: &str| -> bool {
+            let rl = raw.trim().to_ascii_lowercase();
+            rl.is_empty()
+                || rl.starts_with("was ")
+                || rl.starts_with("is ")
+                || rl.starts_with("were ")
+                || rl.starts_with("are ")
+                || rl.starts_with("did ")
+                || rl.starts_with("does ")
+                || rl.starts_with("do ")
+                || rl.starts_with("has ")
+                || rl.starts_with("have ")
+                || rl.starts_with("had ")
+                || rl.starts_with("can ")
+                || rl.starts_with("could ")
+                || rl.starts_with("should ")
+                || rl.starts_with("would ")
+                || rl.starts_with("will ")
+                || rl.starts_with("the last ")
+                || rl.starts_with("the latest ")
+                || rl.starts_with("the most recent ")
+                || rl.starts_with("last ")
+                || rl.starts_with("latest ")
+                || rl.contains(" to access ")
+                || rl.contains(" blocked by ")
+        };
 
         let capitalize = |s: &str| -> String {
             s.split_whitespace()
@@ -2000,36 +2486,60 @@ impl DeterministicOfflineSynthesisEngine {
         // 1. "who is / who was / who are / who were"
         if lower.starts_with("who is ") {
             let raw = clean_prompt["who is ".len()..].trim();
+            if is_clause_or_malformed_tail(raw) {
+                return String::new();
+            }
             return format!("{} is ", capitalize(raw));
         }
         if lower.starts_with("who was ") {
             let raw = clean_prompt["who was ".len()..].trim();
+            if is_clause_or_malformed_tail(raw) {
+                return String::new();
+            }
             return format!("{} was ", capitalize(raw));
         }
         if lower.starts_with("who are ") {
             let raw = clean_prompt["who are ".len()..].trim();
+            if is_clause_or_malformed_tail(raw) {
+                return String::new();
+            }
             return format!("{} are ", capitalize(raw));
         }
         if lower.starts_with("who were ") {
             let raw = clean_prompt["who were ".len()..].trim();
+            if is_clause_or_malformed_tail(raw) {
+                return String::new();
+            }
             return format!("{} were ", capitalize(raw));
         }
 
         // 2. "what is / what was / what are / what were"
         if lower.starts_with("what is ") {
             let raw = clean_prompt["what is ".len()..].trim();
+            if is_clause_or_malformed_tail(raw) {
+                return String::new();
+            }
             return format!("{} is ", capitalize(raw));
         }
         if lower.starts_with("what was ") {
             let raw = clean_prompt["what was ".len()..].trim();
+            if is_clause_or_malformed_tail(raw) {
+                return String::new();
+            }
             return format!("{} was ", capitalize(raw));
         }
         if lower.starts_with("what are ") {
             let raw = clean_prompt["what are ".len()..].trim();
+            if is_clause_or_malformed_tail(raw) {
+                return String::new();
+            }
             return format!("{} are ", capitalize(raw));
         }
         if lower.starts_with("what were ") {
             let raw = clean_prompt["what were ".len()..].trim();
+            if is_clause_or_malformed_tail(raw) {
+                return String::new();
+            }
             return format!("{} were ", capitalize(raw));
         }
 
@@ -2238,6 +2748,215 @@ impl DeterministicOfflineSynthesisEngine {
         }
         // Bare noun-phrase topic ("African Churches and Gang Violence") -> "African Churches And Gang Violence — "
         format!("{} — ", capitalize(clean_prompt))
+    }
+
+    fn extract_collected_unix_secs(chunk: &quorum_types::DocumentChunk) -> i64 {
+        let meta_str = chunk.metadata_json.trim();
+        if meta_str.is_empty() {
+            return 0;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(meta_str) else {
+            return 0;
+        };
+        val.get("collected_unix_secs")
+            .and_then(|v| v.as_i64())
+            .or_else(|| val.get("ingested_unix_secs").and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+    }
+
+    fn extract_forensic_kv(text: &str, key: &str) -> Option<String> {
+        let quoted_pat = format!("{}='", key);
+        if let Some(start) = text.find(&quoted_pat) {
+            let rest = &text[start + quoted_pat.len()..];
+            if let Some(end) = rest.find('\'') {
+                let v = rest[..end].trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        let plain_pat = format!("{}=", key);
+        if let Some(start) = text.find(&plain_pat) {
+            let rest = &text[start + plain_pat.len()..];
+            if !rest.starts_with('\'') {
+                let end = rest
+                    .find(|c: char| c == ',' || c == '\n' || c == '\r' || c.is_whitespace())
+                    .unwrap_or(rest.len());
+                let v = rest[..end].trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Synthesizes a direct, verbatim-grounded Artemis DFIR forensic answer strictly from `artemis://` host telemetry chunks.
+    pub fn synthesize_artemis_forensic_answer(
+        intent: ForensicQueryIntent,
+        _prompt: &str,
+        matched_chunks: &[&ScoredChunk],
+    ) -> String {
+        if matched_chunks.is_empty() {
+            return String::new();
+        }
+
+        let top = matched_chunks[0];
+        let top_text = Self::clean_chunk_text(&top.chunk.text_content);
+        let top_path = top.chunk.file_path.as_str();
+
+        let lead = match intent {
+            ForensicQueryIntent::NetworkInternet => {
+                let proc_name = Self::extract_forensic_kv(&top_text, "process");
+                let pid = Self::extract_forensic_kv(&top_text, "pid");
+                let image = Self::extract_forensic_kv(&top_text, "image");
+                let proto = Self::extract_forensic_kv(&top_text, "protocol")
+                    .unwrap_or_else(|| "TCP".to_string());
+                let state = Self::extract_forensic_kv(&top_text, "state")
+                    .unwrap_or_else(|| "ACTIVE".to_string());
+                let scope = Self::extract_forensic_kv(&top_text, "scope").unwrap_or_default();
+                let local = Self::extract_forensic_kv(&top_text, "local").unwrap_or_default();
+                let remote = Self::extract_forensic_kv(&top_text, "remote").unwrap_or_default();
+
+                let is_ext = scope == "external_internet"
+                    || top_text.contains("Live Internet Connection")
+                    || top_path.contains("/network/internet_");
+
+                if is_ext && (proc_name.is_some() || pid.is_some()) {
+                    let p_label = proc_name
+                        .clone()
+                        .unwrap_or_else(|| format!("PID {}", pid.as_deref().unwrap_or("0")));
+                    let pid_clause = pid
+                        .as_deref()
+                        .filter(|p| *p != "0")
+                        .map(|p| format!(" (PID `{}`)", p))
+                        .unwrap_or_default();
+                    let img_clause = image
+                        .as_deref()
+                        .filter(|im| !im.is_empty() && Some(*im) != proc_name.as_deref())
+                        .map(|im| format!(", executable `{}`", im))
+                        .unwrap_or_default();
+                    format!(
+                        "According to **Artemis DFIR** host network telemetry (`{}`), the most recent process observed accessing the external internet on this asset is **`{}`**{}{} over **{} ({})** from local socket `{}` to remote public endpoint **`{}`** **[1]**.",
+                        top_path, p_label, pid_clause, img_clause, proto, state, local, remote
+                    )
+                } else if proc_name.is_some() || !remote.is_empty() {
+                    let p_label = proc_name
+                        .unwrap_or_else(|| format!("PID {}", pid.as_deref().unwrap_or("unknown")));
+                    let scope_note = if !is_ext {
+                        " (no active public external-IP `ESTABLISHED` socket was open at snapshot time; showing the top active host network socket)"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "According to **Artemis DFIR** host network telemetry (`{}`), the top recorded network socket belongs to **`{}`** (`{}` `{}`, `{}` → **`{}`**){} **[1]**.",
+                        top_path, p_label, proto, state, local, remote, scope_note
+                    )
+                } else {
+                    let first_line = top_text.lines().next().unwrap_or(top_text.as_str()).trim();
+                    format!(
+                        "**Artemis DFIR** host network telemetry (`{}`): {} **[1]**",
+                        top_path, first_line
+                    )
+                }
+            }
+            ForensicQueryIntent::AntivirusBlocked => {
+                let channel = Self::extract_forensic_kv(&top_text, "channel").unwrap_or_default();
+                let event_id = Self::extract_forensic_kv(&top_text, "event_id").unwrap_or_default();
+                let date = Self::extract_forensic_kv(&top_text, "date").unwrap_or_default();
+                let first_line = top_text
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with("SystemEventLog ["))
+                    .or_else(|| top_text.lines().map(str::trim).find(|l| !l.is_empty()))
+                    .unwrap_or("");
+                let meta_clause = if !channel.is_empty() || !event_id.is_empty() {
+                    let d_part = if date.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" at `{}`", date)
+                    };
+                    format!(" (`{}` Event ID `{}`{})", channel, event_id, d_part)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "According to **Artemis DFIR** security event telemetry (`{}`){}: {} **[1]**",
+                    top_path, meta_clause, first_line
+                )
+            }
+            ForensicQueryIntent::ProcessExecution => {
+                let image = Self::extract_forensic_kv(&top_text, "image").unwrap_or_default();
+                let cmdline = Self::extract_forensic_kv(&top_text, "cmdline").unwrap_or_default();
+                let pid = Self::extract_forensic_kv(&top_text, "pid").unwrap_or_default();
+                let user = Self::extract_forensic_kv(&top_text, "user").unwrap_or_default();
+                if !image.is_empty() || !cmdline.is_empty() {
+                    let display_bin = if !image.is_empty() {
+                        image.as_str()
+                    } else {
+                        cmdline.as_str()
+                    };
+                    let pid_part = if !pid.is_empty() && pid != "0" {
+                        format!(" (PID `{}`)", pid)
+                    } else {
+                        String::new()
+                    };
+                    let user_part = if !user.is_empty() {
+                        format!(", user `{}`", user)
+                    } else {
+                        String::new()
+                    };
+                    let cmd_part = if !cmdline.is_empty() && cmdline != image {
+                        format!(" with command line `{}`", cmdline)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "According to **Artemis DFIR** process telemetry (`{}`), the most recent recorded process execution on this asset is **`{}`**{}{}{} **[1]**.",
+                        top_path, display_bin, pid_part, user_part, cmd_part
+                    )
+                } else {
+                    let first_line = top_text.lines().next().unwrap_or(top_text.as_str()).trim();
+                    format!("**Artemis DFIR** process telemetry (`{}`): {} **[1]**", top_path, first_line)
+                }
+            }
+            ForensicQueryIntent::RegistryPersistence
+            | ForensicQueryIntent::PrefetchExecution
+            | ForensicQueryIntent::ServiceDaemon
+            | ForensicQueryIntent::EventLogGeneral => {
+                let first_line = top_text
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("");
+                format!(
+                    "**Artemis DFIR** host forensic telemetry (`{}`): {} **[1]**",
+                    top_path, first_line
+                )
+            }
+        };
+
+        let mut out = String::new();
+        out.push_str(&lead);
+        out.push_str("\n\n### Artemis DFIR Host Telemetry Evidence\n\n");
+        for (idx, c) in matched_chunks.iter().take(6).enumerate() {
+            let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
+            let compact_lines: Vec<&str> = cleaned
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            if compact_lines.is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "- **[{}]** (`{}`): {}\n",
+                idx + 1,
+                c.chunk.file_path,
+                compact_lines.join(" | ")
+            ));
+        }
+        out.trim_end().to_string()
     }
 
     /// Strips any trailing Markdown sources footer from an assistant message so continuation history
@@ -4733,18 +5452,24 @@ impl DeterministicOfflineSynthesisEngine {
             // Never prune candidate chunks on exhaustive authorship enumeration queries
             return chunks.to_vec();
         }
+        let prompt_l = prompt.to_ascii_lowercase();
+        let asks_image = prompt_l.contains("image")
+            || prompt_l.contains("photo")
+            || prompt_l.contains("picture")
+            || prompt_l.contains("screenshot");
         let threshold = ((best * 3 + 3) / 4).max(1);
         let remote_threshold = ((best + 1) / 2).max(1);
         let kept: Vec<&'a ScoredChunk> = scored
             .into_iter()
             .filter(|(n, c)| {
                 let path_l = c.chunk.file_path.to_ascii_lowercase();
-                if crate::vision::is_image_chunk_text(&c.chunk.text_content)
-                    || path_l.ends_with(".png")
-                    || path_l.ends_with(".jpg")
-                    || path_l.ends_with(".jpeg")
-                    || path_l.ends_with(".gif")
-                    || path_l.ends_with(".webp")
+                if (asks_image || *n > 0)
+                    && (crate::vision::is_image_chunk_text(&c.chunk.text_content)
+                        || path_l.ends_with(".png")
+                        || path_l.ends_with(".jpg")
+                        || path_l.ends_with(".jpeg")
+                        || path_l.ends_with(".gif")
+                        || path_l.ends_with(".webp"))
                 {
                     return true;
                 }
@@ -8418,6 +9143,28 @@ mod tests {
         );
         assert!(cleaned_other.contains("### Who Is Femi Oyesanya"), "Typo heading must be normalized: got '{}'", cleaned_other);
         assert!(!cleaned_other.contains("### Whi Is"), "Typo heading must not echo 'Whi'");
+    }
+
+    #[test]
+    fn test_clean_chunk_text_strips_image_exif_and_ocr_headers() {
+        let raw = "[Image Document: Screenshot 2026-10-25 192839.png]\n\
+                   Format: PNG (image/png)\n\
+                   Resolution: 776x641 pixels (Aspect Ratio: 1.21:1, Channels: 4, Bit Depth: 8-bit, File Size: 34 KB)\n\
+                   [OCR Text]\n\
+                   File Edit View Misc Packages Windows Help R Console";
+        let cleaned = DeterministicOfflineSynthesisEngine::clean_chunk_text(raw);
+        assert!(!cleaned.contains("Resolution:"), "must strip Resolution: metadata line; got: {}", cleaned);
+        assert!(!cleaned.contains("Format:"), "must strip Format: metadata line; got: {}", cleaned);
+        assert!(!cleaned.contains("[OCR Text]"), "must strip bare [OCR Text] tag; got: {}", cleaned);
+        assert!(cleaned.contains("R Console"), "must preserve actual OCR body text; got: {}", cleaned);
+    }
+
+    #[test]
+    fn test_forensic_internet_process_intent_matches_grammatical_variant() {
+        assert_eq!(
+            ForensicQueryIntent::detect("What is process are accessing the internet"),
+            Some(ForensicQueryIntent::NetworkInternet)
+        );
     }
 }
 

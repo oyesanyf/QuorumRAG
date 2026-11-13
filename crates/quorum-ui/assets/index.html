@@ -248,7 +248,7 @@
           <input type="hidden" id="reindex-target-path" value="">
           <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:6px;">
             <span id="reindex-selected-folder-badge" class="status-pill healthy" style="font-size:12.5px; padding:5px 12px;">💽 All Watched Drives &amp; Folders</span>
-            <button type="button" class="pill-btn" id="btn-browse-reindex-folder" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">📂 Browse &amp; Select Folder...</button>
+            <button type="button" class="pill-btn" id="btn-browse-reindex-folder" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600;">📁 Select Folder</button>
             <button type="button" class="pill-btn hidden" id="btn-clear-reindex-folder">✕ All Watched Drives</button>
           </div>
         </div>
@@ -455,7 +455,7 @@
         <div id="settings-tab-artemis-dfir" class="settings-tab-pane hidden" style="display:none;">
           <input type="hidden" id="artemis-jsonl-dir-input" value="">
           <div id="artemis-selected-folder-display" class="chatgpt-selected-folder-pill">No folder selected</div>
-          <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="artemis">📂 Open Pure Rust Folder Picker...</button>
+          <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="artemis">📁 Select Folder</button>
           <input type="file" id="artemis-folder-upload-input" webkitdirectory directory multiple style="display:none;">
           <div id="artemis-folder-browser-list"></div>
           <input type="checkbox" id="chk-artemis-collection-toggle" class="quorum-switch" data-action="artemis-toggle-collection">
@@ -476,15 +476,15 @@
     </section>
   </div>
 
-  <!-- PURE RUST FOLDER PICKER MODAL (Zero Windows Explorer / Zero External OS Subprocesses) -->
+  <!-- SELECT FOLDER MODAL (Drives on Asset & Subfolder Drill-Down) -->
   <div id="modal-pure-rust-folder-picker" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="pure-rust-picker-title" style="z-index: 100000;">
-    <div class="modal-card" style="max-width: 740px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
+    <div class="modal-card" style="max-width: 760px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
       <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <h3 id="pure-rust-picker-title" style="margin:0; font-size:16px;">🦀 Pure Rust Folder Picker</h3>
-          <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Folder</span>
+          <h3 id="pure-rust-picker-title" style="margin:0; font-size:16px;">📁 Select Folder</h3>
+          <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Drive or Folder</span>
         </div>
-        <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Folder Picker" aria-label="Close Folder Picker">&times;</button>
+        <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Select Folder" aria-label="Close Select Folder">&times;</button>
       </div>
       <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
         <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
@@ -495,13 +495,13 @@
           <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1; min-inline-size:0;"></div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <input type="search" id="pure-rust-picker-filter-input" class="settings-input" aria-label="Filter folders in current view" placeholder="🔍 Filter folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
+          <input type="search" id="pure-rust-picker-filter-input" class="settings-input" aria-label="Filter folders in current view" placeholder="🔍 Filter drives or folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
           <div style="display:flex; gap:6px; align-items:center;">
             <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" aria-label="New subfolder name" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
             <button type="button" class="pill-btn" id="btn-pure-rust-picker-create-folder" style="padding:5px 10px; font-size:12px; font-weight:600;">+ Create Subfolder</button>
           </div>
         </div>
-        <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:320px; min-height:200px;"></div>
+        <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:380px; min-height:240px;"></div>
       </div>
       <div class="modal-footer" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
         <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; min-inline-size:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">

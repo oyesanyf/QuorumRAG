@@ -455,12 +455,14 @@ pub async fn post_bootstrap_peers_handler(
     }
     controller.save_to_disk();
 
+    let mut dial_errors: Vec<String> = Vec::new();
     if payload.dial_now.unwrap_or(true) {
         if let Some(ref handle) = state.swarm_handle {
             for addr_str in peers_to_dial {
                 if let Ok(multiaddr) = addr_str.parse::<quorum_network::Multiaddr>() {
-                    if handle.dial(multiaddr).await.is_ok() {
-                        dialed.push(addr_str);
+                    match handle.dial_trusted(multiaddr).await {
+                        Ok(()) => dialed.push(addr_str),
+                        Err(e) => dial_errors.push(format!("{}: {}", addr_str, e)),
                     }
                 }
             }
@@ -473,6 +475,7 @@ pub async fn post_bootstrap_peers_handler(
         .unwrap_or_else(|e| e.into_inner())
         .mesh
         .clone();
+    let wan_info = crate::wan_mesh::cached_wan_telemetry();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -481,6 +484,9 @@ pub async fn post_bootstrap_peers_handler(
             "duckdns_domain": updated.duckdns_domain,
             "auto_bootstrap_duckdns": updated.auto_bootstrap_duckdns,
             "dialed_peers": dialed,
+            "dial_errors": dial_errors,
+            "external_wan_ip": wan_info.external_wan_ip,
+            "tailscale_ips": wan_info.tailscale_self_ips,
             "message": "Bootstrap peers updated and saved to config."
         })),
     )

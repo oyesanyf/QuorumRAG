@@ -636,11 +636,18 @@ pub async fn run_in_daemon_mesh_heal(state: &Arc<DaemonState>, req: HealMeshRequ
     }
 
     if let Ok(guard) = global_mesh_dlp_controller().settings.read() {
-        for bp in &guard.mesh.bootstrap_peers {
-            let clean = strip_p2p_suffix(bp.trim());
-            if clean.starts_with("/ip4/") || clean.starts_with("/dns4/") || clean.starts_with("/dns/") {
-                dial_targets.insert(clean);
-            }
+        for bp in quorum_coordinator::mesh::collect_trusted_bootstrap_multiaddrs(&guard.mesh, &[]) {
+            dial_targets.insert(bp);
+        }
+    }
+    let wan_snap = crate::wan_mesh::cached_wan_telemetry();
+    for ts_addr in wan_snap.tailscale_peer_addrs {
+        dial_targets.insert(ts_addr);
+    }
+    if wan_snap.is_duckdns_host {
+        if let Some(ref fqdn) = wan_snap.duckdns_fqdn {
+            let f_low = fqdn.to_ascii_lowercase();
+            dial_targets.retain(|a| !a.to_ascii_lowercase().contains(&f_low));
         }
     }
 
@@ -683,7 +690,7 @@ pub async fn run_in_daemon_mesh_heal(state: &Arc<DaemonState>, req: HealMeshRequ
             continue;
         }
         if let Ok(ma) = target.parse::<Multiaddr>() {
-            if handle.dial(ma).await.is_ok() {
+            if handle.dial_trusted(ma).await.is_ok() {
                 dialed_count += 1;
                 watcher.peers_redialed.fetch_add(1, Ordering::Relaxed);
             }
