@@ -115,6 +115,7 @@ async fn ensure_live_forensics_for_query(state: &Arc<DaemonState>, prompt: &str)
             intent,
             quorum_coordinator::ForensicQueryIntent::NetworkInternet
                 | quorum_coordinator::ForensicQueryIntent::ProcessExecution
+                | quorum_coordinator::ForensicQueryIntent::DnsTraffic
         );
     if must_await_synchronously {
         sync_fut.await;

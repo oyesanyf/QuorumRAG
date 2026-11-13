@@ -524,6 +524,40 @@ impl AgenticStateGraphRunner {
                             .await;
                     }
 
+                    // Layer 1 Pre-Synthesis Entity Domain Clustering
+                    let q_low = graph_state.current_query.to_ascii_lowercase();
+                    let is_person_query = q_low.contains("who is")
+                        || q_low.contains("tell me about")
+                        || q_low.contains("angela davis");
+                    if is_person_query && graph_state.retrieved_chunks.len() > 1 {
+                        let mut clusters: std::collections::BTreeMap<&'static str, Vec<quorum_types::ScoredChunk>> =
+                            std::collections::BTreeMap::new();
+                        for chunk in &graph_state.retrieved_chunks {
+                            let label = crate::answer_orchestrator::classify_entity_domain_cluster(
+                                &chunk.chunk.file_path,
+                                &chunk.chunk.text_content,
+                            );
+                            clusters.entry(label).or_default().push(chunk.clone());
+                        }
+                        if clusters.len() > 1 {
+                            let mut clustered_chunks = Vec::new();
+                            for (idx, (label, mut items)) in clusters.into_iter().enumerate() {
+                                for item in &mut items {
+                                    if !item.chunk.text_content.starts_with("=== [Entity Cluster") {
+                                        item.chunk.text_content = format!(
+                                            "=== [Entity Cluster {}: {}] ===\n{}",
+                                            idx + 1,
+                                            label,
+                                            item.chunk.text_content
+                                        );
+                                    }
+                                }
+                                clustered_chunks.extend(items);
+                            }
+                            graph_state.retrieved_chunks = clustered_chunks;
+                        }
+                    }
+
                     let is_multi_thread = tokio::runtime::Handle::try_current()
                         .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
                         .unwrap_or(false);

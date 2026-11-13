@@ -354,6 +354,9 @@ pub struct CandidateChunkDto {
     pub score: f32,
     #[zeroize(skip)]
     pub access_tier: u8,
+    #[serde(default)]
+    #[zeroize(skip)]
+    pub origin_peer_id: Option<String>,
 }
 
 impl CandidateChunkDto {
@@ -367,14 +370,24 @@ impl CandidateChunkDto {
             content: scored.chunk.text_content.clone(),
             score: scored.score,
             access_tier: scored.chunk.access_tier,
+            origin_peer_id: if scored.is_remote
+                && !scored.source_peer.is_empty()
+                && scored.source_peer != "local"
+            {
+                Some(scored.source_peer.clone())
+            } else {
+                None
+            },
         }
     }
 
     /// Consumes this DTO by value into a volatile memory container without duplicating heap memory.
     pub fn into_volatile_remote_chunk(self, peer_id: impl Into<String>) -> VolatileRemoteChunk {
+        let fallback_peer = peer_id.into();
+        let effective_peer = self.origin_peer_id.unwrap_or(fallback_peer);
         VolatileRemoteChunk {
             chunk_id: self.chunk_id,
-            peer_id: peer_id.into(),
+            peer_id: effective_peer,
             file_path: self.file_path,
             line_start: self.line_start,
             line_end: self.line_end,
@@ -418,6 +431,18 @@ pub struct FederatedQueryRequest {
     /// Ed25519 signature over canonical query payload (64 bytes).
     #[serde(with = "serde_sig64")]
     pub signature: [u8; 64],
+
+    /// Original originating peer ID across 1-hop relays (None if direct query).
+    #[serde(default)]
+    pub origin_peer_id: Option<String>,
+
+    /// Number of relay hops traversed (0 = direct, 1 = 1-hop relay). Clamped to <= 1.
+    #[serde(default)]
+    pub relay_hops: u8,
+
+    /// List of peer IDs that have already processed or forwarded this request (loop prevention).
+    #[serde(default)]
+    pub visited_peers: Vec<String>,
 }
 
 /// Helper module to serialize and deserialize 64-byte Ed25519 signatures.

@@ -157,6 +157,32 @@ pub fn detect_media_intent(query: &str) -> MediaIntent {
     MediaIntent::None
 }
 
+/// Which protocol/forensic category a query is explicitly asking about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolIntent {
+    Dns,
+    None,
+}
+
+pub fn detect_protocol_forensic_intent(query: &str) -> ProtocolIntent {
+    let lower = query.to_ascii_lowercase();
+    if has_word(
+        &lower,
+        &[
+            "dns", "53", "5353", "5355", "853", "dnscache", "sysmon",
+        ],
+    ) || lower.contains("dns traffic")
+        || lower.contains("dns query")
+        || lower.contains("port 53")
+        || lower.contains("udp 53")
+        || lower.contains(":53")
+    {
+        ProtocolIntent::Dns
+    } else {
+        ProtocolIntent::None
+    }
+}
+
 /// Content prefix written by the corresponding media indexer.
 pub fn media_content_prefix(intent: MediaIntent) -> Option<&'static str> {
     match intent {

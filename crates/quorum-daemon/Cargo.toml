@@ -89,4 +89,8 @@ path = "tests/artemis_daemon_tests.rs"
 name = "m4_challenger_harvest_tests"
 path = "tests/m4_challenger_harvest_tests.rs"
 
+[[test]]
+name = "regression_dns_forensic_routing"
+path = "tests/regression_dns_forensic_routing.rs"
+
 

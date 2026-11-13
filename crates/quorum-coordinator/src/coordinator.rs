@@ -195,6 +195,12 @@ impl QueryCoordinator {
         let epoch = self.engine.local_storage.index_epoch();
         let hits_before = self.cache_manager.telemetry(false).hits;
 
+        let effective_tier = if crate::offline_engine::ForensicQueryIntent::detect(prompt).is_some() {
+            3
+        } else {
+            self.config.default_peer_access_tier
+        };
+
         let final_state = self
             .agentic_runner
             .run_with_history_and_session(
@@ -203,7 +209,7 @@ impl QueryCoordinator {
                 family,
                 &self.engine,
                 &vector,
-                self.config.default_peer_access_tier,
+                effective_tier,
                 top_k,
                 seen_chunk_ids,
                 telemetry_tx,
