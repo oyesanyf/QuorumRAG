@@ -340,10 +340,15 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         }
 
         // Automatically populate discovered user document folders and watch paths into shared_folders
+        let isolated_watch_only = std::env::var("QUORUM_ISOLATED_WATCH_DIR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let mut candidate_folders = ingest_config.watch_paths.clone();
-        for user_root in quorum_ingest::IngestConfig::discover_user_document_roots() {
-            if !candidate_folders.contains(&user_root) {
-                candidate_folders.push(user_root);
+        if !isolated_watch_only {
+            for user_root in quorum_ingest::IngestConfig::discover_user_document_roots() {
+                if !candidate_folders.contains(&user_root) {
+                    candidate_folders.push(user_root);
+                }
             }
         }
 
@@ -721,7 +726,14 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&uploaded_docs_dir);
 
     // Collect initial real-time watch directories (user roots + uploaded_documents + shared_folders + opt_in_folders + expanded workspace slices)
-    let mut initial_watch_dirs = quorum_ingest::IngestConfig::discover_user_document_roots();
+    let isolated_watch_only = std::env::var("QUORUM_ISOLATED_WATCH_DIR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut initial_watch_dirs = if isolated_watch_only {
+        Vec::new()
+    } else {
+        quorum_ingest::IngestConfig::discover_user_document_roots()
+    };
     if uploaded_docs_dir.exists() && !initial_watch_dirs.contains(&uploaded_docs_dir) {
         initial_watch_dirs.push(uploaded_docs_dir.clone());
     }
@@ -948,7 +960,11 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         }
 
         // Pass 0: Priority fast pass over user document & screenshot folders (Documents, Desktop, Downloads before Pictures)
-        let mut priority_user_roots = quorum_ingest::IngestConfig::discover_user_document_roots();
+        let mut priority_user_roots = if isolated_watch_only {
+            Vec::new()
+        } else {
+            quorum_ingest::IngestConfig::discover_user_document_roots()
+        };
         priority_user_roots.sort_by_key(|r| {
             let name = r.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
             match name.as_str() {

@@ -4663,7 +4663,15 @@ impl DeterministicOfflineSynthesisEngine {
             if p_trim.is_empty() {
                 continue;
             }
-            if p_trim.starts_with('#') || p_trim.starts_with("---") || p_trim.starts_with("```") {
+            if p_trim.starts_with('#')
+                || p_trim.starts_with("---")
+                || p_trim.starts_with("```")
+                || p_trim.starts_with('|')
+                || p_trim.starts_with("> ")
+                || p_trim.starts_with("- ")
+                || p_trim.starts_with("* ")
+                || Self::is_numbered_list_item(p_trim)
+            {
                 para_items.push(ParaItem::Verbatim(p_trim.to_string()));
                 continue;
             }
@@ -6168,7 +6176,8 @@ impl DeterministicOfflineSynthesisEngine {
             || trimmed.ends_with("!\"")
             || trimmed.ends_with("?\"")
             || trimmed.ends_with("```")
-            || trimmed.ends_with("---");
+            || trimmed.ends_with("---")
+            || trimmed.ends_with('|');
 
         if is_clean {
             return;
@@ -9638,6 +9647,30 @@ mod tests {
         assert_eq!(
             ForensicQueryIntent::detect("What is process are accessing the internet"),
             Some(ForensicQueryIntent::NetworkInternet)
+        );
+    }
+
+    #[test]
+    fn test_consolidate_preserves_markdown_tables_and_bullet_lists() {
+        let md = "### Residential Property Leasing & Real Estate Management\n\n\
+- **Role:** landlord [2], [3]\n\
+- **Amounts:** $725.00 [2]\n\n\
+| Ref | Source Document | Origin Node | Grounded Context Summary |\n\
+|---|---|---|---|\n\
+| **[2]** | `Castiglione_Lease.doc` | Local Host | Monthly rent is $725.00 payable on the first day. |\n\
+| **[3]** | `Hope_St_Lease.doc` | Mesh Peer (`12D3KooWKHc3`) | Residential lease at 1967 Hope St., New Orleans. |\n\n\
+Angela Davis is documented as the lessor in New Orleans [2].";
+
+        let out = DeterministicOfflineSynthesisEngine::consolidate_duplicate_entity_statements(md);
+        assert!(
+            out.contains("\n|---|---|---|---|\n"),
+            "Markdown table header separator must preserve newlines, got:\n{}",
+            out
+        );
+        assert!(
+            out.contains("- **Role:** landlord [2], [3]\n- **Amounts:** $725.00 [2]"),
+            "Markdown bullet list must preserve newlines, got:\n{}",
+            out
         );
     }
 }

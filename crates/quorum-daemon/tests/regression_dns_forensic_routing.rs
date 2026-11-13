@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use tempfile::tempdir;
 use quorum_types::DocumentChunk;
-use quorum_storage::query_framing::detect_protocol_forensic_intent;
+use quorum_storage::query_framing::{detect_protocol_forensic_intent, ProtocolIntent};
 use quorum_coordinator::{
     offline_engine::{DeterministicOfflineSynthesisEngine, ForensicQueryIntent},
     CoordinatorConfig, LocalOnlyDispatcher, PeerAclManager, QueryCoordinator,
@@ -43,7 +43,7 @@ fn test_forensic_dns_intent_detection_and_zero_false_positives() {
     );
     assert_eq!(
         detect_protocol_forensic_intent("WHAT PROCESS IS USING DNS TRAFFIC"),
-        Some((53, "UDP"))
+        ProtocolIntent::Dns
     );
 
     // Negative false-positive guards
@@ -64,7 +64,7 @@ fn test_forensic_dns_intent_detection_and_zero_false_positives() {
     );
     assert_eq!(
         detect_protocol_forensic_intent("connect to oshoosi.duckdns.org at 12:53 in 1853"),
-        None
+        ProtocolIntent::None
     );
 }
 
@@ -192,6 +192,10 @@ async fn test_dns_forensic_routing_clean_formatting_and_zero_drift() {
     assert!(
         !answer.contains("get_dns_query_sysmon") && !answer.contains("TODO:"),
         "Must not leak static Python .docx snippets into live DNS forensic response: {}",
+        answer
+    );
+    println!(
+        "\n=== [REGRESSION TEST OUTPUT: WHAT PROCESS IS USING DNS TRAFFIC] ===\n{}\n=== [END DNS FORENSIC OUTPUT] ===",
         answer
     );
 }
