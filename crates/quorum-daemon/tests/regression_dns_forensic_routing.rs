@@ -14,7 +14,7 @@ use tempfile::tempdir;
 use quorum_types::DocumentChunk;
 use quorum_storage::query_framing::{detect_protocol_forensic_intent, ProtocolIntent};
 use quorum_coordinator::{
-    offline_engine::{DeterministicOfflineSynthesisEngine, ForensicQueryIntent},
+    offline_engine::ForensicQueryIntent,
     CoordinatorConfig, LocalOnlyDispatcher, PeerAclManager, QueryCoordinator,
     ScatterGatherEngine, SynthesisModelFamily,
 };

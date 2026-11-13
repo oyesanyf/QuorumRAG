@@ -164,6 +164,35 @@ pub enum ProtocolIntent {
     None,
 }
 
+fn has_ip_socket_port_53(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let pat = b":53";
+    let mut i = 0;
+    while i + pat.len() <= bytes.len() {
+        if &bytes[i..i + pat.len()] == pat {
+            let after_ok = i + pat.len() == bytes.len()
+                || !bytes[i + pat.len()].is_ascii_alphanumeric();
+            if after_ok && i > 0 {
+                if bytes[i - 1] == b']' {
+                    return true;
+                }
+                let mut d_start = i;
+                while d_start > 0
+                    && (i - d_start) < 3
+                    && bytes[d_start - 1].is_ascii_digit()
+                {
+                    d_start -= 1;
+                }
+                if d_start < i && d_start > 0 && bytes[d_start - 1] == b'.' {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 pub fn detect_protocol_forensic_intent(query: &str) -> ProtocolIntent {
     let lower = query.to_ascii_lowercase();
     let has_dns_port_phrase = lower.contains("port 53")
@@ -175,8 +204,7 @@ pub fn detect_protocol_forensic_intent(query: &str) -> ProtocolIntent {
         || lower.contains("port 853")
         || lower.contains("port 5353")
         || lower.contains("port 5355")
-        || lower.contains(":53 ")
-        || lower.ends_with(":53");
+        || has_ip_socket_port_53(&lower);
     if has_word(&lower, &["dns", "dnscache", "5353", "5355"])
         || has_dns_port_phrase
         || lower.contains("dns traffic")
@@ -229,5 +257,37 @@ mod tests {
         assert_eq!(detect_media_intent("tell me about the song Savannah Woman"), MediaIntent::Audio);
         assert_eq!(detect_media_intent("show me the File that contains a cow"), MediaIntent::None);
         assert_eq!(detect_media_intent("lease agreement"), MediaIntent::None);
+    }
+
+    #[test]
+    fn detects_protocol_dns_intent_without_clock_false_positives() {
+        assert_eq!(
+            detect_protocol_forensic_intent("WHAT PROCESS IS USING DNS TRAFFIC"),
+            ProtocolIntent::Dns
+        );
+        assert_eq!(
+            detect_protocol_forensic_intent("which pid is bound to 8.8.8.8:53"),
+            ProtocolIntent::Dns
+        );
+        assert_eq!(
+            detect_protocol_forensic_intent("check socket [::1]:53 now"),
+            ProtocolIntent::Dns
+        );
+        assert_eq!(
+            detect_protocol_forensic_intent("udp/53 resolver"),
+            ProtocolIntent::Dns
+        );
+        assert_eq!(
+            detect_protocol_forensic_intent("connect to oshoosi.duckdns.org at 12:53 in 1853"),
+            ProtocolIntent::None
+        );
+        assert_eq!(
+            detect_protocol_forensic_intent("meeting scheduled at 09:53"),
+            ProtocolIntent::None
+        );
+        assert_eq!(
+            detect_protocol_forensic_intent("http://127.0.0.1:5300/api/query"),
+            ProtocolIntent::None
+        );
     }
 }

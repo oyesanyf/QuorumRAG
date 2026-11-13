@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.10.
+"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.11.
 
 Spawns a real `quorumrag` release daemon against an isolated corpus containing
 homonym clusters, noisy ChatGPT export markers, and forensic distractors, then

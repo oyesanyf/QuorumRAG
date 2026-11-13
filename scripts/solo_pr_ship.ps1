@@ -77,7 +77,7 @@ $pythonExe = if (Test-Path "C:\Python314\python.exe") {
 if ($BuildInstallers -and (Test-Path "scripts\package.ps1")) {
     Write-Host "[0a/5] Building Windows MSI & portable release bundle..." -ForegroundColor Magenta
     $CargoTomlText = Get-Content -Path (Join-Path $ScriptRepoRoot "Cargo.toml") -Raw -Encoding UTF8
-    $PkgVersion = if ($CargoTomlText -match '(?m)^version\s*=\s*"([^"]+)"') { $Matches[1] } else { "0.6.10" }
+    $PkgVersion = if ($CargoTomlText -match '(?m)^version\s*=\s*"([^"]+)"') { $Matches[1] } else { "0.6.11" }
     & powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\package.ps1" -Version $PkgVersion
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Installer packaging failed. Aborting PR shipping."
