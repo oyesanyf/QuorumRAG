@@ -5,7 +5,7 @@ set -euo pipefail
 # Generates macOS native installer (.pkg), disk image (.dmg), and portable (.tar.gz) packages.
 
 BINARY_PATH="${1:-target/release/quorumrag}"
-VERSION="${2:-0.6.7}"
+VERSION="${2:-0.6.8}"
 INPUT_ARCH="${3:-universal}"
 DIST_DIR="${4:-deploy/macos}"
 PACKAGE_NAME="${5:-quorumrag}"

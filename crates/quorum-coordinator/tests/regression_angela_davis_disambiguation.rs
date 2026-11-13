@@ -525,10 +525,13 @@ async fn test_three_node_one_hop_mesh_relay_parent_rlm_expansion_and_provenance(
     ));
 
     // Verify scatter-gather provenance & RLM 10,000-byte parent expansion on relayed Peer C chunk
-    let (_, _, fused, _volatile, diag) = scatter_a
-        .search_federated_text_with_volatile("WHO IS ANGELA DAVIS", "WHO IS ANGELA DAVIS", &[0.05f32; 768], 12)
+    let (fused, _volatile, _elapsed_ms, _local_vec_hits) = scatter_a
+        .execute_query_with_cached_vector("WHO IS ANGELA DAVIS", &[0.05f32; 768], None, 0, 12)
+        .await;
+    let diag = scatter_a
+        .last_diagnostics()
         .await
-        .expect("federated search");
+        .expect("federated diagnostics");
 
     let peer_c_chunk = fused
         .iter()
