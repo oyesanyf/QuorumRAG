@@ -290,6 +290,7 @@ async fn test_who_is_angela_davis_two_layer_disambiguation() {
     assert!(!answer.contains("entity[\""));
     assert!(!answer.contains("Zrubrics"));
     assert!(!answer.contains("Davis.pm"));
+    println!("\n=== [REGRESSION TEST OUTPUT: WHO IS ANGELA DAVIS (2-LAYER DISAMBIGUATION)] ===\n{}\n=== [END OUTPUT] ===", answer);
 }
 
 #[tokio::test]
@@ -568,4 +569,8 @@ async fn test_three_node_one_hop_mesh_relay_parent_rlm_expansion_and_provenance(
     assert!(ans.contains("STEWARD"), "Must include Gateway Node B Ministry record: {}", ans);
     assert!(ans.contains("2913 Castiglione St."), "Must include relayed LAN Peer C Lease record: {}", ans);
     assert!(ans.len() >= 900, "Cross-all-hosts disambiguated RLM answer must be thorough and detailed (got {} chars)", ans.len());
+    println!(
+        "\n=== [REGRESSION TEST OUTPUT: 3-HOST 1-HOP MESH RELAY + 10KB RLM EXPANSION (WHO IS ANGELA DAVIS)] ===\nContributing Peers: {:?}\n{}\n=== [END 3-HOST OUTPUT] ===",
+        diag.contributing_peer_ids, ans
+    );
 }

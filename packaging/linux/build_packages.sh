@@ -5,7 +5,7 @@ set -euo pipefail
 # Generates Debian (.deb), RedHat (.rpm), and portable (.tar.gz) packages for Linux deployments.
 
 BINARY_PATH="${1:-target/release/quorumrag}"
-VERSION="${2:-0.6.8}"
+VERSION="${2:-0.6.9}"
 INPUT_ARCH="${3:-amd64}"
 DIST_DIR="${4:-deploy/linux}"
 PACKAGE_NAME="${5:-quorumrag}"

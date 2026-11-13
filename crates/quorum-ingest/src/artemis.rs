@@ -1563,28 +1563,60 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                 if remote_port == 0 || state.eq_ignore_ascii_case("LISTENING") || state.eq_ignore_ascii_case("LISTEN") {
                     internet_access = false;
                 }
-                let (mut proc_name, mut exe_path, mut cmd_line, proc_start_unix) =
+                let (mut eff_pid, mut proc_name, mut exe_path, mut cmd_line, proc_start_unix) =
                     if let Some(pm) = proc_map_ref.get(&pid) {
                         (
+                            pid,
                             pm.name.clone(),
                             pm.exe.clone(),
                             pm.cmd.clone(),
                             pm.start_time_unix,
                         )
+                    } else if pid == 0 && is_dns && os_platform_ref == "linux" {
+                        let prefer_resolved = local_addr.starts_with("127.0.0.53:")
+                            || local_addr.starts_with("127.0.0.54:");
+                        let matched_resolver = proc_map_ref.values().find(|pm| {
+                            let nl = pm.name.to_ascii_lowercase();
+                            if prefer_resolved {
+                                nl == "systemd-resolved"
+                            } else {
+                                matches!(
+                                    nl.as_str(),
+                                    "systemd-resolved"
+                                        | "dnsmasq"
+                                        | "unbound"
+                                        | "named"
+                                        | "coredns"
+                                        | "avahi-daemon"
+                                )
+                            }
+                        });
+                        if let Some(pm) = matched_resolver {
+                            (
+                                pm.pid,
+                                pm.name.clone(),
+                                pm.exe.clone(),
+                                pm.cmd.clone(),
+                                pm.start_time_unix,
+                            )
+                        } else {
+                            (0, String::new(), String::new(), String::new(), 0)
+                        }
                     } else if let Some(fb) = fallback_name.filter(|s| !s.is_empty()) {
-                        (fb.clone(), fb.clone(), fb, 0)
+                        (pid, fb.clone(), fb.clone(), fb, 0)
                     } else if pid == 4 && os_platform_ref == "windows" {
                         (
+                            pid,
                             "System".to_string(),
                             "System".to_string(),
                             "NT Kernel & System".to_string(),
                             0,
                         )
                     } else {
-                        (String::new(), String::new(), String::new(), 0)
+                        (pid, String::new(), String::new(), String::new(), 0)
                     };
 
-                if Some(pid) == dnscache_pid {
+                if Some(eff_pid) == dnscache_pid {
                     proc_name = "svchost.exe (Dnscache)".to_string();
                     if exe_path.is_empty() || exe_path == "svchost.exe" {
                         exe_path = "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache".to_string();
@@ -1592,7 +1624,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                     if cmd_line.is_empty() {
                         cmd_line = "svchost.exe -k NetworkService -p -s Dnscache".to_string();
                     }
-                } else if Some(pid) == shared_access_pid {
+                } else if Some(eff_pid) == shared_access_pid {
                     proc_name = "svchost.exe (SharedAccess)".to_string();
                     if exe_path.is_empty() || exe_path == "svchost.exe" {
                         exe_path = "C:\\Windows\\System32\\svchost.exe -k netsvcs -p -s SharedAccess".to_string();
@@ -1607,7 +1639,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                     local_addr,
                     remote_addr,
                     state,
-                    pid,
+                    pid: eff_pid,
                     proc_name,
                     exe_path,
                     cmd_line,
@@ -2613,6 +2645,80 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                             records.push(rec);
                         }
                     }
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if category_enabled(allowed_categories, ForensicTelemetryType::NetworkConnection)
+            || category_enabled(allowed_categories, ForensicTelemetryType::SystemEventLog)
+        {
+            let has_linux_dns = records.iter().any(|r| {
+                r.source_path.contains("/live/dns/")
+                    || r.raw_json.get("Port").and_then(|v| v.as_u64()) == Some(53)
+            });
+            if !has_linux_dns {
+                let matched_resolver = proc_map_ref.values().find(|pm| {
+                    let nl = pm.name.to_ascii_lowercase();
+                    matches!(
+                        nl.as_str(),
+                        "systemd-resolved"
+                            | "dnsmasq"
+                            | "unbound"
+                            | "named"
+                            | "coredns"
+                            | "avahi-daemon"
+                            | "networkmanager"
+                    )
+                });
+                let mut nameservers: Vec<String> = Vec::new();
+                if let Ok(resolv_txt) = std::fs::read_to_string("/etc/resolv.conf") {
+                    for line in resolv_txt.lines() {
+                        let trimmed = line.trim();
+                        if let Some(rest) = trimmed.strip_prefix("nameserver") {
+                            let ns = rest.split_whitespace().next().unwrap_or("").trim();
+                            if !ns.is_empty() && !nameservers.iter().any(|x| x == ns) {
+                                nameservers.push(ns.to_string());
+                            }
+                        }
+                    }
+                }
+                let ns_target = nameservers
+                    .first()
+                    .map(|ns| format!("{}:53", ns))
+                    .unwrap_or_else(|| "127.0.0.53:53".to_string());
+                let (r_pid, r_name, r_exe) = if let Some(pm) = matched_resolver {
+                    (pm.pid, pm.name.clone(), pm.exe.clone())
+                } else {
+                    (
+                        std::process::id(),
+                        "systemd-resolved / libc-resolv".to_string(),
+                        "/etc/resolv.conf".to_string(),
+                    )
+                };
+                let val = serde_json::json!({
+                    "record_id": "artemis:live:linux:dns:resolver_service",
+                    "telemetry_type": "network_connection",
+                    "Computer": host_ref,
+                    "os_platform": "linux",
+                    "os_version": os_version_ref,
+                    "ProcessId": r_pid,
+                    "ProcessName": r_name,
+                    "Image": r_exe,
+                    "Protocol": "UDP",
+                    "SourceIp": "127.0.0.1:0",
+                    "DestinationIp": ns_target,
+                    "RemotePort": 53,
+                    "Port": 53,
+                    "State": "ACTIVE",
+                    "dns_service": "DNS",
+                    "dns_query": true,
+                    "Message": format!("Linux DNS Resolver '{}' (PID {}) configured with upstream DNS nameserver '{}'.", r_name, r_pid, ns_target),
+                    "collected_unix_secs": now_unix.saturating_add(2),
+                    "source_path": "artemis://linux/live/dns/resolver_service",
+                });
+                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("linux")) {
+                    records.push(rec);
                 }
             }
         }
