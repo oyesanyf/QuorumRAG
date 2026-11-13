@@ -415,6 +415,95 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
     }
 }
 
+/// Normalizes a configured DuckDNS setting (e.g. `"oshoosi"`, `"oshoosi.duckdns.org"`,
+/// `"https://oshoosi.duckdns.org/"`) into `<subdomain>.duckdns.org`.
+pub fn normalize_duckdns_fqdn(domain: &str) -> Option<String> {
+    let stripped = domain
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if stripped.is_empty()
+        || stripped.chars().any(|c| c.is_whitespace() || c.is_control() || c == ':')
+    {
+        return None;
+    }
+    if stripped.ends_with(".duckdns.org") {
+        Some(stripped)
+    } else if stripped.contains('.') {
+        Some(stripped)
+    } else {
+        Some(format!("{}.duckdns.org", stripped))
+    }
+}
+
+/// Extracts the host literal (`/ip4/<ip>`, `/ip6/<ip>`, or `/dns4/<host>`) from a multiaddr string.
+pub fn extract_multiaddr_host_str(addr: &str) -> Option<String> {
+    let clean = addr.split("/p2p/").next().unwrap_or(addr).trim();
+    let mut parts = clean.split('/').filter(|s| !s.is_empty());
+    while let Some(proto) = parts.next() {
+        if matches!(proto, "ip4" | "ip6" | "dns" | "dns4" | "dns6" | "dnsaddr") {
+            return parts.next().map(|h| h.to_string());
+        }
+    }
+    None
+}
+
+/// Collects deduplicated trusted dial targets from explicit `bootstrap_peers`,
+/// auto-configured DuckDNS (`<domain>.duckdns.org` across `mesh_port` + `3032`/`3031` TCP & QUIC),
+/// and persisted `p2p_known_peers.json` multiaddrs, filtering out port 4001 IPFS noise.
+pub fn collect_trusted_bootstrap_multiaddrs(
+    mesh: &crate::dlp_mesh::OsoosiMeshSettings,
+    known_multiaddrs: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push_unique = |raw: &str| {
+        let trimmed = raw.split("/p2p/").next().unwrap_or(raw).trim();
+        if trimmed.is_empty()
+            || trimmed.contains("/tcp/4001")
+            || trimmed.contains("/udp/4001")
+            || trimmed.ends_with("/4001")
+        {
+            return;
+        }
+        if !out.iter().any(|existing: &String| existing.eq_ignore_ascii_case(trimmed)) {
+            out.push(trimmed.to_string());
+        }
+    };
+
+    for bp in &mesh.bootstrap_peers {
+        push_unique(bp);
+    }
+
+    if mesh.auto_bootstrap_duckdns {
+        if let Some(ref raw_domain) = mesh.duckdns_domain {
+            if let Some(fqdn) = normalize_duckdns_fqdn(raw_domain) {
+                let mut ports = Vec::new();
+                for p in [mesh.mesh_port, 3032, 3031] {
+                    if p > 0 && p != 4001 && !ports.contains(&p) {
+                        ports.push(p);
+                    }
+                }
+                for p in ports {
+                    push_unique(&format!("/dns4/{}/tcp/{}", fqdn, p));
+                    push_unique(&format!("/dns4/{}/udp/{}/quic-v1", fqdn, p));
+                }
+            }
+        }
+    }
+
+    for kp in known_multiaddrs {
+        push_unique(kp);
+    }
+
+    out
+}
+
 /// Production mesh dispatcher bridging to the `NetworkSwarmHandle`.
 #[derive(Clone)]
 pub struct SwarmMeshDispatcher {
@@ -474,9 +563,9 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             .await
             .map_err(|e| CoordinatorError::Network(e.to_string()))?;
 
-        // If no peers are currently connected (e.g., idle TCP drop or remote node restarted),
-        // proactively dial configured bootstrap_peers and known peers from p2p_known_peers.json on mesh port,
-        // subject to a 10-second cooldown so offline peers do not inject 450ms sleep per sub-query.
+        // If no peers are currently connected (e.g., idle TCP drop, roaming on WAN, or remote node restarted),
+        // proactively dial configured bootstrap_peers, auto DuckDNS endpoints, and known peers from p2p_known_peers.json,
+        // subject to a 10-second cooldown so offline peers do not stall repeated queries.
         if peers.is_empty() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -488,14 +577,14 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             if now_ms.saturating_sub(last_dial) >= 10_000 {
                 self.last_bootstrap_dial_ms
                     .store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                let (bootstrap_addrs, mesh_port) = {
+                let mesh_cfg = {
                     let controller = crate::dlp_mesh::global_mesh_dlp_controller();
                     let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
-                    (s.mesh.bootstrap_peers.clone(), s.mesh.mesh_port)
+                    s.mesh.clone()
                 };
-                let mut dial_targets: Vec<String> = bootstrap_addrs;
 
                 // Discover and dial known peers from p2p_known_peers.json on mesh_port (default 3032)
+                let mut known_addrs: Vec<String> = Vec::new();
                 let controller = crate::dlp_mesh::global_mesh_dlp_controller();
                 let known_peers_path = controller
                     .settings_file_path
@@ -509,13 +598,48 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                             if let Some(multiaddrs) = val.get("multiaddrs").and_then(|m| m.as_array()) {
                                 for ma in multiaddrs {
                                     if let Some(s) = ma.as_str() {
-                                        let s = s.trim();
-                                        if !s.contains("/4001")
-                                            && (s.contains(&format!("/tcp/{}", mesh_port))
-                                                || s.contains(&format!("/udp/{}", mesh_port))
-                                                || s.contains("/tcp/3032"))
-                                        {
-                                            dial_targets.push(s.to_string());
+                                        known_addrs.push(s.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let has_explicit_or_known = !mesh_cfg.bootstrap_peers.is_empty() || !known_addrs.is_empty();
+                let mut dial_targets = collect_trusted_bootstrap_multiaddrs(&mesh_cfg, &known_addrs);
+
+                // Resolve auto DuckDNS FQDN with a tight 300ms timeout so travel/WAN nodes also get direct
+                // IPv4/IPv6 addresses without blocking offline tests.
+                let mut duckdns_resolved = false;
+                if mesh_cfg.auto_bootstrap_duckdns {
+                    if let Some(fqdn) = mesh_cfg.duckdns_domain.as_deref().and_then(normalize_duckdns_fqdn) {
+                        if let Ok(Ok(resolved)) = tokio::time::timeout(
+                            Duration::from_millis(300),
+                            tokio::net::lookup_host((fqdn.as_str(), mesh_cfg.mesh_port)),
+                        )
+                        .await
+                        {
+                            for sock in resolved {
+                                duckdns_resolved = true;
+                                let ip = sock.ip();
+                                for p in [mesh_cfg.mesh_port, 3032, 3031] {
+                                    if p > 0 && p != 4001 {
+                                        let (tcp_ma, quic_ma) = match ip {
+                                            std::net::IpAddr::V4(v4) => (
+                                                format!("/ip4/{}/tcp/{}", v4, p),
+                                                format!("/ip4/{}/udp/{}/quic-v1", v4, p),
+                                            ),
+                                            std::net::IpAddr::V6(v6) => (
+                                                format!("/ip6/{}/tcp/{}", v6, p),
+                                                format!("/ip6/{}/udp/{}/quic-v1", v6, p),
+                                            ),
+                                        };
+                                        if !dial_targets.contains(&tcp_ma) {
+                                            dial_targets.push(tcp_ma);
+                                        }
+                                        if !dial_targets.contains(&quic_ma) {
+                                            dial_targets.push(quic_ma);
                                         }
                                     }
                                 }
@@ -524,20 +648,31 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                     }
                 }
 
-                dial_targets.retain(|a| !a.contains("/4001"));
-
                 if !dial_targets.is_empty() {
+                    let mut dial_futs = futures::stream::FuturesUnordered::new();
                     for addr_str in &dial_targets {
                         if let Ok(addr) = addr_str.trim().parse::<quorum_network::Multiaddr>() {
-                            let _ = self.handle.dial(addr).await;
+                            let h = self.handle.clone();
+                            dial_futs.push(async move { h.dial_trusted(addr).await });
                         }
                     }
-                    for _ in 0..9 {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        if let Ok(rechecked) = self.handle.connected_peers().await {
-                            if !rechecked.is_empty() {
-                                peers = rechecked;
-                                break;
+                    use futures::StreamExt;
+                    let mut any_dial_started = false;
+                    while let Some(res) = dial_futs.next().await {
+                        if res.is_ok() {
+                            any_dial_started = true;
+                        }
+                    }
+                    if any_dial_started {
+                        // Allow up to 1.8s when dialing real WAN/DuckDNS/explicit peers; keep offline probes fast (350ms).
+                        let max_iters = if has_explicit_or_known || duckdns_resolved { 36 } else { 7 };
+                        for _ in 0..max_iters {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            if let Ok(rechecked) = self.handle.connected_peers().await {
+                                if !rechecked.is_empty() {
+                                    peers = rechecked;
+                                    break;
+                                }
                             }
                         }
                     }

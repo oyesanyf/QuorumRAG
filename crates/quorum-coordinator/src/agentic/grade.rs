@@ -59,8 +59,35 @@ impl GradeRelevanceNode {
 
         state.relevance_score = max_score;
 
-        let has_content_match =
-            !is_empty && Self::has_content_relevance(&state.original_prompt, &state.retrieved_chunks);
+        let forensic_artemis_match = !is_empty
+            && crate::offline_engine::ForensicQueryIntent::detect(&state.original_prompt).is_some()
+            && state
+                .retrieved_chunks
+                .iter()
+                .any(|c| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"));
+
+        let has_content_match = forensic_artemis_match
+            || (!is_empty && Self::has_content_relevance(&state.original_prompt, &state.retrieved_chunks));
+
+        let requires_named_entity_match = {
+            let orig_l = state.original_prompt.trim().to_ascii_lowercase();
+            let has_proper_noun = state
+                .original_prompt
+                .split_whitespace()
+                .enumerate()
+                .any(|(i, raw)| {
+                    if i == 0 {
+                        return false;
+                    }
+                    let clean = raw.trim_matches(|c: char| !c.is_alphanumeric());
+                    clean.len() >= 3 && clean.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                });
+            has_proper_noun
+                || orig_l.contains("who is ")
+                || orig_l.contains("who was ")
+                || orig_l.contains("who are ")
+                || orig_l.contains("tell me about ")
+        };
 
         let effective_threshold = if max_score > 0.0 && has_content_match {
             self.relevance_threshold * (1.0 / 60.0)
@@ -78,6 +105,7 @@ impl GradeRelevanceNode {
         let is_author_query = crate::offline_engine::DeterministicOfflineSynthesisEngine::is_authorship_query(&state.original_prompt);
         let satisfactory = !is_empty
             && max_score >= effective_threshold
+            && (!requires_named_entity_match || has_content_match)
             && (!is_author_query
                 || distinct_docs >= 2
                 || (distinct_docs >= 1 && (max_score >= 0.70 || has_content_match)));
@@ -243,5 +271,47 @@ mod tests {
         assert!(grade.satisfactory, "Single-document author query with verified content must be satisfactory");
         assert!(grade.is_relevant);
         assert!(!will_rewrite, "Hop 0 must not rewrite when author document is verified");
+    }
+
+    #[test]
+    fn test_grade_relevance_rejects_unrelated_screenshot_for_named_person_query() {
+        let grader = GradeRelevanceNode::default();
+        let mut state = AgenticGraphState::new(
+            "who is Angela Davis",
+            crate::types::SynthesisModelFamily::AutoFusion,
+            3,
+        );
+        state.retrieved_chunks = vec![make_test_chunk(
+            "shot1",
+            r"C:\Users\oyesanyf\Pictures\Screenshots\Screenshot 2026-10-25 192839.png",
+            "Format: PNG (image/png)\nResolution: 776x641 pixels (Aspect Ratio: 1.21:1, Channels: 4, Bit Depth: 8-bit, File Size: 34 KB)\n[OCR Text]\nFile Edit View Misc Packages Windows Help R Console R version 4.6.1",
+            0.96,
+        )];
+        let (grade, _) = grader.execute(&mut state);
+        assert!(
+            !grade.satisfactory,
+            "Unrelated R Console screenshot at 0.96 cosine score must NOT satisfy 'who is Angela Davis'"
+        );
+        assert!(!grade.is_relevant);
+    }
+
+    #[test]
+    fn test_grade_relevance_accepts_artemis_chunk_for_forensic_internet_process_query() {
+        let grader = GradeRelevanceNode::default();
+        let mut state = AgenticGraphState::new(
+            "What is process are accessing the internet",
+            crate::types::SynthesisModelFamily::AutoFusion,
+            3,
+        );
+        state.retrieved_chunks = vec![make_test_chunk(
+            "art1",
+            "artemis://network_connections",
+            "Artemis DFIR Live NetworkConnection Telemetry:\nPID 4420 | Process: chrome.exe | Remote: 142.250.190.46:443 | State: ESTABLISHED",
+            0.02,
+        )];
+        let (grade, will_rewrite) = grader.execute(&mut state);
+        assert!(grade.satisfactory);
+        assert!(grade.is_relevant);
+        assert!(!will_rewrite);
     }
 }

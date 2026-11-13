@@ -21,6 +21,10 @@ pub enum NetworkCommand {
         addr: Multiaddr,
         reply: oneshot::Sender<Result<(), NetworkError>>,
     },
+    DialTrusted {
+        addr: Multiaddr,
+        reply: oneshot::Sender<Result<(), NetworkError>>,
+    },
     SendQuery {
         peer_id: PeerId,
         request: FederatedQueryRequest,
@@ -65,6 +69,18 @@ impl NetworkSwarmHandle {
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(NetworkCommand::Dial { addr, reply: tx })
+            .await
+            .map_err(|_| NetworkError::ChannelClosed)?;
+        rx.await.map_err(|_| NetworkError::ChannelClosed)?
+    }
+
+    /// Dials an explicitly configured trusted bootstrap peer, DuckDNS endpoint, Tailscale/CGNAT
+    /// overlay address, or routed WAN multiaddr (bypassing RFC1918-only mDNS restrictions while
+    /// still enforcing Ed25519 + Gemma contract hash + Noise authentication after handshake).
+    pub async fn dial_trusted(&self, addr: Multiaddr) -> Result<(), NetworkError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NetworkCommand::DialTrusted { addr, reply: tx })
             .await
             .map_err(|_| NetworkError::ChannelClosed)?;
         rx.await.map_err(|_| NetworkError::ChannelClosed)?

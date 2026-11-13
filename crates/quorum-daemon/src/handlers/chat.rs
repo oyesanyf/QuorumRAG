@@ -11,59 +11,66 @@ use tracing::{error, info};
 use crate::state::DaemonState;
 use quorum_coordinator::{AgenticTelemetryEvent, ChatTurnMessage, SynthesisModelFamily};
 use quorum_storage::SearchMode;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 
-static LAST_FORENSIC_QUERY_SYNC_SECS: AtomicI64 = AtomicI64::new(0);
+static LAST_FORENSIC_SYNC_BY_SCOPE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 
-/// When a user query asks about antivirus, Windows Defender, CodeIntegrity, malware, or blocked processes,
-/// ensures local Artemis DFIR collection is enabled and refreshes live OS event log / process records if stale (> 60s).
+fn forensic_sync_cache() -> &'static Mutex<HashMap<String, i64>> {
+    LAST_FORENSIC_SYNC_BY_SCOPE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// When a user query asks a host forensic / Artemis DFIR question (network/internet connections,
+/// antivirus/Defender/CodeIntegrity blocks, executed processes, registry persistence, prefetch, or services),
+/// ensures local Artemis DFIR collection is active and refreshes live OS telemetry records within category TTL.
 async fn ensure_live_forensics_for_query(state: &Arc<DaemonState>, prompt: &str) {
-    let ql = prompt.to_ascii_lowercase();
-    let is_forensic_q = ql.contains("antivirus")
-        || ql.contains("defender")
-        || ql.contains("codeintegrity")
-        || ql.contains("malware")
-        || ql.contains("trojan")
-        || ql.contains("eventlog")
-        || ql.contains("event log")
-        || (ql.contains("process")
-            && (ql.contains("block")
-                || ql.contains("kill")
-                || ql.contains("quarantin")
-                || ql.contains("detect")));
-    if !is_forensic_q {
+    let Some(intent) = quorum_coordinator::ForensicQueryIntent::detect(prompt) else {
         return;
-    }
+    };
 
-    {
+    let retention_days = {
         let ctrl = quorum_coordinator::dlp_mesh::global_mesh_dlp_controller();
         let mut s = ctrl.settings.write().unwrap_or_else(|e| e.into_inner());
         s.artemis.enabled = true;
         s.artemis.local_collection_enabled = true;
-    }
-
-    let now_secs = chrono::Utc::now().timestamp();
-    let prev = LAST_FORENSIC_QUERY_SYNC_SECS.load(Ordering::Relaxed);
-    if now_secs.saturating_sub(prev) < 600 {
-        return;
-    }
-    LAST_FORENSIC_QUERY_SYNC_SECS.store(now_secs, Ordering::Relaxed);
+        s.artemis.retention_days.max(1)
+    };
 
     let already_indexed = state
         .storage
-        .search_text("windows_defender_antivirus_event", 3, 2)
+        .search_text(intent.target_search_query(), 3, 4)
         .await
-        .map(|hits| !hits.is_empty())
+        .map(|hits| {
+            hits.iter().any(|h| {
+                let fl = h.chunk.file_path.to_ascii_lowercase();
+                let tl = h.chunk.text_content.to_ascii_lowercase();
+                intent.matches_artemis_chunk(&fl, &tl)
+            })
+        })
         .unwrap_or(false);
 
+    let now_secs = chrono::Utc::now().timestamp();
+    let scope_key = format!("{}::{:?}", state.data_dir.to_string_lossy(), intent);
+    {
+        let mut guard = forensic_sync_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if already_indexed {
+            if let Some(&prev) = guard.get(&scope_key) {
+                if now_secs.saturating_sub(prev) < intent.refresh_ttl_secs() {
+                    return;
+                }
+            }
+        }
+        guard.insert(scope_key, now_secs);
+    }
+
+    let categories = intent.live_categories();
     let state_clone = state.clone();
     let sync_fut = async move {
-        let records = tokio::task::spawn_blocking(|| {
-            let cats = vec![
-                "system_event_log".to_string(),
-                "process_execution".to_string(),
-            ];
-            quorum_ingest::artemis::collect_live_os_forensics(&cats)
+        let records = tokio::task::spawn_blocking(move || {
+            quorum_ingest::artemis::collect_live_os_forensics(&categories)
         })
         .await
         .unwrap_or_default();
@@ -73,11 +80,11 @@ async fn ensure_live_forensics_for_query(state: &Arc<DaemonState>, prompt: &str)
         }
 
         let mut chunks = Vec::with_capacity(records.len());
-        for (idx, rec) in records.iter().enumerate() {
+        for rec in &records {
             let _ = state_clone
                 .storage
                 .upsert_parent_document(&rec.to_parent_document(), 3);
-            if let Ok(mut chunk) = rec.to_document_chunk(idx) {
+            if let Ok(mut chunk) = rec.to_document_chunk(0) {
                 chunk.vector = state_clone
                     .embedder
                     .embed_text(&chunk.text_content)
@@ -87,17 +94,32 @@ async fn ensure_live_forensics_for_query(state: &Arc<DaemonState>, prompt: &str)
         }
         if !chunks.is_empty() {
             let _ = state_clone.storage.insert_chunks(&chunks).await;
+            let _ = crate::handlers::artemis::prune_and_sync_artemis_retention(
+                &state_clone.storage,
+                &chunks,
+                retention_days,
+            )
+            .await;
             info!(
+                intent = ?intent,
                 records = chunks.len(),
-                "On-demand Artemis live OS forensic event log sync completed for query"
+                "On-demand Artemis live OS forensic telemetry sync completed for query"
             );
         }
     };
 
-    if already_indexed {
-        tokio::spawn(sync_fut);
-    } else {
+    // Network/process live snapshots complete in ~100ms; always await synchronously when missing
+    // or when querying volatile socket/process state so the first answer is 100% up-to-date.
+    let must_await_synchronously = !already_indexed
+        || matches!(
+            intent,
+            quorum_coordinator::ForensicQueryIntent::NetworkInternet
+                | quorum_coordinator::ForensicQueryIntent::ProcessExecution
+        );
+    if must_await_synchronously {
         sync_fut.await;
+    } else {
+        tokio::spawn(sync_fut);
     }
 }
 

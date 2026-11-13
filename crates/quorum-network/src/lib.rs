@@ -13,7 +13,10 @@ pub use handle::{NetworkCommand, NetworkEvent, NetworkSwarmHandle};
 pub use handshake::{
     extract_contract_hash, make_agent_version, make_protocol_version, verify_peer_contract,
 };
-pub use transport::{is_allowed_dial_address, is_private_or_loopback_ip4, is_private_or_loopback_ip6};
+pub use transport::{
+    is_allowed_dial_address, is_allowed_trusted_bootstrap_address, is_private_or_loopback_ip4,
+    is_private_or_loopback_ip6, is_tailscale_or_cgnat_ip4,
+};
 pub use libp2p::{self, Multiaddr};
 
 /// Derives a libp2p `PeerId` from 32-byte Ed25519 public key bytes.
@@ -94,22 +97,44 @@ pub async fn start_network_node(
     let local_peer_id = keypair.public().to_peer_id();
     let mut swarm = transport::build_swarm(&config, keypair)?;
 
+    let has_v4_tcp = config
+        .tcp_listen_addrs
+        .iter()
+        .any(|a| a.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip4(_))));
     for addr in &config.tcp_listen_addrs {
-        swarm
-            .listen_on(addr.clone())
-            .map_err(|e| NetworkError::TransportError(e.to_string()))?;
+        let is_unspecified_v6 = addr
+            .iter()
+            .any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip6(ip) if ip.is_unspecified()));
+        if let Err(e) = swarm.listen_on(addr.clone()) {
+            if is_unspecified_v6 && has_v4_tcp {
+                tracing::warn!("Skipping optional IPv6 TCP listener {}: {}", addr, e);
+            } else {
+                return Err(NetworkError::TransportError(e.to_string()));
+            }
+        }
     }
+    let has_v4_quic = config
+        .quic_listen_addrs
+        .iter()
+        .any(|a| a.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip4(_))));
     for addr in &config.quic_listen_addrs {
-        swarm
-            .listen_on(addr.clone())
-            .map_err(|e| NetworkError::TransportError(e.to_string()))?;
+        let is_unspecified_v6 = addr
+            .iter()
+            .any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip6(ip) if ip.is_unspecified()));
+        if let Err(e) = swarm.listen_on(addr.clone()) {
+            if is_unspecified_v6 && has_v4_quic {
+                tracing::warn!("Skipping optional IPv6 QUIC listener {}: {}", addr, e);
+            } else {
+                return Err(NetworkError::TransportError(e.to_string()));
+            }
+        }
     }
 
     for peer in &config.bootstrap_peers {
-        if transport::is_allowed_dial_address(peer) {
+        if transport::is_allowed_trusted_bootstrap_address(peer) {
             let _ = swarm.dial(peer.clone());
         } else {
-            tracing::warn!("Rejecting bootstrap peer dial to non-airgapped multiaddr: {}", peer);
+            tracing::warn!("Rejecting invalid bootstrap peer multiaddr: {}", peer);
         }
     }
 

@@ -95,3 +95,4 @@ pub use artemis_airgap::{
 pub use forensic_normalizer::{
     is_internal_private_ip, ArtifactCategoryGate, ForensicStructuralNormalizer, NormalizerPreview,
 };
+pub use offline_engine::ForensicQueryIntent;

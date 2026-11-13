@@ -6,6 +6,7 @@ pub mod p2p_watcher;
 pub mod server;
 pub mod shutdown;
 pub mod state;
+pub mod wan_mesh;
 
 pub use chat_history_db::{
     ChatHistoryStore, ChatSessionDetail, ChatSessionSummary, StoredChatMessage,

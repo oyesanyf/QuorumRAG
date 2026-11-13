@@ -717,11 +717,31 @@ pub fn build_summary_text(
                 .or_else(|| val.get("auid"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let proc_name = val
+                .get("ProcessName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let event_date = val
+                .get("EventDate")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let host = val
+                .get("Computer")
+                .or_else(|| val.get("host_identifier"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("localhost");
 
-            format!(
-                "ProcessExecution [{}]: image='{}', cmdline='{}', pid={}, user='{}'",
-                os_platform, image, cmd, pid, user
-            )
+            if !proc_name.is_empty() && !event_date.is_empty() {
+                format!(
+                    "Artemis DFIR Process Execution [{}] on host '{}' (started/observed {}): Process '{}' (PID {}, user '{}') executed binary '{}' with command line '{}'.\nProcessExecution [{}]: image='{}', cmdline='{}', pid={}, user='{}'",
+                    os_platform, host, event_date, proc_name, pid, user, image, cmd, os_platform, image, cmd, pid, user
+                )
+            } else {
+                format!(
+                    "ProcessExecution [{}]: image='{}', cmdline='{}', pid={}, user='{}'",
+                    os_platform, image, cmd, pid, user
+                )
+            }
         }
         ForensicTelemetryType::RegistryPersistence => {
             let key = val
@@ -830,10 +850,79 @@ pub fn build_summary_text(
                 .or_else(|| val.get("remote_address"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!(
-                "NetworkConnection [{}]: local='{}', remote='{}'",
-                os_platform, local, remote
-            )
+            let proc_name = val
+                .get("ProcessName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let image = val
+                .get("Image")
+                .and_then(|v| v.as_str())
+                .unwrap_or(proc_name);
+            let pid = val
+                .get("ProcessId")
+                .or_else(|| val.get("pid"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let proto = val
+                .get("Protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("TCP");
+            let state = val
+                .get("State")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ACTIVE");
+            let scope = val
+                .get("ConnectionScope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let internet_access = val
+                .get("InternetAccess")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(scope == "external_internet");
+            let host = val
+                .get("Computer")
+                .or_else(|| val.get("host_identifier"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("localhost");
+            let event_date = val
+                .get("EventDate")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if internet_access && (!proc_name.is_empty() || pid > 0) {
+                let label_proc = if proc_name.is_empty() {
+                    format!("PID {}", pid)
+                } else {
+                    proc_name.to_string()
+                };
+                let date_clause = if event_date.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (observed {})", event_date)
+                };
+                format!(
+                    "Artemis DFIR Live Internet Connection [{}] on host '{}'{} — Process '{}' (PID {}, executable '{}') accessed the external internet over {} ({}) from local socket {} to remote public internet endpoint {}.\nNetworkConnection [{}]: process='{}', pid={}, image='{}', protocol='{}', state='{}', scope='external_internet', local='{}', remote='{}'",
+                    os_platform, host, date_clause, label_proc, pid, image, proto, state, local, remote,
+                    os_platform, label_proc, pid, image, proto, state, local, remote
+                )
+            } else if !proc_name.is_empty() || pid > 0 {
+                let label_proc = if proc_name.is_empty() {
+                    format!("PID {}", pid)
+                } else {
+                    proc_name.to_string()
+                };
+                let eff_scope = if scope.is_empty() { "local_socket" } else { scope };
+                format!(
+                    "Artemis DFIR Network Socket [{}] on host '{}' — Process '{}' (PID {}, executable '{}') holds {} socket ({}, scope={}) local {} -> remote {}.\nNetworkConnection [{}]: process='{}', pid={}, protocol='{}', state='{}', scope='{}', local='{}', remote='{}'",
+                    os_platform, host, label_proc, pid, image, proto, state, eff_scope, local, remote,
+                    os_platform, label_proc, pid, proto, state, eff_scope, local, remote
+                )
+            } else {
+                format!(
+                    "NetworkConnection [{}]: local='{}', remote='{}'",
+                    os_platform, local, remote
+                )
+            }
         }
         _ => val.to_string(),
     };
@@ -898,8 +987,11 @@ pub fn parse_artemis_jsonl_str(content: &str) -> Result<Vec<ArtemisTelemetryReco
     parse_artemis_jsonl(content.as_bytes())
 }
 
-/// Runs a local OS command with `CREATE_NO_WINDOW` on Windows so zero console window ever appears.
+/// Runs a local OS command with `CREATE_NO_WINDOW` on Windows and a strict 3-second wall-clock
+/// deadline so hung OS utilities (`netstat`, `wevtutil`, `reg`, `lsof`) are deterministically reaped
+/// and never stall async workers or console-less services.
 fn run_hidden_os_command(program: &str, args: &[&str]) -> Option<String> {
+    use std::io::Read;
     let mut cmd = std::process::Command::new(program);
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -911,9 +1003,37 @@ fn run_hidden_os_command(program: &str, args: &[&str]) -> Option<String> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.output().ok()?;
-    if !out.stdout.is_empty() {
-        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout_pipe = child.stdout.take()?;
+    let reader_handle = std::thread::spawn(move || {
+        let mut buf = Vec::with_capacity(16 * 1024);
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+
+    let bytes = reader_handle.join().ok()?;
+    if !bytes.is_empty() {
+        Some(String::from_utf8_lossy(&bytes).to_string())
     } else {
         None
     }
@@ -930,13 +1050,170 @@ fn category_enabled(allowed_categories: &[String], target: ForensicTelemetryType
     })
 }
 
+/// Parses a socket endpoint string (`142.250.190.46:443`, `[2607:f8b0:4009::200e]:443`, `*:*`, or macOS `142.250.190.46.443`)
+/// into `(Option<IpAddr>, Option<u16>)`.
+fn parse_socket_endpoint_ip(endpoint: &str) -> (Option<std::net::IpAddr>, Option<u16>) {
+    let s = endpoint.trim();
+    if s.is_empty() || s.starts_with('*') {
+        return (None, None);
+    }
+    if let Ok(sock) = s.parse::<std::net::SocketAddr>() {
+        return (Some(sock.ip()), Some(sock.port()));
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((ip_part, port_part)) = rest.split_once(']') {
+            let clean_ip = ip_part.split('%').next().unwrap_or(ip_part);
+            let ip = clean_ip.parse::<std::net::IpAddr>().ok();
+            let port = port_part.trim_start_matches(':').parse::<u16>().ok();
+            return (ip, port);
+        }
+    }
+    if let Some((ip_part, port_part)) = s.rsplit_once(':') {
+        let clean_ip = ip_part.split('%').next().unwrap_or(ip_part);
+        if let Ok(ip) = clean_ip.parse::<std::net::IpAddr>() {
+            let port = port_part.parse::<u16>().ok();
+            return (Some(ip), port);
+        }
+    }
+    // macOS `netstat -anv` uses `a.b.c.d.port`
+    if let Some((ip_part, port_part)) = s.rsplit_once('.') {
+        if let Ok(ip) = ip_part.parse::<std::net::IpAddr>() {
+            let port = port_part.parse::<u16>().ok();
+            return (Some(ip), port);
+        }
+    }
+    (s.parse::<std::net::IpAddr>().ok(), None)
+}
+
+/// Classifies an IP address mathematically into `("external_internet", true)` for globally routable
+/// public Internet endpoints vs `("loopback" | "local_network" | "unspecified", false)` for RFC1918,
+/// loopback, link-local, CGNAT, multicast, ULA, or unspecified addresses.
+fn classify_ip_connection_scope(ip: std::net::IpAddr) -> (&'static str, bool) {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            if v4.is_unspecified() {
+                ("unspecified", false)
+            } else if v4.is_loopback() {
+                ("loopback", false)
+            } else if v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || (oct[0] == 100 && (64..=127).contains(&oct[1]))
+                || oct[0] == 0
+                || (oct[0] == 192 && oct[1] == 0 && oct[2] == 2)
+                || (oct[0] == 198 && (oct[1] == 18 || oct[1] == 19))
+                || (oct[0] == 198 && oct[1] == 51 && oct[2] == 100)
+                || (oct[0] == 203 && oct[1] == 0 && oct[2] == 113)
+                || oct[0] >= 240
+            {
+                ("local_network", false)
+            } else {
+                ("external_internet", true)
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return classify_ip_connection_scope(std::net::IpAddr::V4(mapped_v4));
+            }
+            let seg = v6.segments();
+            if v6.is_unspecified() {
+                ("unspecified", false)
+            } else if v6.is_loopback() {
+                ("loopback", false)
+            } else if v6.is_multicast()
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 Unique Local
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 Link-Local
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 Documentation
+            {
+                ("local_network", false)
+            } else {
+                ("external_internet", true)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn decode_proc_net_v4_endpoint(hex_addr_port: &str) -> Option<String> {
+    let (addr_hex, port_hex) = hex_addr_port.trim().split_once(':')?;
+    if addr_hex.len() != 8 {
+        return None;
+    }
+    let raw = u32::from_str_radix(addr_hex, 16).ok()?;
+    let port = u16::from_str_radix(port_hex, 16).ok()?;
+    let bytes = raw.to_ne_bytes();
+    let ip = std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+    Some(format!("{}:{}", ip, port))
+}
+
+#[cfg(target_os = "linux")]
+fn decode_proc_net_tcp_state(state_hex: &str) -> &'static str {
+    match state_hex.trim().to_ascii_uppercase().as_str() {
+        "01" => "ESTABLISHED",
+        "02" => "SYN_SENT",
+        "03" => "SYN_RECV",
+        "04" => "FIN_WAIT1",
+        "05" => "FIN_WAIT2",
+        "06" => "TIME_WAIT",
+        "07" => "CLOSE",
+        "08" => "CLOSE_WAIT",
+        "09" => "LAST_ACK",
+        "0A" => "LISTENING",
+        "0B" => "CLOSING",
+        _ => "ACTIVE",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_linux_socket_inode_to_pid_map() -> std::collections::HashMap<u64, u32> {
+    let mut inode_map = std::collections::HashMap::new();
+    let Ok(proc_entries) = std::fs::read_dir("/proc") else {
+        return inode_map;
+    };
+    for entry in proc_entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let fd_dir = entry.path().join("fd");
+        let Ok(fds) = std::fs::read_dir(fd_dir) else {
+            continue;
+        };
+        for fd in fds.flatten().take(256) {
+            if let Ok(link) = std::fs::read_link(fd.path()) {
+                let target = link.to_string_lossy();
+                if let Some(inner) = target
+                    .strip_prefix("socket:[")
+                    .and_then(|s| s.strip_suffix(']'))
+                {
+                    if let Ok(inode) = inner.parse::<u64>() {
+                        inode_map.insert(inode, pid);
+                    }
+                }
+            }
+        }
+    }
+    inode_map
+}
+
+#[derive(Clone)]
+struct LiveProcMeta {
+    pid: u32,
+    name: String,
+    exe: String,
+    cmd: String,
+    user: String,
+    start_time_unix: i64,
+}
+
 /// Collects genuine live OS forensic telemetry concurrently across all allowlisted defensive categories:
 /// - `process_execution`: Running processes (`sysinfo::System`) across Windows, macOS, and Linux
-/// - `network_connection`: Active TCP/UDP sockets (`netstat -ano` on Windows, `/proc/net/tcp` on Linux, `netstat -anv` on macOS)
+/// - `network_connection`: Active TCP/UDP sockets (`netstat -ano` on Windows, `/proc/net/tcp` on Linux, `lsof`/`netstat` on macOS) joined with live process names & public Internet classification
 /// - `registry_persistence`: Windows `Run` / `RunOnce` persistence keys (`reg query`) or Unix cron/rc persistence
 /// - `prefetch_amcache_execution`: Windows `C:\Windows\Prefetch\*.pf` & `Amcache.hve` execution artifacts
 /// - `service_daemon`: Windows Services (`HKLM\SYSTEM\CurrentControlSet\Services`), macOS `LaunchDaemons`, Linux `systemd` units
-/// - `system_event_log`: Windows Event Logs (`wevtutil qe System` / `Application`), Linux `syslog`/`journald`, macOS `system.log`
+/// - `system_event_log`: Windows Event Logs (`wevtutil qe System` / `Application` / `Windows Defender` / `CodeIntegrity`), Linux `syslog`/`journald`, macOS `system.log`
 ///
 /// All 6 category collectors execute concurrently via `std::thread::scope` so subprocess queries (`netstat`, `reg`, `wevtutil`)
 /// and filesystem/process table scans overlap across CPU cores with zero sequential bottlenecks.
@@ -944,51 +1221,103 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
     let host = sysinfo::System::host_name().unwrap_or_else(|| "localhost".to_string());
     let os_platform = std::env::consts::OS.to_string();
     let os_version = sysinfo::System::long_os_version().or_else(sysinfo::System::os_version);
-    let now_unix = Utc::now().timestamp();
+    let now_dt = Utc::now();
+    let now_unix = now_dt.timestamp();
+    let now_rfc3339 = now_dt.to_rfc3339();
+
+    let need_proc_table = category_enabled(allowed_categories, ForensicTelemetryType::ProcessExecution)
+        || category_enabled(allowed_categories, ForensicTelemetryType::NetworkConnection);
+
+    let mut proc_map: std::collections::HashMap<u32, LiveProcMeta> = std::collections::HashMap::new();
+    if need_proc_table {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_all();
+        for (pid_val, process) in sys.processes() {
+            let pid_u32 = pid_val.as_u32();
+            let name = process.name().to_string();
+            let exe = process
+                .exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| name.clone());
+            let cmd_joined = process.cmd().join(" ");
+            let cmd = if cmd_joined.trim().is_empty() {
+                exe.clone()
+            } else {
+                cmd_joined
+            };
+            let user = process
+                .user_id()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "system".to_string());
+            let start_raw = process.start_time() as i64;
+            let start_time_unix = if start_raw > 946_684_800 {
+                start_raw
+            } else {
+                now_unix
+            };
+            proc_map.insert(
+                pid_u32,
+                LiveProcMeta {
+                    pid: pid_u32,
+                    name,
+                    exe,
+                    cmd,
+                    user,
+                    start_time_unix,
+                },
+            );
+        }
+    }
 
     let host_ref = host.as_str();
     let os_platform_ref = os_platform.as_str();
     let os_version_ref = os_version.as_deref();
+    let now_rfc3339_ref = now_rfc3339.as_str();
+    let proc_map_ref = &proc_map;
 
     std::thread::scope(|s| {
-        // 1. ProcessExecution (`process_execution`)
+        // 1. ProcessExecution (`process_execution`) — sorted most-recently-started first
         let h_proc = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
             let mut out = Vec::new();
             if !category_enabled(allowed_categories, ForensicTelemetryType::ProcessExecution) {
                 return out;
             }
-            let mut sys = sysinfo::System::new_all();
-            sys.refresh_all();
-            for (pid, process) in sys.processes() {
-                let cmd = process.cmd().join(" ");
-                let cmd_low = cmd.to_ascii_lowercase();
-                if cmd_low.contains("127.0.0.1:303")
-                    || cmd_low.contains("/api/query")
-                    || cmd_low.contains("/api/chat")
-                {
-                    continue;
-                }
-                let exe = process
-                    .exe()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| process.name().to_string());
-                let user = process
-                    .user_id()
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|| "system".to_string());
+            let mut procs: Vec<&LiveProcMeta> = proc_map_ref
+                .values()
+                .filter(|p| {
+                    let cmd_low = p.cmd.to_ascii_lowercase();
+                    !cmd_low.contains("127.0.0.1:303")
+                        && !cmd_low.contains("/api/query")
+                        && !cmd_low.contains("/api/chat")
+                })
+                .collect();
+            procs.sort_by(|a, b| {
+                b.start_time_unix
+                    .cmp(&a.start_time_unix)
+                    .then_with(|| b.pid.cmp(&a.pid))
+            });
 
+            for (rank, p) in procs.into_iter().take(160).enumerate() {
+                let start_iso = chrono::DateTime::from_timestamp(p.start_time_unix, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| now_rfc3339_ref.to_string());
                 let val = serde_json::json!({
+                    "record_id": format!("artemis:live:{}:process:{}", os_platform_ref, rank),
                     "telemetry_type": "process_execution",
                     "Computer": host_ref,
                     "os_platform": os_platform_ref,
                     "os_version": os_version_ref,
-                    "CommandLine": if cmd.is_empty() { exe.clone() } else { cmd },
-                    "Image": exe,
-                    "ProcessId": pid.as_u32(),
-                    "SubjectUserName": user,
-                    "collected_unix_secs": now_unix,
+                    "ProcessName": p.name,
+                    "CommandLine": p.cmd,
+                    "Image": p.exe,
+                    "ProcessId": p.pid,
+                    "SubjectUserName": p.user,
+                    "ProcessStartTimeUnix": p.start_time_unix,
+                    "EventDate": start_iso,
+                    "collected_unix_secs": p.start_time_unix.max(now_unix - 5),
                     "Channel": "Security",
-                    "source_path": format!("artemis://{}/live/process/{}", os_platform_ref, pid.as_u32()),
+                    "source_path": format!("artemis://{}/live/process/latest_{}", os_platform_ref, rank),
                 });
                 if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some(os_platform_ref))
                 {
@@ -998,96 +1327,283 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
             out
         });
 
-        // 2. NetworkConnection (`network_connection`)
+        // 2. NetworkConnection (`network_connection`) — joined with PID -> ProcessName/Image & external Internet scope
         let h_net = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
             let mut out = Vec::new();
             if !category_enabled(allowed_categories, ForensicTelemetryType::NetworkConnection) {
                 return out;
             }
+
+            #[derive(Clone)]
+            struct RawSocketCandidate {
+                proto: String,
+                local_addr: String,
+                remote_addr: String,
+                state: String,
+                pid: u32,
+                proc_name: String,
+                exe_path: String,
+                cmd_line: String,
+                proc_start_unix: i64,
+                scope: &'static str,
+                internet_access: bool,
+                remote_port: u16,
+            }
+
+            let mut candidates: Vec<RawSocketCandidate> = Vec::new();
+            let mut push_socket = |proto: String,
+                                   local_addr: String,
+                                   remote_addr: String,
+                                   state: String,
+                                   pid: u32,
+                                   fallback_name: Option<String>| {
+                // Exclude QuorumRAG's own local UI HTTP loopback socket on :3031
+                if (local_addr.ends_with(":3031") || remote_addr.ends_with(":3031"))
+                    && (local_addr.starts_with("127.0.0.1:")
+                        || remote_addr.starts_with("127.0.0.1:")
+                        || local_addr.starts_with("[::1]:")
+                        || remote_addr.starts_with("[::1]:"))
+                {
+                    return;
+                }
+                let (rem_ip_opt, rem_port_opt) = parse_socket_endpoint_ip(&remote_addr);
+                let remote_port = rem_port_opt.unwrap_or(0);
+                let (scope, mut internet_access) = match rem_ip_opt {
+                    Some(ip) => classify_ip_connection_scope(ip),
+                    None => ("unspecified", false),
+                };
+                if remote_port == 0 || state.eq_ignore_ascii_case("LISTENING") || state.eq_ignore_ascii_case("LISTEN") {
+                    internet_access = false;
+                }
+                let (proc_name, exe_path, cmd_line, proc_start_unix) =
+                    if let Some(pm) = proc_map_ref.get(&pid) {
+                        (
+                            pm.name.clone(),
+                            pm.exe.clone(),
+                            pm.cmd.clone(),
+                            pm.start_time_unix,
+                        )
+                    } else if let Some(fb) = fallback_name.filter(|s| !s.is_empty()) {
+                        (fb.clone(), fb.clone(), fb, 0)
+                    } else if pid == 4 && os_platform_ref == "windows" {
+                        (
+                            "System".to_string(),
+                            "System".to_string(),
+                            "NT Kernel & System".to_string(),
+                            0,
+                        )
+                    } else {
+                        (String::new(), String::new(), String::new(), 0)
+                    };
+
+                candidates.push(RawSocketCandidate {
+                    proto,
+                    local_addr,
+                    remote_addr,
+                    state,
+                    pid,
+                    proc_name,
+                    exe_path,
+                    cmd_line,
+                    proc_start_unix,
+                    scope: if internet_access {
+                        "external_internet"
+                    } else {
+                        scope
+                    },
+                    internet_access,
+                    remote_port,
+                });
+            };
+
             #[cfg(target_os = "windows")]
             if let Some(netstat_out) = run_hidden_os_command("netstat", &["-ano"]) {
-                for (idx, line) in netstat_out.lines().enumerate().take(120) {
+                for line in netstat_out.lines() {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 4
                         && (parts[0].eq_ignore_ascii_case("TCP")
                             || parts[0].eq_ignore_ascii_case("UDP"))
                     {
                         let proto = parts[0].to_ascii_uppercase();
-                        let local_addr = parts[1];
-                        let remote_addr = parts[2];
+                        let local_addr = parts[1].to_string();
+                        let remote_addr = parts[2].to_string();
                         let (state, pid_str) = if proto == "TCP" && parts.len() >= 5 {
-                            (parts[3], parts[4])
+                            (parts[3].to_string(), parts[4])
                         } else {
-                            ("STATELESS", parts[3])
+                            ("STATELESS".to_string(), parts[3])
                         };
-                        let pid = pid_str.parse::<u64>().unwrap_or(0);
-                        let val = serde_json::json!({
-                            "telemetry_type": "network_connection",
-                            "Computer": host_ref,
-                            "os_platform": "windows",
-                            "os_version": os_version_ref,
-                            "Protocol": proto,
-                            "SourceIp": local_addr,
-                            "DestinationIp": remote_addr,
-                            "State": state,
-                            "ProcessId": pid,
-                            "collected_unix_secs": now_unix,
-                            "source_path": format!("artemis://windows/live/netstat/{}", idx),
-                        });
-                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows"))
-                        {
-                            out.push(rec);
-                        }
+                        let pid = pid_str.parse::<u32>().unwrap_or(0);
+                        push_socket(proto, local_addr, remote_addr, state, pid, None);
                     }
                 }
             }
 
             #[cfg(target_os = "linux")]
-            if let Ok(tcp_content) = std::fs::read_to_string("/proc/net/tcp") {
-                for (idx, line) in tcp_content.lines().skip(1).enumerate().take(80) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 {
-                        let local_hex = parts[1];
-                        let rem_hex = parts[2];
-                        let val = serde_json::json!({
-                            "telemetry_type": "network_connection",
-                            "Computer": host_ref,
-                            "os_platform": "linux",
-                            "Protocol": "TCP",
-                            "SourceIp": local_hex,
-                            "DestinationIp": rem_hex,
-                            "collected_unix_secs": now_unix,
-                            "source_path": format!("artemis://linux/proc/net/tcp/{}", idx),
-                        });
-                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("linux"))
-                        {
-                            out.push(rec);
+            {
+                let inode_to_pid = build_linux_socket_inode_to_pid_map();
+                if let Ok(tcp_content) = std::fs::read_to_string("/proc/net/tcp") {
+                    for line in tcp_content.lines().skip(1) {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 10 {
+                            let local_dec = decode_proc_net_v4_endpoint(parts[1])
+                                .unwrap_or_else(|| parts[1].to_string());
+                            let rem_dec = decode_proc_net_v4_endpoint(parts[2])
+                                .unwrap_or_else(|| parts[2].to_string());
+                            let state = decode_proc_net_tcp_state(parts[3]).to_string();
+                            let inode = parts[9].parse::<u64>().unwrap_or(0);
+                            let pid = inode_to_pid.get(&inode).copied().unwrap_or(0);
+                            push_socket("TCP".to_string(), local_dec, rem_dec, state, pid, None);
                         }
                     }
                 }
             }
 
             #[cfg(target_os = "macos")]
-            if let Some(netstat_out) = run_hidden_os_command("netstat", &["-anv"]) {
-                for (idx, line) in netstat_out.lines().enumerate().take(80) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 5
-                        && (parts[0].starts_with("tcp") || parts[0].starts_with("udp"))
-                    {
-                        let val = serde_json::json!({
-                            "telemetry_type": "network_connection",
-                            "Computer": host_ref,
-                            "os_platform": "macos",
-                            "Protocol": parts[0],
-                            "SourceIp": parts[3],
-                            "DestinationIp": parts[4],
-                            "collected_unix_secs": now_unix,
-                            "source_path": format!("artemis://macos/live/netstat/{}", idx),
-                        });
-                        if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("macos"))
-                        {
-                            out.push(rec);
+            {
+                if let Some(lsof_out) = run_hidden_os_command("lsof", &["-nP", "-iTCP", "-iUDP"]) {
+                    for line in lsof_out.lines().skip(1) {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 9 {
+                            let cmd_name = parts[0].to_string();
+                            let pid = parts[1].parse::<u32>().unwrap_or(0);
+                            let proto = if parts[7].eq_ignore_ascii_case("UDP") {
+                                "UDP".to_string()
+                            } else {
+                                "TCP".to_string()
+                            };
+                            let name_col = parts[8];
+                            let state = parts
+                                .get(9)
+                                .map(|s| s.trim_matches(&['(', ')'][..]).to_string())
+                                .unwrap_or_else(|| "ACTIVE".to_string());
+                            if let Some((loc, rem)) = name_col.split_once("->") {
+                                push_socket(
+                                    proto,
+                                    loc.to_string(),
+                                    rem.to_string(),
+                                    state,
+                                    pid,
+                                    Some(cmd_name),
+                                );
+                            }
                         }
+                    }
+                } else if let Some(netstat_out) = run_hidden_os_command("netstat", &["-anv"]) {
+                    for line in netstat_out.lines() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 9
+                            && (parts[0].starts_with("tcp") || parts[0].starts_with("udp"))
+                        {
+                            let proto = parts[0].to_ascii_uppercase();
+                            let local_addr = parts[3].to_string();
+                            let remote_addr = parts[4].to_string();
+                            let state = parts[5].to_string();
+                            let pid = parts.get(8).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+                            push_socket(proto, local_addr, remote_addr, state, pid, None);
+                        }
+                    }
+                }
+            }
+
+            // Sort deterministically:
+            // 1. External public Internet connections FIRST (`internet_access == true`)
+            // 2. Active `ESTABLISHED` / `SYN_SENT` connections ahead of `TIME_WAIT` / `LISTENING`
+            // 3. Connections with a resolved live user/system process (`!proc_name.is_empty()`) first
+            // 4. Most recently started process (`proc_start_unix` descending) first!
+            let state_rank = |st: &str| -> u8 {
+                if st.eq_ignore_ascii_case("ESTABLISHED") {
+                    4
+                } else if st.eq_ignore_ascii_case("SYN_SENT") || st.eq_ignore_ascii_case("SYN_RECV") {
+                    3
+                } else if st.eq_ignore_ascii_case("CLOSE_WAIT") || st.eq_ignore_ascii_case("FIN_WAIT1") || st.eq_ignore_ascii_case("FIN_WAIT2") {
+                    2
+                } else if st.eq_ignore_ascii_case("TIME_WAIT") || st.eq_ignore_ascii_case("STATELESS") {
+                    1
+                } else {
+                    0
+                }
+            };
+
+            candidates.sort_by(|a, b| {
+                b.internet_access
+                    .cmp(&a.internet_access)
+                    .then_with(|| state_rank(&b.state).cmp(&state_rank(&a.state)))
+                    .then_with(|| (!b.proc_name.is_empty()).cmp(&(!a.proc_name.is_empty())))
+                    .then_with(|| b.proc_start_unix.cmp(&a.proc_start_unix))
+                    .then_with(|| b.pid.cmp(&a.pid))
+            });
+
+            // Deduplicate identical (pid, remote_addr, state) tuples while keeping bounded rich coverage
+            let mut seen_tuples = std::collections::HashSet::new();
+            let mut ext_rank = 0usize;
+            let mut local_rank = 0usize;
+
+            for cand in candidates {
+                let dedup_key = format!("{}:{}:{}", cand.pid, cand.remote_addr, cand.state);
+                if !seen_tuples.insert(dedup_key) {
+                    continue;
+                }
+                if cand.internet_access {
+                    if ext_rank >= 48 {
+                        continue;
+                    }
+                    let rank = ext_rank;
+                    ext_rank += 1;
+                    let val = serde_json::json!({
+                        "record_id": format!("artemis:live:{}:net:internet:{}", os_platform_ref, rank),
+                        "telemetry_type": "network_connection",
+                        "Computer": host_ref,
+                        "os_platform": os_platform_ref,
+                        "os_version": os_version_ref,
+                        "Protocol": cand.proto,
+                        "SourceIp": cand.local_addr,
+                        "DestinationIp": cand.remote_addr,
+                        "RemotePort": cand.remote_port,
+                        "State": cand.state,
+                        "ProcessId": cand.pid,
+                        "ProcessName": cand.proc_name,
+                        "Image": cand.exe_path,
+                        "CommandLine": cand.cmd_line,
+                        "ProcessStartTimeUnix": cand.proc_start_unix,
+                        "InternetAccess": true,
+                        "ConnectionScope": "external_internet",
+                        "EventDate": now_rfc3339_ref,
+                        "collected_unix_secs": now_unix.saturating_sub(rank as i64),
+                        "source_path": format!("artemis://{}/live/network/internet_{}", os_platform_ref, rank),
+                    });
+                    if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some(os_platform_ref)) {
+                        out.push(rec);
+                    }
+                } else {
+                    if local_rank >= 24 {
+                        continue;
+                    }
+                    let rank = local_rank;
+                    local_rank += 1;
+                    let val = serde_json::json!({
+                        "record_id": format!("artemis:live:{}:net:socket:{}", os_platform_ref, rank),
+                        "telemetry_type": "network_connection",
+                        "Computer": host_ref,
+                        "os_platform": os_platform_ref,
+                        "os_version": os_version_ref,
+                        "Protocol": cand.proto,
+                        "SourceIp": cand.local_addr,
+                        "DestinationIp": cand.remote_addr,
+                        "RemotePort": cand.remote_port,
+                        "State": cand.state,
+                        "ProcessId": cand.pid,
+                        "ProcessName": cand.proc_name,
+                        "Image": cand.exe_path,
+                        "CommandLine": cand.cmd_line,
+                        "ProcessStartTimeUnix": cand.proc_start_unix,
+                        "InternetAccess": false,
+                        "ConnectionScope": cand.scope,
+                        "EventDate": now_rfc3339_ref,
+                        "collected_unix_secs": now_unix.saturating_sub(100 + rank as i64),
+                        "source_path": format!("artemis://{}/live/network/socket_{}", os_platform_ref, rank),
+                    });
+                    if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some(os_platform_ref)) {
+                        out.push(rec);
                     }
                 }
             }
@@ -2406,6 +2922,71 @@ mod tests {
             assert!(!r.mesh_sharable);
             assert!(r.harvest_eligible);
             assert!(r.source_path.starts_with("artemis://"));
+        }
+    }
+
+    #[test]
+    fn test_classify_ip_connection_scope_public_vs_private() {
+        let public_endpoints = [
+            "142.250.190.78:443",
+            "1.1.1.1:53",
+            "8.8.8.8.443",
+            "[2607:f8b0:4005:805::200e]:443",
+            "[::ffff:142.250.190.78]:443",
+        ];
+        for ep in public_endpoints {
+            let (ip, port) = parse_socket_endpoint_ip(ep);
+            let ip = ip.unwrap_or_else(|| panic!("expected IP for {ep}"));
+            assert!(port.is_some(), "expected port for {ep}");
+            let (scope, is_internet) = classify_ip_connection_scope(ip);
+            assert_eq!(scope, "external_internet", "expected external_internet for {ep}");
+            assert!(is_internet, "expected public internet=true for {ep}");
+        }
+
+        let non_internet_endpoints = [
+            "127.0.0.1:3031",
+            "[::1]:3031",
+            "10.0.0.5:443",
+            "172.16.4.2:8080",
+            "192.168.1.42:54321",
+            "100.64.0.1:443",
+            "169.254.169.254:80",
+            "[fe80::1%eth0]:443",
+            "[fd00::1]:443",
+            "[::ffff:192.168.1.5]:443",
+            "0.0.0.0:0",
+            "[::]:0",
+        ];
+        for ep in non_internet_endpoints {
+            let (ip, _port) = parse_socket_endpoint_ip(ep);
+            let ip = ip.unwrap_or_else(|| panic!("expected IP for {ep}"));
+            let (_scope, is_internet) = classify_ip_connection_scope(ip);
+            assert!(!is_internet, "expected public internet=false for {ep}");
+        }
+    }
+
+    #[test]
+    fn test_live_network_and_process_collection_populates_tier3_artemis_records() {
+        let categories = vec![
+            "network_connection".to_string(),
+            "process_execution".to_string(),
+        ];
+        let records = collect_live_os_forensics(&categories);
+        assert!(
+            !records.is_empty(),
+            "Live OS process/network collection must yield real host telemetry records"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.telemetry_type == ForensicTelemetryType::ProcessExecution),
+            "Live OS collection must include ProcessExecution records"
+        );
+        for rec in &records {
+            assert_eq!(rec.access_tier, 3);
+            assert!(rec.artemis_dfir);
+            assert!(!rec.mesh_sharable);
+            assert!(rec.source_path.starts_with("artemis://"));
         }
     }
 }

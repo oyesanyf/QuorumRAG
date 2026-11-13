@@ -173,6 +173,11 @@ pub fn is_contact_bar_or_header(line: &str) -> bool {
         || lower.contains("codeintegrity")
         || lower.contains("systemeventlog")
         || lower.contains("processexecution")
+        || lower.contains("networkconnection")
+        || lower.contains("registrypersistence")
+        || lower.contains("prefetchamcacheexecution")
+        || lower.contains("servicedaemon")
+        || lower.contains("artemis dfir")
         || lower.contains("blocked and removed")
         || lower.contains("event id ")
     {
