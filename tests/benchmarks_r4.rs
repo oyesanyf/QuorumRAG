@@ -376,6 +376,7 @@ pub fn benchmark_5_byzantine_tolerance() -> BenchmarkMetricResult {
         access_tier: 0,
         score: 0.88,
         content: "legitimate verified consensus data across honest nodes".to_string(),
+        origin_peer_id: None,
     };
 
     let malicious_candidate = CandidateChunkDto {
@@ -386,6 +387,7 @@ pub fn benchmark_5_byzantine_tolerance() -> BenchmarkMetricResult {
         access_tier: 0,
         score: 0.999, // Attempted score stuffing
         content: "malicious rogue payload attempting to hijack consensus".to_string(),
+        origin_peer_id: None,
     };
 
     // Peer 1 (Honest): returns honest chunk

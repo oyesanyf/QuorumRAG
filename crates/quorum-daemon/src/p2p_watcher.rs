@@ -489,6 +489,9 @@ pub async fn run_in_daemon_canary_probe(state: &Arc<DaemonState>) -> Vec<PeerCan
         top_k: 0,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&watcher.node_seed, &mut req, AccessTier::Tier0Public);
 

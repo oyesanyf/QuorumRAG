@@ -72,6 +72,7 @@ async fn challenge_slow_peer_first_must_not_drop_fast_peer() {
             content: "Slow hanging chunk".to_string(),
             score: 0.99,
             access_tier: 0,
+            origin_peer_id: None,
         }],
     });
 
@@ -88,6 +89,7 @@ async fn challenge_slow_peer_first_must_not_drop_fast_peer() {
             content: "Fast query text remote".to_string(),
             score: 0.88,
             access_tier: 0,
+            origin_peer_id: None,
         }],
     });
 
@@ -141,6 +143,7 @@ async fn challenge_scatter_gather_engine_slow_peer_first() {
                 content: "Slow hanging chunk".to_string(),
                 score: 0.99,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         })
         .await;
@@ -159,6 +162,7 @@ async fn challenge_scatter_gather_engine_slow_peer_first() {
                 content: "Fast query text remote".to_string(),
                 score: 0.88,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         })
         .await;
@@ -428,6 +432,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
                 content: "Multi peer chunk content".to_string(),
                 score: 0.9,
                 access_tier: 0,
+                origin_peer_id: None,
             },
             CandidateChunkDto {
                 chunk_id: "chunk_same_peer_dup".to_string(),
@@ -437,6 +442,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
                 content: "Duplicate in same peer".to_string(),
                 score: 0.7,
                 access_tier: 0,
+                origin_peer_id: None,
             },
             CandidateChunkDto {
                 chunk_id: "chunk_same_peer_dup".to_string(),
@@ -446,6 +452,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
                 content: "Duplicate in same peer".to_string(),
                 score: 0.6,
                 access_tier: 0,
+                origin_peer_id: None,
             },
         ],
         vec![CandidateChunkDto {
@@ -456,6 +463,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
             content: "Multi peer chunk content".to_string(),
             score: 0.9,
             access_tier: 0,
+            origin_peer_id: None,
         }],
     ];
 
@@ -531,6 +539,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
             content: "Tie content alpha".to_string(),
             score: 0.5,
             access_tier: 0,
+            origin_peer_id: None,
         }]],
         60.0,
         2,
@@ -687,6 +696,7 @@ async fn challenge_scatter_gather_interleaved_fast_and_slow_peers() {
                     content: format!("Interleaved test query remote for {}", cid),
                     score: 0.85,
                     access_tier: 0,
+                    origin_peer_id: None,
                 }],
             })
             .await;

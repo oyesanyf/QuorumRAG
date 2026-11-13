@@ -338,6 +338,7 @@ fn challenge_tier5_zeroize_on_drop_remote_peer_memory_clearing() {
         content: "CANARY_VOLATILE_REMOTE_SECRET_CLEARING_TEST".to_string(),
         score: 0.97,
         access_tier: 1,
+        origin_peer_id: None,
     };
 
     let mut volatile_chunks = wrap_candidates("remote_peer_bob", vec![dto]);

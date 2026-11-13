@@ -166,16 +166,26 @@ pub enum ProtocolIntent {
 
 pub fn detect_protocol_forensic_intent(query: &str) -> ProtocolIntent {
     let lower = query.to_ascii_lowercase();
-    if has_word(
-        &lower,
-        &[
-            "dns", "53", "5353", "5355", "853", "dnscache", "sysmon",
-        ],
-    ) || lower.contains("dns traffic")
-        || lower.contains("dns query")
-        || lower.contains("port 53")
+    let has_dns_port_phrase = lower.contains("port 53")
+        || lower.contains("port:53")
         || lower.contains("udp 53")
-        || lower.contains(":53")
+        || lower.contains("udp/53")
+        || lower.contains("tcp 53")
+        || lower.contains("tcp/53")
+        || lower.contains("port 853")
+        || lower.contains("port 5353")
+        || lower.contains("port 5355")
+        || lower.contains(":53 ")
+        || lower.ends_with(":53");
+    if has_word(&lower, &["dns", "dnscache", "5353", "5355"])
+        || has_dns_port_phrase
+        || lower.contains("dns traffic")
+        || lower.contains("dns query")
+        || lower.contains("dns-client")
+        || lower.contains("dns client")
+        || lower.contains("sysmon 22")
+        || lower.contains("event 22")
+        || lower.contains("event_id 22")
     {
         ProtocolIntent::Dns
     } else {

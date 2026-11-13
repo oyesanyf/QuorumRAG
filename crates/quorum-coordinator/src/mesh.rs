@@ -566,7 +566,8 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
         // If no peers are currently connected (e.g., idle TCP drop, roaming on WAN, or remote node restarted),
         // proactively dial configured bootstrap_peers, auto DuckDNS endpoints, and known peers from p2p_known_peers.json,
         // subject to a 10-second cooldown so offline peers do not stall repeated queries.
-        if peers.is_empty() {
+        // Skip bootstrap dialing on relayed 1-hop queries (`relay_hops > 0`) so relays never stall.
+        if peers.is_empty() && request.relay_hops == 0 {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -680,9 +681,17 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
             }
         }
 
-        // Filter out non-QuorumRAG IPFS peers on port 4001 before dispatching candidate queries
+        // Filter out already-visited / sender / origin peers (preventing 1-hop relay echo loops & early straggler cutoff)
+        // and filter out non-QuorumRAG IPFS peers on port 4001 before dispatching candidate queries
         let connected_addrs = self.handle.connected_peer_addresses();
         peers.retain(|peer| {
+            let pid = peer.to_string();
+            if pid == request.sender_peer_id
+                || request.origin_peer_id.as_deref() == Some(pid.as_str())
+                || request.visited_peers.iter().any(|v| v == &pid)
+            {
+                return false;
+            }
             if let Some(addr) = connected_addrs.get(peer) {
                 let s = addr.to_string();
                 !s.contains("/tcp/4001") && !s.contains("/udp/4001") && !s.ends_with(":4001")
@@ -947,8 +956,9 @@ impl MeshQueryDispatcher for LocalOnlyDispatcher {
 
 /// Production inbound Mesh query handler enforcing OshoosiClaw Shared Folder ACLs
 /// and Two-Tier HIPAA PHI / PII Data Loss Prevention (`Redact` or `Block`).
-fn seen_query_cache() -> &'static std::sync::RwLock<HashMap<uuid::Uuid, Instant>> {
-    static CACHE: OnceLock<std::sync::RwLock<HashMap<uuid::Uuid, Instant>>> = OnceLock::new();
+fn seen_query_cache() -> &'static std::sync::RwLock<HashMap<(String, uuid::Uuid), Instant>> {
+    static CACHE: OnceLock<std::sync::RwLock<HashMap<(String, uuid::Uuid), Instant>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
@@ -1009,15 +1019,17 @@ impl OsoosiMeshInboundHandler {
 #[async_trait::async_trait]
 impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
     async fn handle_query(&self, req: FederatedQueryRequest) -> FederatedQueryResponse {
-        // 0. Deduplicate duplicate query_id within 60s TTL window to prevent replay or relay loops
+        // 0. Deduplicate duplicate (local_peer_id, query_id) within 60s TTL window to prevent replay or relay loops
         {
             let now = Instant::now();
+            let cache_key = (self.local_peer_id.clone(), req.query_id);
             let mut cache = seen_query_cache().write().unwrap_or_else(|e| e.into_inner());
             cache.retain(|_, seen_time| now.duration_since(*seen_time) < Duration::from_secs(60));
-            if cache.contains_key(&req.query_id) {
+            if cache.contains_key(&cache_key) {
                 tracing::debug!(
-                    "Dropping duplicate mesh query_id {} already processed within 60s TTL",
-                    req.query_id
+                    "Dropping duplicate mesh query_id {} already processed on {} within 60s TTL",
+                    req.query_id,
+                    self.local_peer_id
                 );
                 return FederatedQueryResponse {
                     query_id: req.query_id,
@@ -1025,7 +1037,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     chunks: Vec::new(),
                 };
             }
-            cache.insert(req.query_id, now);
+            cache.insert(cache_key, now);
         }
 
         // 0b. Loop prevention: do not process query if this node was already visited
@@ -1160,6 +1172,34 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             };
         }
 
+        // Spawn loop-free 1-hop federated relay CONCURRENTLY with local hybrid search + RLM parent expansion
+        // so cross-WAN gateway -> home LAN peer fan-out adds zero sequential stall!
+        let relay_handle = if req.relay_hops == 0 {
+            let disp_opt = self.dispatcher.read().unwrap_or_else(|e| e.into_inner()).clone();
+            disp_opt.map(|disp| {
+                let mut relayed_req = req.clone();
+                let original_origin = req
+                    .origin_peer_id
+                    .clone()
+                    .unwrap_or_else(|| req.sender_peer_id.clone());
+                relayed_req.origin_peer_id = Some(original_origin);
+                relayed_req.relay_hops = 1;
+                if !relayed_req.visited_peers.contains(&self.local_peer_id) {
+                    relayed_req.visited_peers.push(self.local_peer_id.clone());
+                }
+                if !relayed_req.visited_peers.contains(&req.sender_peer_id) {
+                    relayed_req.visited_peers.push(req.sender_peer_id.clone());
+                }
+                tokio::spawn(async move {
+                    disp.query_peers(&relayed_req, Duration::from_millis(3500))
+                        .await
+                        .ok()
+                })
+            })
+        } else {
+            None
+        };
+
         // Re-embed query in local embedding space if local embedder is available or incoming vector is unpopulated
         let query_embedding = if let Some(ref embedder) = self.embedder {
             match embedder.embed_text(&req.query_text) {
@@ -1177,7 +1217,21 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             req.embedding.clone()
         };
 
-        let (mut scored, text_scored) = tokio::join!(
+        let stripped_entity_q =
+            quorum_storage::query_framing::strip_conversational_framing(&req.query_text);
+        let stripped_fut = async {
+            if !stripped_entity_q.trim().is_empty()
+                && !stripped_entity_q.eq_ignore_ascii_case(&req.query_text)
+            {
+                self.local_storage
+                    .search_text(&stripped_entity_q, effective_tier, 24)
+                    .await
+            } else {
+                Vec::new()
+            }
+        };
+
+        let (mut scored, text_scored, stripped_scored) = tokio::join!(
             self.local_storage.search_hybrid(
                 &req.query_text,
                 &query_embedding,
@@ -1185,15 +1239,54 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 req.top_k.clamp(16, 32),
             ),
             self.local_storage
-                .search_text(&req.query_text, effective_tier, 24)
+                .search_text(&req.query_text, effective_tier, 24),
+            stripped_fut,
         );
 
         let mut seen_ids: std::collections::HashSet<String> =
             scored.iter().map(|c| c.chunk.chunk_id.clone()).collect();
-        for hit in text_scored {
+        for hit in stripped_scored.into_iter().chain(text_scored.into_iter()) {
             if seen_ids.insert(hit.chunk.chunk_id.clone()) {
                 scored.push(hit);
             }
+        }
+
+        // Prioritize chunks matching ALL non-stopword content terms so multi-word entity queries
+        // ("WHO IS ANGELA DAVIS") rank complete entity matches ahead of single-word distractors.
+        let content_words: Vec<String> = stripped_entity_q
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3 && !crate::agentic::retrieve::STOPWORDS.contains(w))
+            .fold(Vec::new(), |mut acc, w| {
+                let s = w.to_string();
+                if !acc.contains(&s) {
+                    acc.push(s);
+                }
+                acc
+            });
+        if content_words.len() >= 2 && scored.len() > 1 {
+            scored.sort_by(|a, b| {
+                let count_hits = |sc: &quorum_types::ScoredChunk| -> usize {
+                    let tl = sc.chunk.text_content.to_ascii_lowercase();
+                    let fl = sc.chunk.file_path.to_ascii_lowercase();
+                    let tokens: std::collections::HashSet<&str> = tl
+                        .split(|c: char| !c.is_alphanumeric())
+                        .chain(fl.split(|c: char| !c.is_alphanumeric()))
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    content_words
+                        .iter()
+                        .filter(|w| tokens.contains(w.as_str()))
+                        .count()
+                };
+                count_hits(b)
+                    .cmp(&count_hits(a))
+                    .then_with(|| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            });
         }
 
         // Preserve multimodal chunks matching key query content terms
@@ -1312,33 +1405,19 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
         let mut safe_chunks = controller
             .filter_and_enforce_outbound_mesh_chunks(candidate_dtos, &req.sender_peer_id);
 
-        // Loop-free 1-hop federated relay across WAN NAT gateways
-        // If relay_hops == 0, forward to other connected mesh peers (clamping depth <= 1)
-        if req.relay_hops == 0 {
-            let disp_opt = self.dispatcher.read().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(ref disp) = disp_opt {
-                let mut relayed_req = req.clone();
-                let original_origin = req
-                    .origin_peer_id
-                    .clone()
-                    .unwrap_or_else(|| req.sender_peer_id.clone());
-                relayed_req.origin_peer_id = Some(original_origin);
-                relayed_req.relay_hops = 1;
-                relayed_req.visited_peers.push(self.local_peer_id.clone());
-                if !relayed_req.visited_peers.contains(&req.sender_peer_id) {
-                    relayed_req.visited_peers.push(req.sender_peer_id.clone());
-                }
-                if let Ok(relayed_resps) = disp
-                    .query_peers(&relayed_req, Duration::from_millis(1500))
-                    .await
-                {
-                    for resp in relayed_resps {
-                        for mut chunk in resp.chunks {
-                            if chunk.origin_peer_id.is_none() {
-                                chunk.origin_peer_id = Some(resp.responder_peer_id.clone());
-                            }
-                            safe_chunks.push(chunk);
+        // Join concurrent 1-hop federated relay responses and preserve authentic origin_peer_id
+        if let Some(jh) = relay_handle {
+            if let Ok(Some(relayed_resps)) = jh.await {
+                for resp in relayed_resps {
+                    for mut chunk in resp.chunks {
+                        if chunk
+                            .origin_peer_id
+                            .as_deref()
+                            .map_or(true, |p| p.is_empty() || p.eq_ignore_ascii_case("local"))
+                        {
+                            chunk.origin_peer_id = Some(resp.responder_peer_id.clone());
                         }
+                        safe_chunks.push(chunk);
                     }
                 }
             }

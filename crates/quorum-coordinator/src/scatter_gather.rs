@@ -476,6 +476,9 @@ impl ScatterGatherEngine {
                         top_k: top_k.max(16),
                         timestamp: Utc::now().timestamp(),
                         signature: [0u8; 64],
+                        origin_peer_id: None,
+                        relay_hops: 0,
+                        visited_peers: Vec::new(),
                     };
                     let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
                     sign_request(&self.secret_seed, &mut req, tier);
@@ -686,28 +689,26 @@ impl ScatterGatherEngine {
         inspected_items.sort_by_key(|(resp_idx, chunk_idx, _, _, _)| (*resp_idx, *chunk_idx));
 
         let mut volatile_chunks = Vec::with_capacity(inspected_items.len());
-        let mut remote_lists = Vec::new();
-        let mut current_resp_idx = usize::MAX;
-        let mut current_peer = String::new();
-        let mut current_list = Vec::new();
+        let mut remote_lists: Vec<(String, Vec<quorum_types::CandidateChunkDto>)> = Vec::new();
 
-        for (resp_idx, _, peer_id, mut chunk, dlp_res) in inspected_items {
+        for (_resp_idx, _, peer_id, mut chunk, dlp_res) in inspected_items {
             if dlp_res.allowed_to_share {
+                let effective_peer = chunk
+                    .origin_peer_id
+                    .clone()
+                    .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("local"))
+                    .unwrap_or_else(|| peer_id.clone());
+                chunk.origin_peer_id = Some(effective_peer.clone());
                 chunk.content = dlp_res.scrubbed_text;
-                volatile_chunks.push(chunk.to_volatile_remote_chunk(&peer_id));
-                if resp_idx != current_resp_idx {
-                    if !current_list.is_empty() {
-                        remote_lists.push((current_peer, current_list));
-                        current_list = Vec::new();
-                    }
-                    current_resp_idx = resp_idx;
-                    current_peer = peer_id;
+                volatile_chunks.push(chunk.to_volatile_remote_chunk(&effective_peer));
+                if let Some((_existing_peer, list)) =
+                    remote_lists.iter_mut().find(|(p, _)| p == &effective_peer)
+                {
+                    list.push(chunk);
+                } else {
+                    remote_lists.push((effective_peer, vec![chunk]));
                 }
-                current_list.push(chunk);
             }
-        }
-        if !current_list.is_empty() {
-            remote_lists.push((current_peer, current_list));
         }
 
         // 4. Reciprocal Rank Fusion preserving responder_peer_id
@@ -916,6 +917,9 @@ impl ScatterGatherEngine {
                             top_k,
                             timestamp: Utc::now().timestamp(),
                             signature: [0u8; 64],
+                            origin_peer_id: None,
+                            relay_hops: 0,
+                            visited_peers: Vec::new(),
                         };
                         let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
                         sign_request(&self.secret_seed, &mut req, tier);
@@ -992,8 +996,14 @@ impl ScatterGatherEngine {
 
             for (_, _, peer_id, mut chunk, dlp_res) in evaluated {
                 if dlp_res.allowed_to_share {
+                    let effective_peer = chunk
+                        .origin_peer_id
+                        .clone()
+                        .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("local"))
+                        .unwrap_or_else(|| peer_id.clone());
+                    chunk.origin_peer_id = Some(effective_peer.clone());
                     chunk.content = dlp_res.scrubbed_text.clone();
-                    volatile.push(chunk.to_volatile_remote_chunk(&peer_id));
+                    volatile.push(chunk.to_volatile_remote_chunk(&effective_peer));
                     let derived_doc_id = chunk
                         .chunk_id
                         .rsplit_once(':')
@@ -1016,7 +1026,7 @@ impl ScatterGatherEngine {
                     results.push(ScoredChunk::new(
                         doc_chunk,
                         chunk.score,
-                        peer_id,
+                        effective_peer,
                         true,
                     ));
                 }

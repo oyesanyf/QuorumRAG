@@ -416,6 +416,7 @@ async fn test_cross_platform_concurrency_stress_and_end_to_end_benchmarks() {
                     ),
                     score: 0.91,
                     access_tier: 0,
+                    origin_peer_id: None,
                 }],
             })
             .await;
@@ -443,6 +444,9 @@ async fn test_cross_platform_concurrency_stress_and_end_to_end_benchmarks() {
             top_k: 5,
             timestamp: 1_700_000_000,
             signature: [9u8; 64],
+            origin_peer_id: None,
+            relay_hops: 0,
+            visited_peers: Vec::new(),
         };
         let t0 = Instant::now();
         let (responses, _diag) = dispatcher

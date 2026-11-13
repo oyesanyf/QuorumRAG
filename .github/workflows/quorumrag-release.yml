@@ -144,6 +144,13 @@ jobs:
           workspaces: .
           key: quorumrag-linux-x64
 
+      - name: Verify Workspace Compilation & v0.6.6 Regression Suites
+        run: |
+          cargo check --workspace --all-targets
+          cargo test -p quorum-types --lib
+          cargo test -p quorum-coordinator --test regression_angela_davis_disambiguation
+          cargo test -p quorum-daemon --test regression_dns_forensic_routing
+
       - name: Build & Package Linux x64 (.deb, .rpm, .tar.gz)
         env:
           INPUT_VERSION: ${{ inputs.version }}

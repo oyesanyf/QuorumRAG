@@ -28,6 +28,7 @@ impl InboundQueryHandler for EchoQueryHandler {
                 content: format!("[{}] Echo: {}", self.node_name, req.query_text),
                 score: 0.99,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         }
     }
@@ -123,6 +124,9 @@ async fn test_adversarial_concurrent_point_to_point_queries() {
                 top_k: 5,
                 timestamp: Utc::now().timestamp(),
                 signature: [0u8; 64],
+                origin_peer_id: None,
+                relay_hops: 0,
+                visited_peers: Vec::new(),
             };
             let resp = handle.send_query(target_peer, req).await;
             (q_id, q_text, resp)
@@ -185,6 +189,9 @@ async fn test_adversarial_bidirectional_simultaneous_queries() {
                 top_k: 3,
                 timestamp: Utc::now().timestamp(),
                 signature: [0u8; 64],
+                origin_peer_id: None,
+                relay_hops: 0,
+                visited_peers: Vec::new(),
             };
             let resp = ha.send_query(pb, req).await.unwrap();
             assert_eq!(resp.responder_peer_id, "node_beta");
@@ -207,6 +214,9 @@ async fn test_adversarial_bidirectional_simultaneous_queries() {
                 top_k: 3,
                 timestamp: Utc::now().timestamp(),
                 signature: [0u8; 64],
+                origin_peer_id: None,
+                relay_hops: 0,
+                visited_peers: Vec::new(),
             };
             let resp = hb.send_query(pa, req).await.unwrap();
             assert_eq!(resp.responder_peer_id, "node_alpha");

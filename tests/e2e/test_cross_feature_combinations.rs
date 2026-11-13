@@ -178,6 +178,7 @@ async fn test_pair_scatter_gather_timeout_during_active_query() {
             content: "Never arrives".to_string(),
             score: 0.99,
             access_tier: 0,
+            origin_peer_id: None,
         }],
     };
     coordinator.add_peer(hanging_peer);
@@ -273,6 +274,7 @@ fn test_pair_memory_security_volatile_vs_persistent_lifecycle() {
         content: remote_text.to_string(),
         score: 0.95,
         access_tier: 0,
+        origin_peer_id: None,
     };
     let mut volatile = dto.to_volatile_remote_chunk("peer_ephemeral");
 

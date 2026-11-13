@@ -74,6 +74,7 @@ fn test_byzantine_sybil_score_stuffing_under_high_load() {
             access_tier: 0,
             score: 0.999, // Artificially inflated
             content: sybil_text.to_string(),
+            origin_peer_id: None,
         });
     }
 
@@ -86,6 +87,7 @@ fn test_byzantine_sybil_score_stuffing_under_high_load() {
         access_tier: 0,
         score: 0.92,
         content: "Official verified corporate financial statement and audit.".to_string(),
+        origin_peer_id: None,
     }];
 
     // Execute RRF Fusion: Local + Rogue Peer A + Honest Peer B
@@ -148,6 +150,7 @@ fn test_byzantine_merkle_root_and_chunk_hash_tampering() {
         access_tier: 0,
         score: 0.99,
         content: "Malicious payload under legitimate ID".to_string(),
+        origin_peer_id: None,
     };
 
     let fused = RrfCombiner::fuse_rankings(
@@ -197,6 +200,9 @@ async fn test_byzantine_ed25519_forged_signature_and_identity_spoofing() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed_a, &mut spoofed_req, AccessTier::Tier0Public);
     let resp_spoofed = handler.handle_query(spoofed_req).await;
@@ -213,6 +219,9 @@ async fn test_byzantine_ed25519_forged_signature_and_identity_spoofing() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed_a, &mut forged_sig_req, AccessTier::Tier0Public);
     forged_sig_req.signature[0] ^= 0x01; // Bit flip
@@ -230,6 +239,9 @@ async fn test_byzantine_ed25519_forged_signature_and_identity_spoofing() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed_a, &mut tampered_text_req, AccessTier::Tier0Public);
     tampered_text_req.query_text = "Classified confidential keys".to_string();
@@ -277,6 +289,7 @@ async fn test_byzantine_network_partition_and_silent_drop_400ms_deadline() {
             access_tier: 0,
             score: 0.90,
             content: "Fast remote peer document".to_string(),
+            origin_peer_id: None,
         }],
     });
 
@@ -294,6 +307,7 @@ async fn test_byzantine_network_partition_and_silent_drop_400ms_deadline() {
                 access_tier: 0,
                 score: 0.99,
                 content: format!("Partitioned peer {} data should be discarded", i),
+                origin_peer_id: None,
             }],
         });
     }
@@ -367,6 +381,9 @@ async fn test_byzantine_replay_attack_and_drift_window_rejection() {
             top_k: 5,
             timestamp: ts,
             signature: [0u8; 64],
+            origin_peer_id: None,
+            relay_hops: 0,
+            visited_peers: Vec::new(),
         };
         sign_request(&seed, &mut req, AccessTier::Tier0Public);
 
@@ -390,6 +407,9 @@ async fn test_byzantine_replay_attack_and_drift_window_rejection() {
             top_k: 5,
             timestamp: ts,
             signature: [0u8; 64],
+            origin_peer_id: None,
+            relay_hops: 0,
+            visited_peers: Vec::new(),
         };
         sign_request(&seed, &mut valid_req, AccessTier::Tier0Public);
         assert!(verify_request(&valid_req, AccessTier::Tier0Public, 60).is_ok());

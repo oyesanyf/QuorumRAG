@@ -50,6 +50,9 @@ fn test_timestamp_boundary_extremes_and_overflow_immunity() {
             top_k: 10,
             timestamp: ts,
             signature: [0u8; 64],
+            origin_peer_id: None,
+            relay_hops: 0,
+            visited_peers: Vec::new(),
         };
 
         // 1. is_fresh(60) must never panic
@@ -89,6 +92,9 @@ fn test_timestamp_with_extreme_max_drift_secs() {
         top_k: 10,
         timestamp: now,
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
 
     // Test extreme drift parameters: 0, i64::MAX, -1, i64::MIN
@@ -215,6 +221,9 @@ fn test_canonical_signing_bytes_with_multibyte_and_extreme_embeddings() {
         top_k: 42,
         timestamp: Utc::now().timestamp(),
         signature: [0x11u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
 
     let bytes = req.canonical_signing_bytes();
@@ -239,6 +248,7 @@ fn test_into_volatile_remote_chunk_zeroize_on_drop_stress() {
         content: secret,
         score: 0.95,
         access_tier: 2,
+        origin_peer_id: None,
     };
 
     // Consume DTO by value into VolatileRemoteChunk

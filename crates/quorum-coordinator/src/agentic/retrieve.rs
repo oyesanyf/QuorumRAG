@@ -264,7 +264,13 @@ impl RetrieveMeshNode {
         } else {
             state.original_prompt.as_str()
         };
-        let proper_terms: Vec<String> = proper_source
+        let proper_source_low = proper_source.trim().to_ascii_lowercase();
+        let is_explicit_person_lookup = proper_source_low.starts_with("who is ")
+            || proper_source_low.starts_with("who was ")
+            || proper_source_low.starts_with("who are ")
+            || proper_source_low.contains(" who is ")
+            || proper_source_low.contains(" who was ");
+        let mut proper_terms: Vec<String> = proper_source
             .split_whitespace()
             .enumerate()
             .filter_map(|(i, raw)| {
@@ -282,6 +288,7 @@ impl RetrieveMeshNode {
                     && lw.len() >= 3
                     && !STOPWORDS.contains(&lw.as_str())
                     && !GENERIC_ATTRIBUTE_TERMS.contains(&lw.as_str())
+                    && !QUERY_META_INTENT_TERMS.contains(&lw.as_str())
                 {
                     Some(lw)
                 } else {
@@ -294,6 +301,24 @@ impl RetrieveMeshNode {
                 }
                 acc
             });
+        if proper_terms.is_empty() && is_explicit_person_lookup {
+            for raw in proper_source_low.split_whitespace() {
+                let lw = raw
+                    .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+                    .trim_end_matches("'s")
+                    .trim_end_matches("\u{2019}s")
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_string();
+                if lw.len() >= 3
+                    && !STOPWORDS.contains(&lw.as_str())
+                    && !GENERIC_ATTRIBUTE_TERMS.contains(&lw.as_str())
+                    && !QUERY_META_INTENT_TERMS.contains(&lw.as_str())
+                    && !proper_terms.contains(&lw)
+                {
+                    proper_terms.push(lw);
+                }
+            }
+        }
 
         // Precompute supplemental search queries upfront so they can execute concurrently with the primary search
         let should_run_supplemental = (daemon_active || !state.extracted_entities.is_empty()) && !prelim_entities.is_empty();
@@ -510,6 +535,7 @@ impl RetrieveMeshNode {
             const EXCLUDED_EXTS: &[&str] = &[
                 ".rs", ".py", ".js", ".ts", ".jsx", ".tsx", ".c", ".cpp", ".h", ".hpp",
                 ".cc", ".cs", ".java", ".go", ".kt", ".rb", ".php", ".swift", ".scala",
+                ".pm", ".pl", ".t", ".pod", ".xs", ".r", ".rmd", ".ipynb",
                 ".sh", ".bash", ".ps1", ".bat", ".cmd", ".sql", ".css", ".scss", ".less",
                 ".vue", ".svelte", ".toml", ".yaml", ".yml", ".lock", ".dat", ".log",
                 ".tmp", ".bak", ".wbk",
@@ -1133,6 +1159,9 @@ impl RetrieveMeshNode {
             }
 
             if any_lexical_match && !paired.is_empty() {
+                let any_relevant_match = paired
+                    .iter()
+                    .any(|(_, crit)| crit.is_relevant && crit.weighted_hits > 0);
                 paired.retain(|(c, crit)| {
                     let path_l = c.chunk.file_path.to_ascii_lowercase();
                     let is_forensic_artemis = path_l.starts_with("artemis://")
@@ -1143,7 +1172,11 @@ impl RetrieveMeshNode {
                     let wanted_media = media_prefix
                         .map_or(false, |p| c.chunk.text_content.trim_start().starts_with(p) && crit.weighted_hits > 0);
                     is_forensic_artemis
-                        || (c.is_remote && (!any_proper_match || crit.proper_ok) && (!any_prompt_entity_match || crit.prompt_entity_hits >= required_prompt_hits))
+                        || (c.is_remote
+                            && crit.weighted_hits > 0
+                            && (!any_relevant_match || crit.is_relevant)
+                            && (!any_proper_match || crit.proper_ok)
+                            && (!any_prompt_entity_match || crit.prompt_entity_hits >= required_prompt_hits))
                         || wanted_media
                         || (crit.is_relevant
                             && crit.weighted_hits > 0
@@ -1586,6 +1619,7 @@ mod tests {
                 content: "Femi Oyesanya — AI Security Resume Timeline | LinkedIn: linkedin.com/in/femioyesanya | GitHub: github.com/oyesanyf".to_string(),
                 score: 0.96,
                 access_tier: 0,
+                origin_peer_id: None,
             },
             CandidateChunkDto {
                 chunk_id: "remote_pdf_doc:1".to_string(),
@@ -1595,6 +1629,7 @@ mod tests {
                 content: "Career Timeline: 2022–Present: Principal AI Security Architect — Led LLM & Agentic RAG containment. 2018–2022: Lead Application Security Engineer — Directed SDLC threat modeling and cloud security.".to_string(),
                 score: 0.91,
                 access_tier: 0,
+                origin_peer_id: None,
             },
             CandidateChunkDto {
                 chunk_id: "remote_docx_doc:0".to_string(),
@@ -1604,6 +1639,7 @@ mod tests {
                 content: "Femi Oyesanya — AI Security Resume Timeline | LinkedIn: linkedin.com/in/femioyesanya | GitHub: github.com/oyesanyf".to_string(),
                 score: 0.93,
                 access_tier: 0,
+                origin_peer_id: None,
             },
             CandidateChunkDto {
                 chunk_id: "remote_docx_doc:1".to_string(),
@@ -1613,6 +1649,7 @@ mod tests {
                 content: "Career Timeline: 2022–Present: Principal AI Security Architect | 2014–2018: Senior Information Security Consultant.".to_string(),
                 score: 0.89,
                 access_tier: 0,
+                origin_peer_id: None,
             },
         ];
 
@@ -1745,16 +1782,13 @@ mod tests {
         let remote_peer_id = "12D3KooWKHc3PeerDistractor";
         let distractor = CandidateChunkDto {
             chunk_id: "remote_best_internet:0".to_string(),
-            document_id: "remote_best_internet".to_string(),
             file_path: r"C:\Users\Peer\Documents\Best Internet Guy Awards.docx".to_string(),
             line_start: 1,
             line_end: 20,
+            content: "Best Internet Guy Awards certificate for Internet excellence.".to_string(),
+            score: 0.93,
             access_tier: 0,
-            text_content: "Best Internet Guy Awards certificate for Internet excellence.".to_string(),
-            blake3_hash: [7u8; 32],
-            metadata_json: "{}".to_string(),
-            relevance_score: 0.93,
-            language: "english".to_string(),
+            origin_peer_id: None,
         };
         let remote_mock = MockMeshDispatcher::new(vec![MockRemotePeer {
             peer_id: remote_peer_id.to_string(),

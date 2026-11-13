@@ -92,6 +92,7 @@ fn test_byzantine_consensus_anti_stuffing() {
         access_tier: 0,
         score: 0.9,
         content: "malicious duplicated payload".to_string(),
+        origin_peer_id: None,
     };
 
     // Peer 1 sends identical content 5 times under different or identical chunk IDs
@@ -148,6 +149,7 @@ fn test_multi_peer_consensus_boost() {
         access_tier: 0,
         score: 0.9,
         content: content.to_string(),
+        origin_peer_id: None,
     }];
 
     let peer2 = vec![CandidateChunkDto {
@@ -158,6 +160,7 @@ fn test_multi_peer_consensus_boost() {
         access_tier: 0,
         score: 0.88,
         content: content.to_string(),
+        origin_peer_id: None,
     }];
 
     let fused = RrfCombiner::fuse_rankings(local, vec![peer1, peer2], 60.0, 10);
@@ -228,6 +231,9 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed, &mut valid_req, AccessTier::Tier0Public);
 
@@ -247,6 +253,9 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         top_k: 5,
         timestamp: Utc::now().timestamp() - 120, // 2 minutes ago
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed, &mut stale_req, AccessTier::Tier0Public);
 
@@ -266,6 +275,9 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed, &mut spoofed_req, AccessTier::Tier0Public);
 
@@ -285,6 +297,9 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed, &mut malformed_emb_req, AccessTier::Tier0Public);
 
@@ -306,6 +321,9 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
     sign_request(&seed, &mut nan_req, AccessTier::Tier0Public);
 
@@ -408,6 +426,7 @@ async fn test_mesh_early_resolution_single_peer_latency() {
             content: "Remote test content".to_string(),
             score: 0.85,
             access_tier: 0,
+            origin_peer_id: None,
         }],
     };
     dispatcher.add_peer(peer).await;
@@ -421,6 +440,9 @@ async fn test_mesh_early_resolution_single_peer_latency() {
         top_k: 5,
         timestamp: Utc::now().timestamp(),
         signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
     };
 
     let start = Instant::now();

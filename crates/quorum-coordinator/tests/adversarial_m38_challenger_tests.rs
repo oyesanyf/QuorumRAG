@@ -117,7 +117,10 @@ fn create_signed_test_request(query: &str) -> FederatedQueryRequest {
         signature: [0u8; 64],
     };
     sign_request(&[0x42u8; 32], &mut req, AccessTier::Tier0Public);
-    req
+    req,
+    origin_peer_id: None,
+    relay_hops: 0,
+    visited_peers: Vec::new(),
 }
 
 // ============================================================================
@@ -141,6 +144,7 @@ async fn test_empirical_mesh_latency_single_peer_resolves_immediately_under_200m
                     content: "QuorumRAG deterministic scatter-gather architecture".to_string(),
                     score: 0.92,
                     access_tier: 0,
+                    origin_peer_id: None,
                 },
                 CandidateChunkDto {
                     chunk_id: "chunk_remote_2".to_string(),
@@ -150,6 +154,7 @@ async fn test_empirical_mesh_latency_single_peer_resolves_immediately_under_200m
                     content: "Byzantine fault tolerance and RRF rank fusion".to_string(),
                     score: 0.88,
                     access_tier: 0,
+                    origin_peer_id: None,
                 },
             ],
         })
@@ -207,6 +212,7 @@ async fn test_empirical_scatter_gather_single_peer_immediate_resolution() {
                 content: "Remote zero-trust cryptographic enclaves".to_string(),
                 score: 0.90,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         })
         .await;
@@ -267,6 +273,7 @@ async fn test_empirical_dead_peer_straggler_early_resolution_with_fast_responder
                     content: "Fast peer high-priority candidate chunk".to_string(),
                     score: 0.95,
                     access_tier: 0,
+                    origin_peer_id: None,
                 },
                 CandidateChunkDto {
                     chunk_id: "c_fast_2".to_string(),
@@ -276,6 +283,7 @@ async fn test_empirical_dead_peer_straggler_early_resolution_with_fast_responder
                     content: "Fast peer second candidate chunk".to_string(),
                     score: 0.89,
                     access_tier: 0,
+                    origin_peer_id: None,
                 },
             ],
         })
@@ -295,6 +303,7 @@ async fn test_empirical_dead_peer_straggler_early_resolution_with_fast_responder
                 content: "Straggler delayed content".to_string(),
                 score: 0.50,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         })
         .await;
@@ -383,6 +392,7 @@ async fn test_empirical_dead_peer_straggler_with_zero_chunks_fast_peer() {
                 content: "Too slow".to_string(),
                 score: 0.1,
                 access_tier: 0,
+                origin_peer_id: None,
             }],
         })
         .await;
@@ -861,6 +871,7 @@ async fn test_empirical_semaphore_bounded_dlp_concurrent_chunk_streams_stress() 
                 content,
                 score: 0.90,
                 access_tier: 0,
+                origin_peer_id: None,
             });
         }
 
