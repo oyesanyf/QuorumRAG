@@ -1563,7 +1563,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                 if remote_port == 0 || state.eq_ignore_ascii_case("LISTENING") || state.eq_ignore_ascii_case("LISTEN") {
                     internet_access = false;
                 }
-                let (mut eff_pid, mut proc_name, mut exe_path, mut cmd_line, proc_start_unix) =
+                let (eff_pid, mut proc_name, mut exe_path, mut cmd_line, proc_start_unix) =
                     if let Some(pm) = proc_map_ref.get(&pid) {
                         (
                             pid,
@@ -1913,6 +1913,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
 
         // 3. RegistryPersistence (`registry_persistence`)
         let h_reg = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
+            #[allow(unused_mut)]
             let mut out = Vec::new();
             if !category_enabled(allowed_categories, ForensicTelemetryType::RegistryPersistence) {
                 return out;
@@ -1979,6 +1980,7 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
 
         // 4. PrefetchAmcacheExecution (`prefetch_amcache_execution`)
         let h_pf = s.spawn(move || -> Vec<ArtemisTelemetryRecord> {
+            #[allow(unused_mut)]
             let mut out = Vec::new();
             if !category_enabled(
                 allowed_categories,

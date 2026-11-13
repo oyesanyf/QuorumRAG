@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.9.
+"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.10.
 
 Spawns a real `quorumrag` release daemon against an isolated corpus containing
 homonym clusters, noisy ChatGPT export markers, and forensic distractors, then
@@ -108,6 +108,11 @@ def seed_corpus(corpus_dir: Path) -> None:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="Verify live QuorumRAG HTTP test queries")
     parser.add_argument("--bin", required=True, help="Path to compiled quorumrag binary")
     parser.add_argument("--port", type=int, default=3045, help="HTTP port for isolated daemon")

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?ifndef ProductVersion ?>
-<?define ProductVersion = "0.6.9" ?>
+<?define ProductVersion = "0.6.10" ?>
 <?endif ?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
     <Package Name="QuorumRAG P2P Agentic RAG"

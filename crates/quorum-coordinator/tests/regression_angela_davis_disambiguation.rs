@@ -539,9 +539,16 @@ async fn test_three_node_one_hop_mesh_relay_parent_rlm_expansion_and_provenance(
         .find(|c| c.source_peer == peer_c_id)
         .expect("Relayed chunk from LAN Peer C must preserve Peer C's authentic origin_peer_id");
     assert!(
-        peer_c_chunk.chunk.text_content.contains("2913 Castiglione St.")
-            && peer_c_chunk.chunk.text_content.contains("No subletting is permitted"),
+        peer_c_chunk.chunk.text_content.contains("monthly rent of $725.00")
+            && peer_c_chunk.chunk.text_content.contains("No subletting is permitted")
+            && peer_c_chunk.chunk.text_content.contains("Castiglione St."),
         "Peer C inbound handler must RLM-expand full parent window across sibling chunks before returning: {}",
+        peer_c_chunk.chunk.text_content
+    );
+    assert!(
+        peer_c_chunk.chunk.text_content.contains("[REDACTED:GLINER_LOCATION]")
+            || peer_c_chunk.chunk.text_content.contains("2913 Castiglione St."),
+        "Peer C outbound Three-Engine DLP must inspect expanded parent window prior to wire egress: {}",
         peer_c_chunk.chunk.text_content
     );
     assert!(
@@ -567,7 +574,11 @@ async fn test_three_node_one_hop_mesh_relay_parent_rlm_expansion_and_provenance(
     let ans = res.synthesis_prompt;
     assert!(ans.contains("Women, Race & Class"), "Must include Node A Academic record: {}", ans);
     assert!(ans.contains("STEWARD"), "Must include Gateway Node B Ministry record: {}", ans);
-    assert!(ans.contains("2913 Castiglione St."), "Must include relayed LAN Peer C Lease record: {}", ans);
+    assert!(
+        ans.contains("Castiglione") && ans.contains("$725.00") && ans.contains("Aerial McDougle"),
+        "Must include relayed LAN Peer C Lease record: {}",
+        ans
+    );
     assert!(ans.len() >= 900, "Cross-all-hosts disambiguated RLM answer must be thorough and detailed (got {} chars)", ans.len());
     println!(
         "\n=== [REGRESSION TEST OUTPUT: 3-HOST 1-HOP MESH RELAY + 10KB RLM EXPANSION (WHO IS ANGELA DAVIS)] ===\nContributing Peers: {:?}\n{}\n=== [END 3-HOST OUTPUT] ===",
