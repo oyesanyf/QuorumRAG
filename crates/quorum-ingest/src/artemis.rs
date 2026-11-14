@@ -1115,9 +1115,14 @@ pub fn parse_artemis_jsonl_str(content: &str) -> Result<Vec<ArtemisTelemetryReco
 
 /// Runs a local OS command with `CREATE_NO_WINDOW` on Windows and a strict 3-second wall-clock
 /// deadline so hung OS utilities (`netstat`, `wevtutil`, `reg`, `lsof`) are deterministically reaped
-/// and never stall async workers or console-less services.
+/// and never stall async workers, console-less services, or inherited stdout pipes.
 fn run_hidden_os_command(program: &str, args: &[&str]) -> Option<String> {
     use std::io::Read;
+    use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static SPAWN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
     let mut cmd = std::process::Command::new(program);
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -1129,25 +1134,48 @@ fn run_hidden_os_command(program: &str, args: &[&str]) -> Option<String> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd.spawn().ok()?;
+
+    // Serialize process creation across concurrent scoped threads so sibling child processes
+    // never inherit another thread's transient anonymous pipe write handle on Windows.
+    let mut child = {
+        let lock = SPAWN_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        cmd.spawn().ok()?
+    };
+
     let mut stdout_pipe = child.stdout.take()?;
-    let reader_handle = std::thread::spawn(move || {
-        let mut buf = Vec::with_capacity(16 * 1024);
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
+    let shared_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(16 * 1024)));
+    let reader_buf = Arc::clone(&shared_buf);
+    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stdout_pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut guard = reader_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.len() < 4 * 1024 * 1024 {
+                        guard.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = done_tx.send(());
     });
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+    let deadline = Instant::now() + Duration::from_millis(3000);
     loop {
         match child.try_wait() {
             Ok(Some(_status)) => break,
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
+                if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
                     return None;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(20));
             }
             Err(_) => {
                 let _ = child.kill();
@@ -1157,7 +1185,13 @@ fn run_hidden_os_command(program: &str, args: &[&str]) -> Option<String> {
         }
     }
 
-    let bytes = reader_handle.join().ok()?;
+    // Bound post-exit EOF drain so grandchild processes (`conhost.exe` / WMI providers) holding
+    // inherited handles on Windows can never stall callers indefinitely.
+    let _ = done_rx.recv_timeout(Duration::from_millis(150));
+    let bytes = {
+        let guard = shared_buf.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clone()
+    };
     if !bytes.is_empty() {
         Some(String::from_utf8_lossy(&bytes).to_string())
     } else {
@@ -2532,119 +2566,64 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                     }
                 }
 
-                // 2. Query PowerShell Get-DnsClientCache or ipconfig /displaydns fallback
-                if let Some(cache_out) = run_hidden_os_command(
-                    "powershell",
-                    &[
-                        "-NoProfile",
-                        "-Command",
-                        "Get-DnsClientCache | Select-Object -Property Entry, Type, Status, Section, Data | ConvertTo-Json -Compress",
-                    ],
-                ) {
-                    if let Ok(parsed_json) =
-                        serde_json::from_str::<serde_json::Value>(cache_out.trim())
-                    {
-                        let items = if let Some(arr) = parsed_json.as_array() {
-                            arr.clone()
-                        } else if parsed_json.is_object() {
-                            vec![parsed_json]
-                        } else {
-                            Vec::new()
-                        };
-                        for (c_idx, item) in items.into_iter().take(32).enumerate() {
-                            let entry_name = item
-                                .get("Entry")
-                                .or_else(|| item.get("Name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if entry_name.is_empty() {
-                                continue;
-                            }
-                            let q_type = item.get("Type").and_then(|v| v.as_u64()).unwrap_or(1);
-                            let q_data = item
-                                .get("Data")
-                                .or_else(|| item.get("IPAddress"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let q_status = item.get("Status").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let q_section = item.get("Section").and_then(|v| v.as_u64()).unwrap_or(1);
-                            let val = serde_json::json!({
-                                "record_id": format!("artemis:live:windows:dns:cache:{}", c_idx),
-                                "telemetry_type": "network_connection",
-                                "Computer": host_ref,
-                                "os_platform": "windows",
-                                "os_version": os_version_ref,
-                                "ProcessId": dnscache_live_pid,
-                                "ProcessName": "svchost.exe (Dnscache)",
-                                "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
-                                "Port": 53,
-                                "Protocol": "UDP",
-                                "dns_service": "DNS",
-                                "dns_query": true,
-                                "QueryName": entry_name,
-                                "QueryResults": q_data,
-                                "QueryStatus": q_status.to_string(),
-                                "QueryType": q_type.to_string(),
-                                "CacheSection": q_section,
-                                "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Section: {}, Status: {}, Data: '{}')", entry_name, q_type, q_section, q_status, q_data),
-                                "collected_unix_secs": now_unix.saturating_add(1).saturating_sub(c_idx as i64),
-                                "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
-                            });
-                            if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
-                                records.push(rec);
-                            }
-                        }
-                    }
-                } else if let Some(ipconfig_out) = run_hidden_os_command("ipconfig", &["/displaydns"]) {
+                // 2. Query fast native `ipconfig /displaydns` first (~35ms, zero .NET cold start),
+                // falling back to PowerShell `Get-DnsClientCache` only if needed.
+                let mut added_cache_entries = 0usize;
+                if let Some(ipconfig_out) = run_hidden_os_command("ipconfig", &["/displaydns"]) {
                     let mut current_name = String::new();
                     let mut current_type = String::new();
                     let mut current_data = String::new();
-                    let mut c_idx = 0usize;
                     for line in ipconfig_out.lines() {
                         let trimmed = line.trim();
-                        if let Some(rest) = trimmed.strip_prefix("Record Name . . . . . :") {
-                            if !current_name.is_empty() && c_idx < 32 {
-                                let val = serde_json::json!({
-                                    "record_id": format!("artemis:live:windows:dns:cache:{}", c_idx),
-                                    "telemetry_type": "network_connection",
-                                    "Computer": host_ref,
-                                    "os_platform": "windows",
-                                    "os_version": os_version_ref,
-                                    "ProcessId": dnscache_live_pid,
-                                    "ProcessName": "svchost.exe (Dnscache)",
-                                    "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
-                                    "Port": 53,
-                                    "Protocol": "UDP",
-                                    "dns_service": "DNS",
-                                    "dns_query": true,
-                                    "QueryName": current_name,
-                                    "QueryResults": current_data,
-                                    "QueryType": current_type,
-                                    "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Data: '{}')", current_name, current_type, current_data),
-                                    "collected_unix_secs": now_unix.saturating_add(1).saturating_sub(c_idx as i64),
-                                    "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
-                                });
-                                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
-                                    records.push(rec);
+                        if let Some((lhs, rhs)) = trimmed.split_once(':') {
+                            let key = lhs
+                                .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
+                                .to_ascii_lowercase();
+                            let val_str = rhs.trim();
+                            if key == "record name" {
+                                if !current_name.is_empty() && added_cache_entries < 32 {
+                                    let val = serde_json::json!({
+                                        "record_id": format!("artemis:live:windows:dns:cache:{}", added_cache_entries),
+                                        "telemetry_type": "network_connection",
+                                        "Computer": host_ref,
+                                        "os_platform": "windows",
+                                        "os_version": os_version_ref,
+                                        "ProcessId": dnscache_live_pid,
+                                        "ProcessName": "svchost.exe (Dnscache)",
+                                        "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
+                                        "Port": 53,
+                                        "Protocol": "UDP",
+                                        "dns_service": "DNS",
+                                        "dns_query": true,
+                                        "QueryName": current_name,
+                                        "QueryResults": current_data,
+                                        "QueryType": current_type,
+                                        "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Data: '{}')", current_name, current_type, current_data),
+                                        "collected_unix_secs": now_unix.saturating_add(1).saturating_sub(added_cache_entries as i64),
+                                        "source_path": format!("artemis://windows/live/dns/cache_{}", added_cache_entries),
+                                    });
+                                    if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
+                                        records.push(rec);
+                                        added_cache_entries += 1;
+                                    }
+                                    current_data.clear();
+                                    current_type.clear();
                                 }
-                                c_idx += 1;
-                                current_data.clear();
-                                current_type.clear();
+                                current_name = val_str.to_string();
+                            } else if key == "record type" {
+                                current_type = val_str.to_string();
+                            } else if matches!(
+                                key.as_str(),
+                                "a (host) record" | "aaaa record" | "ptr record" | "cname record"
+                            ) && current_data.is_empty()
+                            {
+                                current_data = val_str.to_string();
                             }
-                            current_name = rest.trim().to_string();
-                        } else if let Some(rest) = trimmed.strip_prefix("Record Type . . . . . :") {
-                            current_type = rest.trim().to_string();
-                        } else if let Some(rest) = trimmed.strip_prefix("A (Host) Record  . . . :")
-                            .or_else(|| trimmed.strip_prefix("AAAA Record . . . . . :"))
-                            .or_else(|| trimmed.strip_prefix("PTR Record  . . . . . :"))
-                            .or_else(|| trimmed.strip_prefix("CNAME Record  . . . . :"))
-                        {
-                            current_data = rest.trim().to_string();
                         }
                     }
-                    if !current_name.is_empty() && c_idx < 32 {
+                    if !current_name.is_empty() && added_cache_entries < 32 {
                         let val = serde_json::json!({
-                            "record_id": format!("artemis:live:windows:dns:cache:{}", c_idx),
+                            "record_id": format!("artemis:live:windows:dns:cache:{}", added_cache_entries),
                             "telemetry_type": "network_connection",
                             "Computer": host_ref,
                             "os_platform": "windows",
@@ -2660,11 +2639,79 @@ pub fn collect_live_os_forensics(allowed_categories: &[String]) -> Vec<ArtemisTe
                             "QueryResults": current_data,
                             "QueryType": current_type,
                             "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Data: '{}')", current_name, current_type, current_data),
-                            "collected_unix_secs": now_unix.saturating_add(1).saturating_sub(c_idx as i64),
-                            "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
+                            "collected_unix_secs": now_unix.saturating_add(1).saturating_sub(added_cache_entries as i64),
+                            "source_path": format!("artemis://windows/live/dns/cache_{}", added_cache_entries),
                         });
                         if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
                             records.push(rec);
+                            added_cache_entries += 1;
+                        }
+                    }
+                }
+
+                if added_cache_entries == 0 {
+                    if let Some(cache_out) = run_hidden_os_command(
+                        "powershell",
+                        &[
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-Command",
+                            "Get-DnsClientCache | Select-Object -Property Entry, Type, Status, Section, Data | ConvertTo-Json -Compress",
+                        ],
+                    ) {
+                        if let Ok(parsed_json) =
+                            serde_json::from_str::<serde_json::Value>(cache_out.trim())
+                        {
+                            let items = if let Some(arr) = parsed_json.as_array() {
+                                arr.clone()
+                            } else if parsed_json.is_object() {
+                                vec![parsed_json]
+                            } else {
+                                Vec::new()
+                            };
+                            for (c_idx, item) in items.into_iter().take(32).enumerate() {
+                                let entry_name = item
+                                    .get("Entry")
+                                    .or_else(|| item.get("Name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if entry_name.is_empty() {
+                                    continue;
+                                }
+                                let q_type = item.get("Type").and_then(|v| v.as_u64()).unwrap_or(1);
+                                let q_data = item
+                                    .get("Data")
+                                    .or_else(|| item.get("IPAddress"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let q_status = item.get("Status").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let q_section = item.get("Section").and_then(|v| v.as_u64()).unwrap_or(1);
+                                let val = serde_json::json!({
+                                    "record_id": format!("artemis:live:windows:dns:cache:{}", c_idx),
+                                    "telemetry_type": "network_connection",
+                                    "Computer": host_ref,
+                                    "os_platform": "windows",
+                                    "os_version": os_version_ref,
+                                    "ProcessId": dnscache_live_pid,
+                                    "ProcessName": "svchost.exe (Dnscache)",
+                                    "Image": "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
+                                    "Port": 53,
+                                    "Protocol": "UDP",
+                                    "dns_service": "DNS",
+                                    "dns_query": true,
+                                    "QueryName": entry_name,
+                                    "QueryResults": q_data,
+                                    "QueryStatus": q_status.to_string(),
+                                    "QueryType": q_type.to_string(),
+                                    "CacheSection": q_section,
+                                    "Message": format!("Windows DNS Client Resolver Cache Entry for '{}' (Type: {}, Section: {}, Status: {}, Data: '{}')", entry_name, q_type, q_section, q_status, q_data),
+                                    "collected_unix_secs": now_unix.saturating_add(1).saturating_sub(c_idx as i64),
+                                    "source_path": format!("artemis://windows/live/dns/cache_{}", c_idx),
+                                });
+                                if let Ok(rec) = ArtemisTelemetryRecord::from_json_value(val, Some("windows")) {
+                                    records.push(rec);
+                                }
+                            }
                         }
                     }
                 }
