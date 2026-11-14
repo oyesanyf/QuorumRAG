@@ -179,10 +179,14 @@ def collect_canonical_artifacts(root: Path, version: str) -> list[Path]:
         f"deploy/macos/quorumrag-{version}-macos-universal.tar.gz",
     ]
     found = []
+    seen: set[Path] = set()
     for rel in expected_patterns:
         p = root / rel
         if p.exists():
-            found.append(p)
+            resolved = p.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                found.append(p)
     return found
 
 
@@ -334,7 +338,7 @@ def assert_repo_boundary(root: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="QuorumRAG Solo-Developer Release Publisher")
-    parser.add_argument("--version", default="0.6.12", help="Semantic version (default: 0.6.12)")
+    parser.add_argument("--version", default="0.6.13", help="Semantic version (default: 0.6.13)")
     parser.add_argument(
         "--push-tag",
         action="store_true",

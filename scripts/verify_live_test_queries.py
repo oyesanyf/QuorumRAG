@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.12.
+"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.13.
 
 Spawns a real `quorumrag` release daemon against an isolated corpus containing
 homonym clusters, noisy ChatGPT export markers, and forensic distractors, then
@@ -161,6 +161,7 @@ def main() -> int:
         )
 
         print(f"[E2E 2/4] Starting live QuorumRAG daemon on 127.0.0.1:{args.port}...")
+        daemon_log_path = tmp_path / "daemon.log"
         daemon_cmd = [
             str(bin_path),
             "--host",
@@ -177,20 +178,21 @@ def main() -> int:
             "--local-only",
             "--no-p2p-watcher",
         ]
+        # Stream daemon logs directly to a disk file rather than an un-drained anonymous pipe;
+        # Windows anonymous pipes default to a 4 KB buffer and block `tracing` writes once full.
+        daemon_log_f = open(daemon_log_path, "w", encoding="utf-8", errors="replace")
         proc = subprocess.Popen(
             daemon_cmd,
             env=child_env,
-            stdout=subprocess.PIPE,
+            stdout=daemon_log_f,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
         )
         try:
             ready = False
             for _ in range(60):
                 if proc.poll() is not None:
-                    out_log = proc.stdout.read() if proc.stdout else ""
+                    daemon_log_f.flush()
+                    out_log = daemon_log_path.read_text(encoding="utf-8", errors="replace")
                     raise RuntimeError(f"Daemon exited early with code {proc.returncode}:\n{out_log}")
                 try:
                     code, _ = http_json(args.port, "GET", "/api/health", timeout=2.0)
@@ -284,6 +286,14 @@ def main() -> int:
                 http_json(args.port, "POST", "/api/shutdown", {}, timeout=5.0)
             except Exception:
                 pass
+        except Exception:
+            try:
+                daemon_log_f.flush()
+                tail = daemon_log_path.read_text(encoding="utf-8", errors="replace")[-8000:]
+                print(f"\n=== [DAEMON LOG TAIL] ===\n{tail}\n=== [END DAEMON LOG TAIL] ===", file=sys.stderr)
+            except Exception:
+                pass
+            raise
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -291,6 +301,11 @@ def main() -> int:
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+            daemon_log_f.close()
 
     print("\nALL LIVE HTTP /api/query E2E TEST QUERIES PASSED SUCCESSFULLY!")
     return 0
