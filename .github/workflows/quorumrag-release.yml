@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g. 0.6.13)'
+        description: 'Release version (e.g. 0.6.14)'
         required: false
-        default: '0.6.13'
+        default: '0.6.14'
 
 permissions: read-all
 
@@ -66,7 +66,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           $env:PATH = "$env:USERPROFILE\.dotnet\tools;C:\ProgramData\chocolatey\bin;$env:PATH"
-          $ver = if ($env:REF_NAME -like "quorumrag-v*") { $env:REF_NAME.Substring(11) } elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "0.6.13" }
+          $ver = if ($env:REF_NAME -like "quorumrag-v*") { $env:REF_NAME.Substring(11) } elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "0.6.14" }
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1 -Version $ver -SkipDefenderScan
           $msi = "deploy\windows\QuorumRAG-$ver-x86_64.msi"
           $zip = "deploy\windows\QuorumRAG-$ver-windows-x86_64.zip"
@@ -149,7 +149,7 @@ jobs:
           workspaces: .
           key: quorumrag-linux-x64
 
-      - name: Verify Workspace Compilation & v0.6.13 Regression Suites
+      - name: Verify Workspace Compilation & v0.6.14 Regression Suites
         run: |
           cargo check --workspace --all-targets
           cargo test -p quorum-types --lib
@@ -162,7 +162,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.13}"
+          VERSION="${INPUT_VERSION:-0.6.14}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag
           ./target/release/quorumrag --version
@@ -243,7 +243,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.13}"
+          VERSION="${INPUT_VERSION:-0.6.14}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag
           ./target/release/quorumrag --version
@@ -261,86 +261,13 @@ jobs:
   # 4. macOS Universal (Apple Silicon arm64 + Intel x86_64) Native .pkg, .dmg & .tar.gz
   build-macos:
     name: macOS Universal (.pkg, .dmg, .tar.gz)
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 120
     continue-on-error: true
     permissions:
       contents: read
     outputs:
       built: ${{ steps.done.outputs.built }}
-    steps:
-      - name: Checkout commit
-        shell: bash
-        env:
-          REPO_URL: https://github.com/${{ github.repository }}.git
-          SHA: ${{ github.sha }}
-        run: |
-          git init -q .
-          git remote add origin "$REPO_URL"
-          git -c protocol.version=2 fetch --no-tags --depth 1 origin "$SHA"
-          git checkout -q FETCH_HEAD
-
-      - name: Ensure protobuf & cmake on macOS
-        run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if ! command -v cmake >/dev/null 2>&1; then
-            brew install cmake
-          fi
-
-      - name: Install Rust stable (arm64 + x86_64)
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-
-      - name: Cache Cargo registry & target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.7.5
-        with:
-          workspaces: .
-          key: quorumrag-macos-universal-intel
-          cache-on-failure: "true"
-
-      - name: Build Universal Binary & Native .pkg / .dmg / .tar.gz
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          VERSION="${INPUT_VERSION:-0.6.13}"
-          if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
-          cargo build --release -p quorum-daemon --bin quorumrag --target aarch64-apple-darwin
-          cargo build --release -p quorum-daemon --bin quorumrag --target x86_64-apple-darwin
-          mkdir -p target/release
-          lipo -create -output target/release/quorumrag \
-            target/aarch64-apple-darwin/release/quorumrag \
-            target/x86_64-apple-darwin/release/quorumrag
-          lipo -info target/release/quorumrag
-          lipo -info target/release/quorumrag | grep -E "x86_64.*arm64|arm64.*x86_64"
-          ./target/release/quorumrag --version
-          bash packaging/macos/build_packages.sh target/release/quorumrag "${VERSION}" universal deploy/macos quorumrag
-          pkgutil --payload-files "deploy/macos/QuorumRAG-${VERSION}-macos-universal.pkg" | head -n 20
-          hdiutil imageinfo "deploy/macos/QuorumRAG-${VERSION}-macos-universal.dmg" | head -n 20
-
-      - name: Upload macOS Universal Artifacts
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
-        with:
-          name: quorumrag-macos-universal
-          path: deploy/macos/*
-          if-no-files-found: error
-
-      - name: Mark macOS Universal Build Complete
-        id: done
-        run: echo "built=true" >> "$GITHUB_OUTPUT"
-
-  # 4b. Automatic Apple Silicon Fallback if Intel macOS runner pool is unavailable
-  build-macos-fallback:
-    name: macOS Universal Fallback (Apple Silicon)
-    needs: [build-macos]
-    if: always() && needs.build-macos.outputs.built != 'true'
-    runs-on: macos-15
-    timeout-minutes: 120
-    permissions:
-      contents: read
     steps:
       - name: Checkout commit
         shell: bash
@@ -379,7 +306,80 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.13}"
+          VERSION="${INPUT_VERSION:-0.6.14}"
+          if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
+          cargo build --release -p quorum-daemon --bin quorumrag --target aarch64-apple-darwin
+          cargo build --release -p quorum-daemon --bin quorumrag --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/quorumrag \
+            target/aarch64-apple-darwin/release/quorumrag \
+            target/x86_64-apple-darwin/release/quorumrag
+          lipo -info target/release/quorumrag
+          lipo -info target/release/quorumrag | grep -E "x86_64.*arm64|arm64.*x86_64"
+          ./target/release/quorumrag --version
+          bash packaging/macos/build_packages.sh target/release/quorumrag "${VERSION}" universal deploy/macos quorumrag
+          pkgutil --payload-files "deploy/macos/QuorumRAG-${VERSION}-macos-universal.pkg" | head -n 20
+          hdiutil imageinfo "deploy/macos/QuorumRAG-${VERSION}-macos-universal.dmg" | head -n 20
+
+      - name: Upload macOS Universal Artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: quorumrag-macos-universal
+          path: deploy/macos/*
+          if-no-files-found: error
+
+      - name: Mark macOS Universal Build Complete
+        id: done
+        run: echo "built=true" >> "$GITHUB_OUTPUT"
+
+  # 4b. Automatic macOS-14 Fallback if macos-15 runner pool is unavailable
+  build-macos-fallback:
+    name: macOS Universal Fallback (macOS 14)
+    needs: [build-macos]
+    if: always() && needs.build-macos.outputs.built != 'true'
+    runs-on: macos-14
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout commit
+        shell: bash
+        env:
+          REPO_URL: https://github.com/${{ github.repository }}.git
+          SHA: ${{ github.sha }}
+        run: |
+          git init -q .
+          git remote add origin "$REPO_URL"
+          git -c protocol.version=2 fetch --no-tags --depth 1 origin "$SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Ensure protobuf & cmake on macOS
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            brew install protobuf
+          fi
+          if ! command -v cmake >/dev/null 2>&1; then
+            brew install cmake
+          fi
+
+      - name: Install Rust stable (arm64 + x86_64)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo registry & target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.7.5
+        with:
+          workspaces: .
+          key: quorumrag-macos-universal-m14
+          cache-on-failure: "true"
+
+      - name: Build Universal Binary & Native .pkg / .dmg / .tar.gz
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${INPUT_VERSION:-0.6.14}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag --target aarch64-apple-darwin
           cargo build --release -p quorum-daemon --bin quorumrag --target x86_64-apple-darwin
@@ -439,7 +439,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.13}"
+          VERSION="${INPUT_VERSION:-0.6.14}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           mkdir -p release_assets
           find dist/ -type f \( -name "*.msi" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg" -o -name "*.dmg" -o -name "*.tar.gz" \) -exec cp -f {} release_assets/ \;
@@ -482,7 +482,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.13}"
+          VERSION="${INPUT_VERSION:-0.6.14}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           TAG_NAME="quorumrag-v${VERSION}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then TAG_NAME="${REF_NAME}"; fi
