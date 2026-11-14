@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.13.
+"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.14.
 
 Spawns a real `quorumrag` release daemon against an isolated corpus containing
 homonym clusters, noisy ChatGPT export markers, and forensic distractors, then
@@ -122,7 +122,7 @@ def main() -> int:
     bin_path = Path(args.bin).resolve()
     require(bin_path.is_file(), f"Binary does not exist: {bin_path}")
 
-    with tempfile.TemporaryDirectory(prefix="quorumrag_e2e_") as tmp_root:
+    with tempfile.TemporaryDirectory(prefix="quorumrag_e2e_", ignore_cleanup_errors=True) as tmp_root:
         tmp_path = Path(tmp_root)
         data_dir = tmp_path / "data"
         corpus_dir = tmp_path / "corpus"
@@ -305,6 +305,12 @@ def main() -> int:
                         proc.wait(timeout=5)
                     except Exception:
                         pass
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    check=False,
+                )
             daemon_log_f.close()
 
     print("\nALL LIVE HTTP /api/query E2E TEST QUERIES PASSED SUCCESSFULLY!")
