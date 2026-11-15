@@ -156,6 +156,13 @@ fn reset_to_clean_defaults() {
     controller.update_settings(current);
 }
 
+fn enable_artemis_for_challenger() {
+    let controller = global_mesh_dlp_controller();
+    let mut current = controller.get_settings();
+    current.artemis.enabled = true;
+    controller.update_settings(current);
+}
+
 // =========================================================================
 // 1. DEFAULT STATUS INVARIANTS & AIRGAP INTEGRITY
 // =========================================================================
@@ -165,6 +172,7 @@ async fn test_challenger_artemis_status_default_invariants() {
     let (app, _state, _temp_dir) = setup_challenger_test_app().await;
     reset_to_clean_defaults();
 
+    // 1. By default, forensics is completely disabled -> 403 Forbidden
     let res = app
         .clone()
         .oneshot(
@@ -177,8 +185,28 @@ async fn test_challenger_artemis_status_default_invariants() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let json = read_body_json(res).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let json_forbidden = read_body_json(res).await;
+    assert_eq!(json_forbidden["status"], "forbidden");
+    assert_eq!(json_forbidden["forensics_enabled"], false);
+
+    // 2. When opted-in, verify status invariants & category allowlist disjointness
+    enable_artemis_for_challenger();
+
+    let res_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/artemis/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res_ok.status(), StatusCode::OK);
+    let json = read_body_json(res_ok).await;
 
     // Core invariants mandated by R3 / Acceptance Criteria
     assert_eq!(json["status"], "ok");
@@ -236,7 +264,7 @@ async fn test_challenger_artemis_status_default_invariants() {
 #[tokio::test]
 async fn test_challenger_artemis_collect_live_403_adversarial_matrix() {
     let (app, _state, _temp_dir) = setup_challenger_test_app().await;
-    reset_to_clean_defaults();
+    enable_artemis_for_challenger();
 
     let expected_error =
         "Local Artemis DFIR collection is disabled by default. Enable in Settings first.";
@@ -318,7 +346,7 @@ async fn test_challenger_artemis_collect_live_403_adversarial_matrix() {
 #[tokio::test]
 async fn test_challenger_artemis_config_update_persistence_roundtrip() {
     let (app, _state, _temp_dir) = setup_challenger_test_app().await;
-    reset_to_clean_defaults();
+    enable_artemis_for_challenger();
 
     // 1. Initial verification via GET /api/v1/artemis/config
     let initial_res = app
@@ -434,6 +462,7 @@ async fn test_challenger_artemis_config_update_persistence_roundtrip() {
 #[tokio::test]
 async fn test_challenger_artemis_preview_normalizer_pseudonymization() {
     let (app, _state, _temp_dir) = setup_challenger_test_app().await;
+    enable_artemis_for_challenger();
 
     // Complex adversarial forensic event containing multiple identifier classes
     let raw_forensic_event = "\
@@ -575,6 +604,7 @@ ProcessName: C:\\Windows\\System32\\cmd.exe";
 #[tokio::test]
 async fn test_challenger_artemis_preview_normalizer_malformed_and_boundary_inputs() {
     let (app, _state, _temp_dir) = setup_challenger_test_app().await;
+    enable_artemis_for_challenger();
 
     // 1. Completely empty JSON body
     let res_empty = app
@@ -641,6 +671,7 @@ async fn test_challenger_artemis_preview_normalizer_malformed_and_boundary_input
 #[tokio::test]
 async fn test_challenger_artemis_collect_adversarial_paths_and_scrubbing() {
     let (app, state, temp_dir) = setup_challenger_test_app().await;
+    enable_artemis_for_challenger();
 
     // 1. Nonexistent target path should fail with 400 Bad Request
     let bad_path_res = app
@@ -757,9 +788,10 @@ async fn test_challenger_artemis_collect_adversarial_paths_and_scrubbing() {
 async fn test_challenger_artemis_live_collection_opt_in_and_revocation() {
     let (app, _state, _temp_dir) = setup_challenger_test_app().await;
 
-    // Enable local collection explicitly
+    // Enable local collection explicitly (and enable forensics subsystem)
     let controller = global_mesh_dlp_controller();
     let mut current = controller.get_settings();
+    current.artemis.enabled = true;
     current.artemis.local_collection_enabled = true;
     controller.update_settings(current);
 

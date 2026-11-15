@@ -76,6 +76,8 @@ impl InboundQueryHandler for DefaultInboundQueryHandler {
             query_id: req.query_id,
             responder_peer_id: String::new(),
             chunks: Vec::new(),
+            synthesis_response: None,
+            warm_llm_available: false,
         }
     }
 }

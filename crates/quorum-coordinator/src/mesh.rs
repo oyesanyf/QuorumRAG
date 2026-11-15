@@ -257,10 +257,30 @@ impl MockRemotePeer {
     }
 }
 
+static GLOBAL_MESH_DISPATCHER: std::sync::OnceLock<std::sync::RwLock<Option<Arc<dyn MeshQueryDispatcher>>>> =
+    std::sync::OnceLock::new();
+
+pub fn get_global_mesh_dispatcher() -> Option<Arc<dyn MeshQueryDispatcher>> {
+    GLOBAL_MESH_DISPATCHER
+        .get()?
+        .read()
+        .ok()?
+        .clone()
+}
+
+pub fn set_global_mesh_dispatcher(dispatcher: Arc<dyn MeshQueryDispatcher>) {
+    let cell = GLOBAL_MESH_DISPATCHER.get_or_init(|| std::sync::RwLock::new(None));
+    if let Ok(mut lock) = cell.write() {
+        *lock = Some(dispatcher);
+    }
+}
+
 /// In-memory mock dispatcher holding multiple mock peers for deterministic testing.
 #[derive(Debug, Default, Clone)]
 pub struct MockMeshDispatcher {
     pub peers: Arc<RwLock<Vec<MockRemotePeer>>>,
+    pub warm_llm_peers: Arc<RwLock<std::collections::HashSet<String>>>,
+    pub synthesis_responses: Arc<RwLock<std::collections::HashMap<String, String>>>,
 }
 
 impl MockMeshDispatcher {
@@ -271,6 +291,14 @@ impl MockMeshDispatcher {
     pub async fn add_peer(&self, peer: MockRemotePeer) {
         let mut p = self.peers.write().await;
         p.push(peer);
+    }
+
+    pub async fn register_warm_llm(&self, peer_id: impl Into<String>, simulated_synthesis: Option<String>) {
+        let pid = peer_id.into();
+        self.warm_llm_peers.write().await.insert(pid.clone());
+        if let Some(text) = simulated_synthesis {
+            self.synthesis_responses.write().await.insert(pid, text);
+        }
     }
 }
 
@@ -338,6 +366,8 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
             }
         };
 
+        let warm_llm_peers = self.warm_llm_peers.read().await.clone();
+        let synth_map = self.synthesis_responses.read().await.clone();
         let mut responses = Vec::new();
         let primary_deadline = tokio::time::Instant::now() + timeout;
         let mut active_deadline = primary_deadline;
@@ -369,21 +399,55 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
                         latency_ms,
                         error_message: None,
                     });
+                    let is_warm = warm_llm_peers.contains(&peer_id);
+                    let synthesis_resp = if let Some(ref relay) = request.synthesis_relay {
+                        if is_warm {
+                            let text = synth_map.get(&peer_id).cloned().unwrap_or_else(|| {
+                                format!("Synthesized answer by {}: grounded in evidence.", peer_id)
+                            });
+                            Some(quorum_types::MeshSynthesisRelayResponse {
+                                synthesized_text: text.clone(),
+                                citations: vec![quorum_types::Citation {
+                                    peer_id: peer_id.clone(),
+                                    file_path: relay.evidence_chunks.first().map(|c| c.file_path.clone()).unwrap_or_default(),
+                                    line_start: 1,
+                                    line_end: 1,
+                                    score: 1.0,
+                                    snippet: text.chars().take(120).collect(),
+                                    node_id: Some(peer_id.clone()),
+                                    is_external_node: true,
+                                    origin_label: Some("mesh".to_string()),
+                                    node_alias: None,
+                                    verbatim_quote: None,
+                                    byte_range: None,
+                                    grounding_rationale: Some("Synthesized evidence delegation".to_string()),
+                                }],
+                                model_tag: relay.model_tag.clone().unwrap_or_else(|| "qwen2.5:7b".to_string()),
+                                responder_peer_id: peer_id.clone(),
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     responses.push(FederatedQueryResponse {
                         query_id,
                         responder_peer_id: peer_id,
                         chunks,
+                        synthesis_response: synthesis_resp,
+                        warm_llm_available: is_warm,
                     });
                     if responses.len() >= max_peer_responses || pending_ids.is_empty() {
                         break;
                     }
                     let max_straggler_grace = if chunks_count > 0 {
                         got_non_empty = true;
-                        Duration::from_millis(120)
+                        Duration::from_millis(800)
                     } else if !got_non_empty {
-                        Duration::from_millis(200)
+                        Duration::from_millis(1200)
                     } else {
-                        Duration::from_millis(120)
+                        Duration::from_millis(800)
                     };
                     let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
                     if straggler_deadline < active_deadline {
@@ -831,11 +895,11 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                     // If empty chunks arrive and no prior peer returned hits, clamp grace to 200ms.
                     let max_straggler_grace = if chunks_len > 0 {
                         got_non_empty_peer = true;
-                        Duration::from_millis(120)
+                        Duration::from_millis(800)
                     } else if !got_non_empty_peer {
-                        Duration::from_millis(200)
+                        Duration::from_millis(1200)
                     } else {
-                        Duration::from_millis(120)
+                        Duration::from_millis(800)
                     };
                     let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
                     if straggler_deadline < active_deadline {
@@ -1035,6 +1099,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     query_id: req.query_id,
                     responder_peer_id: self.local_peer_id.clone(),
                     chunks: Vec::new(),
+                    synthesis_response: None,
+                    warm_llm_available: false,
                 };
             }
             cache.insert(cache_key, now);
@@ -1050,6 +1116,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 query_id: req.query_id,
                 responder_peer_id: self.local_peer_id.clone(),
                 chunks: Vec::new(),
+                synthesis_response: None,
+                warm_llm_available: false,
             };
         }
 
@@ -1067,6 +1135,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 query_id: req.query_id,
                 responder_peer_id: self.local_peer_id.clone(),
                 chunks: Vec::new(),
+                synthesis_response: None,
+                warm_llm_available: false,
             };
         }
 
@@ -1080,6 +1150,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 query_id: req.query_id,
                 responder_peer_id: self.local_peer_id.clone(),
                 chunks: Vec::new(),
+                synthesis_response: None,
+                warm_llm_available: false,
             };
         }
 
@@ -1096,6 +1168,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                         query_id: req.query_id,
                         responder_peer_id: self.local_peer_id.clone(),
                         chunks: Vec::new(),
+                        synthesis_response: None,
+                        warm_llm_available: false,
                     };
                 }
             }
@@ -1109,6 +1183,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     query_id: req.query_id,
                     responder_peer_id: self.local_peer_id.clone(),
                     chunks: Vec::new(),
+                    synthesis_response: None,
+                    warm_llm_available: false,
                 };
             }
         }
@@ -1133,6 +1209,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 query_id: req.query_id,
                 responder_peer_id: self.local_peer_id.clone(),
                 chunks: Vec::new(),
+                synthesis_response: None,
+                warm_llm_available: false,
             };
         }
 
@@ -1158,6 +1236,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     query_id: req.query_id,
                     responder_peer_id: self.local_peer_id.clone(),
                     chunks: Vec::new(),
+                    synthesis_response: None,
+                    warm_llm_available: false,
                 };
             }
         };
@@ -1169,12 +1249,70 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 query_id: req.query_id,
                 responder_peer_id: self.local_peer_id.clone(),
                 chunks: Vec::new(),
+                synthesis_response: None,
+                warm_llm_available: false,
             };
         }
 
-        // Spawn loop-free 1-hop federated relay CONCURRENTLY with local hybrid search + RLM parent expansion
+        // If this query carries a synthesis relay payload, handle synthesis delegation:
+        if let Some(ref relay) = req.synthesis_relay {
+            // Airgap check on evidence chunks
+            if relay.evidence_chunks.iter().any(|c| crate::artemis_airgap::is_airgap_restricted_chunk_dto(c)) {
+                tracing::warn!("Rejecting synthesis relay with airgapped artemis evidence chunks from peer: {}", req.sender_peer_id);
+                return FederatedQueryResponse {
+                    query_id: req.query_id,
+                    responder_peer_id: self.local_peer_id.clone(),
+                    chunks: Vec::new(),
+                    synthesis_response: None,
+                    warm_llm_available: false,
+                };
+            }
+
+            let scored_chunks: Vec<quorum_types::ScoredChunk> = relay.evidence_chunks.iter().map(|dto| {
+                let doc_chunk = quorum_types::DocumentChunk {
+                    chunk_id: dto.chunk_id.clone(),
+                    document_id: dto.chunk_id.rsplit_once(':').map(|(d, _)| d.to_string()).unwrap_or_else(|| dto.file_path.clone()),
+                    file_path: dto.file_path.clone(),
+                    line_start: dto.line_start,
+                    line_end: dto.line_end,
+                    blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(&dto.content),
+                    access_tier: dto.access_tier,
+                    vector: vec![0.0; 768],
+                    text_content: dto.content.clone(),
+                    metadata_json: "{}".to_string(),
+                };
+                quorum_types::ScoredChunk::new(doc_chunk, 1.0, self.local_peer_id.clone(), false)
+            }).collect();
+            let scored_refs: Vec<&quorum_types::ScoredChunk> = scored_chunks.iter().collect();
+
+            let model = relay.model_tag.as_deref().unwrap_or("qwen2.5:7b");
+            let synthesis_opt = crate::offline_engine::DeterministicOfflineSynthesisEngine::query_local_ollama_chat(
+                &relay.prompt,
+                &relay.history,
+                &scored_refs,
+                model,
+                None,
+            );
+
+            if let Some((synthesized_text, citations)) = synthesis_opt {
+                return FederatedQueryResponse {
+                    query_id: req.query_id,
+                    responder_peer_id: self.local_peer_id.clone(),
+                    chunks: Vec::new(),
+                    synthesis_response: Some(quorum_types::MeshSynthesisRelayResponse {
+                        synthesized_text,
+                        citations,
+                        model_tag: model.to_string(),
+                        responder_peer_id: self.local_peer_id.clone(),
+                    }),
+                    warm_llm_available: true,
+                };
+            }
+        }
+
+        // Spawn loop-free federated relay CONCURRENTLY with local hybrid search + RLM parent expansion
         // so cross-WAN gateway -> home LAN peer fan-out adds zero sequential stall!
-        let relay_handle = if req.relay_hops == 0 {
+        let relay_handle = if req.relay_hops < 3 {
             let disp_opt = self.dispatcher.read().unwrap_or_else(|e| e.into_inner()).clone();
             disp_opt.map(|disp| {
                 let mut relayed_req = req.clone();
@@ -1183,7 +1321,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     .clone()
                     .unwrap_or_else(|| req.sender_peer_id.clone());
                 relayed_req.origin_peer_id = Some(original_origin);
-                relayed_req.relay_hops = 1;
+                relayed_req.relay_hops = req.relay_hops + 1;
                 if !relayed_req.visited_peers.contains(&self.local_peer_id) {
                     relayed_req.visited_peers.push(self.local_peer_id.clone());
                 }
@@ -1286,6 +1424,8 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                             .partial_cmp(&a.score)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
+                    .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
+                    .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
             });
         }
 
@@ -1363,7 +1503,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                             .unwrap_or(0.015);
                         scored.push(quorum_types::ScoredChunk::new(
                             extra,
-                            (base * 0.92).max(0.012),
+                            (base * 0.94).max(0.012),
                             "local",
                             false,
                         ));
@@ -1423,10 +1563,13 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             }
         }
 
+        let warm_llm = !crate::offline_engine::DeterministicOfflineSynthesisEngine::probe_installed_ollama_models_default().is_empty();
         FederatedQueryResponse {
             query_id: req.query_id,
             responder_peer_id: self.local_peer_id.clone(),
             chunks: safe_chunks,
+            synthesis_response: None,
+            warm_llm_available: warm_llm,
         }
     }
 }

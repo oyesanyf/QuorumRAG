@@ -19,6 +19,7 @@ use std::time::Instant;
 use crate::state::DaemonState;
 use quorum_contract::ForensicTelemetryType;
 use quorum_coordinator::artemis_airgap::prohibited_categories;
+use quorum_coordinator::dfir_consensus::{DfirTelemetryInput, MultiVoterConsensusEngine};
 use quorum_coordinator::dlp_mesh::global_mesh_dlp_controller;
 use quorum_coordinator::ForensicStructuralNormalizer;
 use quorum_ingest::secret_scrubber::SecretScrubber;
@@ -187,11 +188,43 @@ pub struct ArtemisPreviewNormalizerRequest {
     pub session_salt: Option<String>,
 }
 
-/// GET /api/v1/artemis/status
+/// Returns true if the forensics subsystem is enabled in persistent daemon settings.
+pub fn is_forensics_enabled() -> bool {
+    global_mesh_dlp_controller().get_settings().artemis.enabled
+}
+
+/// Standard fail-closed 403 Forbidden response when forensics subsystem is disabled.
+pub fn forensics_disabled_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "Forensics subsystem is disabled. Enable forensics in configuration or settings to use Artemis endpoints.",
+            "status": "forbidden",
+            "forensics_enabled": false
+        })),
+    )
+}
+
+/// Fail-closed Axum route middleware enforcing `403 Forbidden` before body deserialization (`Json<T>`)
+/// on every `/api/v1/artemis/*` and `/api/artemis/*` endpoint when forensics is disabled.
+pub async fn require_forensics_enabled_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !is_forensics_enabled() {
+        return forensics_disabled_response().into_response();
+    }
+    next.run(req).await
+}
+
+/// GET /api/v1/artemis/status and GET /api/artemis/status
 /// Returns current Artemis DFIR configuration, airgap enforcement, and category allowlists.
 pub async fn artemis_status_handler(
     State(_state): State<Arc<DaemonState>>,
 ) -> impl IntoResponse {
+    if !is_forensics_enabled() {
+        return forensics_disabled_response().into_response();
+    }
     let controller = global_mesh_dlp_controller();
     let settings = controller.get_settings();
     let total_collected = TOTAL_ARTEMIS_COLLECTED_RECORDS.load(Ordering::Relaxed);
@@ -215,22 +248,28 @@ pub async fn artemis_status_handler(
         "normalize_for_harvest": settings.artemis.normalize_for_harvest,
         "total_collected_records": total_collected,
         "last_collection_timestamp": last_ts,
-    }))
+    })).into_response()
 }
 
-/// GET /api/v1/artemis/config
+/// GET /api/v1/artemis/config and GET /api/artemis/config
 /// Returns current `ArtemisDfirSettings` as JSON.
 pub async fn artemis_get_config_handler() -> impl IntoResponse {
+    if !is_forensics_enabled() {
+        return forensics_disabled_response().into_response();
+    }
     let controller = global_mesh_dlp_controller();
     let settings = controller.get_settings();
-    Json(settings.artemis)
+    Json(settings.artemis).into_response()
 }
 
-/// POST /api/v1/artemis/config and PUT /api/v1/artemis/config
+/// POST /api/v1/artemis/config and PUT /api/v1/artemis/config (and /api/artemis/config)
 /// Updates `ArtemisDfirSettings` in controller and persists to disk.
 pub async fn artemis_update_config_handler(
     Json(body): Json<ArtemisConfigUpdatePayload>,
 ) -> impl IntoResponse {
+    if !is_forensics_enabled() {
+        return forensics_disabled_response().into_response();
+    }
     let controller = global_mesh_dlp_controller();
     let mut current = controller.get_settings();
 
@@ -288,7 +327,7 @@ pub async fn artemis_update_config_handler(
     controller.update_settings(current);
     controller.save_to_disk();
     let updated = controller.get_settings();
-    (StatusCode::OK, Json(updated.artemis))
+    (StatusCode::OK, Json(updated.artemis)).into_response()
 }
 
 const MAX_JSONL_COLLECT_DEPTH: usize = 16;
@@ -325,12 +364,15 @@ fn collect_jsonl_paths_bounded(dir: &Path, depth: usize, max_depth: usize) -> Ve
     results
 }
 
-/// POST /api/v1/artemis/collect
+/// POST /api/v1/artemis/collect and POST /api/artemis/collect
 /// Triggers on-demand collection or imports forensic telemetry from `.jsonl` files/folders.
 pub async fn artemis_collect_handler(
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<ArtemisCollectRequest>,
 ) -> impl IntoResponse {
+    if !is_forensics_enabled() {
+        return forensics_disabled_response().into_response();
+    }
     let start_time = Instant::now();
     let controller = global_mesh_dlp_controller();
     let settings = controller.get_settings();
@@ -551,11 +593,14 @@ pub async fn artemis_collect_handler(
         .into_response()
 }
 
-/// POST /api/v1/artemis/preview-normalizer
+/// POST /api/v1/artemis/preview-normalizer and POST /api/artemis/preview-normalizer
 /// Demonstrates live keyed BLAKE3 structural normalization over raw forensic telemetry.
 pub async fn artemis_preview_normalizer_handler(
     Json(req): Json<ArtemisPreviewNormalizerRequest>,
 ) -> impl IntoResponse {
+    if !is_forensics_enabled() {
+        return forensics_disabled_response().into_response();
+    }
     let raw = req
         .sample_text
         .or(req.raw_telemetry);
@@ -596,6 +641,38 @@ pub async fn artemis_preview_normalizer_handler(
         .into_response()
 }
 
+/// POST /api/v1/artemis/evaluate and POST /api/artemis/evaluate
+/// Evaluates host telemetry input across the 4-voter consensus panel.
+pub async fn artemis_evaluate_handler(
+    Json(input): Json<DfirTelemetryInput>,
+) -> impl IntoResponse {
+    if !is_forensics_enabled() {
+        return forensics_disabled_response().into_response();
+    }
+    let verdict = MultiVoterConsensusEngine::evaluate_telemetry_detailed(&input);
+    (StatusCode::OK, Json(verdict)).into_response()
+}
+
+/// POST /api/v1/artemis/summary-table and POST /api/artemis/summary-table
+/// Generates a calibrated Markdown summary table from a batch of telemetry inputs.
+pub async fn artemis_summary_table_handler(
+    Json(inputs): Json<Vec<DfirTelemetryInput>>,
+) -> impl IntoResponse {
+    if !is_forensics_enabled() {
+        return forensics_disabled_response().into_response();
+    }
+    let table = quorum_coordinator::offline_engine::DeterministicOfflineSynthesisEngine::format_calibrated_dfir_summary_table(&inputs);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "record_count": inputs.len(),
+            "summary_table": table,
+        })),
+    )
+        .into_response()
+}
+
 /// Spawns the background periodic Artemis DFIR auto-collection worker.
 ///
 /// Remains completely dormant unless the operator has explicitly enabled
@@ -604,15 +681,24 @@ pub fn spawn_artemis_auto_collector(
     state: Arc<DaemonState>,
     shutdown_notify: Arc<tokio::sync::Notify>,
 ) {
+    static AUTO_COLLECTOR_SPAWNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if AUTO_COLLECTOR_SPAWNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown_notify.notified() => break,
+                _ = shutdown_notify.notified() => {
+                    AUTO_COLLECTOR_SPAWNED.store(false, Ordering::SeqCst);
+                    break;
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
             }
 
             let settings = global_mesh_dlp_controller().get_settings().artemis;
-            if !settings.local_collection_enabled || settings.auto_collection_interval_mins == 0 {
+            if !settings.enabled || !settings.local_collection_enabled || settings.auto_collection_interval_mins == 0 {
                 continue;
             }
 

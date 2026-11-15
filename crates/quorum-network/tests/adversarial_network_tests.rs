@@ -30,6 +30,8 @@ impl InboundQueryHandler for EchoQueryHandler {
                 access_tier: 0,
                 origin_peer_id: None,
             }],
+            synthesis_response: None,
+            warm_llm_available: false,
         }
     }
 }
@@ -127,6 +129,7 @@ async fn test_adversarial_concurrent_point_to_point_queries() {
                 origin_peer_id: None,
                 relay_hops: 0,
                 visited_peers: Vec::new(),
+                synthesis_relay: None,
             };
             let resp = handle.send_query(target_peer, req).await;
             (q_id, q_text, resp)
@@ -192,6 +195,7 @@ async fn test_adversarial_bidirectional_simultaneous_queries() {
                 origin_peer_id: None,
                 relay_hops: 0,
                 visited_peers: Vec::new(),
+                synthesis_relay: None,
             };
             let resp = ha.send_query(pb, req).await.unwrap();
             assert_eq!(resp.responder_peer_id, "node_beta");
@@ -217,6 +221,7 @@ async fn test_adversarial_bidirectional_simultaneous_queries() {
                 origin_peer_id: None,
                 relay_hops: 0,
                 visited_peers: Vec::new(),
+                synthesis_relay: None,
             };
             let resp = hb.send_query(pa, req).await.unwrap();
             assert_eq!(resp.responder_peer_id, "node_alpha");

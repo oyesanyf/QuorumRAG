@@ -2,6 +2,7 @@ pub mod browser;
 pub mod chat_history_db;
 pub mod cli;
 pub mod handlers;
+pub mod nimble_provisioner;
 pub mod p2p_watcher;
 pub mod server;
 pub mod shutdown;
@@ -12,6 +13,7 @@ pub use chat_history_db::{
     ChatHistoryStore, ChatSessionDetail, ChatSessionSummary, StoredChatMessage,
 };
 pub use cli::{Cli, Commands};
+pub use nimble_provisioner::{NimbleProvisionState, NimbleProvisioner, NimbleStatusResponse};
 pub use p2p_watcher::{
     discover_local_private_ipv4_addresses, is_private_lan_ipv4, P2pWatcherRuntime,
     P2pWatcherStatusDto,

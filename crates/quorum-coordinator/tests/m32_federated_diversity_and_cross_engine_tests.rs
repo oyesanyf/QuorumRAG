@@ -233,6 +233,7 @@ async fn test_inbound_mesh_handler_reembedding_and_multimodal_parity() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut req, AccessTier::Tier0Public);
 

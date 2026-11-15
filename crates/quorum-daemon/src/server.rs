@@ -118,21 +118,42 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         .route("/api/v1/marketplace/test/execute-transaction", post(marketplace::marketplace_test_execute_transaction_handler))
         .route("/api/v1/marketplace/issue-nonce", post(marketplace::marketplace_issue_nonce_handler))
  
-        // Artemis DFIR & Forensics Local-Only Endpoints (Disabled by Default)
-        .route("/api/v1/artemis/status", get(artemis::artemis_status_handler))
-        .route(
-            "/api/v1/artemis/config",
-            get(artemis::artemis_get_config_handler)
-                .post(artemis::artemis_update_config_handler)
-                .put(artemis::artemis_update_config_handler),
+        // Artemis DFIR & Forensics Local-Only Endpoints (Disabled by Default; middleware gates before Json<T> extraction)
+        .merge(
+            axum::Router::new()
+                .route("/api/v1/artemis/status", get(artemis::artemis_status_handler))
+                .route("/api/artemis/status", get(artemis::artemis_status_handler))
+                .route(
+                    "/api/v1/artemis/config",
+                    get(artemis::artemis_get_config_handler)
+                        .post(artemis::artemis_update_config_handler)
+                        .put(artemis::artemis_update_config_handler),
+                )
+                .route(
+                    "/api/artemis/config",
+                    get(artemis::artemis_get_config_handler)
+                        .post(artemis::artemis_update_config_handler)
+                        .put(artemis::artemis_update_config_handler),
+                )
+                .route("/api/v1/artemis/collect", post(artemis::artemis_collect_handler))
+                .route("/api/artemis/collect", post(artemis::artemis_collect_handler))
+                .route("/api/v1/artemis/preview-normalizer", post(artemis::artemis_preview_normalizer_handler))
+                .route("/api/artemis/preview-normalizer", post(artemis::artemis_preview_normalizer_handler))
+                .route("/api/v1/artemis/evaluate", post(artemis::artemis_evaluate_handler))
+                .route("/api/artemis/evaluate", post(artemis::artemis_evaluate_handler))
+                .route("/api/v1/artemis/summary-table", post(artemis::artemis_summary_table_handler))
+                .route("/api/artemis/summary-table", post(artemis::artemis_summary_table_handler))
+                .route_layer(axum::middleware::from_fn(
+                    artemis::require_forensics_enabled_middleware,
+                )),
         )
-        .route("/api/v1/artemis/collect", post(artemis::artemis_collect_handler))
-        .route("/api/v1/artemis/preview-normalizer", post(artemis::artemis_preview_normalizer_handler))
 
         // Health & Models Telemetry
         .route("/api/health", get(health::health_handler))
         .route("/api/models", get(health::models_handler))
         .route("/api/models/pull", post(health::pull_model_handler))
+        .route("/api/models/nimble/status", get(health::nimble_status_handler))
+        .route("/api/models/nimble/provision", post(health::nimble_provision_handler))
         .route("/api/ollama/install", post(health::install_ollama_handler))
 
         // Graceful Shutdown Endpoint

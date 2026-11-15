@@ -128,11 +128,18 @@ async fn read_body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("valid json response")
 }
 
+fn enable_artemis_forensics() {
+    let controller = global_mesh_dlp_controller();
+    let mut current = controller.get_settings();
+    current.artemis.enabled = true;
+    controller.update_settings(current);
+}
+
 #[tokio::test]
 async fn test_artemis_status_endpoint_defaults() {
     let (app, _state, _temp_dir) = setup_artemis_test_app().await;
 
-    // Reset settings to default
+    // Reset settings to default (forensics disabled)
     let controller = global_mesh_dlp_controller();
     let mut current = controller.get_settings();
     current.artemis = quorum_coordinator::artemis_airgap::ArtemisDfirSettings::default();
@@ -150,22 +157,42 @@ async fn test_artemis_status_endpoint_defaults() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
     let json = read_body_json(res).await;
+    assert_eq!(json["status"], "forbidden");
+    assert_eq!(json["forensics_enabled"], false);
 
-    assert_eq!(json["status"], "ok");
-    assert_eq!(json["collection_enabled"], false);
-    assert_eq!(json["marketplace_harvest_enabled"], false);
-    assert_eq!(json["airgap_enforced"], true);
-    assert_eq!(json["retention_days"], 30);
-    assert_eq!(json["redact_secrets"], true);
-    assert_eq!(json["normalize_for_harvest"], true);
+    // Explicitly enable forensics to verify 200 OK fields
+    enable_artemis_forensics();
 
-    let allowed = json["allowed_artifact_categories"].as_array().expect("allowed array");
+    let res_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/artemis/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res_ok.status(), StatusCode::OK);
+    let json_ok = read_body_json(res_ok).await;
+
+    assert_eq!(json_ok["status"], "ok");
+    assert_eq!(json_ok["collection_enabled"], false);
+    assert_eq!(json_ok["marketplace_harvest_enabled"], false);
+    assert_eq!(json_ok["airgap_enforced"], true);
+    assert_eq!(json_ok["retention_days"], 30);
+    assert_eq!(json_ok["redact_secrets"], true);
+    assert_eq!(json_ok["normalize_for_harvest"], true);
+
+    let allowed = json_ok["allowed_artifact_categories"].as_array().expect("allowed array");
     assert!(allowed.iter().any(|v| v == "process_execution"));
     assert!(allowed.iter().any(|v| v == "system_event_log"));
 
-    let prohibited = json["prohibited_artifact_categories"].as_array().expect("prohibited array");
+    let prohibited = json_ok["prohibited_artifact_categories"].as_array().expect("prohibited array");
     assert!(prohibited.iter().any(|v| v == "browser_cookies"));
     assert!(prohibited.iter().any(|v| v == "credential_store"));
 }
@@ -173,6 +200,7 @@ async fn test_artemis_status_endpoint_defaults() {
 #[tokio::test]
 async fn test_artemis_config_get_and_update() {
     let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     // GET config
     let get_res = app
@@ -238,6 +266,7 @@ async fn test_artemis_config_get_and_update() {
 #[tokio::test]
 async fn test_artemis_preview_normalizer() {
     let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     let sample_forensic = "User S-1-5-21-3623811015-3361044348-30300820-1013 on host WIN-DC01 accessed \\\\InternalFiles\\SecLogs\\data.csv from 192.168.1.105 with MAC 00:1A:2B:3C:4D:5E";
 
@@ -301,9 +330,10 @@ async fn test_artemis_preview_normalizer() {
 async fn test_artemis_collect_live_disabled_fails_closed() {
     let (app, _state, _temp_dir) = setup_artemis_test_app().await;
 
-    // Ensure local collection is disabled
+    // Ensure local collection is disabled but forensics subsystem is enabled
     let controller = global_mesh_dlp_controller();
     let mut current = controller.get_settings();
+    current.artemis.enabled = true;
     current.artemis.local_collection_enabled = false;
     controller.update_settings(current);
 
@@ -333,6 +363,7 @@ async fn test_artemis_collect_live_disabled_fails_closed() {
 #[tokio::test]
 async fn test_artemis_collect_from_jsonl_file() {
     let (app, _state, temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     // Create a sample .jsonl file with forensic records
     let jsonl_path = temp_dir.path().join("forensic_sample.jsonl");
@@ -378,6 +409,7 @@ async fn test_artemis_collect_from_jsonl_file() {
 #[tokio::test]
 async fn test_artemis_collect_inline_jsonl() {
     let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     let inline_jsonl = r#"{"Computer": "LINUX-HOST", "cmdline": "/usr/bin/curl -s https://evil.example/beacon", "pid": 1234, "user": "www-data", "timestamp": 1700000050}"#;
 
@@ -410,6 +442,7 @@ async fn test_artemis_collect_inline_jsonl() {
 #[tokio::test]
 async fn test_marketplace_harvest_prohibited_category_rejected() {
     let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     // Enable marketplace opt-in
     let opt_in = app
@@ -486,6 +519,24 @@ async fn test_marketplace_harvest_prohibited_category_rejected() {
 #[tokio::test]
 async fn test_marketplace_harvest_allowed_category_structural_normalized() {
     let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
+
+    // Explicitly opt into marketplace forensic harvesting
+    let enable_harvest = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/artemis/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "marketplace_harvest_enabled": true }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enable_harvest.status(), StatusCode::OK);
 
     // Enable marketplace opt-in
     let opt_in = app
@@ -598,8 +649,76 @@ async fn test_marketplace_harvest_allowed_category_structural_normalized() {
 }
 
 #[tokio::test]
+async fn test_marketplace_harvest_rejects_artemis_candidate_when_harvest_toggle_disabled() {
+    let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
+
+    // Keep marketplace_harvest_enabled at its default (false), while enabling marketplace opt-in
+    let opt_in = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/opt-in")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "opt_in_enabled": true }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opt_in.status(), StatusCode::OK);
+
+    let candidate = serde_json::json!({
+        "record_id": "cand_harvest_toggle_off_01",
+        "domain_tags": ["process_execution", "artemis_dfir"],
+        "prompt": "Perform deep forensic triage on Computer: CORP-SEC-DC01 regarding anomalous process execution where cmd.exe spawned powershell.exe.",
+        "rlm_trajectory": [
+            {
+                "step_index": 1,
+                "action_kind": "inspect_evtx",
+                "sanitized_query_or_pattern": "find EventID 4688 on Computer: CORP-SEC-DC01",
+                "abstracted_takeaway": "Correlated process creation event"
+            }
+        ],
+        "chosen_response": "Forensic analysis of the security log reveals powershell.exe PID 5120 spawned by cmd.exe PID 1040.",
+        "citations": [
+            ["artemis://windows/eventlog/Security.evtx", "powershell.exe PID 5120 spawned by cmd.exe PID 1040"]
+        ],
+        "source_file_path": "artemis://windows/eventlog/Security.evtx"
+    });
+
+    let harvest_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/harvest")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "candidates": [candidate] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(harvest_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = read_body_json(harvest_res).await;
+    assert_eq!(json["accepted_count"], 0);
+    assert_eq!(json["rejected_count"], 1);
+    let reason = json["rejected_candidates"][0]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("Marketplace forensic harvest is disabled"),
+        "Expected harvest toggle rejection reason, got: {reason}"
+    );
+}
+
+#[tokio::test]
 async fn test_artemis_collect_file_source_missing_path_returns_bad_request() {
     let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     let res = app
         .clone()
@@ -627,6 +746,7 @@ async fn test_artemis_collect_file_source_missing_path_returns_bad_request() {
 #[tokio::test]
 async fn test_artemis_config_prohibited_categories_filtered() {
     let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     let update_payload = serde_json::json!({
         "allowed_artifact_categories": [
@@ -666,6 +786,7 @@ async fn test_artemis_config_prohibited_categories_filtered() {
 #[tokio::test]
 async fn test_artemis_collect_deep_directory_bounded() {
     let (app, _state, temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     // Create a 20-level deep nested directory structure
     let mut deep_dir = temp_dir.path().to_path_buf();
@@ -719,6 +840,7 @@ async fn test_artemis_collect_deep_directory_bounded() {
 #[tokio::test]
 async fn test_artemis_collect_multi_format_directory_and_live_when_enabled() {
     let (app, _state, temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     let dump_dir = temp_dir.path().join("forensic_dump_multi");
     std::fs::create_dir_all(&dump_dir).unwrap();
@@ -893,6 +1015,7 @@ async fn test_pure_rust_folder_picker_and_browse_folders_endpoints() {
 #[tokio::test]
 async fn test_marketplace_harvest_auto_includes_indexed_artemis_chunks_when_enabled() {
     let (app, _state, temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     // 1. Ingest a forensic JSONL file into local Tier3Restricted storage
     let jsonl_path = temp_dir.path().join("auto_harvest_forensic.jsonl");
@@ -991,6 +1114,7 @@ async fn test_marketplace_harvest_auto_includes_indexed_artemis_chunks_when_enab
 #[tokio::test]
 async fn test_artemis_retention_pruning_and_rlm_parent_document_inspection() {
     let (app, state, temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     // Set retention_days = 7 in Artemis settings
     let cfg_res = app
@@ -1094,6 +1218,7 @@ async fn test_artemis_retention_pruning_and_rlm_parent_document_inspection() {
 #[tokio::test]
 async fn test_forensic_query_last_process_to_access_internet_and_zero_thesis_contamination() {
     let (app, state, temp_dir) = setup_artemis_test_app().await;
+    enable_artemis_forensics();
 
     // 1. Seed distractor non-forensic documents matching the exact bug report (thesis, resume, EULA, MITRE note)
     let distractors = [
@@ -1296,4 +1421,200 @@ async fn test_forensic_query_last_process_to_access_internet_and_zero_thesis_con
             .any(|d| d["is_drive"].as_bool() == Some(true)),
         "Root browse-folders view must list asset drives for immediate click-to-drill-down"
     );
+}
+
+#[tokio::test]
+async fn test_artemis_endpoints_gated_with_403_when_forensics_disabled() {
+    let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+
+    // Ensure forensics is explicitly disabled (default state)
+    let controller = global_mesh_dlp_controller();
+    let mut current = controller.get_settings();
+    current.artemis.enabled = false;
+    controller.update_settings(current);
+
+    let endpoints = [
+        ("GET", "/api/v1/artemis/status", serde_json::Value::Null),
+        ("GET", "/api/artemis/status", serde_json::Value::Null),
+        ("GET", "/api/v1/artemis/config", serde_json::Value::Null),
+        ("GET", "/api/artemis/config", serde_json::Value::Null),
+        ("POST", "/api/v1/artemis/config", serde_json::json!({ "local_collection_enabled": true })),
+        ("POST", "/api/artemis/config", serde_json::json!({ "local_collection_enabled": true })),
+        ("PUT", "/api/v1/artemis/config", serde_json::json!({ "local_collection_enabled": true })),
+        ("PUT", "/api/artemis/config", serde_json::json!({ "local_collection_enabled": true })),
+        ("POST", "/api/v1/artemis/collect", serde_json::json!({ "source_type": "file", "target_path": "test.jsonl" })),
+        ("POST", "/api/artemis/collect", serde_json::json!({ "source_type": "file", "target_path": "test.jsonl" })),
+        ("POST", "/api/v1/artemis/preview-normalizer", serde_json::json!({ "sample_text": "sample" })),
+        ("POST", "/api/artemis/preview-normalizer", serde_json::json!({ "sample_text": "sample" })),
+        ("POST", "/api/v1/artemis/evaluate", serde_json::json!({
+            "record_id": "rec_01",
+            "telemetry_type": "network_connection",
+            "source_path": "artemis://windows/dns/cache",
+            "process_name": "svchost.exe",
+            "pid": 1024,
+            "parent_pid": 600,
+            "command_line": "svchost.exe -k NetworkService",
+            "query_name": "example.com",
+            "is_signed": true,
+            "raw_summary": "DNS lookup example.com",
+            "metadata_json": "{}"
+        })),
+        ("POST", "/api/artemis/evaluate", serde_json::json!({
+            "record_id": "rec_01",
+            "telemetry_type": "network_connection",
+            "source_path": "artemis://windows/dns/cache",
+            "process_name": "svchost.exe",
+            "pid": 1024,
+            "parent_pid": 600,
+            "command_line": "svchost.exe -k NetworkService",
+            "query_name": "example.com",
+            "is_signed": true,
+            "raw_summary": "DNS lookup example.com",
+            "metadata_json": "{}"
+        })),
+        ("POST", "/api/v1/artemis/summary-table", serde_json::json!([])),
+        ("POST", "/api/artemis/summary-table", serde_json::json!([])),
+    ];
+
+    for (method, uri, body) in endpoints {
+        let mut req_builder = Request::builder().method(method).uri(uri);
+        let req_body = if body.is_null() {
+            Body::empty()
+        } else {
+            req_builder = req_builder.header("content-type", "application/json");
+            Body::from(body.to_string())
+        };
+
+        let res = app
+            .clone()
+            .oneshot(req_builder.body(req_body).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "Endpoint {} {} must return 403 Forbidden when forensics is disabled",
+            method,
+            uri
+        );
+
+        let json = read_body_json(res).await;
+        assert_eq!(
+            json["status"], "forbidden",
+            "Endpoint {} {} JSON payload must include status: forbidden",
+            method, uri
+        );
+        assert_eq!(
+            json["forensics_enabled"], false,
+            "Endpoint {} {} JSON payload must include forensics_enabled: false",
+            method, uri
+        );
+        assert!(
+            json["error"].as_str().unwrap().contains("Forensics subsystem is disabled"),
+            "Endpoint {} {} JSON payload must indicate forensics subsystem is disabled",
+            method, uri
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_artemis_endpoints_unlocked_via_settings_api() {
+    let (app, _state, _temp_dir) = setup_artemis_test_app().await;
+
+    // 1. Confirm default is 403 Forbidden
+    let controller = global_mesh_dlp_controller();
+    let mut current = controller.get_settings();
+    current.artemis.enabled = false;
+    controller.update_settings(current);
+
+    let res_locked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/artemis/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_locked.status(), StatusCode::FORBIDDEN);
+
+    // 2. Toggle forensics on via POST /api/settings
+    let enable_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "forensics_enabled": true }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enable_res.status(), StatusCode::OK);
+    let enable_json = read_body_json(enable_res).await;
+    assert_eq!(enable_json["forensics_enabled"], true);
+
+    // 3. Confirm endpoints are unlocked
+    let res_unlocked_v1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/artemis/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_unlocked_v1.status(), StatusCode::OK);
+
+    let res_unlocked_bare = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/artemis/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_unlocked_bare.status(), StatusCode::OK);
+
+    // 4. Toggle forensics back off via POST /api/settings
+    let disable_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "forensics_enabled": false }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disable_res.status(), StatusCode::OK);
+
+    // 5. Confirm endpoints are locked again
+    let res_relocked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/artemis/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_relocked.status(), StatusCode::FORBIDDEN);
 }

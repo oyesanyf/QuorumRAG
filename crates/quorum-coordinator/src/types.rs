@@ -57,12 +57,7 @@ pub enum SynthesisModelFamily {
     AutoFusion,
 }
 
-/// A single turn in a multi-turn conversation (`role`: `"user"` or `"assistant"`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChatTurnMessage {
-    pub role: String,
-    pub content: String,
-}
+pub use quorum_types::ChatTurnMessage;
 
 /// Full state context propagated through the agentic graph nodes.
 #[derive(Debug)]

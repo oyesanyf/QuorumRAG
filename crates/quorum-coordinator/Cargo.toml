@@ -36,6 +36,7 @@ x509-parser = { version = "0.18", features = ["verify"] }
 rhai = { version = "1.19", features = ["sync", "serde"] }
 dashmap = "6.2"
 bytes = "1.12"
+reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -45,3 +46,7 @@ quorum-ui = { workspace = true }
 axum = { version = "0.7", features = ["macros", "tokio"] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+
+[[test]]
+name = "cross_host_mesh_parity_e2e_tests"
+path = "../../tests/cross_host_mesh_parity_e2e_tests.rs"

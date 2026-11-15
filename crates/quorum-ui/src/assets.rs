@@ -5,10 +5,46 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use std::borrow::Cow;
+use std::path::{Component, Path};
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
 pub struct WebAssets;
+
+/// Fail-closed `Path::join` replacement guard for relative UI asset lookups:
+/// rejects drive letters (`:`), leading slashes/backslashes, UNC prefixes (`\\`),
+/// parent traversal (`..`), NUL bytes, percent-encoded traversal (`%2e`, `%2f`, `%5c`, `%00`),
+/// NTFS Alternate Data Streams, and any non-`Component::Normal` path segment.
+fn is_safe_relative_asset_path(target: &str) -> bool {
+    if target.is_empty()
+        || target.contains(':')
+        || target.starts_with('/')
+        || target.starts_with('\\')
+        || target.contains("\\\\")
+        || target.contains("..")
+        || target.contains('\0')
+    {
+        return false;
+    }
+    let lower = target.to_ascii_lowercase();
+    if lower.contains("%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || lower.contains("%00")
+    {
+        return false;
+    }
+    let p = Path::new(target);
+    let mut saw_normal = false;
+    for comp in p.components() {
+        match comp {
+            Component::Normal(_) => saw_normal = true,
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    saw_normal
+}
 
 /// Compile-time embedded fallback bytes for core UI assets so that under any build profile
 /// (debug or release) and on any machine without the source tree, every UI asset is 100% baked into the binary.
@@ -54,10 +90,11 @@ pub fn get_asset(path: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
         stripped
     };
 
-    if !target.contains("..") {
+    if is_safe_relative_asset_path(target) {
         for base in [
-            std::path::Path::new("crates/quorum-ui/assets"),
-            std::path::Path::new(r"d:\harfile\QuorumRAG\crates\quorum-ui\assets"),
+            Path::new("crates/quorum-ui/assets"),
+            Path::new("assets"),
+            Path::new(r"d:\harfile\QuorumRAG\crates\quorum-ui\assets"),
         ] {
             let candidate = base.join(target);
             if let Ok(bytes) = std::fs::read(&candidate) {
@@ -82,8 +119,9 @@ pub fn get_asset(path: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
 /// Returns the index.html string (checking disk first for live hot-reload, then embedded binary bytes).
 pub fn get_index_html() -> String {
     for base in [
-        std::path::Path::new("crates/quorum-ui/assets/index.html"),
-        std::path::Path::new(r"d:\harfile\QuorumRAG\crates\quorum-ui\assets\index.html"),
+        Path::new("crates/quorum-ui/assets/index.html"),
+        Path::new("assets/index.html"),
+        Path::new(r"d:\harfile\QuorumRAG\crates\quorum-ui\assets\index.html"),
     ] {
         if let Ok(bytes) = std::fs::read(base) {
             return String::from_utf8_lossy(&bytes).to_string();
@@ -101,10 +139,11 @@ pub async fn static_handler(uri: Uri) -> Response {
     let target_path = if stripped.is_empty() { "index.html" } else { stripped };
 
     // Try reading live asset from disk first so UI edits apply immediately without re-linking
-    if !target_path.contains("..") {
+    if is_safe_relative_asset_path(target_path) {
         for base in [
-            std::path::Path::new("crates/quorum-ui/assets"),
-            std::path::Path::new(r"d:\harfile\QuorumRAG\crates\quorum-ui\assets"),
+            Path::new("crates/quorum-ui/assets"),
+            Path::new("assets"),
+            Path::new(r"d:\harfile\QuorumRAG\crates\quorum-ui\assets"),
         ] {
             let candidate = base.join(target_path);
             let cache_header = if target_path == "index.html" {

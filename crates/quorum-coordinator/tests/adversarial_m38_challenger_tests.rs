@@ -118,6 +118,7 @@ fn create_signed_test_request(query: &str) -> FederatedQueryRequest {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&[0x42u8; 32], &mut req, AccessTier::Tier0Public);
     req

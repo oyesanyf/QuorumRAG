@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.6.14",
+    [string]$Version = "0.6.15",
     [switch]$SkipBuild = $false,
     [switch]$SkipDefenderScan = $false,
     [string]$CertThumbprint = "9A6D3B509500813058EC63183476464FAC8F015B"
@@ -69,7 +69,9 @@ if (-not $SkipBuild) {
     Remove-Item -Path (Join-Path $ProjectRoot "target\release\deps\quorumrag*") -Force -ErrorAction SilentlyContinue
 
     $env:CARGO_INCREMENTAL = "0"
-    $maxAttempts = 15
+    $env:VSCMD_SKIP_SENDTELEMETRY = "1"
+    $env:CARGO_BUILD_JOBS = "6"
+    $maxAttempts = 60
     $buildOk = $false
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         # Invoke cargo directly (not Start-Process -Wait): -Wait also waits for detached descendants
@@ -88,19 +90,83 @@ if (-not $SkipBuild) {
             $buildOk = $true
             break
         }
-        # If Windows 11 Smart App Control blocked a stale pre-existing build-script-build.exe
-        # (os error 4551), purge ONLY that stale build directory so link.exe emits a fresh
-        # Smartlocker-trusted inode on retry.
-        if ($errText -match 'target[\\/]release[\\/]build[\\/]([^\\/]+)[\\/]build-script-build' -and $attempt -lt $maxAttempts) {
-            $blockedPkgDir = Join-Path $ProjectRoot ("target\release\build\" + $matches[1])
-            Write-Host "  [SAC] Purging stale build-script directory '$blockedPkgDir' so link.exe creates a fresh inode ($attempt/$maxAttempts)..." -ForegroundColor Yellow
-            Remove-Item -Recurse -Force -Path $blockedPkgDir -ErrorAction SilentlyContinue
-            continue
+        $handledSac = $false
+        # If Windows 11 Smart App Control blocked stale pre-existing build-script-build.exe binaries
+        # (including Cargo 1.100+ nested build/<crate>/<hash>/out/build_script_build.exe, os error 4551),
+        # purge all matched build directories in one pass so link.exe emits fresh Smartlocker-trusted inodes.
+        $bsMatches = [regex]::Matches($errText, 'target[\\/](?:debug|release)[\\/]build[\\/]([^\\/]+)[\\/].*build[-_]script[-_]build')
+        if ($bsMatches.Count -gt 0 -and $attempt -lt $maxAttempts) {
+            $seenBs = @{}
+            foreach ($bm in $bsMatches) {
+                $bsPkg = $bm.Groups[1].Value
+                if ($seenBs.ContainsKey($bsPkg)) { continue }
+                $seenBs[$bsPkg] = $true
+                foreach ($prof in @("release", "debug")) {
+                    $blockedPkgDir = Join-Path $ProjectRoot ("target\$prof\build\" + $bsPkg)
+                    if (Test-Path $blockedPkgDir) {
+                        Write-Host "  [SAC] Purging stale build-script directory '$blockedPkgDir' ($attempt/$maxAttempts)..." -ForegroundColor Yellow
+                        Remove-Item -Recurse -Force -Path $blockedPkgDir -ErrorAction SilentlyContinue
+                    }
+                    Remove-Item -Recurse -Force -Path (Join-Path $ProjectRoot "target\$prof\.fingerprint\$bsPkg*") -ErrorAction SilentlyContinue
+                }
+            }
+            $handledSac = $true
         }
-        if ($errText -match 'target[\\/]release[\\/]deps[\\/]([^\\/:\s]+\.dll).*4551' -and $attempt -lt $maxAttempts) {
-            $blockedDll = Join-Path $ProjectRoot ("target\release\deps\" + $matches[1])
-            Write-Host "  [SAC] Purging stale proc-macro DLL '$blockedDll' so link.exe creates a fresh inode ($attempt/$maxAttempts)..." -ForegroundColor Yellow
-            Remove-Item -Force -Path $blockedDll -ErrorAction SilentlyContinue
+        $dllMatches = [regex]::Matches($errText, '(target[\\/](?:debug|release)[\\/][^\r\n:`"'']+?\.dll)')
+        if ($dllMatches.Count -gt 0 -and ($errText -match '4551' -or $errText -match 'E0463' -or $errText -match 'LoadLibraryExW') -and $attempt -lt $maxAttempts) {
+            $cleanedDllPkgs = @{}
+            foreach ($dm in $dllMatches) {
+                $relDll = $dm.Groups[1].Value -replace '/', '\'
+                $blockedDll = Join-Path $ProjectRoot $relDll
+                $dllName = [System.IO.Path]::GetFileName($blockedDll)
+                $stemPrefix = ($dllName -split '-')[0]
+                Write-Host "  [SAC] Purging stale proc-macro DLL '$blockedDll' ($attempt/$maxAttempts)..." -ForegroundColor Yellow
+                Remove-Item -Force -Path $blockedDll -ErrorAction SilentlyContinue
+                $parentDir = [System.IO.Path]::GetDirectoryName($blockedDll)
+                if ([System.IO.Path]::GetFileName($parentDir) -eq "out") {
+                    $hashDir = [System.IO.Path]::GetDirectoryName($parentDir)
+                    $crateDirName = [System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName($hashDir))
+                    Remove-Item -Recurse -Force -Path $hashDir -ErrorAction SilentlyContinue
+                    $cleanedDllPkgs[$crateDirName] = $true
+                } else {
+                    $cleanedDllPkgs[($stemPrefix -replace '_', '-')] = $true
+                }
+            }
+            foreach ($pkg in $cleanedDllPkgs.Keys) {
+                $pkgUnder = $pkg -replace '-', '_'
+                foreach ($prof in @("release", "debug")) {
+                    Remove-Item -Force -Path (Join-Path $ProjectRoot "target\$prof\deps\$pkgUnder*.dll") -ErrorAction SilentlyContinue
+                    Remove-Item -Force -Path (Join-Path $ProjectRoot "target\$prof\deps\$pkgUnder*.pdb") -ErrorAction SilentlyContinue
+                    Remove-Item -Recurse -Force -Path (Join-Path $ProjectRoot "target\$prof\.fingerprint\$pkg*") -ErrorAction SilentlyContinue
+                    Remove-Item -Recurse -Force -Path (Join-Path $ProjectRoot "target\$prof\.fingerprint\$pkgUnder*") -ErrorAction SilentlyContinue
+                    Remove-Item -Recurse -Force -Path (Join-Path $ProjectRoot "target\$prof\build\$pkg") -ErrorAction SilentlyContinue
+                    Remove-Item -Recurse -Force -Path (Join-Path $ProjectRoot "target\$prof\build\$pkgUnder") -ErrorAction SilentlyContinue
+                }
+            }
+            $handledSac = $true
+        }
+        $e0463Matches = [regex]::Matches($errText, 'error\[E0463\]: can''t find crate for [`'']([a-zA-Z0-9_]+)[`'']')
+        if ($e0463Matches.Count -gt 0 -and $attempt -lt $maxAttempts) {
+            $seenCrates = @{}
+            foreach ($m in $e0463Matches) {
+                $cname = $m.Groups[1].Value
+                if ($seenCrates.ContainsKey($cname)) { continue }
+                $seenCrates[$cname] = $true
+                $cdash = $cname -replace '_', '-'
+                Write-Host "  [SAC] Fast-purging E0463 proc-macro fingerprints/DLLs for $cdash / $cname ($attempt/$maxAttempts)..." -ForegroundColor Yellow
+                foreach ($prof in @("release", "debug")) {
+                    Remove-Item -Force -Path (Join-Path $ProjectRoot "target\$prof\deps\$cname*.dll") -ErrorAction SilentlyContinue
+                    Remove-Item -Force -Path (Join-Path $ProjectRoot "target\$prof\deps\$cname*.pdb") -ErrorAction SilentlyContinue
+                    Remove-Item -Recurse -Force -Path (Join-Path $ProjectRoot "target\$prof\.fingerprint\$cdash*") -ErrorAction SilentlyContinue
+                    Remove-Item -Recurse -Force -Path (Join-Path $ProjectRoot "target\$prof\.fingerprint\$cname*") -ErrorAction SilentlyContinue
+                    Remove-Item -Recurse -Force -Path (Join-Path $ProjectRoot "target\$prof\build\$cdash") -ErrorAction SilentlyContinue
+                    Remove-Item -Recurse -Force -Path (Join-Path $ProjectRoot "target\$prof\build\$cname") -ErrorAction SilentlyContinue
+                }
+            }
+            $handledSac = $true
+        }
+        if ($handledSac) {
+            Start-Sleep -Milliseconds 300
             continue
         }
         $LASTEXITCODE = $cargoExit

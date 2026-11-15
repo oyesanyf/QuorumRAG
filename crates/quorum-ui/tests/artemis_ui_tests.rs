@@ -278,3 +278,48 @@ fn test_artemis_dfir_search_auto_jump_and_upload_refresh() {
     );
 }
 
+#[test]
+fn test_artemis_dfir_master_forensics_subsystem_toggle_and_badge() {
+    let html = get_index_html();
+    assert!(
+        html.contains(r#"id="chk-artemis-master-toggle""#),
+        "index.html must contain #chk-artemis-master-toggle"
+    );
+    assert!(
+        html.contains(r#"data-action="artemis-toggle-subsystem""#),
+        "index.html must wire master toggle to data-action=\"artemis-toggle-subsystem\""
+    );
+    assert!(
+        html.contains(r#"id="artemis-subsystem-status-badge""#),
+        "index.html must contain #artemis-subsystem-status-badge"
+    );
+    assert!(
+        html.contains("DISABLED (DEFAULT)"),
+        "index.html must display DISABLED (DEFAULT) by default"
+    );
+
+    let (js_bytes, _) = get_asset("app.js").expect("app.js must be embedded");
+    let js = String::from_utf8_lossy(&js_bytes);
+
+    assert!(
+        js.contains(r#"id="chk-artemis-master-toggle""#),
+        "app.js must render #chk-artemis-master-toggle"
+    );
+    assert!(
+        js.contains(r#"id="artemis-subsystem-status-badge""#),
+        "app.js must render #artemis-subsystem-status-badge"
+    );
+    assert!(
+        js.contains("DISABLED (DEFAULT)"),
+        "app.js must include default badge DISABLED (DEFAULT)"
+    );
+    assert!(
+        js.contains("case 'artemis-toggle-subsystem':"),
+        "app.js must handle action 'artemis-toggle-subsystem'"
+    );
+    assert!(
+        js.contains("forensics_enabled: isChecked"),
+        "app.js must send forensics_enabled payload to /api/settings"
+    );
+}
+

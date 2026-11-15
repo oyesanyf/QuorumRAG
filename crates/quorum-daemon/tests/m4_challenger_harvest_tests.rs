@@ -151,6 +151,38 @@ fn decode_hex(hex_str: &str) -> Vec<u8> {
 }
 
 async fn enable_marketplace_opt_in(app: &axum::Router) {
+    let enable_forensics = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "forensics_enabled": true }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enable_forensics.status(), StatusCode::OK);
+
+    let enable_harvest = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/artemis/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "marketplace_harvest_enabled": true }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enable_harvest.status(), StatusCode::OK);
+
     let opt_in = app
         .clone()
         .oneshot(
@@ -758,5 +790,71 @@ async fn test_challenge_session_scoped_normalizer_isolation() {
     assert_ne!(
         pseudo_alpha, pseudo_beta,
         "Session isolation failure: Same IP mapped to identical pseudonym across different batch sessions! alpha={pseudo_alpha}, beta={pseudo_beta}"
+    );
+}
+
+#[tokio::test]
+async fn test_challenge_forensics_disabled_rejects_artemis_candidates_even_when_opted_in() {
+    let (app, _state, _temp_dir) = setup_challenger_daemon_app().await;
+    // Opt into Marketplace WITHOUT enabling forensics (default = false)
+    let opt_in = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/opt-in")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "opt_in_enabled": true,
+                        "user_consent_checked": true,
+                        "consent_statement": "Explicit consent for forensics-disabled harvest check."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opt_in.status(), StatusCode::OK);
+
+    let candidate = make_defensive_telemetry_candidate(
+        "cand_disabled_forensics_01",
+        vec!["process_execution", "system_event_log"],
+        "CORP-SEC-DC01",
+        "svc_netdefense",
+        "S-1-5-21-3623811015-3361044348-30300820-1013",
+        "192.168.1.55",
+        "00:1A:2B:3C:4D:5E",
+        "\\\\DomainController\\Sysvol",
+    );
+
+    let harvest_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/marketplace/harvest")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "batch_id": "batch-disabled-forensics-01",
+                        "candidates": [candidate]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(harvest_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = read_body_json(harvest_res).await;
+    assert_eq!(json["accepted_count"], 0);
+    assert_eq!(json["rejected_count"], 1);
+    let reason = json["rejected_candidates"][0]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("Forensics subsystem is disabled"),
+        "Expected forensics-disabled rejection reason, got: {reason}"
     );
 }

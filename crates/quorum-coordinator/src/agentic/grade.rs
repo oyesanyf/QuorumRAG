@@ -103,16 +103,28 @@ impl GradeRelevanceNode {
             .len();
 
         let is_author_query = crate::offline_engine::DeterministicOfflineSynthesisEngine::is_authorship_query(&state.original_prompt);
-        let satisfactory = !is_empty
+
+        // Feature 6: Evaluate context sufficiency across retrieved chunks (local and 1-hop mesh peers)
+        let sufficiency_decision = crate::scatter_gather::ScatterGatherEngine::evaluate_context_sufficiency(&state.retrieved_chunks);
+        let p_sufficient = sufficiency_decision.probability_of("SufficientAsIs");
+        let is_early_sufficient = !is_empty && has_content_match && p_sufficient >= 0.90;
+
+        let satisfactory = (!is_empty
             && max_score >= effective_threshold
             && (!requires_named_entity_match || has_content_match)
             && (!is_author_query
                 || distinct_docs >= 2
-                || (distinct_docs >= 1 && (max_score >= 0.70 || has_content_match)));
+                || (distinct_docs >= 1 && (max_score >= 0.70 || has_content_match))))
+            || is_early_sufficient;
         let will_rewrite = !satisfactory && state.hop_count < state.max_hops;
 
         let reasoning = if is_empty {
             "Empty chunks retrieved. Scheduling query rewrite or fallback.".to_string()
+        } else if is_early_sufficient {
+            format!(
+                "Context sufficiency high-confidence early stopping: P(SufficientAsIs) = {:.3} >= 0.90 across retrieved local and 1-hop mesh chunks",
+                p_sufficient
+            )
         } else if satisfactory {
             format!(
                 "Top chunk score {:.3} meets threshold {:.3}{}",
@@ -313,5 +325,26 @@ mod tests {
         assert!(grade.satisfactory);
         assert!(grade.is_relevant);
         assert!(!will_rewrite);
+    }
+
+    #[test]
+    fn test_grade_relevance_early_sufficiency_stopping_p90() {
+        let grader = GradeRelevanceNode::default();
+        let mut state = AgenticGraphState::new(
+            "Explain quantum computing fundamentals",
+            crate::types::SynthesisModelFamily::AutoFusion,
+            3,
+        );
+        // Complete, self-contained context that scores P(SufficientAsIs) >= 0.90
+        state.retrieved_chunks = vec![make_test_chunk(
+            "c_suff",
+            "quantum.txt",
+            "Quantum computing uses qubits with superposition and entanglement to solve discrete optimization problems.",
+            0.05, // low raw score, but context is fully sufficient
+        )];
+        let (grade, will_rewrite) = grader.execute(&mut state);
+        assert!(grade.satisfactory, "High-confidence sufficiency must pass");
+        assert!(!will_rewrite, "High-confidence sufficiency must stop rewrites early");
+        assert!(grade.reasoning.contains("early stopping"));
     }
 }

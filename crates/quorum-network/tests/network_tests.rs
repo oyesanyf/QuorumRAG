@@ -27,6 +27,8 @@ impl InboundQueryHandler for TestQueryHandler {
                 access_tier: 0,
                 origin_peer_id: None,
             }],
+            synthesis_response: None,
+            warm_llm_available: false,
         }
     }
 }
@@ -83,6 +85,7 @@ async fn test_dual_node_point_to_point_cbor_query() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
 
     let response = handle_a

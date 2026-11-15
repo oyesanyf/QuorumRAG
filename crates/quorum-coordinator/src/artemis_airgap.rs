@@ -198,6 +198,14 @@ pub fn is_airgap_restricted_chunk(chunk: &quorum_types::DocumentChunk) -> bool {
     false
 }
 
+/// Returns true if the forensics subsystem is explicitly enabled in persistent daemon settings.
+pub fn is_forensics_enabled() -> bool {
+    crate::dlp_mesh::global_mesh_dlp_controller()
+        .get_settings()
+        .artemis
+        .enabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
