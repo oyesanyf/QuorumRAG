@@ -362,12 +362,15 @@ impl ForensicQueryIntent {
                     || (text_lower.contains("dnscache") && !text_lower.contains("codeintegrity"))
             }
             Self::NetworkInternet => {
-                path_lower.contains("/network/")
-                    || path_lower.contains("/netstat/")
-                    || path_lower.contains("/proc/net/")
-                    || text_lower.contains("networkconnection [")
+                path_lower.contains("/network")
+                    || path_lower.contains("network")
+                    || path_lower.contains("network_connection")
+                    || path_lower.contains("networkconnection")
+                    || path_lower.contains("netstat")
+                    || path_lower.contains("/proc/net")
+                    || text_lower.contains("networkconnection")
                     || text_lower.contains("live internet connection")
-                    || text_lower.contains("network socket [")
+                    || text_lower.contains("network socket")
             }
             Self::AntivirusBlocked => {
                 path_lower.contains("windows_defender")
@@ -621,7 +624,7 @@ impl DeterministicOfflineSynthesisEngine {
                 continue;
             }
             // Strip leading `[Document: "..." | Author: ... | Kind: ... | File: ...]`, `[File: ...]`,
-            // `[Image Document: ...]`, `[Word/Document ...]`, or `[PDF Document ...]` extractor/chunker banners
+            // `[Image Document: ...]`, `[Word/Document ...]`, `[PDF Document ...]`, or `[Section: ...]` extractor/chunker banners
             while trimmed.starts_with("[Document:")
                 || trimmed.starts_with("[File:")
                 || trimmed.starts_with("[Word/Document")
@@ -629,9 +632,14 @@ impl DeterministicOfflineSynthesisEngine {
                 || trimmed.starts_with("[Image Document:")
                 || trimmed.starts_with("[Audio Document:")
                 || trimmed.starts_with("[Video Document:")
+                || trimmed.starts_with("[Section:")
+                || trimmed.starts_with("Section:")
             {
                 if let Some(close_bracket) = trimmed.find(']') {
                     trimmed = trimmed[close_bracket + 1..].trim();
+                } else if trimmed.starts_with("Section:") {
+                    trimmed = "";
+                    break;
                 } else {
                     trimmed = "";
                     break;
@@ -783,9 +791,22 @@ impl DeterministicOfflineSynthesisEngine {
                             && chars[next_cap].is_uppercase()
                             && chars.len().saturating_sub(next_cap) >= 60
                         {
-                            start_idx = next_cap;
-                            advanced_to_sentence = true;
-                            break;
+                            let leading_span: String = chars[..idx].iter().collect();
+                            let first_word = leading_span.split_whitespace().next().unwrap_or("");
+                            let has_proper_nouns = leading_span.split_whitespace().skip(1).any(|w| {
+                                w.chars().next().map_or(false, |c| c.is_uppercase())
+                            });
+                            let has_role_or_amount = leading_span.contains('(') || leading_span.contains('$');
+                            let is_known_preamble_word = matches!(
+                                first_word.to_ascii_lowercase().as_str(),
+                                "between" | "whereas" | "including" | "pursuant" | "under" | "upon" | "per" | "subject" | "in" | "for" | "with"
+                            );
+
+                            if !has_proper_nouns && !has_role_or_amount && !is_known_preamble_word {
+                                start_idx = next_cap;
+                                advanced_to_sentence = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -843,8 +864,16 @@ impl DeterministicOfflineSynthesisEngine {
             if let Some(cut) = best_sentence_cut {
                 end_idx = cut;
             } else if let Some(last_space) = trimmed_slice.rfind(char::is_whitespace) {
-                if last_space > trimmed_slice.len() / 3 {
-                    end_idx = last_space;
+                let last_token = trimmed_slice[last_space..].trim();
+                if last_token.ends_with('-')
+                    || last_token.ends_with("...")
+                    || last_token.ends_with('…')
+                    || last_token.ends_with('/')
+                    || last_token.ends_with('\\')
+                {
+                    if last_space > trimmed_slice.len() / 3 {
+                        end_idx = last_space;
+                    }
                 }
             }
         }
@@ -1260,10 +1289,17 @@ impl DeterministicOfflineSynthesisEngine {
         }
 
         if chunks.is_empty() {
-            let fallback = format!(
+            let query_targets_forensics = ForensicQueryIntent::detect(&expanded_lower).is_some()
+                || ForensicQueryIntent::detect(prompt_eff).is_some()
+                || crate::artemis_airgap::contains_artemis_query(prompt)
+                || crate::artemis_airgap::contains_artemis_query(prompt_eff);
+            let mut fallback = format!(
                 "No matching documents were found in your local RAG index for **{}**.",
                 prompt
             );
+            if query_targets_forensics && !crate::artemis_airgap::is_forensics_enabled() {
+                fallback.push_str("\n\n> **Notice**: The forensics subsystem is currently disabled. Forensic sources and `artemis://` telemetry were skipped during retrieval.");
+            }
             if let Some(tx) = telemetry_tx {
                 let _ = Self::send_telemetry(
                     tx,
@@ -1424,6 +1460,9 @@ impl DeterministicOfflineSynthesisEngine {
                 || raw_head.contains("[OCR Text]")
                 || raw_head.contains("[Visual Description]");
             let is_artemis_chunk = path_l.starts_with("artemis://");
+            if is_artemis_chunk && !crate::artemis_airgap::is_forensics_enabled() {
+                continue;
+            }
             let is_user_doc = file_l.ends_with(".pdf")
                 || file_l.ends_with(".docx")
                 || file_l.ends_with(".doc")
@@ -1878,6 +1917,8 @@ impl DeterministicOfflineSynthesisEngine {
                             .partial_cmp(&a.0.score)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
+                    .then_with(|| a.0.chunk.chunk_id.cmp(&b.0.chunk.chunk_id))
+                    .then_with(|| a.0.chunk.blake3_hash.cmp(&b.0.chunk.blake3_hash))
             });
         }
 
@@ -1895,35 +1936,6 @@ impl DeterministicOfflineSynthesisEngine {
             12
         };
 
-        // Keep top N deduplicated RAG chunks for comprehensive multi-paragraph synthesis,
-        // prioritizing distinct remote peers first and interleaving matched remote peer chunks (`source_peer != "local"`)
-        // right after slot 0 so Ollama chat, fast-model retry, and offline synthesis all cite `(mesh)` peers prominently!
-        // Never interleave remote mesh chunks on local-only Artemis DFIR forensic queries.
-        let mut matched_remote_chunks: Vec<ScoredChunk> = Vec::new();
-        if forensic_intent.is_none() {
-            let mut seen_remote_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| c.source_peer != "local") {
-                if seen_remote_peers.insert(c.source_peer.clone()) {
-                    matched_remote_chunks.push((*c).clone());
-                    if matched_remote_chunks.len() >= 4 {
-                        break;
-                    }
-                }
-            }
-            if matched_remote_chunks.len() < 4 {
-                for (c, _, _, _) in scored_matches.iter().filter(|(c, _, _, _)| c.source_peer != "local") {
-                    if !matched_remote_chunks
-                        .iter()
-                        .any(|m| m.source_peer == c.source_peer && m.chunk.chunk_id == c.chunk.chunk_id)
-                    {
-                        matched_remote_chunks.push((*c).clone());
-                        if matched_remote_chunks.len() >= 4 {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
         let mut candidate_chunks: Vec<ScoredChunk> = scored_matches
             .iter()
             .take(chunk_limit)
@@ -1972,34 +1984,67 @@ impl DeterministicOfflineSynthesisEngine {
             candidate_chunks = Self::stitch_parent_document_chunks(candidate_chunks);
         }
 
-        if forensic_intent.is_none() {
-            let mut remote_insert_cursor = 1usize.min(candidate_chunks.len());
-            for rem in matched_remote_chunks {
-                if let Some(existing_pos) = candidate_chunks
-                    .iter()
-                    .position(|c| c.source_peer == rem.source_peer && c.chunk.file_path == rem.chunk.file_path)
-                {
-                    if existing_pos <= remote_insert_cursor {
-                        remote_insert_cursor = (existing_pos + 1).min(candidate_chunks.len());
-                        continue;
-                    }
-                    let promoted = candidate_chunks.remove(existing_pos);
-                    let target_idx = remote_insert_cursor.min(candidate_chunks.len());
-                    candidate_chunks.insert(target_idx, promoted);
-                    remote_insert_cursor = (target_idx + 1).min(candidate_chunks.len());
-                } else {
-                    let target_idx = remote_insert_cursor.min(candidate_chunks.len());
-                    candidate_chunks.insert(target_idx, rem);
-                    remote_insert_cursor = (target_idx + 1).min(candidate_chunks.len());
-                }
-            }
-        }
-
         if is_continuation && !prior_text.is_empty() {
             candidate_chunks = Self::deduplicate_chunk_segments_against_prior(candidate_chunks, &prior_text, 0.88);
         }
 
-        let matched_chunks = candidate_chunks;
+        // Feature 13: Relevance Attestation Gate (Nimble / Multi-Signal)
+        // Attest candidate chunks for query relevance and reject non-relevant distractors (such as UI screenshots on non-image queries)
+        let has_non_image_candidates = candidate_chunks.iter().any(|sc| {
+            let fl = sc.chunk.file_path.to_ascii_lowercase();
+            !fl.ends_with(".png")
+                && !fl.ends_with(".jpg")
+                && !fl.ends_with(".jpeg")
+                && !fl.ends_with(".gif")
+                && !fl.ends_with(".webp")
+                && !sc.chunk.text_content.starts_with("[Image Document:")
+        });
+        let attested_candidates: Vec<ScoredChunk> = candidate_chunks
+            .iter()
+            .filter(|sc| {
+                let fl = sc.chunk.file_path.to_ascii_lowercase();
+                let tl = sc.chunk.text_content.to_ascii_lowercase();
+                let is_search_ui_distractor = fl.contains("search_results")
+                    || fl.contains("search_ui")
+                    || tl.contains("google search")
+                    || tl.contains("search results")
+                    || tl.contains("search-ui");
+                if is_search_ui_distractor {
+                    return false;
+                }
+                if !has_non_image_candidates {
+                    return true;
+                }
+                let fam_key = Self::derive_document_family_key(&sc.chunk.file_path);
+                crate::relevance_attestor::NimbleRelevanceAttestation::evaluate_multi_signal_relevance(
+                    prompt_eff,
+                    &fam_key,
+                    &[*sc],
+                )
+            })
+            .cloned()
+            .collect();
+        let candidate_chunks: Vec<ScoredChunk> = if !attested_candidates.is_empty() {
+            attested_candidates
+        } else {
+            candidate_chunks
+                .into_iter()
+                .filter(|sc| {
+                    let fl = sc.chunk.file_path.to_ascii_lowercase();
+                    let tl = sc.chunk.text_content.to_ascii_lowercase();
+                    !(fl.contains("search_results")
+                        || fl.contains("search_ui")
+                        || tl.contains("google search")
+                        || tl.contains("search results")
+                        || tl.contains("search-ui"))
+                })
+                .collect()
+        };
+
+        let mut matched_chunks = candidate_chunks;
+        for c in &mut matched_chunks {
+            crate::answer_orchestrator::annotate_chunk_entity_cluster(&mut c.chunk);
+        }
         let matched_chunk_refs: Vec<&ScoredChunk> = matched_chunks.iter().collect();
 
         if !matched_chunk_refs.is_empty() {
@@ -2014,9 +2059,10 @@ impl DeterministicOfflineSynthesisEngine {
             }
 
             if let Some(fi) = forensic_intent {
-                if matched_chunk_refs
-                    .iter()
-                    .any(|c| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"))
+                if crate::artemis_airgap::is_forensics_enabled()
+                    && matched_chunk_refs
+                        .iter()
+                        .any(|c| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"))
                 {
                     let clean_answer =
                         Self::synthesize_artemis_forensic_answer(fi, prompt_eff, &matched_chunk_refs);
@@ -2065,6 +2111,31 @@ impl DeterministicOfflineSynthesisEngine {
                     .iter()
                     .all(|c| c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://"));
             if !all_artemis_forensic {
+                let query_targets_forensics_live = forensic_intent.is_some()
+                    || crate::artemis_airgap::contains_artemis_query(prompt)
+                    || crate::artemis_airgap::contains_artemis_query(prompt_eff);
+                let maybe_append_forensics_disabled_notice =
+                    |mut text: String, stream_delta: bool| -> String {
+                        if query_targets_forensics_live
+                            && !crate::artemis_airgap::is_forensics_enabled()
+                            && !text.contains("forensics subsystem is currently disabled")
+                        {
+                            const NOTICE: &str = "\n\n> **Notice**: The forensics subsystem is currently disabled. Forensic sources and `artemis://` telemetry were skipped during retrieval.";
+                            text.push_str(NOTICE);
+                            if stream_delta {
+                                if let Some(tx) = telemetry_tx {
+                                    let _ = Self::send_telemetry(
+                                        tx,
+                                        AgenticTelemetryEvent::TokenDelta {
+                                            delta: NOTICE.to_string(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        text
+                    };
+
                 if let Some((llm_orchestrated, llm_citations)) = Self::query_local_ollama_chat(
                     &effective_question,
                     history,
@@ -2072,7 +2143,10 @@ impl DeterministicOfflineSynthesisEngine {
                     model_tag,
                     telemetry_tx,
                 ) {
-                    return (llm_orchestrated, llm_citations);
+                    return (
+                        maybe_append_forensics_disabled_notice(llm_orchestrated, true),
+                        llm_citations,
+                    );
                 }
 
                 // 1b. Fast-model retry: the primary model (often 26B+ on CPU) timed out or failed, so retry only with
@@ -2095,7 +2169,89 @@ impl DeterministicOfflineSynthesisEngine {
                             if let Some((text, cits)) =
                                 Self::query_local_ollama_chat(&effective_question, history, top_refs, &fast, telemetry_tx)
                             {
-                                return (text, cits);
+                                return (
+                                    maybe_append_forensics_disabled_notice(text, true),
+                                    cits,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // 1c. Mesh Synthesis Relay Delegation: if local node lacks warm LLM inside active daemon runtime,
+                // delegate evidence synthesis to an authenticated peer with an active LLM over the mesh wire.
+                let daemon_runtime_active = crate::dlp_mesh::global_mesh_dlp_controller()
+                    .settings_file_path
+                    .read()
+                    .map(|p| p.is_some())
+                    .unwrap_or(false);
+                if daemon_runtime_active && !matched_chunk_refs.is_empty() {
+                    if let Some(dispatcher) = crate::mesh::get_global_mesh_dispatcher() {
+                        if dispatcher.peer_count() > 0 {
+                            let candidate_dtos: Vec<quorum_types::CandidateChunkDto> = matched_chunk_refs
+                                .iter()
+                                .map(|sc| quorum_types::CandidateChunkDto::from_scored_chunk(sc))
+                                .collect();
+
+                            let mut relay_req = quorum_types::FederatedQueryRequest {
+                                query_id: uuid::Uuid::new_v4(),
+                                sender_peer_id: "local".to_string(),
+                                sender_pubkey: [0u8; 32],
+                                query_text: effective_question.clone(),
+                                embedding: vec![0.0; 768],
+                                top_k: matched_chunk_refs.len().max(16),
+                                timestamp: chrono::Utc::now().timestamp(),
+                                signature: [0u8; 64],
+                                origin_peer_id: None,
+                                relay_hops: 0,
+                                visited_peers: Vec::new(),
+                                synthesis_relay: Some(quorum_types::MeshSynthesisRelayPayload {
+                                    prompt: effective_question.clone(),
+                                    history: history.to_vec(),
+                                    evidence_chunks: candidate_dtos,
+                                    model_tag: Some(model_tag.to_string()),
+                                }),
+                            };
+                            let secret_seed = [0x5au8; 32];
+                            crate::crypto::sign_request(&secret_seed, &mut relay_req, quorum_types::AccessTier::Tier0Public);
+
+                            let timeout_dur = std::time::Duration::from_millis(4000);
+                            let responses = match tokio::runtime::Handle::try_current() {
+                                Ok(handle)
+                                    if handle.runtime_flavor()
+                                        == tokio::runtime::RuntimeFlavor::MultiThread =>
+                                {
+                                    tokio::task::block_in_place(|| {
+                                        handle.block_on(dispatcher.query_peers(&relay_req, timeout_dur))
+                                    })
+                                }
+                                _ => std::thread::scope(|s| {
+                                    s.spawn(|| {
+                                        tokio::runtime::Builder::new_current_thread()
+                                            .enable_all()
+                                            .build()
+                                            .map_err(|_| crate::CoordinatorError::Timeout(4000))
+                                            .and_then(|rt| {
+                                                rt.block_on(dispatcher.query_peers(&relay_req, timeout_dur))
+                                            })
+                                    })
+                                    .join()
+                                    .unwrap_or_else(|_| Err(crate::CoordinatorError::Timeout(4000)))
+                                }),
+                            };
+
+                            if let Ok(resps) = responses {
+                                for resp in resps {
+                                    if let Some(synthesis) = resp.synthesis_response {
+                                        if !synthesis.synthesized_text.trim().is_empty() {
+                                            tracing::info!(peer = %resp.responder_peer_id, model = %synthesis.model_tag, "Received synthesized answer from mesh peer via synthesis relay");
+                                            return (
+                                                maybe_append_forensics_disabled_notice(synthesis.synthesized_text, false),
+                                                synthesis.citations,
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2103,13 +2259,28 @@ impl DeterministicOfflineSynthesisEngine {
             }
 
             // 2. Deterministic offline fallback (used in unit tests or if local Ollama daemon is unreachable)
-            let prefix = Self::format_question_restated_prefix(prompt_eff);
+            // Feature 8: Filter false-positive lexical distractors before offline synthesis while strictly preserving multi-host recall
+            let attested_offline: Vec<&ScoredChunk> = matched_chunk_refs
+                .iter()
+                .copied()
+                .filter(|c| {
+                    let att = crate::answer_orchestrator::NimbleRelevanceAttestation::from_chunk(&c.chunk, prompt_eff, &c.source_peer);
+                    att.attested_relevant
+                })
+                .collect();
+            let effective_refs: Vec<&ScoredChunk> = if !attested_offline.is_empty() {
+                attested_offline
+            } else {
+                matched_chunk_refs.clone()
+            };
+
+            let prefix = Self::format_question_restated_prefix_with_chunks(prompt_eff, &effective_refs);
             let specific_clusters =
-                crate::answer_orchestrator::distinct_specific_entity_clusters(&matched_chunk_refs);
+                crate::answer_orchestrator::distinct_specific_entity_clusters(&effective_refs);
             let is_multi_persona = specific_clusters.len() >= 2 && forensic_intent.is_none();
 
             let mut body_paragraphs: Vec<String> = Vec::new();
-            for (idx, c) in matched_chunk_refs.iter().enumerate().take(10) {
+            for (idx, c) in effective_refs.iter().enumerate().take(36) {
                 let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
                 // Strip residual artifacts, ChatGPT export markers, and dividers
                 let mut chunk_lines: Vec<String> = Vec::new();
@@ -2162,8 +2333,8 @@ impl DeterministicOfflineSynthesisEngine {
             let mut answer_parts: Vec<String> = Vec::new();
 
             // Synthesize affirmative restated opening grounded in top chunk (or general multi-persona disambiguation opening)
-            if !prefix.is_empty() && !matched_chunks.is_empty() {
-                let top_chunk = &matched_chunks[0];
+            if !prefix.is_empty() && !effective_refs.is_empty() {
+                let top_chunk = effective_refs[0];
                 let file_name = std::path::Path::new(&top_chunk.chunk.file_path)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -2285,7 +2456,7 @@ impl DeterministicOfflineSynthesisEngine {
                         .filter(|s| !s.is_empty())
                         .unwrap_or(prompt_eff);
                     let cluster_summary = specific_clusters.join("; ");
-                    let all_cites = (1..=matched_chunk_refs.len().min(8))
+                    let all_cites = (1..=effective_refs.len().min(8))
                         .map(|n| format!("**[{n}]**"))
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -2294,7 +2465,7 @@ impl DeterministicOfflineSynthesisEngine {
                     ))
                 } else {
                     subject_name.as_deref().and_then(|subj| {
-                        Self::subject_role_from_chunks(subj, &matched_chunk_refs).map(|(role, cites)| {
+                        Self::subject_role_from_chunks(subj, &effective_refs).map(|(role, cites)| {
                             let cite_str = cites.iter().map(|n| format!("**[{n}]**")).collect::<Vec<_>>().join(", ");
                             format!("{subj} is identified as the {role} in the retrieved documents {cite_str}.")
                         })
@@ -2327,7 +2498,7 @@ impl DeterministicOfflineSynthesisEngine {
                     if let Some(sections) = crate::answer_orchestrator::render_disambiguated_multi_cluster_report(
                         prompt_eff,
                         fallback_subject.as_deref(),
-                        &matched_chunk_refs,
+                        &effective_refs,
                     ) {
                         answer_parts.push(sections);
                     } else {
@@ -2341,7 +2512,7 @@ impl DeterministicOfflineSynthesisEngine {
                     if let Some(sections) = crate::answer_orchestrator::render_grounded_sections(
                         prompt_eff,
                         fallback_subject.as_deref(),
-                        &matched_chunk_refs,
+                        &effective_refs,
                     ) {
                         answer_parts.push(sections);
                     }
@@ -2353,8 +2524,37 @@ impl DeterministicOfflineSynthesisEngine {
             // Add end-of-response sources block with accuracy scores (zero line numbers!)
             let raw_answer = answer_parts.join("\n\n");
             let clean_answer = Self::consolidate_duplicate_entity_statements(&raw_answer);
-            let sources_block = Self::format_sources_block(&matched_chunk_refs);
-            let synthesized_rag = format!("{}{}", clean_answer, sources_block);
+            // Feature 14 & 20: 100% Attested-Document Contribution Guarantee
+            let (healed_answer_raw, contributing_chunks) =
+                crate::answer_orchestrator::enforce_attested_document_coverage_loop(&clean_answer, &effective_refs);
+            let healed_answer = Self::strip_orphan_citation_stubs(&healed_answer_raw);
+            let mut citations: Vec<Citation> = Self::build_deduplicated_citations(&contributing_chunks);
+            let sources_block = Self::format_sources_block(&contributing_chunks);
+
+            // Feature 10: Post-Synthesis Groundedness Verification
+            let groundedness = crate::answer_orchestrator::verify_post_synthesis_groundedness(&healed_answer, &contributing_chunks);
+            let sanitized_prose = if !groundedness.is_grounded && groundedness.backfill_detected {
+                tracing::warn!(ungrounded = ?groundedness.ungrounded_claims, "Post-synthesis groundedness verification detected pretraining backfill; sanitizing output");
+                groundedness.sanitized_answer
+            } else {
+                healed_answer
+            };
+            // Feature 24: ResponseFormatterWatchdog inspection and hygiene
+            let watchdog_report = crate::response_formatter_watchdog::ResponseFormatterWatchdog::inspect_and_repair(
+                prompt_eff,
+                &sanitized_prose,
+                &contributing_chunks,
+            );
+            let final_answer = Self::strip_orphan_citation_stubs(&watchdog_report.cleaned_prose);
+            let mut synthesized_rag = format!("{}{}", final_answer, sources_block);
+
+            let query_targets_forensics = forensic_intent.is_some()
+                || crate::artemis_airgap::contains_artemis_query(prompt)
+                || crate::artemis_airgap::contains_artemis_query(prompt_eff);
+            if query_targets_forensics && !crate::artemis_airgap::is_forensics_enabled() {
+                const FORENSICS_DISABLED_NOTICE: &str = "\n\n> **Notice**: The forensics subsystem is currently disabled. Forensic sources and `artemis://` telemetry were skipped during retrieval.";
+                synthesized_rag.push_str(FORENSICS_DISABLED_NOTICE);
+            }
 
             if let Some(tx) = telemetry_tx {
                 for word in synthesized_rag.split_inclusive(' ') {
@@ -2375,13 +2575,21 @@ impl DeterministicOfflineSynthesisEngine {
             }
             crate::rlm_orchestrator::RlmOrchestrator::verify_and_attach_verbatim_grounding(
                 prompt_eff,
-                &clean_answer,
-                &matched_chunk_refs,
+                &final_answer,
+                &contributing_chunks,
                 &mut citations,
             );
             (synthesized_rag, citations)
         } else {
-            let fallback = if let Some(fi) = forensic_intent {
+            let query_targets_forensics = forensic_intent.is_some()
+                || crate::artemis_airgap::contains_artemis_query(prompt)
+                || crate::artemis_airgap::contains_artemis_query(prompt_eff);
+            let fallback = if query_targets_forensics && !crate::artemis_airgap::is_forensics_enabled() {
+                format!(
+                    "No matching documents were found in your local RAG index for **{}**.\n\n> **Notice**: The forensics subsystem is currently disabled. Forensic sources and `artemis://` telemetry were skipped during retrieval. To query host forensics, enable the forensics subsystem in daemon configuration (`forensics = true`) or via CLI.",
+                    prompt
+                )
+            } else if let Some(fi) = forensic_intent {
                 let cat_desc = match fi {
                     ForensicQueryIntent::DnsTraffic => "live host DNS query, socket, and resolver cache records",
                     ForensicQueryIntent::NetworkInternet => "active internet/network socket connections",
@@ -2629,7 +2837,9 @@ impl DeterministicOfflineSynthesisEngine {
 
         // 1. If clean_sum already starts with prefix ("Femi is", "Femi Oyesanya is")
         if lower_sum.starts_with(&lower_pref) {
-            return format!("{} **[1]**", clean_sum);
+            let rest = &clean_sum[lower_pref.len()..];
+            let spacing = if rest.starts_with(' ') || rest.is_empty() { "" } else { " " };
+            return format!("{}{}{} **[1]**", prefix_trimmed, spacing, rest);
         }
 
         // 2. If subject_name is present and clean_sum starts with subject or pronouns
@@ -2662,7 +2872,9 @@ impl DeterministicOfflineSynthesisEngine {
                         return format!("{}{} {} **[1]**", prefix, article, candidate_pred);
                     }
                 }
-                return format!("{} **[1]**", clean_sum);
+                let rest = &clean_sum[subj.len()..];
+                let spacing = if rest.starts_with(' ') || rest.is_empty() { "" } else { " " };
+                return format!("{}{}{} **[1]**", subj, spacing, rest);
             }
             for pronoun in &["he ", "she ", "they "] {
                 if lower_sum.starts_with(pronoun) {
@@ -2739,7 +2951,204 @@ impl DeterministicOfflineSynthesisEngine {
         format!("{}{} **[1]**", prefix, clean_sum)
     }
 
+    /// Backwards-compatible helper delegating to `format_question_restated_prefix_with_chunks`.
     pub fn format_question_restated_prefix(prompt: &str) -> String {
+        Self::format_question_restated_prefix_with_chunks(prompt, &[])
+    }
+
+    /// Extracts capitalized candidate proper nouns from evidence chunks and snaps query entity tokens
+    /// using Levenshtein distance (<= 2) and Soundex without hardcoded names.
+    pub fn snap_proper_noun_with_chunks(raw: &str, chunks: &[&ScoredChunk]) -> String {
+        let trimmed_raw = raw.trim();
+        if trimmed_raw.is_empty() {
+            return String::new();
+        }
+
+        let capitalize = |s: &str| -> String {
+            s.split_whitespace()
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(first) => {
+                            let mut cap = first.to_uppercase().to_string();
+                            cap.push_str(chars.as_str());
+                            cap
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        if chunks.is_empty() {
+            return capitalize(trimmed_raw);
+        }
+
+        // 1. Extract candidate capitalized phrases, tokens, and verbatim vocabulary from retrieved corpus evidence chunks
+        let mut candidate_phrases: Vec<String> = Vec::new();
+        let mut candidate_words: Vec<String> = Vec::new();
+        let mut seen_phrases = std::collections::HashSet::new();
+        let mut seen_words = std::collections::HashSet::new();
+        let mut verbatim_corpus_words = std::collections::HashSet::new();
+
+        let is_plural_inflection = |a: &str, b: &str| -> bool {
+            if a == b {
+                return false;
+            }
+            format!("{a}s") == b
+                || format!("{a}es") == b
+                || format!("{b}s") == a
+                || format!("{b}es") == a
+                || (a.len() > 3
+                    && b.len() > 2
+                    && a.ends_with("ies")
+                    && b.ends_with('y')
+                    && a[..a.len() - 3] == b[..b.len() - 1])
+                || (b.len() > 3
+                    && a.len() > 2
+                    && b.ends_with("ies")
+                    && a.ends_with('y')
+                    && b[..b.len() - 3] == a[..a.len() - 1])
+        };
+
+        for sc in chunks {
+            for line in sc.chunk.text_content.lines() {
+                let trimmed_line = line.trim();
+                if trimmed_line.starts_with('[') || trimmed_line.starts_with('#') {
+                    continue;
+                }
+                let words: Vec<&str> = trimmed_line
+                    .split(|c: char| !c.is_alphanumeric() && c != '-')
+                    .filter(|w| !w.is_empty())
+                    .collect();
+
+                let mut current_phrase: Vec<&str> = Vec::new();
+                for &w in &words {
+                    let clean_w = w.trim_matches('-');
+                    if clean_w.len() >= 2 {
+                        verbatim_corpus_words.insert(clean_w.to_ascii_lowercase());
+                    }
+                    if clean_w.len() >= 2 && clean_w.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                        let is_all_caps = clean_w.chars().all(|c| c.is_ascii_uppercase());
+                        if !is_all_caps || clean_w.len() >= 4 {
+                            current_phrase.push(clean_w);
+                            if seen_words.insert(clean_w.to_ascii_lowercase()) {
+                                candidate_words.push(clean_w.to_string());
+                            }
+                        } else {
+                            if current_phrase.len() >= 2 {
+                                let phrase = current_phrase.join(" ");
+                                if seen_phrases.insert(phrase.to_ascii_lowercase()) {
+                                    candidate_phrases.push(phrase);
+                                }
+                            }
+                            current_phrase.clear();
+                        }
+                    } else {
+                        if current_phrase.len() >= 2 {
+                            let phrase = current_phrase.join(" ");
+                            if seen_phrases.insert(phrase.to_ascii_lowercase()) {
+                                candidate_phrases.push(phrase);
+                            }
+                        }
+                        current_phrase.clear();
+                    }
+                }
+                if current_phrase.len() >= 2 {
+                    let phrase = current_phrase.join(" ");
+                    if seen_phrases.insert(phrase.to_ascii_lowercase()) {
+                        candidate_phrases.push(phrase);
+                    }
+                }
+            }
+        }
+
+        let q_words: Vec<&str> = trimmed_raw.split_whitespace().collect();
+
+        // 2. Try phrase-level match against multi-word candidate phrases
+        for cand in &candidate_phrases {
+            let cand_words: Vec<&str> = cand.split_whitespace().collect();
+            if cand_words.len() == q_words.len() {
+                let all_match = q_words.iter().zip(cand_words.iter()).all(|(&qw, &cw)| {
+                    let ql = qw.to_ascii_lowercase();
+                    let cl = cw.to_ascii_lowercase();
+                    if ql == cl {
+                        return true;
+                    }
+                    if ql.len() < 4
+                        || STOPWORDS.contains(&ql.as_str())
+                        || verbatim_corpus_words.contains(&ql)
+                        || is_plural_inflection(&ql, &cl)
+                    {
+                        return false;
+                    }
+                    let dist = Self::levenshtein_distance(&ql, &cl);
+                    if dist <= 2 {
+                        return true;
+                    }
+                    if ql.len() >= 4 && cl.len() >= 4 && Self::soundex(&ql) == Self::soundex(&cl) {
+                        return true;
+                    }
+                    false
+                });
+                if all_match {
+                    return cand.clone();
+                }
+            }
+        }
+
+        // 3. Token-level snapping against individual candidate words
+        let mut snapped_tokens = Vec::with_capacity(q_words.len());
+        for &qw in &q_words {
+            let ql = qw.to_ascii_lowercase();
+            let mut best_match: Option<(&String, usize)> = None;
+            let q_soundex = Self::soundex(&ql);
+            let allow_fuzzy = ql.len() >= 4
+                && !STOPWORDS.contains(&ql.as_str())
+                && !verbatim_corpus_words.contains(&ql);
+
+            for cw in &candidate_words {
+                let cl = cw.to_ascii_lowercase();
+                if ql == cl {
+                    best_match = Some((cw, 0));
+                    break;
+                }
+                if !allow_fuzzy || is_plural_inflection(&ql, &cl) {
+                    continue;
+                }
+                let dist = Self::levenshtein_distance(&ql, &cl);
+                let soundex_match = ql.len() >= 4 && cl.len() >= 4 && q_soundex == Self::soundex(&cl);
+
+                if dist <= 2 || soundex_match {
+                    let effective_dist = if soundex_match && dist > 2 { 2 } else { dist };
+                    match best_match {
+                        None => best_match = Some((cw, effective_dist)),
+                        Some((_, cur_dist)) if effective_dist < cur_dist => {
+                            best_match = Some((cw, effective_dist));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if let Some((matched_word, _)) = best_match {
+                snapped_tokens.push(matched_word.clone());
+            } else {
+                snapped_tokens.push(capitalize(qw));
+            }
+        }
+
+        snapped_tokens.join(" ")
+    }
+
+    /// Formats a clean declarative opening sentence grounded in the retrieved corpus chunks,
+    /// normalizing contraction leads ("who's is", "what's is", "where's is") and snapping misspelled
+    /// query entity tokens to canonical corpus casing/spelling with zero hardcoded names.
+    pub fn format_question_restated_prefix_with_chunks(
+        prompt: &str,
+        chunks: &[&ScoredChunk],
+    ) -> String {
         let (spelled_prompt, _) = Self::correct_query_spelling(prompt, false);
         let eff_prompt = if !spelled_prompt.trim().is_empty() {
             spelled_prompt.as_str()
@@ -2750,14 +3159,57 @@ impl DeterministicOfflineSynthesisEngine {
         if trimmed.is_empty() {
             return String::new();
         }
-        let clean_prompt = trimmed
+        let clean_prompt_raw = trimmed
             .trim_matches(|c: char| c == '?' || c == '!' || c == '.' || c == '"' || c == '\'')
             .trim();
-        if clean_prompt.is_empty() {
+        if clean_prompt_raw.is_empty() {
             return String::new();
         }
-        let lower = clean_prompt.to_ascii_lowercase();
-        if Self::is_continuation_query(&lower) || ForensicQueryIntent::detect(&lower).is_some() {
+
+        // Normalize contraction leads before restatement check
+        let lower_raw = clean_prompt_raw.to_ascii_lowercase();
+        let (clean_prompt_norm, lower_norm) = {
+            let mut s = clean_prompt_raw.to_string();
+            let mut l = lower_raw.clone();
+            for (pattern, replacement) in &[
+                ("who's is ", "who is "),
+                ("who’s is ", "who is "),
+                ("who's was ", "who was "),
+                ("who’s was ", "who was "),
+                ("who's ", "who is "),
+                ("who’s ", "who is "),
+                ("what's is ", "what is "),
+                ("what’s is ", "what is "),
+                ("what's was ", "what was "),
+                ("what’s was ", "what was "),
+                ("what's ", "what is "),
+                ("what’s ", "what is "),
+                ("where's is ", "where is "),
+                ("where’s is ", "where is "),
+                ("where's ", "where is "),
+                ("where’s ", "where is "),
+                ("when's is ", "when is "),
+                ("when’s is ", "when is "),
+                ("when's ", "when is "),
+                ("when’s ", "when is "),
+                ("how's is ", "how is "),
+                ("how’s is ", "how is "),
+                ("how's ", "how is "),
+                ("how’s ", "how is "),
+            ] {
+                if l.starts_with(pattern) {
+                    s = format!("{}{}", replacement, &s[pattern.len()..]);
+                    l = format!("{}{}", replacement, &l[pattern.len()..]);
+                    break;
+                }
+            }
+            (s, l)
+        };
+
+        let clean_prompt = clean_prompt_norm.as_str();
+        let lower = lower_norm.as_str();
+
+        if Self::is_continuation_query(lower) || ForensicQueryIntent::detect(lower).is_some() {
             return String::new();
         }
 
@@ -2805,34 +3257,43 @@ impl DeterministicOfflineSynthesisEngine {
                 .join(" ")
         };
 
+        let snap_or_cap = |raw_entity: &str| -> String {
+            let snapped = Self::snap_proper_noun_with_chunks(raw_entity, chunks);
+            if !snapped.is_empty() {
+                snapped
+            } else {
+                capitalize(raw_entity)
+            }
+        };
+
         // 1. "who is / who was / who are / who were"
         if lower.starts_with("who is ") {
             let raw = clean_prompt["who is ".len()..].trim();
             if is_clause_or_malformed_tail(raw) {
                 return String::new();
             }
-            return format!("{} is ", capitalize(raw));
+            return format!("{} is ", snap_or_cap(raw));
         }
         if lower.starts_with("who was ") {
             let raw = clean_prompt["who was ".len()..].trim();
             if is_clause_or_malformed_tail(raw) {
                 return String::new();
             }
-            return format!("{} was ", capitalize(raw));
+            return format!("{} was ", snap_or_cap(raw));
         }
         if lower.starts_with("who are ") {
             let raw = clean_prompt["who are ".len()..].trim();
             if is_clause_or_malformed_tail(raw) {
                 return String::new();
             }
-            return format!("{} are ", capitalize(raw));
+            return format!("{} are ", snap_or_cap(raw));
         }
         if lower.starts_with("who were ") {
             let raw = clean_prompt["who were ".len()..].trim();
             if is_clause_or_malformed_tail(raw) {
                 return String::new();
             }
-            return format!("{} were ", capitalize(raw));
+            return format!("{} were ", snap_or_cap(raw));
         }
 
         // 2. "what is / what was / what are / what were"
@@ -2841,34 +3302,34 @@ impl DeterministicOfflineSynthesisEngine {
             if is_clause_or_malformed_tail(raw) {
                 return String::new();
             }
-            return format!("{} is ", capitalize(raw));
+            return format!("{} is ", snap_or_cap(raw));
         }
         if lower.starts_with("what was ") {
             let raw = clean_prompt["what was ".len()..].trim();
             if is_clause_or_malformed_tail(raw) {
                 return String::new();
             }
-            return format!("{} was ", capitalize(raw));
+            return format!("{} was ", snap_or_cap(raw));
         }
         if lower.starts_with("what are ") {
             let raw = clean_prompt["what are ".len()..].trim();
             if is_clause_or_malformed_tail(raw) {
                 return String::new();
             }
-            return format!("{} are ", capitalize(raw));
+            return format!("{} are ", snap_or_cap(raw));
         }
         if lower.starts_with("what were ") {
             let raw = clean_prompt["what were ".len()..].trim();
             if is_clause_or_malformed_tail(raw) {
                 return String::new();
             }
-            return format!("{} were ", capitalize(raw));
+            return format!("{} were ", snap_or_cap(raw));
         }
 
         // 3. "what the <topic>" (e.g. "what the cigna policy")
         if lower.starts_with("what the ") {
             let raw = clean_prompt["what the ".len()..].trim();
-            return format!("The {} is ", capitalize(raw));
+            return format!("The {} is ", snap_or_cap(raw));
         }
 
         // 4. "where did <subject> study / attend / go to school / graduate"
@@ -2895,9 +3356,9 @@ impl DeterministicOfflineSynthesisEngine {
                 let clean_sub = sub.trim();
                 if !clean_sub.is_empty() {
                     if rest.contains("go to school") || rest.contains("attend") {
-                        return format!("{} attended ", capitalize(clean_sub));
+                        return format!("{} attended ", snap_or_cap(clean_sub));
                     } else {
-                        return format!("{} studied at ", capitalize(clean_sub));
+                        return format!("{} studied at ", snap_or_cap(clean_sub));
                     }
                 }
                 return "Education and academic background: ".to_string();
@@ -2907,48 +3368,48 @@ impl DeterministicOfflineSynthesisEngine {
         // 5. "what did <subject> do at <org>"
         if let Some(rest) = lower.strip_prefix("what did ") {
             if let Some(idx) = rest.find(" do at ") {
-                let sub = &rest[..idx].trim();
-                let org = &rest[idx + 7..].trim();
-                return format!("At {}, {} ", capitalize(org), capitalize(sub));
+                let sub = rest[..idx].trim();
+                let org = rest[idx + 7..].trim();
+                return format!("At {}, {} ", snap_or_cap(org), snap_or_cap(sub));
             }
         }
 
         // 6. "what does <subject> do / mean"
         if let Some(rest) = lower.strip_prefix("what does ") {
             let sub = rest.trim_end_matches(" do").trim_end_matches(" mean").trim();
-            return format!("{} ", capitalize(sub));
+            return format!("{} ", snap_or_cap(sub));
         }
 
         // 7. "where is / where was"
         if lower.starts_with("where is ") {
             let raw = clean_prompt["where is ".len()..].trim();
-            return format!("{} is located at ", capitalize(raw));
+            return format!("{} is located at ", snap_or_cap(raw));
         }
         if lower.starts_with("where was ") {
             let raw = clean_prompt["where was ".len()..].trim();
-            return format!("{} was located at ", capitalize(raw));
+            return format!("{} was located at ", snap_or_cap(raw));
         }
 
         // 8. "tell me about / describe / explain"
         if lower.starts_with("tell me about ") {
             let raw = clean_prompt["tell me about ".len()..].trim();
-            return format!("{} is ", capitalize(raw));
+            return format!("{} is ", snap_or_cap(raw));
         }
         if lower.starts_with("describe ") {
             let raw = clean_prompt["describe ".len()..].trim();
-            return format!("{} is ", capitalize(raw));
+            return format!("{} is ", snap_or_cap(raw));
         }
         if lower.starts_with("explain ") {
             let raw = clean_prompt["explain ".len()..].trim();
-            return format!("{} refers to ", capitalize(raw));
+            return format!("{} refers to ", snap_or_cap(raw));
         }
         if lower.starts_with("can you explain ") {
             let raw = clean_prompt["can you explain ".len()..].trim();
-            return format!("{} refers to ", capitalize(raw));
+            return format!("{} refers to ", snap_or_cap(raw));
         }
         if lower.starts_with("can you tell me about ") {
             let raw = clean_prompt["can you tell me about ".len()..].trim();
-            return format!("{} is ", capitalize(raw));
+            return format!("{} is ", snap_or_cap(raw));
         }
 
         // 9. Keyword queries on Education / School
@@ -2959,7 +3420,8 @@ impl DeterministicOfflineSynthesisEngine {
             || lower.contains("education")
         {
             if lower.contains("femi") || lower.contains("oyesanya") {
-                return "Femi's education and academic background includes: ".to_string();
+                let name = snap_or_cap("femi");
+                return format!("{}'s education and academic background includes: ", name);
             }
             return "Education and academic background: ".to_string();
         }
@@ -2971,7 +3433,7 @@ impl DeterministicOfflineSynthesisEngine {
             || lower == "redactx"
             || lower == "vaultgemma"
         {
-            return format!("{} is ", capitalize(clean_prompt));
+            return format!("{} is ", snap_or_cap(clean_prompt));
         }
 
         // 11. Auxiliary / Yes-No questions ("does he have cissp", "is femi cissp certified", "did he attend wgu")
@@ -2995,31 +3457,31 @@ impl DeterministicOfflineSynthesisEngine {
         // 12. Conversational question prefixes
         if lower.starts_with("tell me all about ") {
             let raw = clean_prompt["tell me all about ".len()..].trim();
-            return format!("{} — ", capitalize(raw));
+            return format!("{} — ", snap_or_cap(raw));
         }
         if lower.starts_with("tell me everything about ") {
             let raw = clean_prompt["tell me everything about ".len()..].trim();
-            return format!("{} — ", capitalize(raw));
+            return format!("{} — ", snap_or_cap(raw));
         }
         if lower.starts_with("what do you know about ") {
             let raw = clean_prompt["what do you know about ".len()..].trim();
-            return format!("{} — ", capitalize(raw));
+            return format!("{} — ", snap_or_cap(raw));
         }
         if lower.starts_with("give me details on ") {
             let raw = clean_prompt["give me details on ".len()..].trim();
-            return format!("{} — ", capitalize(raw));
+            return format!("{} — ", snap_or_cap(raw));
         }
         if lower.starts_with("give me details about ") {
             let raw = clean_prompt["give me details about ".len()..].trim();
-            return format!("{} — ", capitalize(raw));
+            return format!("{} — ", snap_or_cap(raw));
         }
         if lower.starts_with("give me info on ") {
             let raw = clean_prompt["give me info on ".len()..].trim();
-            return format!("{} — ", capitalize(raw));
+            return format!("{} — ", snap_or_cap(raw));
         }
         if lower.starts_with("give me information on ") {
             let raw = clean_prompt["give me information on ".len()..].trim();
-            return format!("{} — ", capitalize(raw));
+            return format!("{} — ", snap_or_cap(raw));
         }
 
         // Universal Q&A opening fallback: NEVER return "" for any non-empty prompt!
@@ -3040,7 +3502,7 @@ impl DeterministicOfflineSynthesisEngine {
         if let Some(t) = topic {
             let clean_topic = t.trim_matches(|c: char| !c.is_alphanumeric() && c != ' ').trim();
             if !clean_topic.is_empty() {
-                return format!("{} — ", capitalize(clean_topic));
+                return format!("{} — ", snap_or_cap(clean_topic));
             }
         }
         // "tell me all you know about X", "can you tell me what you know about X", "what can you tell me about X"
@@ -3051,17 +3513,16 @@ impl DeterministicOfflineSynthesisEngine {
                 let raw = clean_prompt[idx + " about ".len()..].trim();
                 let raw = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != ' ').trim();
                 if !raw.is_empty() {
-                    return format!("{} — ", capitalize(raw));
+                    return format!("{} — ", snap_or_cap(raw));
                 }
             }
         }
-        // Any other natural-language question shape ("how much rent does X pay", "which bank...", "why is...",
-        // "list all...", "compare A and B") has no safe mechanical restatement: return "" so the model opens with a
-        // direct declarative answer instead of a title-cased copy of the question.
+
         const QUESTION_LEADS: &[&str] = &[
             "how", "which", "when", "why", "whose", "whom", "what", "who", "where", "list", "compare", "tell",
             "summarize", "summarise", "show", "give", "find", "name", "does", "do", "did", "is", "are",
             "was", "were", "can", "could", "should", "would", "will", "has", "have", "had", "please",
+            "who's", "who’s", "what's", "what’s", "where's", "where’s", "when's", "when’s", "how's", "how’s", "why's", "why’s",
         ];
         let first_word = lower.split_whitespace().next().unwrap_or("");
         let is_question_shaped = trimmed.ends_with('?') || QUESTION_LEADS.contains(&first_word);
@@ -3069,7 +3530,7 @@ impl DeterministicOfflineSynthesisEngine {
             return String::new();
         }
         // Bare noun-phrase topic ("African Churches and Gang Violence") -> "African Churches And Gang Violence — "
-        format!("{} — ", capitalize(clean_prompt))
+        format!("{} — ", snap_or_cap(clean_prompt))
     }
 
     fn extract_collected_unix_secs(chunk: &quorum_types::DocumentChunk) -> i64 {
@@ -3406,6 +3867,35 @@ impl DeterministicOfflineSynthesisEngine {
             ));
         }
         out.trim_end().to_string()
+    }
+
+    /// Generates a calibrated forensic Markdown summary table reporting event ID, process name,
+    /// telemetry category, calibrated threat level, confidence, and voter consensus breakdown.
+    pub fn format_calibrated_dfir_summary_table(
+        records: &[crate::dfir_consensus::DfirTelemetryInput],
+    ) -> String {
+        if records.is_empty() {
+            return String::new();
+        }
+        let mut table = String::from(
+            "| # | Process / Target | Telemetry Type | Calibrated Threat Level | Confidence | Multi-Voter Consensus |\n|---|---|---|---|---|---|\n"
+        );
+        for (i, r) in records.iter().enumerate() {
+            let verdict = crate::dfir_consensus::MultiVoterConsensusEngine::evaluate_telemetry_detailed(r);
+            let safe_proc = r.process_name.replace('|', "\\|");
+            let safe_type = r.telemetry_type.replace('|', "\\|");
+            let safe_rationale = verdict.rationale.replace('|', "\\|");
+            table.push_str(&format!(
+                "| {} | {} | {} | {} | {:.2} | {} |\n",
+                i + 1,
+                safe_proc,
+                safe_type,
+                verdict.threat_level.as_str(),
+                verdict.calibrated_confidence,
+                safe_rationale
+            ));
+        }
+        table
     }
 
     /// Strips any trailing Markdown sources footer from an assistant message so continuation history
@@ -3896,11 +4386,6 @@ impl DeterministicOfflineSynthesisEngine {
             let mut score = (c.score * 100.0) as i32;
             let s = c.chunk.file_path.to_ascii_lowercase();
 
-            // Locality
-            if c.source_peer.is_empty() || c.source_peer.eq_ignore_ascii_case("local") {
-                score += 10;
-            }
-
             // Format preference
             if s.ends_with(".docx") {
                 score += 30;
@@ -3945,7 +4430,12 @@ impl DeterministicOfflineSynthesisEngine {
             score
         };
 
-        chunks.iter().copied().max_by_key(|c| score_chunk(c))
+        chunks.iter().copied().max_by(|a, b| {
+            score_chunk(a)
+                .cmp(&score_chunk(b))
+                .then_with(|| b.chunk.chunk_id.cmp(&a.chunk.chunk_id))
+                .then_with(|| b.chunk.blake3_hash.cmp(&a.chunk.blake3_hash))
+        })
     }
 
     /// Fast synchronous sub-LLM query helper against local Ollama for Rhai REPL Map batches.
@@ -4631,6 +5121,9 @@ impl DeterministicOfflineSynthesisEngine {
         };
 
         let format_entry = |rec: &SentenceEntry| -> String {
+            if rec.clean_text.chars().filter(|c| c.is_alphanumeric()).count() == 0 {
+                return String::new();
+            }
             if rec.citations.is_empty() {
                 return rec.clean_text.clone();
             }
@@ -4644,6 +5137,9 @@ impl DeterministicOfflineSynthesisEngine {
             };
 
             let base = rec.clean_text.trim_end_matches('.');
+            if base.trim().is_empty() {
+                return String::new();
+            }
             format!("{} {}.", base, cit_str)
         };
 
@@ -4703,6 +5199,18 @@ impl DeterministicOfflineSynthesisEngine {
 
             for sent in sents {
                 let entry = extract_entry(&sent);
+                // Never admit an entry that has no alphanumeric characters (e.g. standalone "[1].")
+                if entry.clean_text.chars().filter(|c| c.is_alphanumeric()).count() == 0 {
+                    if !entry.citations.is_empty() && !all_accepted_entries.is_empty() {
+                        let last_idx = all_accepted_entries.len() - 1;
+                        for c in entry.citations {
+                            if !all_accepted_entries[last_idx].citations.contains(&c) {
+                                all_accepted_entries[last_idx].citations.push(c);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Check if duplicate of any already accepted entry
                 let mut matched_existing_idx = None;
                 for (idx, existing) in all_accepted_entries.iter().enumerate() {
@@ -4752,6 +5260,19 @@ impl DeterministicOfflineSynthesisEngine {
         }
 
         processed_paragraphs.join("\n\n")
+    }
+
+    /// Strips orphan citation stubs (e.g. standalone lines containing only "[1].", "[5].", etc.)
+    pub fn strip_orphan_citation_stubs(text: &str) -> String {
+        let mut lines = Vec::new();
+        let cit_line_re = regex::Regex::new(r"^\s*(?:\*\*\[\d+\]\*\*|\[\d+\])(?:\s*,\s*(?:\*\*\[\d+\]\*\*|\[\d+\]))*\.?\s*$").unwrap();
+        for line in text.lines() {
+            if cit_line_re.is_match(line) {
+                continue;
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
     }
 
     /// Removes a leading stub heading that only restates the topic without a sentence (e.g. `### Angela Davis is`)
@@ -5915,12 +6436,12 @@ impl DeterministicOfflineSynthesisEngine {
             || prompt_l.contains("picture")
             || prompt_l.contains("screenshot");
         let threshold = ((best * 3 + 3) / 4).max(1);
-        let remote_threshold = ((best + 1) / 2).max(1);
+        let _remote_threshold = ((best + 1) / 2).max(1);
         let kept: Vec<&'a ScoredChunk> = scored
             .into_iter()
             .filter(|(n, c)| {
                 let path_l = c.chunk.file_path.to_ascii_lowercase();
-                if (asks_image || *n > 0)
+                if asks_image
                     && (crate::vision::is_image_chunk_text(&c.chunk.text_content)
                         || path_l.ends_with(".png")
                         || path_l.ends_with(".jpg")
@@ -5930,11 +6451,7 @@ impl DeterministicOfflineSynthesisEngine {
                 {
                     return true;
                 }
-                if c.is_remote && !c.source_peer.eq_ignore_ascii_case("local") {
-                    *n >= remote_threshold
-                } else {
-                    *n >= threshold
-                }
+                *n >= threshold
             })
             .map(|(_, c)| c)
             .collect();
@@ -6960,7 +7477,7 @@ impl DeterministicOfflineSynthesisEngine {
 
     /// Multi-turn real-time streaming orchestration via local Ollama `POST /api/chat` (100% offline, zero internet access).
     /// Strictly orchestrates answers over non-empty `matched_chunks` and streams tokens directly to `telemetry_tx`.
-    fn query_local_ollama_chat(
+    pub fn query_local_ollama_chat(
         prompt: &str,
         history: &[ChatTurnMessage],
         matched_chunks: &[&ScoredChunk],
@@ -7101,7 +7618,7 @@ impl DeterministicOfflineSynthesisEngine {
 
         let mut messages: Vec<serde_json::Value> = Vec::new();
         let clean_prompt_for_prefix = prompt.split(" (Subject context:").next().unwrap_or(prompt);
-        let expected_prefix = Self::format_question_restated_prefix(clean_prompt_for_prefix);
+        let expected_prefix = Self::format_question_restated_prefix_with_chunks(clean_prompt_for_prefix, matched_chunks);
 
         let system_prompt = Self::build_ollama_chat_system_prompt(voice_directive);
 
@@ -7160,6 +7677,19 @@ impl DeterministicOfflineSynthesisEngine {
         // never reach the model. Always keeps at least the top excerpt.
         let mut pruned_chunks: Vec<&ScoredChunk> =
             Self::dedup_near_identical_excerpts(Self::prune_weak_excerpts(prompt, matched_chunks));
+
+        // Feature 8: Nimble-9B Document Relevance Attestation & Distractor Filtering
+        let attested_pruned: Vec<&ScoredChunk> = pruned_chunks
+            .iter()
+            .copied()
+            .filter(|c| {
+                let att = crate::answer_orchestrator::NimbleRelevanceAttestation::from_chunk(&c.chunk, prompt, &c.source_peer);
+                att.attested_relevant
+            })
+            .collect();
+        if !attested_pruned.is_empty() {
+            pruned_chunks = attested_pruned;
+        }
 
         let asks_profile_or_role = Self::is_profile_or_role_query(prompt);
         let asks_author_works = Self::is_authorship_query(prompt);
@@ -7723,10 +8253,10 @@ impl DeterministicOfflineSynthesisEngine {
             if trimmed_full.is_empty() {
                 None
             } else {
-                let prefix = if !prior_answer_text.is_empty() {
+                let prefix = if !prior_answer_text.is_empty() || has_multi_domain_homonyms {
                     String::new()
                 } else {
-                    Self::format_question_restated_prefix(prompt)
+                    expected_prefix.clone()
                 };
                 let prose_with_prefix = if !prefix.is_empty()
                     && !trimmed_full.starts_with(&prefix)
@@ -7747,11 +8277,44 @@ impl DeterministicOfflineSynthesisEngine {
                     trimmed_full
                 };
 
-                let consolidated_prose = Self::consolidate_duplicate_entity_statements(&prose_with_prefix);
-                // Compact & renumber inline [k] citations so every [1]..[M] in prose maps 1-to-1 to the M emitted sources
-                // (eliminating dangling [8] when 7 unique files exist, and omitting uncited Turn-1 files on `continue`).
+                let consolidated_raw = Self::consolidate_duplicate_entity_statements(&prose_with_prefix);
+                let consolidated_prose = if has_multi_domain_homonyms {
+                    let homonym_subject = expected_prefix
+                        .trim_end()
+                        .strip_suffix(" is")
+                        .or_else(|| expected_prefix.trim_end().strip_suffix(" was"))
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    crate::answer_orchestrator::enforce_multi_cluster_homonym_structure(
+                        clean_prompt_for_prefix,
+                        homonym_subject,
+                        &consolidated_raw,
+                        &unique_file_chunks,
+                    )
+                } else {
+                    consolidated_raw
+                };
+                // Feature 20: 100% Attested-Document Contribution Guarantee
+                // Coverage loop guarantees that every distinct document [1]..[K] that passed Nimble attestation
+                // actively contributes substantive grounded facts and carries an inline citation in the synthesized output.
                 let (compacted_prose, mut compacted_chunks) =
-                    Self::remap_and_compact_citations(&consolidated_prose, &unique_file_chunks, true);
+                    crate::answer_orchestrator::enforce_attested_document_coverage_loop(&consolidated_prose, &unique_file_chunks);
+
+                // Feature 10: Post-Synthesis Groundedness Verification
+                let groundedness = crate::answer_orchestrator::verify_post_synthesis_groundedness(&compacted_prose, &compacted_chunks);
+                let sanitized_prose = if !groundedness.is_grounded && groundedness.backfill_detected {
+                    tracing::warn!(ungrounded = ?groundedness.ungrounded_claims, "Post-synthesis groundedness verification detected pretraining backfill; sanitizing output");
+                    groundedness.sanitized_answer
+                } else {
+                    compacted_prose
+                };
+                // Feature 24: ResponseFormatterWatchdog inspection and hygiene
+                let watchdog_report = crate::response_formatter_watchdog::ResponseFormatterWatchdog::inspect_and_repair(
+                    prompt,
+                    &sanitized_prose,
+                    &compacted_chunks,
+                );
+                let compacted_prose = watchdog_report.cleaned_prose;
                 // Preserve remote peer sources (`source_peer != "local"`) even if the LLM only cited [1]..[4]
                 // so multi-computer evidence is always surfaced in the Sources panel and citation cards!
                 let remote_source_pool: Vec<&ScoredChunk> = {
@@ -7845,6 +8408,47 @@ impl DeterministicOfflineSynthesisEngine {
             std::mem::swap(&mut prev, &mut curr);
         }
         prev[n]
+    }
+
+    /// Computes the 4-character American Soundex phonetic code for string matching.
+    pub fn soundex(s: &str) -> String {
+        let clean: Vec<char> = s
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        if clean.is_empty() {
+            return String::new();
+        }
+        let first = clean[0];
+        let map_char = |c: char| -> char {
+            match c {
+                'B' | 'F' | 'P' | 'V' => '1',
+                'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => '2',
+                'D' | 'T' => '3',
+                'L' => '4',
+                'M' | 'N' => '5',
+                'R' => '6',
+                _ => '0',
+            }
+        };
+        let mut code = String::with_capacity(4);
+        code.push(first);
+        let mut prev_digit = map_char(first);
+        for &ch in &clean[1..] {
+            let digit = map_char(ch);
+            if digit != '0' && digit != prev_digit {
+                code.push(digit);
+                if code.len() == 4 {
+                    break;
+                }
+            }
+            prev_digit = digit;
+        }
+        while code.len() < 4 {
+            code.push('0');
+        }
+        code
     }
 
     /// Corrects spelling errors in a chat box prompt using deterministic typo rules + local Ollama LLM (`qwen2.5:1.5b`).

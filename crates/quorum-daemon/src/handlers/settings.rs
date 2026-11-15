@@ -18,6 +18,8 @@ pub struct UpdateSettingsPayload {
     pub ui: Option<ChatGptUiSettings>,
     pub mesh: Option<OsoosiMeshSettings>,
     pub dlp: Option<MeshDlpPolicy>,
+    pub artemis: Option<quorum_coordinator::artemis_airgap::ArtemisDfirSettings>,
+    pub forensics_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -137,6 +139,8 @@ pub async fn get_settings_handler(State(state): State<Arc<DaemonState>>) -> impl
         "mesh": settings.mesh,
         "dlp": settings.dlp,
         "dlp_stats": dlp_stats,
+        "artemis": settings.artemis,
+        "forensics_enabled": settings.artemis.enabled,
         "runtime": {
             "local_peer_id": local_peer_id,
             "listen_addrs": listen_addrs,
@@ -158,15 +162,17 @@ pub async fn get_settings_handler(State(state): State<Arc<DaemonState>>) -> impl
 
 /// POST /api/settings - Updates UI, Mesh, or DLP settings and persists immediately to `<data_dir>/settings.json`.
 pub async fn update_settings_handler(
-    State(_state): State<Arc<DaemonState>>,
+    State(state): State<Arc<DaemonState>>,
     Json(payload): Json<UpdateSettingsPayload>,
 ) -> impl IntoResponse {
     let controller = global_mesh_dlp_controller();
+    let prev_forensics_enabled;
     {
         let mut guard = controller
             .settings
             .write()
             .unwrap_or_else(|e| e.into_inner());
+        prev_forensics_enabled = guard.artemis.enabled;
         if let Some(mut ui) = payload.ui {
             ui.sanitize_mock_artifacts();
             guard.ui = ui;
@@ -177,6 +183,12 @@ pub async fn update_settings_handler(
         if let Some(dlp) = payload.dlp {
             guard.dlp = dlp;
         }
+        if let Some(artemis) = payload.artemis {
+            guard.artemis = artemis;
+        }
+        if let Some(forensics_enabled) = payload.forensics_enabled {
+            guard.artemis.enabled = forensics_enabled;
+        }
     }
     controller.save_to_disk();
     let updated = controller
@@ -184,11 +196,22 @@ pub async fn update_settings_handler(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    if updated.artemis.enabled != prev_forensics_enabled {
+        let _ = state.coordinator.cache_clear_all();
+    }
+    if updated.artemis.enabled {
+        crate::handlers::artemis::spawn_artemis_auto_collector(
+            Arc::clone(&state),
+            Arc::clone(&state.shutdown_notify),
+        );
+    }
     Json(serde_json::json!({
         "status": "ok",
         "ui": updated.ui,
         "mesh": updated.mesh,
-        "dlp": updated.dlp
+        "dlp": updated.dlp,
+        "artemis": updated.artemis,
+        "forensics_enabled": updated.artemis.enabled
     }))
 }
 

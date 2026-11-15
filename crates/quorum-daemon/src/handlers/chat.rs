@@ -24,15 +24,19 @@ fn forensic_sync_cache() -> &'static Mutex<HashMap<String, i64>> {
 /// antivirus/Defender/CodeIntegrity blocks, executed processes, registry persistence, prefetch, or services),
 /// ensures local Artemis DFIR collection is active and refreshes live OS telemetry records within category TTL.
 async fn ensure_live_forensics_for_query(state: &Arc<DaemonState>, prompt: &str) {
+    if !quorum_coordinator::artemis_airgap::is_forensics_enabled() {
+        return;
+    }
     let Some(intent) = quorum_coordinator::ForensicQueryIntent::detect(prompt) else {
         return;
     };
 
     let retention_days = {
         let ctrl = quorum_coordinator::dlp_mesh::global_mesh_dlp_controller();
-        let mut s = ctrl.settings.write().unwrap_or_else(|e| e.into_inner());
-        s.artemis.enabled = true;
-        s.artemis.local_collection_enabled = true;
+        let s = ctrl.settings.read().unwrap_or_else(|e| e.into_inner());
+        if !s.artemis.local_collection_enabled {
+            return;
+        }
         s.artemis.retention_days.max(1)
     };
 

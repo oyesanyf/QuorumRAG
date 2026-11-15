@@ -395,6 +395,8 @@ async fn test_adv_remote_chunk_access_tier_clamping_to_requested() {
                 origin_peer_id: None,
             },
         ],
+        synthesis_response: None,
+        warm_llm_available: false,
     };
 
     let dispatcher = Arc::new(DirectResponseDispatcher {
@@ -488,6 +490,8 @@ async fn test_adv_remote_chunk_inverted_lines_rejected() {
                 origin_peer_id: None,
             },
         ],
+        synthesis_response: None,
+        warm_llm_available: false,
     };
 
     let dispatcher = Arc::new(DirectResponseDispatcher {

@@ -447,6 +447,7 @@ async fn test_cross_platform_concurrency_stress_and_end_to_end_benchmarks() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+            synthesis_relay: None,
         };
         let t0 = Instant::now();
         let (responses, _diag) = dispatcher

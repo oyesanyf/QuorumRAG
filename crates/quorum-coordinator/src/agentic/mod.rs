@@ -213,17 +213,38 @@ impl AgenticStateGraphRunner {
                         .map(|s| s.mesh.p2p_enabled)
                         .unwrap_or(true)
                         && engine.mesh_dispatcher.peer_count() > 0;
+                    let forensics_enabled = crate::artemis_airgap::is_forensics_enabled();
+                    let query_targets_forensics =
+                        crate::offline_engine::ForensicQueryIntent::detect(&cache_key_query).is_some()
+                            || crate::artemis_airgap::contains_artemis_query(&cache_key_query);
                     let maybe_cached = if is_continuation {
                         None
                     } else {
-                        self.cache_manager.query_cache.get_with_mesh_requirement(
-                            &cache_key_query,
-                            graph_state.search_mode,
-                            graph_state.model_family,
-                            access_tier,
-                            epoch,
-                            p2p_active,
-                        )
+                        self.cache_manager
+                            .query_cache
+                            .get_with_mesh_requirement(
+                                &cache_key_query,
+                                graph_state.search_mode,
+                                graph_state.model_family,
+                                access_tier,
+                                epoch,
+                                p2p_active,
+                            )
+                            .filter(|cached| {
+                                let resp_txt = cached.synthesized_response.as_deref().unwrap_or_default();
+                                if forensics_enabled {
+                                    !resp_txt.contains("forensics subsystem is currently disabled")
+                                        && !cached
+                                            .synthesis_prompt
+                                            .contains("forensics subsystem is currently disabled")
+                                } else {
+                                    cached.chunks.iter().all(|c| {
+                                        !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
+                                            && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
+                                    }) && (!query_targets_forensics
+                                        || resp_txt.contains("forensics subsystem is currently disabled"))
+                                }
+                            })
                     };
 
                     let cache_hit = maybe_cached.is_some();

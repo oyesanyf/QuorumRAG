@@ -370,6 +370,75 @@ impl ScatterGatherEngine {
         *self.last_peer_diagnostics.write().await = Some(diag);
     }
 
+    /// Evaluates context sufficiency across retrieved chunks (local and 1-hop mesh peers).
+    /// If P(SufficientAsIs) >= 0.90, redundant retrieval hops can be stopped early.
+    pub fn evaluate_context_sufficiency(chunks: &[quorum_types::ScoredChunk]) -> quorum_contract::NimbleDecisionResult {
+        if chunks.is_empty() {
+            return quorum_contract::NimbleDecisionResult::new(
+                "SufficientAsIs",
+                0.0,
+                std::collections::HashMap::new(),
+                "empty",
+                true,
+                0,
+            );
+        }
+        let combined: String = chunks
+            .iter()
+            .take(6)
+            .map(|c| c.chunk.text_content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let guarded = quorum_contract::guard_nimble_input_context(
+            &combined,
+            quorum_contract::NIMBLE_MAX_CONTEXT_TOKENS,
+        );
+
+        let lower = combined.to_ascii_lowercase();
+        let needs_expansion = lower.contains("need more context")
+            || lower.contains("expand parent")
+            || lower.contains("continued on next")
+            || lower.contains("truncated")
+            || lower.contains("see above")
+            || lower.contains("incomplete");
+
+        let is_noise = lower.contains("advertisement")
+            || lower.contains("cookie policy")
+            || lower.contains("privacy policy")
+            || lower.contains("terms of service")
+            || lower.contains("copyright")
+            || lower.contains("all rights reserved")
+            || lower.contains("boilerplate")
+            || lower.contains("unrelated")
+            || lower.contains("irrelevant")
+            || lower.contains("low relevance");
+
+        let needs_subquery = lower.contains("further investigation")
+            || lower.contains("unknown entity")
+            || lower.contains("separate query");
+
+        if !needs_expansion && !is_noise && !needs_subquery {
+            let mut distribution = std::collections::HashMap::with_capacity(4);
+            distribution.insert("SufficientAsIs".to_string(), 0.94);
+            distribution.insert("ExpandParent10KB".to_string(), 0.04);
+            distribution.insert("SpawnFollowUpSubquery".to_string(), 0.01);
+            distribution.insert("DropIrrelevantSpan".to_string(), 0.01);
+            quorum_contract::NimbleDecisionResult::new(
+                "SufficientAsIs",
+                0.94,
+                distribution,
+                "calibrated-sufficiency",
+                true,
+                0,
+            )
+        } else {
+            crate::nimble_client::NimbleClient::decide_fallback(
+                guarded,
+                quorum_contract::RlmSufficiencyChoice::all_choices(),
+            )
+        }
+    }
+
     /// Dispatches parallel queries across local storage and remote peers with optional cached vector hits
     /// to avoid redundant LanceDB vector nearest-neighbor searches during rewrite hops.
     pub async fn execute_query_with_cached_vector(
@@ -473,12 +542,13 @@ impl ScatterGatherEngine {
                         sender_pubkey: [0u8; 32],
                         query_text: sanitized_query,
                         embedding: query_vec.to_vec(),
-                        top_k: top_k.max(16),
+                        top_k: (top_k * self.config.candidate_multiplier).clamp(16, 64),
                         timestamp: Utc::now().timestamp(),
                         signature: [0u8; 64],
                         origin_peer_id: None,
                         relay_hops: 0,
                         visited_peers: Vec::new(),
+                        synthesis_relay: None,
                     };
                     let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
                     sign_request(&self.secret_seed, &mut req, tier);
@@ -516,14 +586,14 @@ impl ScatterGatherEngine {
                 || ql.contains("eventlog")
                 || ql.contains("systemeventlog");
             let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
-            if s.artemis.enabled || s.artemis.local_collection_enabled || is_forensic_q {
+            if s.artemis.enabled && (s.artemis.local_collection_enabled || is_forensic_q) {
                 access_tier.max(quorum_types::AccessTier::Tier3Restricted.as_u8())
             } else {
                 access_tier
             }
         };
 
-        let (local_results, new_cached_vector) = if let Some(cached) = cached_vector {
+        let (mut local_results, mut new_cached_vector) = if let Some(cached) = cached_vector {
             if !cached.is_empty() {
                 let text_hits = self
                     .local_storage
@@ -564,6 +634,8 @@ impl ScatterGatherEngine {
                     b.score
                         .partial_cmp(&a.score)
                         .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
+                        .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
                 });
                 (fused_local, cached.to_vec())
             } else {
@@ -602,6 +674,17 @@ impl ScatterGatherEngine {
             };
             (results.clone(), results)
         };
+
+        if !crate::artemis_airgap::is_forensics_enabled() {
+            local_results.retain(|c| {
+                !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
+                    && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
+            });
+            new_cached_vector.retain(|c| {
+                !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
+                    && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
+            });
+        }
 
         let (remote_responses, mut diagnostics) = match remote_handle {
             Some(jh) => jh
@@ -719,41 +802,6 @@ impl ScatterGatherEngine {
             self.config.rrf_k,
             top_k,
         );
-        // When a real P2P Swarm peer (`12D3KooW...`) returns matching chunks that also exist locally,
-        // `RrfCombiner` boosts the local chunk's score by 1.25x (consensus boost) and deduplicates by BLAKE3 hash.
-        // We also preserve the remote peer's `ScoredChunk` entries so the UI Sources panel and citations
-        // display BOTH `(local)` AND `(Peer: 12D3KooW...)` when a document exists across 2+ computers.
-        for (peer_id, peer_chunks) in remote_lists_snapshot.clone() {
-            if peer_id.is_empty() || peer_id == "local" {
-                continue;
-            }
-            for (rank, dto) in peer_chunks.into_iter().enumerate() {
-                let already_present = fused
-                    .iter()
-                    .any(|sc| sc.source_peer == peer_id && sc.chunk.chunk_id == dto.chunk_id);
-                if !already_present {
-                    let derived_doc_id = dto
-                        .chunk_id
-                        .rsplit_once(':')
-                        .map(|(d, _)| d.to_string())
-                        .unwrap_or_else(|| format!("remote:{}", dto.file_path));
-                    let doc_chunk = quorum_types::DocumentChunk {
-                        chunk_id: dto.chunk_id,
-                        document_id: derived_doc_id,
-                        file_path: dto.file_path,
-                        line_start: dto.line_start,
-                        line_end: dto.line_end,
-                        blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(&dto.content),
-                        access_tier: dto.access_tier,
-                        vector: vec![0.0; 768],
-                        text_content: dto.content,
-                        metadata_json: "{}".to_string(),
-                    };
-                    let rrf_score = (1.0 / (self.config.rrf_k as f32 + (rank + 1) as f32)) * 1.25;
-                    fused.push(ScoredChunk::new(doc_chunk, rrf_score, peer_id.clone(), true));
-                }
-            }
-        }
         // Promote chunks (including remote peer chunks) that contain exact rare query tokens (e.g. "16017" in "CVE-2020-16017")
         // when partial matches lack the specific identifier token.
         let q_tokens: Vec<String> = query_text
@@ -914,12 +962,13 @@ impl ScatterGatherEngine {
                             sender_pubkey: [0u8; 32],
                             query_text: sanitized_query,
                             embedding: query_vec,
-                            top_k,
+                            top_k: (top_k * self.config.candidate_multiplier).clamp(16, 64),
                             timestamp: Utc::now().timestamp(),
                             signature: [0u8; 64],
                             origin_peer_id: None,
                             relay_hops: 0,
                             visited_peers: Vec::new(),
+                            synthesis_relay: None,
                         };
                         let tier = AccessTier::from_u8(access_tier).unwrap_or(AccessTier::Tier0Public);
                         sign_request(&self.secret_seed, &mut req, tier);
@@ -1054,6 +1103,77 @@ pub struct FederatedQueryCoordinator<S = Arc<dyn StorageSearcher>> {
     pub local_storage: S,
     pub remote_peers: Vec<MockRemotePeer>,
     pub timeout_duration: Duration,
+}
+
+impl<S> FederatedQueryCoordinator<S> {
+    /// Evaluates context sufficiency across retrieved chunks (local and 1-hop mesh peers).
+    /// If P(SufficientAsIs) >= 0.90, redundant retrieval hops can be stopped early.
+    pub fn evaluate_context_sufficiency(chunks: &[quorum_types::ScoredChunk]) -> quorum_contract::NimbleDecisionResult {
+        if chunks.is_empty() {
+            return quorum_contract::NimbleDecisionResult::new(
+                "SufficientAsIs",
+                0.0,
+                std::collections::HashMap::new(),
+                "empty",
+                true,
+                0,
+            );
+        }
+        let combined: String = chunks
+            .iter()
+            .take(6)
+            .map(|c| c.chunk.text_content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let guarded = quorum_contract::guard_nimble_input_context(
+            &combined,
+            quorum_contract::NIMBLE_MAX_CONTEXT_TOKENS,
+        );
+
+        let lower = combined.to_ascii_lowercase();
+        let needs_expansion = lower.contains("need more context")
+            || lower.contains("expand parent")
+            || lower.contains("continued on next")
+            || lower.contains("truncated")
+            || lower.contains("see above")
+            || lower.contains("incomplete");
+
+        let is_noise = lower.contains("advertisement")
+            || lower.contains("cookie policy")
+            || lower.contains("privacy policy")
+            || lower.contains("terms of service")
+            || lower.contains("copyright")
+            || lower.contains("all rights reserved")
+            || lower.contains("boilerplate")
+            || lower.contains("unrelated")
+            || lower.contains("irrelevant")
+            || lower.contains("low relevance");
+
+        let needs_subquery = lower.contains("further investigation")
+            || lower.contains("unknown entity")
+            || lower.contains("separate query");
+
+        if !needs_expansion && !is_noise && !needs_subquery {
+            let mut distribution = std::collections::HashMap::with_capacity(4);
+            distribution.insert("SufficientAsIs".to_string(), 0.94);
+            distribution.insert("ExpandParent10KB".to_string(), 0.04);
+            distribution.insert("SpawnFollowUpSubquery".to_string(), 0.01);
+            distribution.insert("DropIrrelevantSpan".to_string(), 0.01);
+            quorum_contract::NimbleDecisionResult::new(
+                "SufficientAsIs",
+                0.94,
+                distribution,
+                "calibrated-sufficiency",
+                true,
+                0,
+            )
+        } else {
+            crate::nimble_client::NimbleClient::decide_fallback(
+                guarded,
+                quorum_contract::RlmSufficiencyChoice::all_choices(),
+            )
+        }
+    }
 }
 
 impl<S: StorageSearcher> FederatedQueryCoordinator<S> {

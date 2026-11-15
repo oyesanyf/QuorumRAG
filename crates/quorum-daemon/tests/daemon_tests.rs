@@ -39,6 +39,24 @@ fn test_cli_parsing_default_and_flags() {
         }
         _ => panic!("Expected FixDrift subcommand"),
     }
+
+    // 5. Forensics CLI flags (defaults to None / false)
+    assert_eq!(cli.forensics, None);
+    assert!(!cli.no_forensics);
+
+    // 6. Explicit --forensics flag
+    let cli_forensics_bare = Cli::parse_from(["quorumrag", "--forensics"]);
+    assert_eq!(cli_forensics_bare.forensics, Some(true));
+
+    let cli_forensics_true = Cli::parse_from(["quorumrag", "--forensics", "true"]);
+    assert_eq!(cli_forensics_true.forensics, Some(true));
+
+    let cli_forensics_false = Cli::parse_from(["quorumrag", "--forensics", "false"]);
+    assert_eq!(cli_forensics_false.forensics, Some(false));
+
+    // 7. Explicit --no-forensics flag
+    let cli_no_forensics = Cli::parse_from(["quorumrag", "--no-forensics"]);
+    assert!(cli_no_forensics.no_forensics);
 }
 
 #[tokio::test]

@@ -234,6 +234,7 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut valid_req, AccessTier::Tier0Public);
 
@@ -256,6 +257,7 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut stale_req, AccessTier::Tier0Public);
 
@@ -278,6 +280,7 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut spoofed_req, AccessTier::Tier0Public);
 
@@ -300,6 +303,7 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut malformed_emb_req, AccessTier::Tier0Public);
 
@@ -324,6 +328,7 @@ async fn test_p2p_cryptographic_handshake_and_replay_rejection() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut nan_req, AccessTier::Tier0Public);
 
@@ -443,6 +448,7 @@ async fn test_mesh_early_resolution_single_peer_latency() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
 
     let start = Instant::now();

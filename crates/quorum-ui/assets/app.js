@@ -270,6 +270,126 @@ function secureRandomIndex(n) {
     });
   });
 
+  // --------------------------------------------------------------------------
+  // BESPOKE-NIMBLE-9B PROVISIONING & GUIDANCE CARD (Feature 18)
+  // --------------------------------------------------------------------------
+  const CANONICAL_NIMBLE_GGUF = 'hf.co/ggml-org/Bespoke-Nimble-9B-v3-GGUF:Q4_K_M';
+  const CANONICAL_NIMBLE_TERMINAL_CMD = 'ollama pull hf.co/ggml-org/Bespoke-Nimble-9B-v3-GGUF:Q4_K_M';
+
+  function renderNimbleModelPills(installedModels, onSelect) {
+    if (!Array.isArray(installedModels) || installedModels.length === 0) {
+      return '<span class="nimble-no-models" style="opacity:0.7;font-style:italic;">No other models installed</span>';
+    }
+    const filtered = installedModels.filter(m => !/embed|moondream|llava/i.test(m));
+    if (filtered.length === 0) {
+      return '<span class="nimble-no-models" style="opacity:0.7;font-style:italic;">No other models installed</span>';
+    }
+    return filtered
+      .map(m => `<button type="button" class="nimble-model-pill missing-model-pill" data-tag="${escapeHtml(m)}" style="margin:3px 4px 0 0;padding:3px 9px;border-radius:999px;border:1px solid rgba(255,255,255,0.22);background:rgba(255,255,255,0.08);color:inherit;cursor:pointer;font-size:11.5px;">${escapeHtml(m)}</button>`)
+      .join('');
+  }
+
+  function renderNimbleGuidanceCard(statusData) {
+    const existing = document.getElementById('nimble-guidance-card');
+    if (statusData && statusData.state === 'ready') {
+      if (existing) existing.remove();
+      return null;
+    }
+    const card = existing || document.createElement('div');
+    card.id = 'nimble-guidance-card';
+    card.style.cssText = 'margin:8px 16px;padding:12px 14px;border-radius:10px;border:1px solid rgba(99,102,241,0.45);background:rgba(99,102,241,0.10);font-size:12.5px;line-height:1.55;';
+
+    const terminalCmd = (statusData && statusData.terminal_command) ? statusData.terminal_command : CANONICAL_NIMBLE_TERMINAL_CMD;
+    const progressPct = (statusData && typeof statusData.progress_pct === 'number') ? Math.max(0, Math.min(100, statusData.progress_pct)) : 0;
+    const state = (statusData && statusData.state) ? statusData.state : 'not_installed';
+    const installed = (window._discoveredOllamaTags || []);
+
+    let statusLine = '';
+    if (state === 'downloading') {
+      const completed = statusData.completed_bytes ? (statusData.completed_bytes / (1024 * 1024)).toFixed(0) + ' MB' : '';
+      const total = statusData.total_bytes ? (statusData.total_bytes / (1024 * 1024)).toFixed(0) + ' MB' : '';
+      const byteInfo = (completed && total) ? ` (${completed} / ${total})` : '';
+      statusLine = `
+        <div style="margin-bottom:6px;">
+          <strong>Downloading Bespoke-Nimble-9B in background:</strong> ${progressPct.toFixed(1)}%${byteInfo}
+          <div style="background:rgba(255,255,255,0.15);border-radius:6px;height:6px;margin-top:4px;overflow:hidden;">
+            <div style="background:#6366f1;height:100%;width:${progressPct}%;transition:width 0.3s ease;"></div>
+          </div>
+        </div>`;
+    } else if (state === 'skipped_low_memory') {
+      const freeRam = (statusData && typeof statusData.free_ram_gb === 'number') ? statusData.free_ram_gb.toFixed(1) : '?';
+      const freeVram = (statusData && typeof statusData.free_vram_mb === 'number') ? statusData.free_vram_mb.toFixed(0) : '?';
+      statusLine = `
+        <div style="margin-bottom:6px;color:#f59e0b;">
+          <strong>Memory Gate Active:</strong> Bespoke-Nimble-9B requires &ge;12 GB free RAM or &ge;6000 MB free VRAM (currently ${escapeHtml(freeRam)} GB RAM, ${escapeHtml(freeVram)} MB VRAM). Operating in deterministic heuristic fallback mode.
+        </div>`;
+    } else if (state === 'offline') {
+      statusLine = `
+        <div style="margin-bottom:6px;color:#ef4444;">
+          <strong>Ollama Offline:</strong> Unable to connect to local Ollama daemon on http://127.0.0.1:11434.
+        </div>`;
+    } else {
+      statusLine = `
+        <div style="margin-bottom:6px;">
+          <strong>Bespoke-Nimble-9B Not Installed:</strong> Autonomous decision scoring and RLM context expansion require Nimble-9B.
+        </div>`;
+    }
+
+    const pillsHtml = renderNimbleModelPills(installed);
+
+    card.innerHTML = `
+      ${statusLine}
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span>Terminal command: <code>${escapeHtml(terminalCmd)}</code></span>
+        <button type="button" id="btn-retry-nimble-provision" style="padding:4px 12px;border-radius:6px;border:1px solid rgba(99,102,241,0.6);background:rgba(99,102,241,0.22);color:inherit;cursor:pointer;font-size:11.5px;font-weight:600;">⚡ Retry Provisioning</button>
+      </div>
+      <div style="margin-top:6px;opacity:0.9;">Installed fallback models (click to switch): ${pillsHtml}</div>
+    `;
+
+    if (!existing && chatStream && chatStream.parentElement) {
+      chatStream.parentElement.insertBefore(card, chatStream);
+    }
+
+    card.querySelectorAll('.nimble-model-pill').forEach(btn => {
+      btn.addEventListener('click', () => {
+        currentModel = btn.dataset.tag;
+      });
+    });
+
+    const retryBtn = card.querySelector('#btn-retry-nimble-provision');
+    if (retryBtn) {
+      retryBtn.addEventListener('click', () => triggerNimbleProvisionRetry());
+    }
+
+    return card;
+  }
+
+  let _nimblePollTimer = null;
+  async function pollNimbleStatus() {
+    try {
+      const res = await fetchWithTimeout('/api/models/nimble/status', {}, 400);
+      if (!res || !res.ok) return;
+      const statusData = await res.json();
+      renderNimbleGuidanceCard(statusData);
+      if (statusData.state === 'downloading') {
+        if (_nimblePollTimer) clearTimeout(_nimblePollTimer);
+        _nimblePollTimer = setTimeout(pollNimbleStatus, 1000);
+      }
+    } catch (_) {
+      // Guaranteed Workspace Law: do NOT wipe card on catch/error
+    }
+  }
+
+  async function triggerNimbleProvisionRetry() {
+    try {
+      await fetch('/api/models/nimble/provision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      pollNimbleStatus();
+    } catch (_) {}
+  }
+
   async function refreshDynamicModels() {
     try {
       const res = await fetchWithTimeout('/api/models', {}, 600);
@@ -343,6 +463,7 @@ function secureRandomIndex(n) {
 
   // Trigger dynamic model hydration on load
   refreshDynamicModels();
+  pollNimbleStatus();
 
   // 3. SEARCH MODE TOGGLE
   searchPills.forEach(pill => {
@@ -3249,6 +3370,9 @@ function secureRandomIndex(n) {
   }
 
   async function fetchArtemisData() {
+    if (!cachedSettingsData || !(cachedSettingsData.forensics_enabled || (cachedSettingsData.artemis && cachedSettingsData.artemis.enabled))) {
+      return { status: cachedArtemisStatus, config: cachedArtemisConfig };
+    }
     try {
       const [statusRes, configRes] = await Promise.allSettled([
         fetch('/api/v1/artemis/status'),
@@ -3277,9 +3401,11 @@ function secureRandomIndex(n) {
     await Promise.all([
       loadFullSettings(),
       fetchMarketplaceData(),
-      fetchBrowseFolders(currentBrowsePath),
-      fetchArtemisData()
+      fetchBrowseFolders(currentBrowsePath)
     ]);
+    if (cachedSettingsData && (cachedSettingsData.forensics_enabled || (cachedSettingsData.artemis && cachedSettingsData.artemis.enabled))) {
+      await fetchArtemisData();
+    }
     if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace' || tab === 'dlp' || tab === 'artemis-dfir') {
       await fetchMeshData();
     }
@@ -3357,7 +3483,9 @@ function secureRandomIndex(n) {
         await fetchMarketplaceData();
       }
       if (tab === 'artemis-dfir') {
-        await fetchArtemisData();
+        if (cachedSettingsData && (cachedSettingsData.forensics_enabled || (cachedSettingsData.artemis && cachedSettingsData.artemis.enabled))) {
+          await fetchArtemisData();
+        }
       }
       if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace' || tab === 'general' || tab === 'dlp' || tab === 'artemis-dfir') {
         await fetchBrowseFolders(currentBrowsePath);
@@ -5055,6 +5183,39 @@ function secureRandomIndex(n) {
           break;
         }
 
+        case 'artemis-toggle-subsystem': {
+          const isChecked = actionEl.checked;
+          try {
+            const resp = await fetch('/api/settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ forensics_enabled: isChecked })
+            });
+            if (resp.ok) {
+              if (cachedSettingsData) {
+                cachedSettingsData.forensics_enabled = isChecked;
+                if (!cachedSettingsData.artemis) cachedSettingsData.artemis = {};
+                cachedSettingsData.artemis.enabled = isChecked;
+              }
+              if (isChecked) {
+                await fetchArtemisData();
+              } else {
+                cachedArtemisStatus = null;
+                cachedArtemisConfig = null;
+              }
+              renderSettingsTabContent('artemis-dfir', '');
+              showSettingsToast(isChecked ? '✓ Forensics subsystem enabled' : 'Forensics subsystem disabled');
+            } else {
+              showSettingsToast('Failed to update forensics subsystem state');
+              actionEl.checked = !isChecked;
+            }
+          } catch (err) {
+            showSettingsToast('Network error: ' + err.message);
+            actionEl.checked = !isChecked;
+          }
+          break;
+        }
+
         case 'artemis-toggle-collection': {
           const isChecked = actionEl.checked;
           try {
@@ -5068,9 +5229,11 @@ function secureRandomIndex(n) {
               renderSettingsTabContent('artemis-dfir', '');
               showSettingsToast(isChecked ? '✓ Local Artemis DFIR collection enabled' : 'Local collection disabled');
             } else {
+              actionEl.checked = !isChecked;
               showSettingsToast('Failed to update collection toggle');
             }
           } catch (err) {
+            actionEl.checked = !isChecked;
             showSettingsToast('Network error: ' + err.message);
           }
           break;
@@ -5089,9 +5252,11 @@ function secureRandomIndex(n) {
               renderSettingsTabContent('artemis-dfir', '');
               showSettingsToast(isChecked ? '✓ Artemis training data harvesting enabled' : 'Harvesting disabled');
             } else {
+              actionEl.checked = !isChecked;
               showSettingsToast('Failed to update harvest toggle');
             }
           } catch (err) {
+            actionEl.checked = !isChecked;
             showSettingsToast('Network error: ' + err.message);
           }
           break;
@@ -5100,28 +5265,42 @@ function secureRandomIndex(n) {
         case 'artemis-toggle-redact': {
           const isChecked = actionEl.checked;
           try {
-            await fetch('/api/v1/artemis/config', {
+            const resp = await fetch('/api/v1/artemis/config', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ redact_secrets: isChecked })
             });
-            await fetchArtemisData();
-            showSettingsToast(isChecked ? 'Secret redaction active' : 'Secret redaction disabled');
-          } catch (_) {}
+            if (resp.ok) {
+              await fetchArtemisData();
+              showSettingsToast(isChecked ? 'Secret redaction active' : 'Secret redaction disabled');
+            } else {
+              actionEl.checked = !isChecked;
+              showSettingsToast('Failed to update secret redaction toggle');
+            }
+          } catch (_) {
+            actionEl.checked = !isChecked;
+          }
           break;
         }
 
         case 'artemis-toggle-normalize': {
           const isChecked = actionEl.checked;
           try {
-            await fetch('/api/v1/artemis/config', {
+            const resp = await fetch('/api/v1/artemis/config', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ normalize_for_harvest: isChecked })
             });
-            await fetchArtemisData();
-            showSettingsToast(isChecked ? 'Structural normalization active' : 'Normalization disabled');
-          } catch (_) {}
+            if (resp.ok) {
+              await fetchArtemisData();
+              showSettingsToast(isChecked ? 'Structural normalization active' : 'Normalization disabled');
+            } else {
+              actionEl.checked = !isChecked;
+              showSettingsToast('Failed to update normalization toggle');
+            }
+          } catch (_) {
+            actionEl.checked = !isChecked;
+          }
           break;
         }
 
@@ -5144,8 +5323,12 @@ function secureRandomIndex(n) {
             if (resp.ok) {
               await fetchArtemisData();
               showSettingsToast(`Updated artifact category: ${cat}`);
+            } else {
+              actionEl.checked = !actionEl.checked;
+              showSettingsToast('Failed to update artifact category');
             }
           } catch (err) {
+            actionEl.checked = !actionEl.checked;
             showSettingsToast('Error updating categories: ' + err.message);
           }
           break;
@@ -8066,6 +8249,11 @@ function secureRandomIndex(n) {
       };
 
       const artCfg = cachedArtemisConfig || {};
+      const isForensicsEnabled = (cachedSettingsData && cachedSettingsData.forensics_enabled !== undefined)
+        ? !!cachedSettingsData.forensics_enabled
+        : ((cachedSettingsData && cachedSettingsData.artemis && cachedSettingsData.artemis.enabled !== undefined)
+          ? !!cachedSettingsData.artemis.enabled
+          : (artCfg.enabled !== undefined ? !!artCfg.enabled : false));
       const isCollectionEnabled = artCfg.local_collection_enabled !== undefined ? !!artCfg.local_collection_enabled : !!art.collection_enabled;
       const isHarvestEnabled = artCfg.marketplace_harvest_enabled !== undefined ? !!artCfg.marketplace_harvest_enabled : !!art.marketplace_harvest_enabled;
       const isRedactEnabled = artCfg.redact_secrets !== undefined ? !!artCfg.redact_secrets : (art.redact_secrets !== false);
@@ -8101,7 +8289,7 @@ function secureRandomIndex(n) {
             </label>
             <div class="settings-row-desc">${cat.desc} (<code>${cat.id}</code>)</div>
           </div>
-          <input id="chk-artemis-cat-${cat.id}" type="checkbox" class="quorum-switch" ${activeAllowedCats.has(cat.id.toLowerCase()) ? 'checked' : ''} data-action="artemis-toggle-category" data-category="${cat.id}">
+          <input id="chk-artemis-cat-${cat.id}" type="checkbox" class="quorum-switch" ${activeAllowedCats.has(cat.id.toLowerCase()) ? 'checked' : ''} ${!isForensicsEnabled ? 'disabled' : ''} data-action="artemis-toggle-category" data-category="${cat.id}">
         </div>
       `).join('');
 
@@ -8135,6 +8323,28 @@ function secureRandomIndex(n) {
             </span>
           </div>
 
+          <!-- 0. FORENSICS MASTER SUBSYSTEM CONTROL CARD -->
+          <div class="settings-card" style="border: 2px solid ${isForensicsEnabled ? '#10a37f' : 'rgba(239,68,68,0.5)'}; background: ${isForensicsEnabled ? 'rgba(16,163,127,0.06)' : 'rgba(239,68,68,0.05)'}; margin-bottom:14px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;">
+              <div>
+                <div class="settings-card-title" style="display:flex; align-items:center; gap:8px;">
+                  <span>🛡️ Forensics Subsystem (Artemis DFIR)</span>
+                  <span id="artemis-subsystem-status-badge" class="status-pill ${isForensicsEnabled ? 'enabled' : 'disabled'}" style="font-size:11px; padding:3px 9px; border-radius:999px; font-weight:700; ${isForensicsEnabled ? 'background:rgba(16,163,127,0.2); color:#10a37f; border:1px solid rgba(16,163,127,0.4);' : 'background:rgba(239,68,68,0.2); color:#f87171; border:1px solid rgba(239,68,68,0.4);'}">
+                    ${isForensicsEnabled ? 'ACTIVE' : 'DISABLED (DEFAULT)'}
+                  </span>
+                </div>
+                <div style="font-size:12.5px; color:var(--text-secondary, #ccc); margin-top:4px;">
+                  ${isForensicsEnabled 
+                    ? 'The host forensics subsystem is enabled. REST APIs and local collectors are active.' 
+                    : 'The forensics subsystem is completely disabled by default. All Artemis REST API endpoints are gated with HTTP 403 Forbidden.'}
+                </div>
+              </div>
+              <div>
+                <input id="chk-artemis-master-toggle" type="checkbox" class="quorum-switch" ${isForensicsEnabled ? 'checked' : ''} data-action="artemis-toggle-subsystem">
+              </div>
+            </div>
+          </div>
+
           <!-- 1. AIRGAP ISOLATION NOTICE CARD -->
           <div class="settings-card" style="border-left:4px solid #10a37f; background:rgba(16,163,127,0.04);">
             <div class="settings-card-title" style="color:#10a37f; display:flex; align-items:center; gap:8px;">
@@ -8166,7 +8376,7 @@ function secureRandomIndex(n) {
                   Collects running process trees, network sockets, and system event logs directly from the host operating system (${art.current_platform || 'Windows'}). Disabled by default.
                 </div>
               </div>
-              <input id="chk-artemis-collection-toggle" type="checkbox" class="quorum-switch" ${isCollectionEnabled ? 'checked' : ''} data-action="artemis-toggle-collection">
+              <input id="chk-artemis-collection-toggle" type="checkbox" class="quorum-switch" ${isCollectionEnabled ? 'checked' : ''} ${!isForensicsEnabled ? 'disabled' : ''} data-action="artemis-toggle-collection">
             </div>
 
             <!-- Master Toggle 2: Marketplace Harvest -->
@@ -8177,7 +8387,7 @@ function secureRandomIndex(n) {
                   Permits sanitized forensic telemetry trajectories to be included in sovereign AI training data harvests. Requires keyed BLAKE3 structural normalization and strict category allowlisting. Disabled by default.
                 </div>
               </div>
-              <input id="chk-artemis-harvest-toggle" type="checkbox" class="quorum-switch" ${isHarvestEnabled ? 'checked' : ''} data-action="artemis-toggle-harvest">
+              <input id="chk-artemis-harvest-toggle" type="checkbox" class="quorum-switch" ${isHarvestEnabled ? 'checked' : ''} ${!isForensicsEnabled ? 'disabled' : ''} data-action="artemis-toggle-harvest">
             </div>
 
             <!-- Pre-Index Secret Redaction -->
@@ -8188,7 +8398,7 @@ function secureRandomIndex(n) {
                   Automatically detects and scrubs API tokens, private keys, connection strings, and high-entropy CLI arguments ($H &gt; 4.20$).
                 </div>
               </div>
-              <input id="chk-artemis-redact-secrets" type="checkbox" class="quorum-switch" ${isRedactEnabled ? 'checked' : ''} data-action="artemis-toggle-redact">
+              <input id="chk-artemis-redact-secrets" type="checkbox" class="quorum-switch" ${isRedactEnabled ? 'checked' : ''} ${!isForensicsEnabled ? 'disabled' : ''} data-action="artemis-toggle-redact">
             </div>
 
             <!-- Keyed BLAKE3 Structural Normalizer -->
@@ -8199,7 +8409,7 @@ function secureRandomIndex(n) {
                   Replaces usernames, hostnames, SIDs, internal IPs, and SMB shares with session-scoped BLAKE3 pseudonyms before staging batches.
                 </div>
               </div>
-              <input id="chk-artemis-normalize-harvest" type="checkbox" class="quorum-switch" ${isNormalizeEnabled ? 'checked' : ''} data-action="artemis-toggle-normalize">
+              <input id="chk-artemis-normalize-harvest" type="checkbox" class="quorum-switch" ${isNormalizeEnabled ? 'checked' : ''} ${!isForensicsEnabled ? 'disabled' : ''} data-action="artemis-toggle-normalize">
             </div>
 
             <!-- Background Auto-Collection Interval (spawn_artemis_auto_collector) -->
@@ -8210,7 +8420,7 @@ function secureRandomIndex(n) {
                   When Local Forensic Telemetry Collection is enabled above, the daemon's background worker (<code>spawn_artemis_auto_collector</code>) periodically collects and indexes allowlisted OS telemetry.
                 </div>
               </div>
-              <select id="sel-artemis-auto-interval" class="pill-select" data-change-action="artemis-update-interval">
+              <select id="sel-artemis-auto-interval" class="pill-select" ${!isForensicsEnabled ? 'disabled' : ''} data-change-action="artemis-update-interval">
                 <option value="0" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 0 ? 'selected' : ''}>Manual Only (Off)</option>
                 <option value="5" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 5 ? 'selected' : ''}>Every 5 minutes</option>
                 <option value="15" ${Number(artCfg.auto_collection_interval_mins ?? art.auto_collection_interval_mins ?? 60) === 15 ? 'selected' : ''}>Every 15 minutes</option>
@@ -8229,7 +8439,7 @@ function secureRandomIndex(n) {
                   Maximum retention period for locally indexed <code>Tier3Restricted</code> forensic telemetry chunks.
                 </div>
               </div>
-              <select id="sel-artemis-retention-days" class="pill-select" data-change-action="artemis-update-retention">
+              <select id="sel-artemis-retention-days" class="pill-select" ${!isForensicsEnabled ? 'disabled' : ''} data-change-action="artemis-update-retention">
                 <option value="7" ${Number(artCfg.retention_days ?? art.retention_days ?? 30) === 7 ? 'selected' : ''}>7 days</option>
                 <option value="14" ${Number(artCfg.retention_days ?? art.retention_days ?? 30) === 14 ? 'selected' : ''}>14 days</option>
                 <option value="30" ${Number(artCfg.retention_days ?? art.retention_days ?? 30) === 30 ? 'selected' : ''}>30 days (Default)</option>
@@ -8340,12 +8550,12 @@ function secureRandomIndex(n) {
             </div>
 
             <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-              <button type="button" id="btn-artemis-collect" class="btn-primary" data-action="trigger-artemis-collect" style="padding:8px 18px; font-weight:700; background:#10a37f; border-color:#10a37f; display:inline-flex; align-items:center; gap:6px;">
+              <button type="button" id="btn-artemis-collect" class="btn-primary" ${!isForensicsEnabled ? 'disabled' : ''} data-action="trigger-artemis-collect" style="padding:8px 18px; font-weight:700; background:#10a37f; border-color:#10a37f; display:inline-flex; align-items:center; gap:6px;">
                 <span>⚡</span>
                 <span>${curSelectedDir ? 'Ingest Selected Folder (.jsonl / .evtx / .pf)' : 'Collect Live OS Telemetry'}</span>
               </button>
               ${curSelectedDir ? `
-                <button type="button" id="btn-artemis-collect-live-explicit" class="pill-btn" data-action="trigger-artemis-collect" data-collect-mode="live" style="padding:8px 14px; font-weight:600; border-color:#6366f1; color:#818cf8;">
+                <button type="button" id="btn-artemis-collect-live-explicit" class="pill-btn" ${!isForensicsEnabled ? 'disabled' : ''} data-action="trigger-artemis-collect" data-collect-mode="live" style="padding:8px 14px; font-weight:600; border-color:#6366f1; color:#818cf8;">
                   🖥️ Also Collect Live Host OS Telemetry (${escapeHtml(art.current_platform || 'Windows')})
                 </button>
               ` : ''}
@@ -8380,7 +8590,7 @@ function secureRandomIndex(n) {
                 <label for="artemis-preview-salt" style="font-size:12px; font-weight:600;">Session Salt:</label>
                 <input type="text" id="artemis-preview-salt" class="settings-input" style="width:180px; font-size:12px; padding:4px 8px;" value="session-preview-salt-1" placeholder="Session Salt">
               </div>
-              <button type="button" id="btn-artemis-preview" class="btn-primary" data-action="test-artemis-preview" style="padding:6px 14px; font-size:12.5px; font-weight:600; background:#6366f1; border-color:#6366f1;">
+              <button type="button" id="btn-artemis-preview" class="btn-primary" ${!isForensicsEnabled ? 'disabled' : ''} data-action="test-artemis-preview" style="padding:6px 14px; font-size:12.5px; font-weight:600; background:#6366f1; border-color:#6366f1;">
                 🔬 Run Live Normalizer Preview
               </button>
             </div>
@@ -9832,6 +10042,14 @@ function secureRandomIndex(n) {
       map_reduce_fact_extraction: true,
       restrl_daemon_running: true
     });
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ forensics_enabled: false })
+    }).catch(() => {});
+    cachedArtemisStatus = null;
+    cachedArtemisConfig = null;
+    await loadFullSettings();
     renderSettingsTabContent(activeSettingsTab, '');
     showSettingsToast('Settings reset to defaults');
   };

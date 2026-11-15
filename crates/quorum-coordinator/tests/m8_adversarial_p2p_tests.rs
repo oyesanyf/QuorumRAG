@@ -115,6 +115,7 @@ async fn test_adv_mismatched_pubkey_vs_peer_id_rejected() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed_a, &mut spoofed_req, AccessTier::Tier0Public);
 
@@ -162,6 +163,7 @@ async fn test_adv_invalid_or_garbage_pubkey_rejected() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+        synthesis_relay: None,
         };
 
         let resp = handler.handle_query(req.clone()).await;
@@ -197,6 +199,7 @@ async fn test_adv_forged_or_tampered_signature_rejected() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed_a, &mut req, AccessTier::Tier0Public);
     req.signature[0] ^= 0x01; // Tamper with signature
@@ -221,6 +224,7 @@ async fn test_adv_forged_or_tampered_signature_rejected() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed_a, &mut req2, AccessTier::Tier0Public);
     req2.query_text = "tampered query payload".to_string();
@@ -245,6 +249,7 @@ async fn test_adv_forged_or_tampered_signature_rejected() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed_a, &mut req3, AccessTier::Tier0Public);
     req3.embedding[42] = 0.999;
@@ -290,6 +295,7 @@ async fn test_adv_timestamp_drift_past_expired_rejected() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+        synthesis_relay: None,
         };
         sign_request(&seed, &mut req, AccessTier::Tier0Public);
 
@@ -338,6 +344,7 @@ async fn test_adv_timestamp_drift_future_rejected() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+        synthesis_relay: None,
         };
         sign_request(&seed, &mut req, AccessTier::Tier0Public);
 
@@ -381,6 +388,7 @@ async fn test_adv_timestamp_boundary_acceptance_and_rejection() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+        synthesis_relay: None,
         };
         sign_request(&seed, &mut req, AccessTier::Tier0Public);
 
@@ -411,6 +419,7 @@ async fn test_adv_timestamp_boundary_acceptance_and_rejection() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+        synthesis_relay: None,
         };
         sign_request(&seed, &mut req, AccessTier::Tier0Public);
 
@@ -479,6 +488,7 @@ async fn test_adv_payload_nan_and_inf_embedding_rejected() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+        synthesis_relay: None,
         };
         sign_request(&seed, &mut req, AccessTier::Tier0Public);
 
@@ -513,6 +523,7 @@ async fn test_adv_payload_invalid_embedding_dimensions_rejected() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+        synthesis_relay: None,
         };
         sign_request(&seed, &mut req, AccessTier::Tier0Public);
 
@@ -545,6 +556,7 @@ async fn test_adv_payload_query_text_boundaries_and_top_k() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut req_4096, AccessTier::Tier0Public);
     let resp_4096 = handler.handle_query(req_4096).await;
@@ -566,6 +578,7 @@ async fn test_adv_payload_query_text_boundaries_and_top_k() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut req_4097, AccessTier::Tier0Public);
     let resp_4097 = handler.handle_query(req_4097).await;
@@ -587,6 +600,7 @@ async fn test_adv_payload_query_text_boundaries_and_top_k() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut req_64k, AccessTier::Tier0Public);
     let resp_64k = handler.handle_query(req_64k).await;
@@ -608,6 +622,7 @@ async fn test_adv_payload_query_text_boundaries_and_top_k() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut req_zero_top_k, AccessTier::Tier0Public);
     let resp_zero_top_k = handler.handle_query(req_zero_top_k).await;

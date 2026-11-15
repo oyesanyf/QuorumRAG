@@ -55,6 +55,14 @@ pub struct Cli {
     /// Logs go to <data-dir>/logs/quorumrag-service.log. On Linux/macOS this flag only enables file logging.
     #[arg(long, default_value_t = false)]
     pub service: bool,
+
+    /// Enable or disable the Artemis DFIR and host forensics subsystem (default: false).
+    #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub forensics: Option<bool>,
+
+    /// Explicitly disable the Artemis DFIR and host forensics subsystem.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_forensics: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]

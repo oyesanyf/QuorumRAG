@@ -84,6 +84,9 @@ impl QueryCoordinator {
             .map(|s| s.mesh.p2p_enabled)
             .unwrap_or(true)
             && self.engine.mesh_dispatcher.peer_count() > 0;
+        let forensics_enabled = crate::artemis_airgap::is_forensics_enabled();
+        let query_targets_forensics = crate::offline_engine::ForensicQueryIntent::detect(prompt).is_some()
+            || crate::artemis_airgap::contains_artemis_query(prompt);
         if let Some(cached) = self.cache_manager.query_cache.get_with_mesh_requirement(
             prompt,
             SearchMode::Hybrid,
@@ -92,16 +95,31 @@ impl QueryCoordinator {
             epoch,
             p2p_active,
         ) {
-            let execution_time_ms = start.elapsed().as_millis() as u64;
-            return Ok(QueryResult {
-                chunks: cached.chunks.clone(),
-                synthesis_prompt: cached.synthesis_prompt.clone(),
-                execution_time_ms,
-                sources_cited: cached.citations.clone(),
-                cache_hit: true,
-                cache_epoch: epoch,
-                peer_diagnostics: None,
-            });
+            let cache_clean_for_forensics = if forensics_enabled {
+                !cached
+                    .synthesis_prompt
+                    .contains("forensics subsystem is currently disabled")
+            } else {
+                cached.chunks.iter().all(|c| {
+                    !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
+                        && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
+                }) && (!query_targets_forensics
+                    || cached
+                        .synthesis_prompt
+                        .contains("forensics subsystem is currently disabled"))
+            };
+            if cache_clean_for_forensics {
+                let execution_time_ms = start.elapsed().as_millis() as u64;
+                return Ok(QueryResult {
+                    chunks: cached.chunks.clone(),
+                    synthesis_prompt: cached.synthesis_prompt.clone(),
+                    execution_time_ms,
+                    sources_cited: cached.citations.clone(),
+                    cache_hit: true,
+                    cache_epoch: epoch,
+                    peer_diagnostics: None,
+                });
+            }
         }
 
         let embedder = quorum_contract::DeterministicOfflineEngine::new();
@@ -114,7 +132,7 @@ impl QueryCoordinator {
             fresh
         };
 
-        let (chunks, _volatile, _) = self
+        let (mut chunks, _volatile, _) = self
             .engine
             .execute_query(
                 prompt,
@@ -124,8 +142,18 @@ impl QueryCoordinator {
             )
             .await;
 
-        let synthesis_prompt =
+        if !forensics_enabled {
+            chunks.retain(|c| {
+                !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
+                    && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
+            });
+        }
+
+        let mut synthesis_prompt =
             DeterministicOfflineSynthesisEngine::build_synthesis_prompt(prompt, &chunks);
+        if !forensics_enabled && query_targets_forensics {
+            synthesis_prompt.push_str("\n\n> **Notice**: The forensics subsystem is currently disabled. Forensic sources and `artemis://` telemetry were skipped during retrieval.");
+        }
         let sources_cited: Vec<Citation> = chunks.iter().map(|c| c.to_citation()).collect();
         let execution_time_ms = start.elapsed().as_millis() as u64;
 
@@ -195,7 +223,9 @@ impl QueryCoordinator {
         let epoch = self.engine.local_storage.index_epoch();
         let hits_before = self.cache_manager.telemetry(false).hits;
 
-        let effective_tier = if crate::offline_engine::ForensicQueryIntent::detect(prompt).is_some() {
+        let effective_tier = if crate::artemis_airgap::is_forensics_enabled()
+            && crate::offline_engine::ForensicQueryIntent::detect(prompt).is_some()
+        {
             3
         } else {
             self.config.default_peer_access_tier

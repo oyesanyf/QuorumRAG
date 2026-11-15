@@ -408,6 +408,7 @@ pub struct ChatSessionRegistry {
     pub(crate) p2p_watcher_runtime: Arc<RwLock<Option<Arc<crate::p2p_watcher::P2pWatcherRuntime>>>>,
     pub(crate) marketplace_db: Arc<RwLock<Option<Arc<crate::handlers::marketplace::MarketplaceStore>>>>,
     pub(crate) fs_watcher_handle: Arc<RwLock<Option<Arc<quorum_ingest::WatcherHandle>>>>,
+    pub(crate) nimble_provisioner: Arc<RwLock<Option<Arc<crate::nimble_provisioner::NimbleProvisioner>>>>,
 }
 
 impl ChatSessionRegistry {
@@ -418,6 +419,7 @@ impl ChatSessionRegistry {
             p2p_watcher_runtime: Arc::new(RwLock::new(None)),
             marketplace_db: Arc::new(RwLock::new(None)),
             fs_watcher_handle: Arc::new(RwLock::new(None)),
+            nimble_provisioner: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -561,6 +563,33 @@ impl DaemonState {
         ));
         *wguard = Some(Arc::clone(&default_rt));
         default_rt
+    }
+
+    /// Returns the active `NimbleProvisioner` (lazily initializing default instance if not explicitly configured).
+    pub fn nimble_provisioner(&self) -> Arc<crate::nimble_provisioner::NimbleProvisioner> {
+        if let Ok(guard) = self.sessions.nimble_provisioner.read() {
+            if let Some(ref existing) = *guard {
+                return Arc::clone(existing);
+            }
+        }
+        let mut wguard = self
+            .sessions
+            .nimble_provisioner
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ref existing) = *wguard {
+            return Arc::clone(existing);
+        }
+        let default_prov = Arc::new(crate::nimble_provisioner::NimbleProvisioner::default());
+        *wguard = Some(Arc::clone(&default_prov));
+        default_prov
+    }
+
+    /// Attaches an explicitly configured `NimbleProvisioner` at daemon startup.
+    pub fn set_nimble_provisioner(&self, provisioner: Arc<crate::nimble_provisioner::NimbleProvisioner>) {
+        if let Ok(mut guard) = self.sessions.nimble_provisioner.write() {
+            *guard = Some(provisioner);
+        }
     }
     /// Returns the persistent SQLite `ChatHistoryStore` backed by `<data_dir>/chat_history.db`.
     pub fn history_store(&self) -> Result<Arc<crate::chat_history_db::ChatHistoryStore>, String> {

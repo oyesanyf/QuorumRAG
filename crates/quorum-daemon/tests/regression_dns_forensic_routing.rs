@@ -70,6 +70,14 @@ fn test_forensic_dns_intent_detection_and_zero_false_positives() {
 
 #[tokio::test]
 async fn test_dns_forensic_routing_clean_formatting_and_zero_drift() {
+    // Opt-in to forensics for this DFIR-specific regression test
+    {
+        let ctrl = quorum_coordinator::dlp_mesh::global_mesh_dlp_controller();
+        let mut s = ctrl.settings.write().unwrap_or_else(|e| e.into_inner());
+        s.artemis.enabled = true;
+        s.artemis.local_collection_enabled = true;
+    }
+
     let temp_dir = tempdir().expect("tempdir");
     let storage_config = quorum_storage::StorageConfig::new(temp_dir.path().to_path_buf());
     let storage = Arc::new(

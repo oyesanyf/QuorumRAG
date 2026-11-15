@@ -353,7 +353,7 @@ impl RetrieveMeshNode {
                 .settings
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if s.artemis.enabled || s.artemis.local_collection_enabled || is_forensic_q {
+            if s.artemis.enabled && (s.artemis.local_collection_enabled || is_forensic_q) {
                 access_tier.max(quorum_types::AccessTier::Tier3Restricted.as_u8())
             } else {
                 access_tier
@@ -394,11 +394,15 @@ impl RetrieveMeshNode {
             }
         };
         let forensic_fut = async {
-            if let Some(fi) = forensic_intent {
-                engine
-                    .local_storage
-                    .search_text(fi.target_search_query(), local_access_tier, 64)
-                    .await
+            if crate::artemis_airgap::is_forensics_enabled() {
+                if let Some(fi) = forensic_intent {
+                    engine
+                        .local_storage
+                        .search_text(fi.target_search_query(), local_access_tier, 64)
+                        .await
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             }
@@ -427,13 +431,12 @@ impl RetrieveMeshNode {
                     }
                 }));
 
-        let local_chunks_satisfy_query = {
-            let local_chunks: Vec<&ScoredChunk> = chunks.iter().filter(|c| !c.is_remote).collect();
-            if local_chunks.is_empty() {
+        let chunks_satisfy_query = {
+            if chunks.is_empty() {
                 false
             } else {
-                let max_score = local_chunks.iter().map(|c| c.score).fold(0.0f32, f32::max);
-                let has_match = prelim_entities.is_empty() || local_chunks.iter().any(|c| {
+                let max_score = chunks.iter().map(|c| c.score).fold(0.0f32, f32::max);
+                let has_match = prelim_entities.is_empty() || chunks.iter().any(|c| {
                     let hay = format!(
                         "{} {}",
                         c.chunk.file_path.to_ascii_lowercase(),
@@ -441,12 +444,12 @@ impl RetrieveMeshNode {
                     );
                     prelim_entities.iter().any(|e| hay.contains(&e.to_ascii_lowercase()))
                 });
-                (local_chunks.len() >= 3 && has_match) || max_score >= 0.70 || (max_score >= 0.015 && has_match)
+                (chunks.len() >= 3 && has_match) || max_score >= 0.70 || (max_score >= 0.015 && has_match)
             }
         };
 
         let peer_count = engine.mesh_dispatcher.peer_count();
-        if !local_chunks_satisfy_query && !has_entity_matched_remote && peer_count > 0 {
+        if !chunks_satisfy_query && !has_entity_matched_remote && peer_count > 0 {
             if let Some(ref entity_q) = entity_kw_query_opt {
                 if !entity_q.eq_ignore_ascii_case(&state.current_query) {
                     let (fb_hits, fb_vol) = engine
@@ -513,6 +516,13 @@ impl RetrieveMeshNode {
                     }
                 }
             }
+        }
+
+        if !crate::artemis_airgap::is_forensics_enabled() {
+            chunks.retain(|c| {
+                !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
+                    && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
+            });
         }
 
         if let Some(ref filters) = state.query_metadata_filters {
@@ -946,6 +956,17 @@ impl RetrieveMeshNode {
                 }
 
                 let has_ocr_text = text_l.contains("[ocr text]");
+                let is_screenshot_ocr = (has_ocr_text || text_l.contains("[ocr text]"))
+                    && (file_name_l.contains("screenshot")
+                        || text_l.contains("search-ui")
+                        || text_l.contains("search results")
+                        || text_l.contains("google search")
+                        || file_name_l.ends_with(".png")
+                        || file_name_l.ends_with(".jpg")
+                        || file_name_l.ends_with(".jpeg"));
+                if !asks_image && is_screenshot_ocr {
+                    intent_bonus -= 300;
+                }
                 if !asks_image
                     && !has_ocr_text
                     && content_matched_terms == 0
@@ -1094,19 +1115,12 @@ impl RetrieveMeshNode {
                 }
             };
 
-            // Stitch multi-chunk remote peer documents BEFORE term-quorum filtering (`paired.retain`)
-            // so a remote resume whose header chunk has the person's name and whose body chunk has Education
+            // Stitch multi-chunk documents BEFORE term-quorum filtering (`paired.retain`)
+            // so a resume whose header chunk has the person's name and whose body chunk has Education
             // merges into a single complete section instead of losing half its terms!
-            if chunks.iter().any(|c| c.is_remote) {
-                let (remote_candidates, mut local_candidates): (Vec<ScoredChunk>, Vec<ScoredChunk>) =
-                    chunks.into_iter().partition(|c| c.is_remote);
-                let stitched_remote =
-                    crate::offline_engine::DeterministicOfflineSynthesisEngine::stitch_parent_document_chunks(
-                        remote_candidates,
-                    );
-                local_candidates.extend(stitched_remote);
-                chunks = local_candidates;
-            }
+            chunks = crate::offline_engine::DeterministicOfflineSynthesisEngine::stitch_parent_document_chunks(
+                chunks,
+            );
 
             // Precompute criteria upfront into static structs for all candidates
             let mut paired: Vec<(ScoredChunk, ChunkScoreCriteria)> = Vec::with_capacity(chunks.len());
@@ -1159,7 +1173,7 @@ impl RetrieveMeshNode {
             }
 
             if any_lexical_match && !paired.is_empty() {
-                let any_relevant_match = paired
+                let _any_relevant_match = paired
                     .iter()
                     .any(|(_, crit)| crit.is_relevant && crit.weighted_hits > 0);
                 paired.retain(|(c, crit)| {
@@ -1172,11 +1186,6 @@ impl RetrieveMeshNode {
                     let wanted_media = media_prefix
                         .map_or(false, |p| c.chunk.text_content.trim_start().starts_with(p) && crit.weighted_hits > 0);
                     is_forensic_artemis
-                        || (c.is_remote
-                            && crit.weighted_hits > 0
-                            && (!any_relevant_match || crit.is_relevant)
-                            && (!any_proper_match || crit.proper_ok)
-                            && (!any_prompt_entity_match || crit.prompt_entity_hits >= required_prompt_hits))
                         || wanted_media
                         || (crit.is_relevant
                             && crit.weighted_hits > 0
@@ -1196,6 +1205,8 @@ impl RetrieveMeshNode {
                                 .partial_cmp(&chunk_a.score)
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         })
+                        .then_with(|| chunk_a.chunk.chunk_id.cmp(&chunk_b.chunk.chunk_id))
+                        .then_with(|| chunk_a.chunk.blake3_hash.cmp(&chunk_b.chunk.blake3_hash))
                 });
             } else if !asks_image && forensic_intent.is_none() && !paired.is_empty() {
                 // Drop ungrounded image/OCR screenshots on non-image queries when no lexical match exists.
@@ -1333,33 +1344,7 @@ impl RetrieveMeshNode {
         // do not starve search context diversity.
         chunks = Self::cap_document_families_federated(chunks, 2);
 
-        // Snapshot top remote peer chunks (`source_peer != "local"`), prioritizing distinct connected peers first,
-        // so federated stitched results from connected computers are interleaved near the top alongside local results.
-        let mut preserved_remote: Vec<ScoredChunk> = Vec::new();
         if !has_local_artemis_for_forensic {
-            let mut seen_remote_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for rc in chunks.iter().filter(|c| c.source_peer != "local") {
-                if seen_remote_peers.insert(rc.source_peer.clone()) {
-                    preserved_remote.push(rc.clone());
-                    if preserved_remote.len() >= 8 {
-                        break;
-                    }
-                }
-            }
-            if preserved_remote.len() < 8 {
-                for rc in chunks.iter().filter(|c| c.source_peer != "local") {
-                    if !preserved_remote
-                        .iter()
-                        .any(|p| p.source_peer == rc.source_peer && p.chunk.chunk_id == rc.chunk.chunk_id)
-                    {
-                        preserved_remote.push(rc.clone());
-                        if preserved_remote.len() >= 8 {
-                            break;
-                        }
-                    }
-                }
-            }
-
             // Apply Maximal Marginal Relevance (MMR) candidate diversity selection (default lambda = 0.70)
             chunks = apply_mmr_selection(chunks, effective_vector, top_k, 0.70);
         }
@@ -1375,36 +1360,16 @@ impl RetrieveMeshNode {
             chunks = media;
         }
 
+        // Enforce global score ranking with deterministic tie-breaking: (score DESC, chunk_id ASC, blake3_hash ASC)
+        chunks.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
+                .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
+        });
+
         chunks.truncate(top_k);
-
-        // Dedicated quota for remote volatile mesh chunks so local sibling expansion
-        // and supplemental text queries cannot crowd out remote peer chunks in top-K context packing.
-        let remote_quota = preserved_remote.len().min((top_k / 3).max(2));
-
-        // Interleave preserved remote peer chunks right after the #1 local chunk (slots 1..=4) rather than
-        // burying them at the tail behind 6+ local files so synthesis and `SOURCES` surface `(mesh)` peers prominently.
-        let mut insert_cursor = 1usize.min(chunks.len());
-        for rem in preserved_remote.into_iter().take(remote_quota.max(4)) {
-            if let Some(existing_idx) = chunks
-                .iter()
-                .position(|c| c.source_peer == rem.source_peer && c.chunk.chunk_id == rem.chunk.chunk_id)
-            {
-                if existing_idx <= insert_cursor {
-                    insert_cursor = (existing_idx + 1).min(chunks.len());
-                    continue;
-                }
-                chunks.remove(existing_idx);
-            } else if chunks.len() >= top_k {
-                if let Some(pos) = chunks.iter().rposition(|c| c.source_peer == "local") {
-                    chunks.remove(pos);
-                } else if !chunks.is_empty() {
-                    chunks.pop();
-                }
-            }
-            let target_idx = insert_cursor.min(chunks.len());
-            chunks.insert(target_idx, rem);
-            insert_cursor = (target_idx + 1).min(chunks.len());
-        }
         state.retrieved_chunks = chunks;
         state.volatile_chunks = volatile;
     }
@@ -1829,6 +1794,12 @@ mod tests {
         );
 
         // 2. "What is process are accessing the internet" must return artemis:// locally and ZERO remote peer distractors
+        {
+            let ctrl = crate::dlp_mesh::global_mesh_dlp_controller();
+            let mut s = ctrl.settings.write().unwrap_or_else(|e| e.into_inner());
+            s.artemis.enabled = true;
+            s.artemis.local_collection_enabled = true;
+        }
         let vec_proc = embedder
             .embed_text("What is process are accessing the internet")
             .unwrap();

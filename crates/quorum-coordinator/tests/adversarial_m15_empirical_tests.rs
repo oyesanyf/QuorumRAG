@@ -146,6 +146,7 @@ async fn test_empirical_inbound_handler_spoofing_gauntlet() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&authentic_seed, &mut req_valid, AccessTier::Tier0Public);
     let resp_valid = inbound.handle_query(req_valid.clone()).await;
@@ -166,6 +167,7 @@ async fn test_empirical_inbound_handler_spoofing_gauntlet() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&attacker_seed, &mut req_attack_a, AccessTier::Tier0Public);
     let resp_a = inbound.handle_query(req_attack_a).await;
@@ -184,6 +186,7 @@ async fn test_empirical_inbound_handler_spoofing_gauntlet() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&authentic_seed, &mut req_attack_b, AccessTier::Tier0Public);
     let resp_b = inbound.handle_query(req_attack_b).await;

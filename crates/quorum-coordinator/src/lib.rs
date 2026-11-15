@@ -16,12 +16,16 @@ pub mod langextract;
 pub mod marketplace_engine;
 pub mod mesh;
 pub mod model_router;
+pub mod nimble_client;
 pub mod offline_engine;
+pub mod relevance_attestor;
+pub mod response_formatter_watchdog;
 pub mod rlm_orchestrator;
 pub mod scatter_gather;
 pub mod telemetry;
 pub mod tpm;
 pub mod types;
+pub mod dfir_consensus;
 pub mod vision;
 pub mod volatile;
 
@@ -52,8 +56,11 @@ pub use mesh::{
     LocalOnlyDispatcher, MeshQueryAdmissionController, MeshQueryDispatcher, MockMeshDispatcher, MockRemotePeer,
     global_peer_health_registry, OsoosiMeshInboundHandler, PeerHealthRegistry, PeerHealthStats, SwarmMeshDispatcher, P2P_WATCHER_CANARY_QUERY,
 };
+pub use answer_orchestrator::query_framing;
 pub use model_router::AutoFusionRouter;
+pub use nimble_client::*;
 pub use offline_engine::DeterministicOfflineSynthesisEngine;
+pub use relevance_attestor::{DocumentRelevanceAttestor, NimbleRelevanceAttestation};
 pub use rlm_orchestrator::{
     execute_rlm_subqueries_unordered, execute_rlm_tools_concurrent, RlmDepthAwareSemaphore,
     RlmOrchestrator, RlmParentSliceCache, RlmToolInvocation, RlmToolOutput, RlmWorkspaceState,
@@ -89,10 +96,14 @@ pub use marketplace_engine::{
 pub use bounty_runner::{BountyMatchResult, BountyRunner};
 pub use artemis_airgap::{
     contains_artemis_query, default_allowed_categories, is_airgap_restricted_chunk,
-    is_airgap_restricted_chunk_dto, is_artemis_uri, percent_decode_ascii_lossy,
-    prohibited_categories, ArtemisDfirSettings,
+    is_airgap_restricted_chunk_dto, is_artemis_uri, is_forensics_enabled,
+    percent_decode_ascii_lossy, prohibited_categories, ArtemisDfirSettings,
 };
 pub use forensic_normalizer::{
     is_internal_private_ip, ArtifactCategoryGate, ForensicStructuralNormalizer, NormalizerPreview,
 };
 pub use offline_engine::ForensicQueryIntent;
+pub use response_formatter_watchdog::{ResponseFormatterWatchdog, WatchdogAuditReport};
+pub use dfir_consensus::{
+    DfirConsensusVerdict, DfirTelemetryInput, DfirVoterReport, MultiVoterConsensusEngine,
+};

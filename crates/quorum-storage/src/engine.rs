@@ -738,6 +738,33 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Enriches a chunk's metadata_json with entity clustering information (`entity_cluster` and `nimble_confidence`),
+    /// preserving all pre-existing metadata fields.
+    pub async fn update_chunk_entity_cluster(
+        &self,
+        chunk_id: &str,
+        entity_cluster: &str,
+        nimble_confidence: f64,
+    ) -> Result<(), StorageError> {
+        let chunks = self.get_chunks_by_ids(&[chunk_id.to_string()]).await?;
+        if let Some(mut chunk) = chunks.into_iter().next() {
+            let mut meta_val = serde_json::from_str::<serde_json::Value>(&chunk.metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(map) = meta_val.as_object_mut() {
+                map.insert("entity_cluster".to_string(), serde_json::json!(entity_cluster));
+                map.insert("nimble_confidence".to_string(), serde_json::json!(nimble_confidence));
+            } else {
+                meta_val = serde_json::json!({
+                    "entity_cluster": entity_cluster,
+                    "nimble_confidence": nimble_confidence
+                });
+            }
+            chunk.metadata_json = meta_val.to_string();
+            self.update_chunk_record(&chunk).await?;
+        }
+        Ok(())
+    }
+
     /// Deletes a chunk by its chunk_id across both stores.
     pub async fn delete_by_chunk_id(&self, chunk_id: &str) -> Result<usize, StorageError> {
         let l = self.vector_store.delete_by_chunk_id(chunk_id).await?;

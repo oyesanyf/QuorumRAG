@@ -17,7 +17,9 @@
 use crate::error::IngestError;
 use crate::secret_scrubber::SecretScrubber;
 use chrono::Utc;
-use quorum_contract::{ForensicContractError, ForensicProvenance, ForensicTelemetryType};
+use quorum_contract::{
+    DfirThreatLevel, ForensicContractError, ForensicProvenance, ForensicTelemetryType,
+};
 use quorum_types::{AccessTier, DocumentChunk, TypeError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -165,6 +167,30 @@ impl ArtemisTelemetryRecord {
         )
     }
 
+    /// Evaluates initial heuristic DFIR threat rubric level for this record.
+    pub fn infer_initial_threat_rubric(&self) -> DfirThreatLevel {
+        let summary_lower = self.summary_text.to_ascii_lowercase();
+        let raw_str = self.raw_json.to_string().to_ascii_lowercase();
+        if summary_lower.contains("meterpreter")
+            || summary_lower.contains("quarantined")
+            || summary_lower.contains("c2 beacon")
+            || summary_lower.contains("dns tunnel")
+            || summary_lower.contains("mimikatz")
+            || summary_lower.contains("-enc ")
+            || raw_str.contains("antivirusblocked")
+        {
+            DfirThreatLevel::HighConfidenceMaliciousIndicator
+        } else if self.source_path.contains("System32")
+            || self.source_path.contains("/systemd")
+            || summary_lower.contains("signed by microsoft")
+            || summary_lower.contains("system idle process")
+        {
+            DfirThreatLevel::BenignVerifiedOsService
+        } else {
+            DfirThreatLevel::BenignUserApplication
+        }
+    }
+
     /// Converts this telemetry record into an indexing-ready `DocumentChunk` with:
     /// - `access_tier = 3` (`AccessTier::Tier3Restricted`)
     /// - `file_path = artemis://...`
@@ -192,6 +218,7 @@ impl ArtemisTelemetryRecord {
             "raw_payload_blake3": self.raw_payload_blake3,
             "collector_name": self.collector_name,
             "collector_version": self.collector_version,
+            "initial_threat_rubric": self.infer_initial_threat_rubric().as_str(),
         });
 
         if let Some(obj) = metadata.as_object_mut() {

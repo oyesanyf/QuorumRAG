@@ -53,6 +53,7 @@ fn test_timestamp_boundary_extremes_and_overflow_immunity() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+            synthesis_relay: None,
         };
 
         // 1. is_fresh(60) must never panic
@@ -95,6 +96,7 @@ fn test_timestamp_with_extreme_max_drift_secs() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
 
     // Test extreme drift parameters: 0, i64::MAX, -1, i64::MIN
@@ -224,6 +226,7 @@ fn test_canonical_signing_bytes_with_multibyte_and_extreme_embeddings() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
 
     let bytes = req.canonical_signing_bytes();

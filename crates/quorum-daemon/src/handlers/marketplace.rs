@@ -1354,7 +1354,7 @@ pub async fn marketplace_harvest_handler(
                 &extra_terms,
                 now,
             );
-            if settings.artemis.marketplace_harvest_enabled {
+            if settings.artemis.enabled && settings.artemis.marketplace_harvest_enabled {
                 let artemis_cands = synthesize_artemis_storage_candidates(
                     &state,
                     &store.origin_node_id,
@@ -1383,6 +1383,35 @@ pub async fn marketplace_harvest_handler(
                 reason,
             });
             continue;
+        }
+
+        if !settings.artemis.enabled || !settings.artemis.marketplace_harvest_enabled {
+            let is_forensic_cand = cand
+                .source_file_path
+                .as_deref()
+                .map_or(false, quorum_coordinator::artemis_airgap::is_artemis_uri)
+                || cand
+                    .citations
+                    .iter()
+                    .any(|(src, snippet)| {
+                        quorum_coordinator::artemis_airgap::is_artemis_uri(src)
+                            || quorum_coordinator::artemis_airgap::is_artemis_uri(snippet)
+                    })
+                || cand.domain_tags.iter().any(|t| {
+                    let tl = t.to_ascii_lowercase();
+                    tl.contains("artemis") || tl.contains("dfir") || tl.contains("forensic")
+                });
+            if is_forensic_cand {
+                rejected_candidates.push(RejectedCandidateReport {
+                    record_id: cand.record_id.clone(),
+                    reason: if !settings.artemis.enabled {
+                        "Forensics subsystem is disabled".to_string()
+                    } else {
+                        "Marketplace forensic harvest is disabled".to_string()
+                    },
+                });
+                continue;
+            }
         }
 
         let cand_to_eval = if settings.artemis.normalize_for_harvest {

@@ -429,6 +429,7 @@ fn test_federated_query_timestamp_overflow_panic_probe() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -462,6 +463,7 @@ fn test_federated_query_canonical_signing_tampering_oracle() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
 
     let digest_orig = req.canonical_digest();
@@ -506,6 +508,7 @@ fn test_federated_query_roundtrip_serialization() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
 
     let json = serde_json::to_string(&req).expect("Serialize FederatedQueryRequest");
@@ -530,6 +533,8 @@ fn test_federated_query_roundtrip_serialization() {
                 origin_peer_id: None,
             },
         ],
+        synthesis_response: None,
+        warm_llm_available: false,
     };
 
     let resp_json = serde_json::to_string(&resp).expect("Serialize FederatedQueryResponse");

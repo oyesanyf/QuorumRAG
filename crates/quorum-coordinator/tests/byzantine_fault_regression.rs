@@ -203,6 +203,7 @@ async fn test_byzantine_ed25519_forged_signature_and_identity_spoofing() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed_a, &mut spoofed_req, AccessTier::Tier0Public);
     let resp_spoofed = handler.handle_query(spoofed_req).await;
@@ -222,6 +223,7 @@ async fn test_byzantine_ed25519_forged_signature_and_identity_spoofing() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed_a, &mut forged_sig_req, AccessTier::Tier0Public);
     forged_sig_req.signature[0] ^= 0x01; // Bit flip
@@ -242,6 +244,7 @@ async fn test_byzantine_ed25519_forged_signature_and_identity_spoofing() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed_a, &mut tampered_text_req, AccessTier::Tier0Public);
     tampered_text_req.query_text = "Classified confidential keys".to_string();
@@ -384,6 +387,7 @@ async fn test_byzantine_replay_attack_and_drift_window_rejection() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+        synthesis_relay: None,
         };
         sign_request(&seed, &mut req, AccessTier::Tier0Public);
 
@@ -410,6 +414,7 @@ async fn test_byzantine_replay_attack_and_drift_window_rejection() {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+        synthesis_relay: None,
         };
         sign_request(&seed, &mut valid_req, AccessTier::Tier0Public);
         assert!(verify_request(&valid_req, AccessTier::Tier0Public, 60).is_ok());

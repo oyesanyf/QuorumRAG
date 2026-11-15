@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.14.
+"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.15.
 
 Spawns a real `quorumrag` release daemon against an isolated corpus containing
 homonym clusters, noisy ChatGPT export markers, and forensic distractors, then
@@ -8,8 +8,16 @@ executes real live queries over HTTP (`POST /api/query`) to confirm:
      zero pretraining biography backfill, zero distractor bleed.
   2. "who is michael chen" -> general 2-cluster homonym disambiguation (zero
      hardcoded entity rules).
-  3. "WHAT PROCESS IS USING DNS TRAFFIC" -> live OS DNS forensic harvesting,
-     structured Markdown DNS summary table, zero raw JSON, zero static Python drift.
+  3. Phase A (Default-Off Forensics): `GET /api/artemis/status` and
+     `GET /api/v1/artemis/status` return HTTP 403 Forbidden by default, and
+     `"WHAT PROCESS IS USING DNS TRAFFIC"` skips forensic/`artemis://` sources
+     with an explicit disabled-forensics notice.
+  4. Phase B (Explicit User Opt-In Forensics): after enabling forensics via
+     `POST /api/settings` (`{"forensics_enabled": true}`) and
+     `POST /api/v1/artemis/config` (`{"enabled": true, "local_collection_enabled": true}`),
+     `"WHAT PROCESS IS USING DNS TRAFFIC"` (`bypass_cache=true`) harvests live OS
+     DNS telemetry into a structured Markdown DNS summary table with zero raw JSON
+     and zero static Python drift.
 """
 
 from __future__ import annotations
@@ -135,7 +143,8 @@ def main() -> int:
         child_env["QUORUM_ISOLATED_WATCH_DIR"] = "1"
         child_env["QUORUM_DISABLE_OLLAMA_AUTOINSTALL"] = "1"
 
-        print(f"[E2E 1/4] Indexing test corpus with {bin_path.name}...")
+        print(f"[E2E 1/5] Indexing test corpus with {bin_path.name}...")
+        reindex_log_path = tmp_path / "reindex.log"
         reindex_cmd = [
             str(bin_path),
             "--data-dir",
@@ -145,22 +154,22 @@ def main() -> int:
             str(corpus_dir),
             "--full",
         ]
-        reindex_res = subprocess.run(
-            reindex_cmd,
-            env=child_env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
-            check=False,
-        )
+        with open(reindex_log_path, "w", encoding="utf-8", errors="replace") as rlog_f:
+            reindex_proc = subprocess.Popen(
+                reindex_cmd,
+                env=child_env,
+                stdin=subprocess.DEVNULL,
+                stdout=rlog_f,
+                stderr=subprocess.STDOUT,
+            )
+            reindex_rc = reindex_proc.wait(timeout=120)
+        reindex_out = reindex_log_path.read_text(encoding="utf-8", errors="replace")
         require(
-            reindex_res.returncode == 0,
-            f"reindex failed ({reindex_res.returncode}):\nSTDOUT:\n{reindex_res.stdout}\nSTDERR:\n{reindex_res.stderr}",
+            reindex_rc == 0,
+            f"reindex failed ({reindex_rc}):\n{reindex_out}",
         )
 
-        print(f"[E2E 2/4] Starting live QuorumRAG daemon on 127.0.0.1:{args.port}...")
+        print(f"[E2E 2/5] Starting live QuorumRAG daemon on 127.0.0.1:{args.port}...")
         daemon_log_path = tmp_path / "daemon.log"
         daemon_cmd = [
             str(bin_path),
@@ -178,12 +187,11 @@ def main() -> int:
             "--local-only",
             "--no-p2p-watcher",
         ]
-        # Stream daemon logs directly to a disk file rather than an un-drained anonymous pipe;
-        # Windows anonymous pipes default to a 4 KB buffer and block `tracing` writes once full.
         daemon_log_f = open(daemon_log_path, "w", encoding="utf-8", errors="replace")
         proc = subprocess.Popen(
             daemon_cmd,
             env=child_env,
+            stdin=subprocess.DEVNULL,
             stdout=daemon_log_f,
             stderr=subprocess.STDOUT,
         )
@@ -205,7 +213,7 @@ def main() -> int:
             require(ready, f"Daemon on 127.0.0.1:{args.port} did not become healthy within 30s")
 
             # Query 1: WHO IS ANGELA DAVIS
-            print("\n[E2E 3/4] Querying live HTTP /api/query: 'WHO IS ANGELA DAVIS'...")
+            print("\n[E2E 3/5] Querying live HTTP /api/query: 'WHO IS ANGELA DAVIS'...")
             st1, q1 = http_json(args.port, "POST", "/api/query", {"prompt": "WHO IS ANGELA DAVIS"})
             require(st1 == 200, f"HTTP {st1} on WHO IS ANGELA DAVIS: {q1}")
             ans1 = q1.get("synthesis_prompt", "")
@@ -238,7 +246,7 @@ def main() -> int:
             require(len(ans1) >= 900, f"Expected detailed exhaustive response >= 900 chars, got {len(ans1)}")
 
             # Query 2: who is michael chen (proves disambiguation is 100% general, zero hardcoded names)
-            print("\n[E2E 3b/4] Querying live HTTP /api/query: 'who is michael chen'...")
+            print("\n[E2E 3b/5] Querying live HTTP /api/query: 'who is michael chen'...")
             st2, q2 = http_json(args.port, "POST", "/api/query", {"prompt": "who is michael chen"})
             require(st2 == 200, f"HTTP {st2} on who is michael chen: {q2}")
             ans2 = q2.get("synthesis_prompt", "")
@@ -251,12 +259,52 @@ def main() -> int:
                 "General homonym disambiguation failed on Michael Chen",
             )
 
-            # Query 3: WHAT PROCESS IS USING DNS TRAFFIC (live OS DNS telemetry + zero static Python drift)
-            print("\n[E2E 4/4] Querying live HTTP /api/query: 'WHAT PROCESS IS USING DNS TRAFFIC'...")
-            st3, q3 = http_json(args.port, "POST", "/api/query", {"prompt": "WHAT PROCESS IS USING DNS TRAFFIC"})
-            require(st3 == 200, f"HTTP {st3} on WHAT PROCESS IS USING DNS TRAFFIC: {q3}")
+            # Phase A (Default-Off Forensics Verification)
+            print("\n[E2E 4/5] Verifying Forensics is OFF BY DEFAULT (HTTP 403 + disabled query notice)...")
+            st_art1, art1 = http_json(args.port, "GET", "/api/artemis/status")
+            require(st_art1 == 403, f"Expected HTTP 403 on GET /api/artemis/status when disabled, got {st_art1}: {art1}")
+            require(art1.get("forensics_enabled") is False, f"Expected forensics_enabled=False in 403 payload: {art1}")
+
+            st_art2, art2 = http_json(args.port, "GET", "/api/v1/artemis/status")
+            require(st_art2 == 403, f"Expected HTTP 403 on GET /api/v1/artemis/status when disabled, got {st_art2}: {art2}")
+
+            st3_off, q3_off = http_json(args.port, "POST", "/api/query", {"prompt": "WHAT PROCESS IS USING DNS TRAFFIC"})
+            require(st3_off == 200, f"HTTP {st3_off} on disabled DNS forensic query: {q3_off}")
+            ans3_off = q3_off.get("synthesis_prompt", "")
+            require(
+                "forensics subsystem is currently disabled" in ans3_off.lower(),
+                f"Expected disabled forensics notice in default-off query response, got:\n{ans3_off}",
+            )
+            require(
+                "artemis://" not in json.dumps(q3_off.get("citations", [])).lower(),
+                "artemis:// citation leaked when forensics was disabled!",
+            )
+
+            # Phase B (Explicit User Opt-In Forensics Verification)
+            print("\n[E2E 5/5] Opting into Forensics via POST /api/settings and verifying live OS DNS table...")
+            st_set, resp_set = http_json(args.port, "POST", "/api/settings", {"forensics_enabled": True})
+            require(st_set == 200, f"Failed to enable forensics via POST /api/settings ({st_set}): {resp_set}")
+
+            st_cfg, resp_cfg = http_json(
+                args.port,
+                "POST",
+                "/api/v1/artemis/config",
+                {"enabled": True, "local_collection_enabled": True},
+            )
+            require(st_cfg == 200, f"Failed to enable local collection via /api/v1/artemis/config ({st_cfg}): {resp_cfg}")
+
+            st_art_on, art_on = http_json(args.port, "GET", "/api/artemis/status")
+            require(st_art_on == 200, f"Expected HTTP 200 on GET /api/artemis/status after opt-in, got {st_art_on}: {art_on}")
+
+            st3, q3 = http_json(
+                args.port,
+                "POST",
+                "/api/query",
+                {"prompt": "WHAT PROCESS IS USING DNS TRAFFIC", "bypass_cache": True},
+            )
+            require(st3 == 200, f"HTTP {st3} on WHAT PROCESS IS USING DNS TRAFFIC (enabled): {q3}")
             ans3 = q3.get("synthesis_prompt", "")
-            print("=== [LIVE /api/query RESPONSE: WHAT PROCESS IS USING DNS TRAFFIC] ===")
+            print("=== [LIVE /api/query RESPONSE: WHAT PROCESS IS USING DNS TRAFFIC (OPT-IN)] ===")
             print(ans3)
             print("=== [END RESPONSE] ===")
             require(
@@ -305,15 +353,9 @@ def main() -> int:
                         proc.wait(timeout=5)
                     except Exception:
                         pass
-            if sys.platform == "win32":
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True,
-                    check=False,
-                )
             daemon_log_f.close()
 
-    print("\nALL LIVE HTTP /api/query E2E TEST QUERIES PASSED SUCCESSFULLY!")
+    print("\nALL LIVE HTTP /api/query E2E TEST QUERIES (DEFAULT-OFF + OPT-IN FORENSICS) PASSED SUCCESSFULLY!")
     return 0
 
 

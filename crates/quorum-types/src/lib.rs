@@ -404,6 +404,34 @@ impl CandidateChunkDto {
     }
 }
 
+/// A single turn in a multi-turn conversation (`role`: `"user"` or `"assistant"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatTurnMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Payload sent over the mesh wire to delegate grounded evidence synthesis to a peer with an active LLM.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshSynthesisRelayPayload {
+    pub prompt: String,
+    #[serde(default)]
+    pub history: Vec<ChatTurnMessage>,
+    pub evidence_chunks: Vec<CandidateChunkDto>,
+    #[serde(default)]
+    pub model_tag: Option<String>,
+}
+
+/// Response returned by a peer answering a synthesis delegation request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshSynthesisRelayResponse {
+    pub synthesized_text: String,
+    #[serde(default)]
+    pub citations: Vec<Citation>,
+    pub model_tag: String,
+    pub responder_peer_id: String,
+}
+
 /// Request dispatched across the rust-libp2p swarm for federated scatter-gather retrieval.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FederatedQueryRequest {
@@ -443,6 +471,10 @@ pub struct FederatedQueryRequest {
     /// List of peer IDs that have already processed or forwarded this request (loop prevention).
     #[serde(default)]
     pub visited_peers: Vec<String>,
+
+    /// Optional synthesis relay delegation payload for offloading evidence synthesis to a peer with a warm LLM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_relay: Option<MeshSynthesisRelayPayload>,
 }
 
 /// Helper module to serialize and deserialize 64-byte Ed25519 signatures.
@@ -613,6 +645,14 @@ pub struct FederatedQueryResponse {
 
     /// Ranked candidate chunks found by the peer under the requester's authorized access tier.
     pub chunks: Vec<CandidateChunkDto>,
+
+    /// Optional synthesized answer returned by a peer handling a synthesis relay delegation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_response: Option<MeshSynthesisRelayResponse>,
+
+    /// Indicates whether this peer currently has a warm local LLM available for synthesis.
+    #[serde(default)]
+    pub warm_llm_available: bool,
 }
 
 /// Volatile memory wrapper for remote chunks received from untrusted peers.
@@ -1175,6 +1215,7 @@ mod tests {
             origin_peer_id: None,
             relay_hops: 0,
             visited_peers: Vec::new(),
+            synthesis_relay: None,
         };
 
         // Fresh within 60s

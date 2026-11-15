@@ -204,6 +204,7 @@ async fn test_persistent_peer_id_spoofing_gate() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut req_valid, AccessTier::Tier0Public);
 
@@ -223,6 +224,7 @@ async fn test_persistent_peer_id_spoofing_gate() {
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&seed, &mut req_spoofed, AccessTier::Tier0Public);
 

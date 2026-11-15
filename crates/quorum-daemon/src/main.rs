@@ -7,6 +7,7 @@ pub mod browser;
 pub mod chat_history_db;
 pub mod cli;
 pub mod handlers;
+pub mod nimble_provisioner;
 pub mod p2p_watcher;
 pub mod server;
 pub mod shutdown;
@@ -339,6 +340,13 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             guard.mesh.max_peer_responses = cli.max_peer_responses;
         }
 
+        // Apply CLI forensics subsystem overrides
+        if cli.no_forensics || cli.forensics == Some(false) {
+            guard.artemis.enabled = false;
+        } else if cli.forensics == Some(true) {
+            guard.artemis.enabled = true;
+        }
+
         // Automatically populate discovered user document folders and watch paths into shared_folders
         let isolated_watch_only = std::env::var("QUORUM_ISOLATED_WATCH_DIR")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -571,11 +579,38 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         cli.service,
     );
 
-    // Start background periodic Artemis DFIR auto-collector (dormant unless local_collection_enabled && auto_collection_interval_mins > 0)
-    handlers::artemis::spawn_artemis_auto_collector(
-        Arc::clone(&app_state),
-        Arc::clone(&shutdown_notify),
-    );
+    // Start background periodic Artemis DFIR auto-collector (only when forensics is enabled)
+    let forensics_enabled = quorum_coordinator::global_mesh_dlp_controller()
+        .get_settings()
+        .artemis
+        .enabled;
+    if forensics_enabled {
+        handlers::artemis::spawn_artemis_auto_collector(
+            Arc::clone(&app_state),
+            Arc::clone(&shutdown_notify),
+        );
+    }
+
+    // Feature 15 & 16: Automated background Nimble-9B model provisioning (single-flight, non-blocking)
+    if !crate::nimble_provisioner::NimbleProvisioner::is_autoinstall_disabled() {
+        let nimble_prov = app_state.nimble_provisioner();
+        tokio::spawn(async move {
+            let status = nimble_prov.probe_status().await;
+            if status.state == "not_installed" {
+                info!("Nimble-9B model not installed; launching single-flight background provisioning...");
+                let _ = nimble_prov.trigger_provision();
+            } else if status.state == "offline" {
+                if nimble_prov.ensure_ollama_daemon_async().await {
+                    let re_status = nimble_prov.probe_status().await;
+                    if re_status.state == "not_installed" {
+                        let _ = nimble_prov.trigger_provision();
+                    }
+                }
+            }
+        });
+    } else {
+        info!("QUORUM_DISABLE_OLLAMA_AUTOINSTALL=1 set; skipping automated Nimble-9B background provisioning");
+    }
 
     // Spawn automatic LAN /24 subnet + ARP + persisted-peer dialer so nodes connect even if Wi-Fi AP blocks UDP 5353 multicast
     if let Some(ref handle) = app_state.swarm_handle {

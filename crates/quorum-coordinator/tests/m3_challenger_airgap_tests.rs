@@ -123,6 +123,7 @@ fn make_signed_request(
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(seed, &mut req, tier);
     req

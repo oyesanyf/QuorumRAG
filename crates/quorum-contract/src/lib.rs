@@ -20,9 +20,11 @@ use thiserror::Error;
 
 pub mod forensics;
 pub mod marketplace;
+pub mod nimble;
 pub mod rlm;
 pub use forensics::*;
 pub use marketplace::*;
+pub use nimble::*;
 pub use quorum_types::{DocumentFormat, IngestedParentDocument, RegexMatchSpan};
 pub use rlm::*;
 

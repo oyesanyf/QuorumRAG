@@ -1,4 +1,5 @@
 use axum::extract::State;
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use std::sync::Arc;
@@ -360,3 +361,37 @@ pub async fn models_handler(
         }
     }))
 }
+
+/// Returns Nimble-9B model provisioning status: `GET /api/models/nimble/status`.
+pub async fn nimble_status_handler(
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
+    let provisioner = state.nimble_provisioner();
+    let status = provisioner.probe_status().await;
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        ],
+        Json(status),
+    )
+}
+
+/// Triggers or retries background Nimble-9B provisioning: `POST /api/models/nimble/provision`.
+pub async fn nimble_provision_handler(
+    State(state): State<Arc<DaemonState>>,
+    _body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let provisioner = state.nimble_provisioner();
+    let status = provisioner.trigger_provision();
+    (
+        StatusCode::ACCEPTED,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        ],
+        Json(status),
+    )
+}
+

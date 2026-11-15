@@ -492,6 +492,7 @@ pub async fn run_in_daemon_canary_probe(state: &Arc<DaemonState>) -> Vec<PeerCan
         origin_peer_id: None,
         relay_hops: 0,
         visited_peers: Vec::new(),
+        synthesis_relay: None,
     };
     sign_request(&watcher.node_seed, &mut req, AccessTier::Tier0Public);
 

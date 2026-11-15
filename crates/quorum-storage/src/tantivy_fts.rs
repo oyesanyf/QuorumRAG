@@ -408,7 +408,17 @@ impl TantivyFtsIndex {
             if content_terms.is_empty() {
                 trimmed.to_string()
             } else {
-                content_terms.join(" ")
+                let formatted_terms: Vec<String> = content_terms
+                    .iter()
+                    .map(|t| {
+                        if t.len() >= 5 && t.chars().all(|c| c.is_ascii_alphanumeric()) {
+                            format!("({} OR {}~1)", t, t)
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                    .collect();
+                formatted_terms.join(" ")
             }
         } else {
             trimmed.to_string()
