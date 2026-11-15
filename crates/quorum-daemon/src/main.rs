@@ -591,21 +591,48 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    // Feature 15 & 16: Automated background Nimble-9B model provisioning (single-flight, non-blocking)
+    // Feature 15 & 16: Calculate live host resources FIRST (`HardwareTelemetry` + `AutoFusionRouter::calculate_provision_plan`),
+    // then provision ONLY the hardware-fitted model tier (single-flight, non-blocking).
     if !crate::nimble_provisioner::NimbleProvisioner::is_autoinstall_disabled() {
         let nimble_prov = app_state.nimble_provisioner();
         tokio::spawn(async move {
-            let status = nimble_prov.probe_status().await;
-            if status.state == "not_installed" {
-                info!("Nimble-9B model not installed; launching single-flight background provisioning...");
-                let _ = nimble_prov.trigger_provision();
-            } else if status.state == "offline" {
-                if nimble_prov.ensure_ollama_daemon_async().await {
-                    let re_status = nimble_prov.probe_status().await;
-                    if re_status.state == "not_installed" {
-                        let _ = nimble_prov.trigger_provision();
-                    }
+            let pre_plan = nimble_prov.calculate_provision_plan(&[]);
+            info!(
+                "Pre-provisioning resource calculation: {:.1} GB free RAM, {} MB free VRAM, {:.1} GB free disk -> requested='{}', effective='{}', downsized={}",
+                pre_plan.free_ram_gb,
+                pre_plan.free_vram_mb,
+                pre_plan.free_disk_gb,
+                pre_plan.requested_tag,
+                pre_plan.effective_tag,
+                pre_plan.downsized_for_resources
+            );
+            if !pre_plan.disk_sufficient {
+                warn!(
+                    "Skipping automatic model provisioning: insufficient disk space ({:.1} GB free)",
+                    pre_plan.free_disk_gb
+                );
+                return;
+            }
+
+            let mut status = nimble_prov.probe_status().await;
+            if status.state == "offline" && nimble_prov.ensure_ollama_daemon_async().await {
+                status = nimble_prov.probe_status().await;
+            }
+
+            if !pre_plan.downsized_for_resources && status.memory_sufficient {
+                if status.state == "not_installed" {
+                    info!(
+                        "Resources sufficient for Nimble-9B ({:.1} GB free RAM); launching single-flight background provisioning...",
+                        status.free_ram_gb
+                    );
+                    let _ = nimble_prov.trigger_provision();
                 }
+            } else if status.fallback_state != "ready" && status.fallback_state != "downloading" {
+                info!(
+                    "Nimble-9B gated by pre-provisioning resource calculation ({:.1} GB free RAM); auto-provisioning hardware-sized fallback '{}'...",
+                    status.free_ram_gb, status.fallback_model_tag
+                );
+                let _ = nimble_prov.spawn_fallback_pull(&status.fallback_model_tag);
             }
         });
     } else {

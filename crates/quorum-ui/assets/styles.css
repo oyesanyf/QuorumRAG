@@ -112,7 +112,8 @@ body {
   background-color: var(--bg-canvas);
   color: var(--text-primary);
   height: 100vh;
-  width: 100vw;
+  height: 100dvh;
+  width: 100%;
   overflow: hidden;
   transition: background-color 0.2s ease, color 0.2s ease;
 }
@@ -120,7 +121,9 @@ body {
 .layout-container {
   display: flex;
   height: 100vh;
-  width: 100vw;
+  height: 100dvh;
+  width: 100%;
+  min-inline-size: 0;
   overflow: hidden;
 }
 
@@ -485,6 +488,7 @@ body {
 /* MAIN CONTENT */
 .main-content {
   flex: 1;
+  min-inline-size: 0;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -496,17 +500,19 @@ body {
   height: 56px;
   border-bottom: 1px solid var(--border-color);
   display: flex;
-  align-items: center;
+  align-items: safe center;
   justify-content: space-between;
   padding: 0 16px;
   background-color: var(--bg-canvas);
   z-index: 10;
+  min-inline-size: 0;
 }
 
 .nav-left, .nav-right {
   display: flex;
-  align-items: center;
+  align-items: safe center;
   gap: 10px;
+  min-inline-size: 0;
 }
 
 .mobile-only {
@@ -668,14 +674,34 @@ body {
 /* MESSAGES CONTAINER */
 .messages-container {
   flex: 1;
+  min-inline-size: 0;
   overflow-y: auto;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
   padding: 20px 16px 120px 16px;
 }
 
 .reading-col-768px {
   max-width: 768px;
   width: 100%;
+  min-inline-size: 0;
   margin: 0 auto;
+}
+
+.nimble-pills-wrap {
+  display: inline-flex;
+  flex-wrap: wrap;
+  flex-wrap: balance;
+  gap: 6px;
+  align-items: safe center;
+}
+
+#nimble-guidance-card,
+#nimble-settings-card-slot {
+  box-sizing: border-box;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
 }
 
 #welcome-banner,

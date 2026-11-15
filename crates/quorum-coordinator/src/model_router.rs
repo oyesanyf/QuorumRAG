@@ -1,6 +1,23 @@
 use crate::hardware::HardwareTelemetry;
 use crate::types::SynthesisModelFamily;
 use quorum_types::ScoredChunk;
+use serde::{Deserialize, Serialize};
+
+/// Pre-provisioning resource calculation result computed from live host RAM, GPU VRAM, and disk headroom
+/// BEFORE any model download (`ollama pull` / `/api/pull`) is attempted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelProvisionPlan {
+    pub requested_tag: String,
+    pub effective_tag: String,
+    pub downsized_for_resources: bool,
+    pub already_installed: bool,
+    pub disk_sufficient: bool,
+    pub free_ram_gb: f64,
+    pub free_vram_mb: u64,
+    pub free_disk_gb: f64,
+    pub recommended_qwen_tier: String,
+    pub recommended_gemma_tier: String,
+}
 
 pub struct AutoFusionRouter;
 
@@ -428,12 +445,100 @@ impl AutoFusionRouter {
             Self::can_run_gemma4_26b(hw)
         } else if low.contains("14b") || low.contains("12b") || low.contains("13b") {
             hw.free_ram_gb >= 24.0 || hw.free_vram_mb >= 14_000
+        } else if low.contains("nimble") {
+            hw.free_ram_gb >= crate::nimble_client::MIN_FREE_RAM_GB
+                || hw.free_vram_mb >= crate::nimble_client::MIN_FREE_VRAM_MB
         } else if low.contains("9b") || low.contains("8b") || low.contains("7b") {
             hw.free_ram_gb >= 12.0 || hw.free_vram_mb >= 4_500
         } else if low.contains("4b") || low.contains("3b") {
             hw.free_ram_gb >= 6.0 || hw.free_vram_mb >= 2_000
         } else {
             true
+        }
+    }
+
+    /// Estimates minimum free disk headroom (GB) required before downloading a given model tier.
+    pub fn estimated_model_disk_gb(tag: &str) -> f64 {
+        let low = tag.trim().to_ascii_lowercase();
+        if low.contains("70b") {
+            42.0
+        } else if low.contains("32b") || low.contains("26b") || low.contains("27b") {
+            18.0
+        } else if low.contains("14b") || low.contains("13b") || low.contains("12b") {
+            9.5
+        } else if low.contains("nimble") || low.contains("9b") || low.contains("8b") || low.contains("7b") {
+            6.0
+        } else if low.contains("4b") || low.contains("3b") {
+            2.5
+        } else {
+            1.2
+        }
+    }
+
+    /// Calculates live host resources (`HardwareTelemetry::probe_fresh()` + `probe_free_disk_gb()`)
+    /// BEFORE attempting to provision any model, downsizing oversized requests automatically.
+    pub fn calculate_provision_plan(
+        requested_tag: &str,
+        installed_models: &[String],
+    ) -> ModelProvisionPlan {
+        let hw = HardwareTelemetry::probe_fresh();
+        let free_disk_gb = HardwareTelemetry::probe_free_disk_gb();
+        Self::calculate_provision_plan_with_hw(requested_tag, &hw, free_disk_gb, installed_models)
+    }
+
+    /// Pure deterministic resource-to-model provisioning calculator given sampled `HardwareTelemetry` and free disk GB.
+    pub fn calculate_provision_plan_with_hw(
+        requested_tag: &str,
+        hw: &HardwareTelemetry,
+        free_disk_gb: f64,
+        installed_models: &[String],
+    ) -> ModelProvisionPlan {
+        let clean_req = requested_tag.trim().to_string();
+        let recommended_qwen_tier = Self::size_qwen_by_hardware(hw);
+        let recommended_gemma_tier = Self::size_gemma_by_hardware(hw);
+
+        let req_fits_mem = !clean_req.is_empty() && Self::model_fits_free_memory(&clean_req, hw);
+        let req_fits_disk = !clean_req.is_empty() && free_disk_gb >= Self::estimated_model_disk_gb(&clean_req);
+
+        let (effective_tag, downsized_for_resources) = if !clean_req.is_empty() && req_fits_mem && req_fits_disk {
+            (clean_req.clone(), false)
+        } else if clean_req.to_ascii_lowercase().starts_with("gemma")
+            && free_disk_gb >= Self::estimated_model_disk_gb(&recommended_gemma_tier)
+        {
+            let same = clean_req.eq_ignore_ascii_case(&recommended_gemma_tier);
+            (recommended_gemma_tier.clone(), !same)
+        } else if free_disk_gb >= Self::estimated_model_disk_gb(&recommended_qwen_tier) {
+            let same = clean_req.eq_ignore_ascii_case(&recommended_qwen_tier);
+            (recommended_qwen_tier.clone(), !same)
+        } else {
+            ("qwen2.5:1.5b".to_string(), !clean_req.eq_ignore_ascii_case("qwen2.5:1.5b"))
+        };
+
+        let eff_low = effective_tag.to_ascii_lowercase();
+        let eff_latest = format!("{}:latest", eff_low);
+        let req_low = clean_req.to_ascii_lowercase();
+        let already_installed = installed_models.iter().any(|m| {
+            let ml = m.trim().to_ascii_lowercase();
+            ml == eff_low
+                || ml == eff_latest
+                || ml.starts_with(&format!("{}-", eff_low))
+                || (!downsized_for_resources
+                    && low_nimble_alias_match(&req_low, &ml))
+        });
+
+        let disk_sufficient = free_disk_gb >= Self::estimated_model_disk_gb(&effective_tag);
+
+        ModelProvisionPlan {
+            requested_tag: clean_req,
+            effective_tag,
+            downsized_for_resources,
+            already_installed,
+            disk_sufficient,
+            free_ram_gb: hw.free_ram_gb,
+            free_vram_mb: hw.free_vram_mb,
+            free_disk_gb,
+            recommended_qwen_tier,
+            recommended_gemma_tier,
         }
     }
 
@@ -463,5 +568,14 @@ impl AutoFusionRouter {
         } else {
             "gemma2:2b".to_string()
         }
+    }
+}
+
+fn low_nimble_alias_match(req_low: &str, installed_low: &str) -> bool {
+    if req_low.contains("nimble") {
+        installed_low.starts_with("bespoke-nimble:9b")
+            || installed_low.contains("bespoke-nimble-9b")
+    } else {
+        false
     }
 }
