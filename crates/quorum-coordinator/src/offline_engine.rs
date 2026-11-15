@@ -7295,14 +7295,16 @@ impl DeterministicOfflineSynthesisEngine {
         Self::probe_installed_ollama_models(&addr, host_port, false)
     }
 
-    /// Triggers an idempotent background `ollama pull <model>` when a memory-eligible model is requested before installation.
+    /// Triggers an idempotent background `ollama pull <model>` ONLY AFTER calculating live host resources
+    /// (`HardwareTelemetry::probe_fresh()` + `AutoFusionRouter::calculate_provision_plan_with_hw`)
+    /// so oversized models are automatically calibrated to the host's runtime free RAM/VRAM/disk tier.
     pub fn trigger_background_ollama_pull(model_tag: &str) -> bool {
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
 
         let clean = model_tag.trim();
         if clean.is_empty()
-            || clean.len() > 64
+            || clean.len() > 96
             || !clean
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '/'))
@@ -7310,10 +7312,25 @@ impl DeterministicOfflineSynthesisEngine {
             return false;
         }
 
+        // Mandatory pre-provisioning resource calculation
+        let hw = crate::hardware::HardwareTelemetry::probe_fresh();
+        let free_disk_gb = crate::hardware::HardwareTelemetry::probe_free_disk_gb();
+        let installed = Self::probe_installed_ollama_models_default();
+        let plan = crate::model_router::AutoFusionRouter::calculate_provision_plan_with_hw(
+            clean,
+            &hw,
+            free_disk_gb,
+            &installed,
+        );
+        if plan.already_installed || !plan.disk_sufficient {
+            return false;
+        }
+        let target_to_pull = plan.effective_tag;
+
         static PULLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
         let set = PULLED.get_or_init(|| Mutex::new(HashSet::new()));
         if let Ok(mut guard) = set.lock() {
-            if !guard.insert(clean.to_ascii_lowercase()) {
+            if !guard.insert(target_to_pull.to_ascii_lowercase()) {
                 return false;
             }
         }
@@ -7323,7 +7340,7 @@ impl DeterministicOfflineSynthesisEngine {
             .unwrap_or_else(|| std::path::PathBuf::from("ollama"));
 
         let mut cmd = std::process::Command::new(binary);
-        cmd.args(["pull", clean]);
+        cmd.args(["pull", &target_to_pull]);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());

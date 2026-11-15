@@ -6754,7 +6754,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-classifier"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "magika",
  "serde",
@@ -6766,7 +6766,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-cli"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "anyhow",
  "blake3",
@@ -6786,7 +6786,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-contract"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "bincode",
  "blake3",
@@ -6808,7 +6808,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-coordinator"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "async-trait",
  "axum",
@@ -6847,7 +6847,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-daemon"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6887,7 +6887,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-ingest"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "blake3",
  "cfb",
@@ -6919,7 +6919,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-network"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6942,7 +6942,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-storage"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -6966,7 +6966,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-types"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "blake3",
  "chrono",
@@ -6980,7 +6980,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-ui"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "axum",
  "mime_guess",

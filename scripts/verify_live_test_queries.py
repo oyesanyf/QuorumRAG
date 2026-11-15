@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.15.
+"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.16.
 
 Spawns a real `quorumrag` release daemon against an isolated corpus containing
 homonym clusters, noisy ChatGPT export markers, and forensic distractors, then
@@ -211,6 +211,33 @@ def main() -> int:
                     pass
                 time.sleep(0.5)
             require(ready, f"Daemon on 127.0.0.1:{args.port} did not become healthy within 30s")
+
+            # Nimble-9B Status & Non-Intrusive UI Asset Check (v0.6.16)
+            print("\n[E2E 2b/5] Verifying live GET /api/models/nimble/status & non-intrusive /assets/app.js...")
+            st_nim, nim_status = http_json(args.port, "GET", "/api/models/nimble/status", timeout=15.0)
+            require(st_nim == 200, f"HTTP {st_nim} on GET /api/models/nimble/status: {nim_status}")
+            require(
+                nim_status.get("fallback_model_tag")
+                in ("qwen2.5:1.5b", "qwen2.5:3b", "qwen2.5:7b", "qwen2.5:14b", "qwen2.5:32b"),
+                f"Expected memory-fitted fallback_model_tag on /api/models/nimble/status, got: {nim_status}",
+            )
+            require(
+                isinstance(nim_status.get("installed_models"), list),
+                f"Expected installed_models array on /api/models/nimble/status, got: {nim_status}",
+            )
+            ui_conn = http.client.HTTPConnection("127.0.0.1", args.port, timeout=15.0)
+            try:
+                ui_conn.request("GET", "/assets/app.js")
+                ui_resp = ui_conn.getresponse()
+                app_js_body = ui_resp.read().decode("utf-8", errors="replace")
+                require(ui_resp.status == 200, f"Expected HTTP 200 on /assets/app.js, got {ui_resp.status}")
+                require(
+                    "nimble-settings-card-slot" in app_js_body
+                    and "chatStream.parentElement.insertBefore(card" not in app_js_body,
+                    "Expected #nimble-guidance-card to be confined to Settings and never injected into chatStream",
+                )
+            finally:
+                ui_conn.close()
 
             # Query 1: WHO IS ANGELA DAVIS
             print("\n[E2E 3/5] Querying live HTTP /api/query: 'WHO IS ANGELA DAVIS'...")

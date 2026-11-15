@@ -57,7 +57,7 @@ pub use mesh::{
     global_peer_health_registry, OsoosiMeshInboundHandler, PeerHealthRegistry, PeerHealthStats, SwarmMeshDispatcher, P2P_WATCHER_CANARY_QUERY,
 };
 pub use answer_orchestrator::query_framing;
-pub use model_router::AutoFusionRouter;
+pub use model_router::{AutoFusionRouter, ModelProvisionPlan};
 pub use nimble_client::*;
 pub use offline_engine::DeterministicOfflineSynthesisEngine;
 pub use relevance_attestor::{DocumentRelevanceAttestor, NimbleRelevanceAttestation};

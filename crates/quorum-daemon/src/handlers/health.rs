@@ -100,11 +100,12 @@ pub struct PullModelRequest {
     pub model: String,
 }
 
-/// Triggers background `ollama pull <model>` and returns installed model pills (`POST /api/models/pull`).
+/// Triggers background `ollama pull <model>` ONLY AFTER calculating live host resources
+/// (`HardwareTelemetry::probe_fresh()` + `AutoFusionRouter::calculate_provision_plan_with_hw`) (`POST /api/models/pull`).
 pub async fn pull_model_handler(Json(payload): Json<PullModelRequest>) -> impl IntoResponse {
     let model = quorum_coordinator::DeterministicOfflineSynthesisEngine::normalize_requested_model_tag(&payload.model);
     if model.is_empty()
-        || model.len() > 64
+        || model.len() > 96
         || !model
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '/'))
@@ -115,22 +116,65 @@ pub async fn pull_model_handler(Json(payload): Json<PullModelRequest>) -> impl I
         )
             .into_response();
     }
-    let started = tokio::task::spawn_blocking({
-        let m = model.clone();
-        move || quorum_coordinator::DeterministicOfflineSynthesisEngine::trigger_background_ollama_pull(&m)
+
+    let (plan, started, installed) = tokio::task::spawn_blocking({
+        let req_model = model.clone();
+        move || {
+            let hw = HardwareTelemetry::probe_fresh();
+            let free_disk_gb = HardwareTelemetry::probe_free_disk_gb();
+            let installed =
+                quorum_coordinator::DeterministicOfflineSynthesisEngine::probe_installed_ollama_models_default();
+            let plan = quorum_coordinator::AutoFusionRouter::calculate_provision_plan_with_hw(
+                &req_model,
+                &hw,
+                free_disk_gb,
+                &installed,
+            );
+            let started = if !plan.already_installed
+                && plan.disk_sufficient
+                && !crate::nimble_provisioner::NimbleProvisioner::is_autoinstall_disabled()
+            {
+                quorum_coordinator::DeterministicOfflineSynthesisEngine::trigger_background_ollama_pull(
+                    &plan.effective_tag,
+                )
+            } else {
+                false
+            };
+            (plan, started, installed)
+        }
     })
     .await
-    .unwrap_or(false);
-    let installed = tokio::task::spawn_blocking(
-        quorum_coordinator::DeterministicOfflineSynthesisEngine::probe_installed_ollama_models_default,
-    )
-    .await
-    .unwrap_or_default();
+    .unwrap_or_else(|_| {
+        let hw = HardwareTelemetry::probe();
+        let plan = quorum_coordinator::AutoFusionRouter::calculate_provision_plan_with_hw(
+            &model,
+            &hw,
+            100.0,
+            &[],
+        );
+        (plan, false, Vec::new())
+    });
+
+    let status_str = if plan.already_installed {
+        "already_installed"
+    } else if !plan.disk_sufficient {
+        "skipped_low_disk"
+    } else if started {
+        "pulling"
+    } else {
+        "already_queued_or_installed"
+    };
 
     Json(serde_json::json!({
-        "status": if started { "pulling" } else { "already_queued_or_installed" },
-        "model": model,
-        "terminal_command": format!("ollama pull {}", model),
+        "status": status_str,
+        "requested_model": plan.requested_tag,
+        "model": plan.effective_tag,
+        "downsized_for_resources": plan.downsized_for_resources,
+        "already_installed": plan.already_installed,
+        "free_ram_gb": plan.free_ram_gb,
+        "free_vram_mb": plan.free_vram_mb,
+        "free_disk_gb": plan.free_disk_gb,
+        "terminal_command": format!("ollama pull {}", plan.effective_tag),
         "installed_models": installed
     }))
     .into_response()

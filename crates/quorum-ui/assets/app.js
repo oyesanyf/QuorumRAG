@@ -177,48 +177,63 @@ function secureRandomIndex(n) {
       window._modelsData = info;
       const installed = Array.isArray(info.installed_models) ? info.installed_models : [];
 
-      // 1. Mandatory Ollama Host Installation Check
+      // 1. Mandatory Ollama Host Installation Check (Settings-scoped — never injected into main chatStream)
       if (info.ollama_installed === false || (!info.ollama_online && installed.length === 0)) {
         const card = document.createElement('div');
         card.id = 'missing-ollama-install-card';
-        card.style.cssText = 'margin:10px 16px; padding:14px 18px; border-radius:10px; border:1px solid rgba(239,68,68,0.5); background:rgba(239,68,68,0.12); font-size:13px; line-height:1.55;';
+        card.style.cssText = 'margin:0 0 10px 0; padding:14px 18px; border-radius:10px; border:1px solid rgba(239,68,68,0.5); background:rgba(239,68,68,0.12); font-size:13px; line-height:1.55; box-sizing:border-box; max-inline-size:100%; min-inline-size:0; overflow-wrap:anywhere;';
         card.innerHTML = `
           <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
-            <div>
+            <div style="min-inline-size:0; flex:1;">
               <strong style="color:#ef4444; font-size:13.5px;">⚠️ Ollama is Not Installed on this Computer</strong>
               <div style="margin-top:3px; opacity:0.9;">QuorumRAG consensus deliberation and local neural synthesis require Ollama. Install it now with 1 click.</div>
             </div>
-            <button type="button" id="btn-install-ollama-auto" class="pill-btn" style="background:#ef4444; color:#fff; border-color:#ef4444; font-weight:600; padding:7px 16px;">
-              ⚡ Install Ollama Automatically
-            </button>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <button type="button" id="btn-install-ollama-auto" class="pill-btn" style="background:#ef4444; color:#fff; border-color:#ef4444; font-weight:600; padding:7px 16px;">
+                ⚡ Install Ollama Automatically
+              </button>
+              <button type="button" class="btn-icon btn-dismiss-guidance-card" aria-label="Dismiss Ollama notice" title="Dismiss">&times;</button>
+            </div>
           </div>
           <div id="ollama-install-progress-status" style="margin-top:8px; font-size:12px; font-family:monospace; display:none;"></div>
         `;
-        if (chatStream && chatStream.parentElement) {
-          chatStream.parentElement.insertBefore(card, chatStream);
+        const settingsMount = document.getElementById('nimble-settings-card-slot') || document.getElementById('nimble-settings-staging');
+        if (settingsMount) {
+          settingsMount.appendChild(card);
         }
         const btn = card.querySelector('#btn-install-ollama-auto');
         if (btn) {
           btn.addEventListener('click', () => window._installOllamaAuto(btn));
         }
+        card.querySelectorAll('.btn-dismiss-guidance-card').forEach(b => b.addEventListener('click', () => card.remove()));
         return;
       }
+      const hwRec = info.hardware_recommendation || {};
+      const freeRamNum = Number(hwRec.free_ram_gb || 0);
+      const freeVramNum = Number(hwRec.free_vram_mb || 0);
       const expectedTagMap = {
         Gemma4_26b: 'gemma4:26b',
         Glm4Agentic: 'glm4:9b',
-        Qwen25Code: (info.hardware_recommendation && info.hardware_recommendation.recommended_qwen_tier) || 'qwen2.5:7b',
-        GemmaProse: (info.hardware_recommendation && info.hardware_recommendation.recommended_gemma_tier) || 'gemma2:9b'
+        Qwen25Code: hwRec.recommended_qwen_tier || selectMemoryFittedFallbackTag(freeRamNum, freeVramNum),
+        GemmaProse: hwRec.recommended_gemma_tier || 'gemma2:2b'
       };
-      const targetTag = expectedTagMap[modelFamily];
-      if (!targetTag) return;
+      const rawTargetTag = expectedTagMap[modelFamily];
+      if (!rawTargetTag) return;
+
+      // Mandatory pre-provisioning resource check: calculate whether the requested model fits runtime free RAM/VRAM FIRST
+      const fitsRequested = (modelFamily === 'Gemma4_26b')
+        ? (info.gemma4_26b_memory_eligible !== false && modelFitsHardware(rawTargetTag, freeRamNum, freeVramNum))
+        : modelFitsHardware(rawTargetTag, freeRamNum, freeVramNum);
+      const targetTag = fitsRequested
+        ? rawTargetTag
+        : ((modelFamily === 'Gemma4_26b' || modelFamily === 'GemmaProse')
+            ? (hwRec.recommended_gemma_tier || 'gemma2:2b')
+            : (hwRec.recommended_qwen_tier || selectMemoryFittedFallbackTag(freeRamNum, freeVramNum)));
+
       const hasTag = installed.some(m => String(m).toLowerCase() === targetTag.toLowerCase() || String(m).toLowerCase() === (targetTag + ':latest').toLowerCase());
-      if (modelFamily === 'Gemma4_26b' && info.gemma4_26b_memory_eligible === false) {
-        const card = document.createElement('div');
-        card.id = 'missing-model-guidance-card';
-        card.style.cssText = 'margin:8px 16px;padding:10px 14px;border-radius:10px;border:1px solid rgba(245,158,11,0.45);background:rgba(245,158,11,0.1);font-size:12.5px;line-height:1.5;';
-        const freeRam = info.hardware_recommendation ? Number(info.hardware_recommendation.free_ram_gb || 0).toFixed(1) : '?';
-        card.innerHTML = `<strong>Memory Gate Active:</strong> <code>gemma4:26b</code> requires &ge;18 GB free RAM or &ge;16 GB free VRAM (currently ${escapeHtml(freeRam)} GB free RAM). Safely routing to a memory-fitted installed model to prevent OOM.`;
-        if (chatStream && chatStream.parentElement) chatStream.parentElement.insertBefore(card, chatStream);
+      if (!fitsRequested && hasTag) {
+        // Hardware-sized fallback is already installed; calibrate silently without injecting banners into main chat
+        currentModel = targetTag;
         return;
       }
       if (!hasTag) {
@@ -229,20 +244,30 @@ function secureRandomIndex(n) {
         }).catch(() => {});
         const card = document.createElement('div');
         card.id = 'missing-model-guidance-card';
-        card.style.cssText = 'margin:8px 16px;padding:12px 14px;border-radius:10px;border:1px solid rgba(99,102,241,0.45);background:rgba(99,102,241,0.10);font-size:12.5px;line-height:1.55;';
+        card.style.cssText = 'margin:0 0 10px 0;padding:12px 14px;border-radius:10px;border:1px solid rgba(99,102,241,0.45);background:rgba(99,102,241,0.10);font-size:12.5px;line-height:1.55;box-sizing:border-box;max-inline-size:100%;min-inline-size:0;overflow-wrap:anywhere;';
         const pillsHtml = installed
           .filter(m => !/embed|moondream|llava/i.test(m))
           .slice(0, 6)
-          .map(m => `<button type="button" class="missing-model-pill" data-tag="${escapeHtml(m)}" style="margin:3px 4px 0 0;padding:3px 9px;border-radius:999px;border:1px solid rgba(255,255,255,0.22);background:rgba(255,255,255,0.08);color:inherit;cursor:pointer;font-size:11.5px;">${escapeHtml(m)}</button>`)
-          .join('');
+          .map(m => `<button type="button" class="missing-model-pill" data-tag="${escapeHtml(m)}" style="padding:3px 9px;border-radius:999px;border:1px solid rgba(255,255,255,0.22);background:rgba(255,255,255,0.08);color:inherit;cursor:pointer;font-size:11.5px;">${escapeHtml(m)}</button>`)
+          .join(' ');
+        const resourceNote = fitsRequested
+          ? ''
+          : ` (sized from <code>${escapeHtml(rawTargetTag)}</code> for ${escapeHtml(freeRamNum.toFixed(1))} GB free RAM)`;
         card.innerHTML = `
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
-            <span><strong>Installing <code>${escapeHtml(targetTag)}</code> in background...</strong> Terminal command: <code>ollama pull ${escapeHtml(targetTag)}</code></span>
-            <button type="button" id="btn-retry-model-check" style="padding:3px 10px;border-radius:6px;border:1px solid rgba(99,102,241,0.6);background:rgba(99,102,241,0.22);color:inherit;cursor:pointer;font-size:11.5px;">Retry Check</button>
+            <span style="min-inline-size:0;"><strong>Installing <code>${escapeHtml(targetTag)}</code>${resourceNote} in background...</strong> Terminal command: <code>ollama pull ${escapeHtml(targetTag)}</code></span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <button type="button" id="btn-retry-model-check" style="padding:3px 10px;border-radius:6px;border:1px solid rgba(99,102,241,0.6);background:rgba(99,102,241,0.22);color:inherit;cursor:pointer;font-size:11.5px;">Retry Check</button>
+              <button type="button" class="btn-icon btn-dismiss-guidance-card" aria-label="Dismiss notice">&times;</button>
+            </div>
           </div>
-          <div style="margin-top:6px;opacity:0.9;">Already installed models (click to switch immediately): ${pillsHtml}</div>
+          <div style="margin-top:6px;opacity:0.9;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">Already installed models (click to switch immediately): ${pillsHtml}</div>
         `;
-        if (chatStream && chatStream.parentElement) chatStream.parentElement.insertBefore(card, chatStream);
+        const settingsMount = document.getElementById('nimble-settings-card-slot') || document.getElementById('nimble-settings-staging');
+        if (settingsMount) {
+          settingsMount.appendChild(card);
+        }
+        card.querySelectorAll('.btn-dismiss-guidance-card').forEach(b => b.addEventListener('click', () => card.remove()));
         card.querySelectorAll('.missing-model-pill').forEach(btn => {
           btn.addEventListener('click', () => {
             currentModel = btn.dataset.tag;
@@ -271,10 +296,33 @@ function secureRandomIndex(n) {
   });
 
   // --------------------------------------------------------------------------
-  // BESPOKE-NIMBLE-9B PROVISIONING & GUIDANCE CARD (Feature 18)
+  // BESPOKE-NIMBLE-9B & AUTO-FALLBACK PROVISIONING (Feature 18 — Settings-Scoped, Zero Main-UI Intrusion)
   // --------------------------------------------------------------------------
   const CANONICAL_NIMBLE_GGUF = 'hf.co/ggml-org/Bespoke-Nimble-9B-v3-GGUF:Q4_K_M';
   const CANONICAL_NIMBLE_TERMINAL_CMD = 'ollama pull hf.co/ggml-org/Bespoke-Nimble-9B-v3-GGUF:Q4_K_M';
+
+  function modelFitsHardware(tag, freeRamGb, freeVramMb) {
+    const low = String(tag || '').trim().toLowerCase();
+    const ram = Number(freeRamGb || 0);
+    const vram = Number(freeVramMb || 0);
+    if (low.includes('32b') || low.includes('70b')) return ram >= 48.0 || vram >= 24000;
+    if (low.includes('26b') || low.includes('27b') || low.startsWith('glm-4.7')) return ram >= 18.0 || vram >= 16384;
+    if (low.includes('14b') || low.includes('12b') || low.includes('13b')) return ram >= 24.0 || vram >= 14000;
+    if (low.includes('nimble')) return ram >= 12.0 || vram >= 6000;
+    if (low.includes('9b') || low.includes('8b') || low.includes('7b')) return ram >= 12.0 || vram >= 4500;
+    if (low.includes('4b') || low.includes('3b')) return ram >= 6.0 || vram >= 2000;
+    return true;
+  }
+
+  function selectMemoryFittedFallbackTag(freeRamGb, freeVramMb) {
+    const ram = Number(freeRamGb || 0);
+    const vram = Number(freeVramMb || 0);
+    if (ram >= 48.0 || vram >= 24000) return 'qwen2.5:32b';
+    if (ram >= 24.0 || vram >= 14000) return 'qwen2.5:14b';
+    if (ram >= 12.0 || vram >= 4500) return 'qwen2.5:7b';
+    if (ram >= 6.0 || vram >= 2000) return 'qwen2.5:3b';
+    return 'qwen2.5:1.5b';
+  }
 
   function renderNimbleModelPills(installedModels, onSelect) {
     if (!Array.isArray(installedModels) || installedModels.length === 0) {
@@ -284,12 +332,17 @@ function secureRandomIndex(n) {
     if (filtered.length === 0) {
       return '<span class="nimble-no-models" style="opacity:0.7;font-style:italic;">No other models installed</span>';
     }
-    return filtered
-      .map(m => `<button type="button" class="nimble-model-pill missing-model-pill" data-tag="${escapeHtml(m)}" style="margin:3px 4px 0 0;padding:3px 9px;border-radius:999px;border:1px solid rgba(255,255,255,0.22);background:rgba(255,255,255,0.08);color:inherit;cursor:pointer;font-size:11.5px;">${escapeHtml(m)}</button>`)
-      .join('');
+    return '<span class="nimble-pills-wrap" style="display:inline-flex;flex-wrap:wrap;gap:6px;align-items:center;">' +
+      filtered
+        .map(m => `<button type="button" class="nimble-model-pill missing-model-pill" data-tag="${escapeHtml(m)}" style="padding:3px 9px;border-radius:999px;border:1px solid rgba(255,255,255,0.22);background:rgba(255,255,255,0.08);color:inherit;cursor:pointer;font-size:11.5px;">${escapeHtml(m)}</button>`)
+        .join(' ') +
+      '</span>';
   }
 
   function renderNimbleGuidanceCard(statusData) {
+    if (statusData) {
+      window._latestNimbleStatus = statusData;
+    }
     const existing = document.getElementById('nimble-guidance-card');
     if (statusData && statusData.state === 'ready') {
       if (existing) existing.remove();
@@ -297,12 +350,51 @@ function secureRandomIndex(n) {
     }
     const card = existing || document.createElement('div');
     card.id = 'nimble-guidance-card';
-    card.style.cssText = 'margin:8px 16px;padding:12px 14px;border-radius:10px;border:1px solid rgba(99,102,241,0.45);background:rgba(99,102,241,0.10);font-size:12.5px;line-height:1.55;';
+    card.style.cssText = 'padding:12px 14px;border-radius:10px;border:1px solid rgba(99,102,241,0.38);background:rgba(99,102,241,0.08);font-size:12.5px;line-height:1.55;box-sizing:border-box;max-inline-size:100%;min-inline-size:0;overflow-wrap:anywhere;';
 
     const terminalCmd = (statusData && statusData.terminal_command) ? statusData.terminal_command : CANONICAL_NIMBLE_TERMINAL_CMD;
     const progressPct = (statusData && typeof statusData.progress_pct === 'number') ? Math.max(0, Math.min(100, statusData.progress_pct)) : 0;
     const state = (statusData && statusData.state) ? statusData.state : 'not_installed';
-    const installed = (window._discoveredOllamaTags || []);
+    const rawInstalled = []
+      .concat(statusData && Array.isArray(statusData.installed_models) ? statusData.installed_models : [])
+      .concat(window._modelsData && Array.isArray(window._modelsData.installed_models) ? window._modelsData.installed_models : [])
+      .concat(Array.isArray(window._discoveredOllamaTags) ? window._discoveredOllamaTags : []);
+    const installed = Array.from(new Set(rawInstalled.filter(Boolean)));
+
+    const hwRec = (window._modelsData && window._modelsData.hardware_recommendation) ? window._modelsData.hardware_recommendation : null;
+    const resourcesCalculated = (statusData && typeof statusData.free_ram_gb === 'number') || (hwRec && typeof hwRec.free_ram_gb === 'number');
+    const calcRamGb = (statusData && typeof statusData.free_ram_gb === 'number')
+      ? statusData.free_ram_gb
+      : (hwRec ? Number(hwRec.free_ram_gb || 0) : 0);
+    const calcVramMb = (statusData && typeof statusData.free_vram_mb === 'number')
+      ? statusData.free_vram_mb
+      : (hwRec ? Number(hwRec.free_vram_mb || 0) : 0);
+
+    const fallbackTag = (statusData && statusData.fallback_model_tag)
+      ? statusData.fallback_model_tag
+      : ((hwRec && hwRec.recommended_qwen_tier) ? hwRec.recommended_qwen_tier : selectMemoryFittedFallbackTag(calcRamGb, calcVramMb));
+    const fallbackAlreadyInstalled = installed.some(m => {
+      const lower = String(m).toLowerCase();
+      const target = String(fallbackTag).toLowerCase();
+      return lower === target || lower === target + ':latest' || lower.startsWith(target + '-');
+    });
+    const fallbackState = fallbackAlreadyInstalled
+      ? 'ready'
+      : ((statusData && statusData.fallback_state) ? statusData.fallback_state : 'not_installed');
+    const fallbackPct = (statusData && typeof statusData.fallback_progress_pct === 'number')
+      ? Math.max(0, Math.min(100, statusData.fallback_progress_pct))
+      : 0;
+
+    // Auto-install resource-fitted fallback model ONLY AFTER host RAM/VRAM resources have been calculated
+    if (resourcesCalculated && state === 'skipped_low_memory' && fallbackState !== 'ready' && fallbackState !== 'downloading' && !window._autoFallbackProvisionSent) {
+      window._autoFallbackProvisionSent = true;
+      fetch('/api/models/pull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: fallbackTag })
+      }).catch(() => {});
+      triggerNimbleProvisionRetry();
+    }
 
     let statusLine = '';
     if (state === 'downloading') {
@@ -319,9 +411,17 @@ function secureRandomIndex(n) {
     } else if (state === 'skipped_low_memory') {
       const freeRam = (statusData && typeof statusData.free_ram_gb === 'number') ? statusData.free_ram_gb.toFixed(1) : '?';
       const freeVram = (statusData && typeof statusData.free_vram_mb === 'number') ? statusData.free_vram_mb.toFixed(0) : '?';
+      const fallbackBanner = fallbackState === 'ready'
+        ? `<div style="margin-top:4px;color:#10a37f;font-weight:600;">&#10003; Memory-fitted fallback model active: <code>${escapeHtml(fallbackTag)}</code> (auto-installed &amp; ready).</div>`
+        : (fallbackState === 'downloading'
+            ? `<div style="margin-top:6px;"><strong>Auto-installing fallback model <code>${escapeHtml(fallbackTag)}</code>:</strong> ${fallbackPct.toFixed(1)}%<div style="background:rgba(255,255,255,0.15);border-radius:6px;height:6px;margin-top:4px;overflow:hidden;"><div style="background:#10a37f;height:100%;width:${fallbackPct}%;transition:width 0.3s ease;"></div></div></div>`
+            : `<div style="margin-top:4px;opacity:0.9;">Auto-provisioning memory-fitted fallback model <code>${escapeHtml(fallbackTag)}</code>...</div>`);
       statusLine = `
-        <div style="margin-bottom:6px;color:#f59e0b;">
-          <strong>Memory Gate Active:</strong> Bespoke-Nimble-9B requires &ge;12 GB free RAM or &ge;6000 MB free VRAM (currently ${escapeHtml(freeRam)} GB RAM, ${escapeHtml(freeVram)} MB VRAM). Operating in deterministic heuristic fallback mode.
+        <div style="margin-bottom:6px;">
+          <div style="color:#f59e0b;">
+            <strong>Memory Gate Active:</strong> Bespoke-Nimble-9B requires &ge;12 GB free RAM or &ge;6000 MB free VRAM (currently ${escapeHtml(freeRam)} GB RAM, ${escapeHtml(freeVram)} MB VRAM). Operating in deterministic heuristic fallback mode.
+          </div>
+          ${fallbackBanner}
         </div>`;
     } else if (state === 'offline') {
       statusLine = `
@@ -331,7 +431,7 @@ function secureRandomIndex(n) {
     } else {
       statusLine = `
         <div style="margin-bottom:6px;">
-          <strong>Bespoke-Nimble-9B Not Installed:</strong> Autonomous decision scoring and RLM context expansion require Nimble-9B.
+          <strong>Bespoke-Nimble-9B Not Installed:</strong> Autonomous decision scoring and RLM context expansion use Nimble-9B when available.
         </div>`;
     }
 
@@ -339,20 +439,30 @@ function secureRandomIndex(n) {
 
     card.innerHTML = `
       ${statusLine}
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
-        <span>Terminal command: <code>${escapeHtml(terminalCmd)}</code></span>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px;">
+        <div style="opacity:0.92;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">Installed fallback models (click to switch): ${pillsHtml}</div>
         <button type="button" id="btn-retry-nimble-provision" style="padding:4px 12px;border-radius:6px;border:1px solid rgba(99,102,241,0.6);background:rgba(99,102,241,0.22);color:inherit;cursor:pointer;font-size:11.5px;font-weight:600;">⚡ Retry Provisioning</button>
       </div>
-      <div style="margin-top:6px;opacity:0.9;">Installed fallback models (click to switch): ${pillsHtml}</div>
+      <details style="margin-top:6px;font-size:11.5px;opacity:0.85;">
+        <summary style="cursor:pointer;user-select:none;">Manual CLI override command</summary>
+        <div style="margin-top:4px;">Terminal command: <code>${escapeHtml(terminalCmd)}</code></div>
+      </details>
     `;
 
-    if (!existing && chatStream && chatStream.parentElement) {
-      chatStream.parentElement.insertBefore(card, chatStream);
+    // Mount strictly inside Settings (AI Models & Endpoints slot or hidden Settings staging) — NEVER inside main chat viewport!
+    const targetMount = document.getElementById('nimble-settings-card-slot') || document.getElementById('nimble-settings-staging');
+    if (targetMount && card.parentElement !== targetMount) {
+      targetMount.appendChild(card);
     }
 
     card.querySelectorAll('.nimble-model-pill').forEach(btn => {
       btn.addEventListener('click', () => {
         currentModel = btn.dataset.tag;
+        if (typeof window._setModelFromSettings === 'function') {
+          window._setModelFromSettings(currentModel);
+        } else if (typeof saveUiSettingsPatch === 'function') {
+          saveUiSettingsPatch({ default_model_family: currentModel }).catch(() => {});
+        }
       });
     });
 
@@ -365,13 +475,24 @@ function secureRandomIndex(n) {
   }
 
   let _nimblePollTimer = null;
+  let _wasFallbackDownloading = false;
   async function pollNimbleStatus() {
     try {
       const res = await fetchWithTimeout('/api/models/nimble/status', {}, 400);
       if (!res || !res.ok) return;
       const statusData = await res.json();
+      if (Array.isArray(statusData.installed_models) && statusData.installed_models.length > 0) {
+        window._discoveredOllamaTags = statusData.installed_models;
+      }
       renderNimbleGuidanceCard(statusData);
-      if (statusData.state === 'downloading') {
+      const fbDownloading = statusData.fallback_state === 'downloading';
+      if (_wasFallbackDownloading && statusData.fallback_state === 'ready') {
+        _wasFallbackDownloading = false;
+        refreshDynamicModels();
+      } else if (fbDownloading) {
+        _wasFallbackDownloading = true;
+      }
+      if (statusData.state === 'downloading' || fbDownloading) {
         if (_nimblePollTimer) clearTimeout(_nimblePollTimer);
         _nimblePollTimer = setTimeout(pollNimbleStatus, 1000);
       }
@@ -438,6 +559,9 @@ function secureRandomIndex(n) {
       // 2. Update telemetry display if auto
       if (currentModel === 'AutoFusion' && info.calibrated_target && telemetryModelInfo) {
         telemetryModelInfo.textContent = 'Auto (' + info.calibrated_target + ')';
+      }
+      if (window._latestNimbleStatus) {
+        renderNimbleGuidanceCard(window._latestNimbleStatus);
       }
     } catch (_) {}
   }
@@ -7147,10 +7271,18 @@ function secureRandomIndex(n) {
             ? window._discoveredOllamaTags.filter(m => !/embed|bge-|minilm/i.test(m))
             : [workhorse]);
 
+      const prevSlot = document.getElementById('nimble-settings-card-slot');
+      const staging = document.getElementById('nimble-settings-staging');
+      if (prevSlot && staging) {
+        while (prevSlot.firstChild) staging.appendChild(prevSlot.firstChild);
+      }
+
       settingsContent.innerHTML = `
         <div class="settings-centered-container">
         <h2 class="settings-page-title">AI Models &amp; Endpoints</h2>
         <p class="settings-page-subtitle">Configure local Ollama instance, QuorumRAG Master IPC bridge, Chrome DevTools Protocol, multi-model fusion panels, and 256k recursive agentic loop chaining.</p>
+
+        <div id="nimble-settings-card-slot" style="margin-bottom:14px;"></div>
 
         <div class="settings-card">
           <!-- Model Catalog Banner -->
@@ -7490,6 +7622,14 @@ function secureRandomIndex(n) {
         </div>
         </div>
       `;
+      const newSlot = document.getElementById('nimble-settings-card-slot');
+      if (newSlot && staging) {
+        while (staging.firstChild) newSlot.appendChild(staging.firstChild);
+      }
+      if (window._latestNimbleStatus) {
+        renderNimbleGuidanceCard(window._latestNimbleStatus);
+      }
+      pollNimbleStatus();
     } else if (tab === 'appearance') {
       const mode = ui.appearance_mode || (ui.theme === 'theme-white' ? 'light' : (ui.theme === 'theme-obsidian' ? 'dark' : 'system'));
       const accent = ui.accent_color || 'Blue';

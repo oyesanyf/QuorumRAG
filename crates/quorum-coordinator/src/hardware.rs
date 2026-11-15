@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sysinfo::System;
+use sysinfo::{Disks, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareTelemetry {
@@ -45,6 +45,20 @@ impl HardwareTelemetry {
             }
         }
 
+        let fresh = Self::sample_uncached();
+        if let Ok(mut guard) = cache_mutex.lock() {
+            *guard = Some((Instant::now(), fresh.clone()));
+        }
+
+        fresh
+    }
+
+    /// Forces an uncached live refresh of host available RAM and GPU VRAM right before model provisioning.
+    pub fn probe_fresh() -> Self {
+        Self::sample_uncached()
+    }
+
+    fn sample_uncached() -> Self {
         let mut sys = System::new();
         sys.refresh_memory();
 
@@ -57,7 +71,7 @@ impl HardwareTelemetry {
 
         let (gpu_name, free_vram_mb, total_vram_mb, gpu_count) = Self::probe_gpu();
 
-        let fresh = Self {
+        Self {
             total_ram_gb,
             free_ram_gb,
             cpu_cores,
@@ -65,13 +79,48 @@ impl HardwareTelemetry {
             free_vram_mb,
             total_vram_mb,
             gpu_count,
-        };
+        }
+    }
 
-        if let Ok(mut guard) = cache_mutex.lock() {
-            *guard = Some((Instant::now(), fresh.clone()));
+    /// Measures available disk space (in GB) on the filesystem hosting Ollama models (`OLLAMA_MODELS`,
+    /// `USERPROFILE`, or `HOME`), falling back safely to 100.0 GB if mount telemetry is unavailable.
+    pub fn probe_free_disk_gb() -> f64 {
+        let target_dir = std::env::var_os("OLLAMA_MODELS")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+
+        let disks = Disks::new_with_refreshed_list();
+        if disks.list().is_empty() {
+            return 100.0;
         }
 
-        fresh
+        if let Some(ref target) = target_dir {
+            let mut best_match_len = 0usize;
+            let mut best_avail_bytes: Option<u64> = None;
+            for d in disks.list() {
+                let mp = d.mount_point();
+                if target.starts_with(mp) {
+                    let mlen = mp.as_os_str().len();
+                    if mlen >= best_match_len {
+                        best_match_len = mlen;
+                        best_avail_bytes = Some(d.available_space());
+                    }
+                }
+            }
+            if let Some(avail) = best_avail_bytes {
+                return (avail as f64 / 1_073_741_824.0).max(0.0);
+            }
+        }
+
+        let max_avail = disks
+            .list()
+            .iter()
+            .map(|d| d.available_space())
+            .max()
+            .unwrap_or(107_374_182_400);
+        (max_avail as f64 / 1_073_741_824.0).max(0.0)
     }
 
     /// Parses multi-line `nvidia-smi` CSV output line-by-line.

@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use quorum_coordinator::HardwareTelemetry;
+use quorum_coordinator::{AutoFusionRouter, HardwareTelemetry, ModelProvisionPlan};
 use quorum_coordinator::nimble_client::{
     CANONICAL_NIMBLE_GGUF, DEFAULT_NIMBLE_ENDPOINT, DEFAULT_NIMBLE_MODEL,
     MIN_FREE_RAM_GB, MIN_FREE_VRAM_MB, PROBE_TIMEOUT,
@@ -28,6 +28,14 @@ pub struct NimbleStatusResponse {
     pub free_ram_gb: f64,
     pub free_vram_mb: f64,
     pub memory_sufficient: bool,
+    #[serde(default)]
+    pub fallback_model_tag: String,
+    #[serde(default)]
+    pub fallback_state: String,
+    #[serde(default)]
+    pub fallback_progress_pct: f64,
+    #[serde(default)]
+    pub installed_models: Vec<String>,
 }
 
 /// Rich internal state representation for model provisioning lifecycle.
@@ -63,6 +71,8 @@ pub struct NimbleProvisioner {
     pub canonical_tag: String,
     pub state: Arc<RwLock<NimbleProvisionState>>,
     pub is_pulling: Arc<AtomicBool>,
+    pub fallback_state: Arc<RwLock<NimbleProvisionState>>,
+    pub is_pulling_fallback: Arc<AtomicBool>,
     pub http_client: reqwest::Client,
 }
 
@@ -87,8 +97,38 @@ impl NimbleProvisioner {
             canonical_tag: CANONICAL_NIMBLE_GGUF.to_string(),
             state: Arc::new(RwLock::new(NimbleProvisionState::NotInstalled)),
             is_pulling: Arc::new(AtomicBool::new(false)),
+            fallback_state: Arc::new(RwLock::new(NimbleProvisionState::NotInstalled)),
+            is_pulling_fallback: Arc::new(AtomicBool::new(false)),
             http_client,
         }
+    }
+
+    /// Selects a memory-fitted local fallback model strictly from runtime available RAM/VRAM
+    /// by delegating directly to `quorum_coordinator::AutoFusionRouter::size_qwen_by_hardware`
+    /// (Dynamic Available Memory Law — never total physical RAM).
+    pub fn select_memory_fitted_fallback_model(free_ram_gb: f64, free_vram_mb: f64) -> String {
+        let hw = HardwareTelemetry {
+            free_ram_gb,
+            free_vram_mb: free_vram_mb.max(0.0) as u64,
+            ..HardwareTelemetry::default()
+        };
+        AutoFusionRouter::size_qwen_by_hardware(&hw)
+    }
+
+    /// Calculates live host resources (`HardwareTelemetry::probe_fresh()` + `probe_free_disk_gb()`)
+    /// via `AutoFusionRouter::calculate_provision_plan` BEFORE any model provisioning attempt.
+    pub fn calculate_provision_plan(&self, installed: &[String]) -> ModelProvisionPlan {
+        AutoFusionRouter::calculate_provision_plan(&self.canonical_tag, installed)
+    }
+
+    /// Checks whether a given model tag (or `:latest` equivalent) is present in an installed tag slice.
+    pub fn tag_in_installed_list(tag: &str, installed: &[String]) -> bool {
+        let target = tag.trim().to_ascii_lowercase();
+        let target_latest = format!("{}:latest", target);
+        installed.iter().any(|m| {
+            let norm = m.trim().to_ascii_lowercase();
+            norm == target || norm == target_latest || norm.starts_with(&format!("{}-", target))
+        })
     }
 
     /// Evaluates if user opted out of automatic background installation via `QUORUM_DISABLE_OLLAMA_AUTOINSTALL=1`.
@@ -101,8 +141,10 @@ impl NimbleProvisioner {
     /// Checks the Dynamic Available Memory Law strictly on runtime free memory (`free_ram_gb >= 12.0 || free_vram_mb >= 6000`).
     /// Returns `(free_ram_gb, free_vram_mb, memory_sufficient)`.
     pub fn check_memory_law() -> (f64, f64, bool) {
-        let hw = HardwareTelemetry::probe();
-        let sufficient = hw.free_ram_gb >= MIN_FREE_RAM_GB || hw.free_vram_mb >= MIN_FREE_VRAM_MB;
+        let hw = HardwareTelemetry::probe_fresh();
+        let free_disk_gb = HardwareTelemetry::probe_free_disk_gb();
+        let sufficient = (hw.free_ram_gb >= MIN_FREE_RAM_GB || hw.free_vram_mb >= MIN_FREE_VRAM_MB)
+            && free_disk_gb >= AutoFusionRouter::estimated_model_disk_gb(CANONICAL_NIMBLE_GGUF);
         (hw.free_ram_gb, hw.free_vram_mb as f64, sufficient)
     }
 
@@ -277,34 +319,232 @@ impl NimbleProvisioner {
         }
     }
 
-    /// Helper to verify if the model tag or canonical tag is present in `/api/tags`.
-    pub async fn is_model_installed(&self) -> bool {
+    /// Helper to probe installed model tags from `/api/tags` (`Some(vec)` when reachable, `None` when offline).
+    pub async fn probe_installed_models(&self) -> Option<Vec<String>> {
         let tags_url = format!("{}/api/tags", self.endpoint);
-        if let Ok(resp) = self
+        let resp = self
             .http_client
             .get(&tags_url)
-            .timeout(Duration::from_millis(400))
+            .timeout(PROBE_TIMEOUT)
             .send()
             .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let val = resp.json::<serde_json::Value>().await.ok()?;
+        let names: Vec<String> = val
+            .get("models")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(names)
+    }
+
+    /// Helper to verify if the model tag or canonical tag is present in `/api/tags`.
+    pub async fn is_model_installed(&self) -> bool {
+        if let Some(names) = self.probe_installed_models().await {
+            return names.iter().any(|n| n == &self.model_tag || n == &self.canonical_tag);
+        }
+        false
+    }
+
+    /// Launches a single-flight background pull for a memory-fitted fallback model (`qwen2.5:1.5b` / `3b` / `7b` / `14b` / `32b`)
+    /// ONLY AFTER calculating live host RAM, VRAM, and disk headroom via `AutoFusionRouter::calculate_provision_plan`.
+    pub fn spawn_fallback_pull(&self, fallback_tag: &str) -> bool {
+        let raw_tag = fallback_tag.trim();
+        if raw_tag.is_empty() || tokio::runtime::Handle::try_current().is_err() {
+            return false;
+        }
+
+        // Mandatory pre-provisioning resource calculation before attempting any pull
+        let plan = AutoFusionRouter::calculate_provision_plan(raw_tag, &[]);
+        if !plan.disk_sufficient {
+            warn!(
+                "Skipping fallback pull for '{}': insufficient disk space ({:.1} GB free)",
+                raw_tag, plan.free_disk_gb
+            );
+            return false;
+        }
+        let clean_tag = plan.effective_tag;
+
+        if self
+            .is_pulling_fallback
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
+            return false;
+        }
+
+        let endpoint = self.endpoint.clone();
+        let http_client = self.http_client.clone();
+        let fb_state = Arc::clone(&self.fallback_state);
+        let pulling_flag = Arc::clone(&self.is_pulling_fallback);
+
+        tokio::spawn(async move {
+            Self::execute_fallback_pull_task(endpoint, clean_tag, http_client, fb_state, pulling_flag).await;
+        });
+        true
+    }
+
+    async fn execute_fallback_pull_task(
+        endpoint: String,
+        fallback_tag: String,
+        http_client: reqwest::Client,
+        fb_state: Arc<RwLock<NimbleProvisionState>>,
+        pulling_flag: Arc<AtomicBool>,
+    ) {
+        struct FallbackGuard(Arc<AtomicBool>);
+        impl Drop for FallbackGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = FallbackGuard(pulling_flag);
+
+        let tags_url = format!("{}/api/tags", endpoint);
+        let mut reachable = false;
+        if let Ok(resp) = http_client.get(&tags_url).timeout(PROBE_TIMEOUT).send().await {
             if resp.status().is_success() {
+                reachable = true;
                 if let Ok(val) = resp.json::<serde_json::Value>().await {
-                    if let Some(models) = val.get("models").and_then(|m| m.as_array()) {
-                        let names: Vec<String> = models
-                            .iter()
-                            .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                            .collect();
-                        return names.iter().any(|n| n == &self.model_tag || n == &self.canonical_tag);
+                    let existing: Vec<String> = val
+                        .get("models")
+                        .and_then(|m| m.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(|s| s.trim().to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if Self::tag_in_installed_list(&fallback_tag, &existing) {
+                        *fb_state.write().await = NimbleProvisionState::Ready;
+                        return;
                     }
                 }
             }
         }
-        false
+
+        if !reachable && endpoint.contains("127.0.0.1:11434") {
+            let helper = NimbleProvisioner::new(endpoint.clone());
+            reachable = helper.ensure_ollama_daemon_async().await;
+        }
+        if !reachable {
+            *fb_state.write().await = NimbleProvisionState::Offline;
+            return;
+        }
+
+        *fb_state.write().await = NimbleProvisionState::Downloading {
+            progress_pct: 0.0,
+            completed_bytes: 0,
+            total_bytes: 986_000_000,
+        };
+
+        info!(
+            "Auto-installing memory-fitted fallback model '{}' via {}/api/pull...",
+            fallback_tag, endpoint
+        );
+
+        let pull_url = format!("{}/api/pull", endpoint);
+        let pull_res = http_client
+            .post(&pull_url)
+            .timeout(Duration::from_secs(3600))
+            .json(&serde_json::json!({ "name": fallback_tag }))
+            .send()
+            .await;
+
+        let resp = match pull_res {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                warn!("Fallback /api/pull for '{}' returned HTTP {}", fallback_tag, r.status());
+                *fb_state.write().await = NimbleProvisionState::NotInstalled;
+                return;
+            }
+            Err(e) => {
+                warn!("Fallback /api/pull request failed for '{}': {}", fallback_tag, e);
+                *fb_state.write().await = NimbleProvisionState::Offline;
+                return;
+            }
+        };
+
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+        let mut completed_bytes: u64 = 0;
+        let mut total_bytes: u64 = 986_000_000;
+        let mut succeeded = false;
+        let mut stream_err = false;
+
+        while let Some(chunk_res) = stream.next().await {
+            match chunk_res {
+                Ok(chunk) => {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(pos) = buffer.find('\n') {
+                        let line = buffer[..pos].trim().to_string();
+                        buffer.drain(..=pos);
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if val.get("error").and_then(|v| v.as_str()).is_some() {
+                                stream_err = true;
+                                break;
+                            }
+                            if val
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.contains("success"))
+                                .unwrap_or(false)
+                            {
+                                succeeded = true;
+                            }
+                            if let Some(c) = val.get("completed").and_then(|v| v.as_u64()) {
+                                completed_bytes = c;
+                            }
+                            if let Some(t) = val.get("total").and_then(|v| v.as_u64()) {
+                                if t > 0 {
+                                    total_bytes = t;
+                                }
+                            }
+                            let pct = if total_bytes > 0 {
+                                ((completed_bytes as f64) / (total_bytes as f64) * 100.0).clamp(0.0, 100.0)
+                            } else {
+                                0.0
+                            };
+                            *fb_state.write().await = NimbleProvisionState::Downloading {
+                                progress_pct: pct,
+                                completed_bytes,
+                                total_bytes,
+                            };
+                        }
+                    }
+                    if stream_err {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    stream_err = true;
+                    break;
+                }
+            }
+        }
+
+        if !stream_err && (succeeded || (total_bytes > 0 && completed_bytes >= total_bytes)) {
+            info!("Memory-fitted fallback model '{}' provisioned and ready", fallback_tag);
+            *fb_state.write().await = NimbleProvisionState::Ready;
+        } else {
+            *fb_state.write().await = NimbleProvisionState::NotInstalled;
+        }
     }
 
     /// Probes the local Ollama `/api/tags` endpoint (400ms timeout) and returns the current `NimbleStatusResponse`.
     pub async fn probe_status(&self) -> NimbleStatusResponse {
         let (free_ram_gb, free_vram_mb, memory_sufficient) = Self::check_memory_law();
+        let fallback_model_tag = Self::select_memory_fitted_fallback_model(free_ram_gb, free_vram_mb).to_string();
 
         // 1. If active background pull is in-flight, return downloading status immediately
         if self.is_pulling.load(Ordering::SeqCst) {
@@ -325,13 +565,48 @@ impl NimbleProvisioner {
                 free_ram_gb,
                 free_vram_mb,
                 memory_sufficient,
+                fallback_model_tag,
+                fallback_state: "not_needed".to_string(),
+                fallback_progress_pct: 0.0,
+                installed_models: Vec::new(),
             };
         }
 
-        // 2. If memory law is not satisfied, mark state skipped_low_memory
+        // 2. If memory law is not satisfied, mark state skipped_low_memory AND auto-provision memory-fitted fallback
         if !memory_sufficient {
-            let mut w = self.state.write().await;
-            *w = NimbleProvisionState::SkippedLowMemory;
+            {
+                let mut w = self.state.write().await;
+                *w = NimbleProvisionState::SkippedLowMemory;
+            }
+
+            let installed_opt = self.probe_installed_models().await;
+            let installed_models = installed_opt.clone().unwrap_or_default();
+
+            let (fb_state_str, fb_pct) = if self.is_pulling_fallback.load(Ordering::SeqCst) {
+                let cur = self.fallback_state.read().await.clone();
+                match cur {
+                    NimbleProvisionState::Downloading { progress_pct, .. } => {
+                        ("downloading".to_string(), progress_pct.clamp(0.0, 100.0))
+                    }
+                    NimbleProvisionState::Ready => ("ready".to_string(), 100.0),
+                    _ => ("downloading".to_string(), 0.0),
+                }
+            } else if let Some(ref models) = installed_opt {
+                if Self::tag_in_installed_list(&fallback_model_tag, models) {
+                    *self.fallback_state.write().await = NimbleProvisionState::Ready;
+                    ("ready".to_string(), 100.0)
+                } else if !Self::is_autoinstall_disabled() && self.spawn_fallback_pull(&fallback_model_tag) {
+                    ("downloading".to_string(), 0.0)
+                } else {
+                    ("not_installed".to_string(), 0.0)
+                }
+            } else {
+                if !Self::is_autoinstall_disabled() {
+                    let _ = self.spawn_fallback_pull(&fallback_model_tag);
+                }
+                ("offline".to_string(), 0.0)
+            };
+
             return NimbleStatusResponse {
                 state: "skipped_low_memory".to_string(),
                 progress_pct: 0.0,
@@ -342,89 +617,47 @@ impl NimbleProvisioner {
                 free_ram_gb,
                 free_vram_mb,
                 memory_sufficient: false,
+                fallback_model_tag,
+                fallback_state: fb_state_str,
+                fallback_progress_pct: fb_pct,
+                installed_models,
             };
         }
 
         // 3. Probe Ollama /api/tags with 400ms timeout
-        let tags_url = format!("{}/api/tags", self.endpoint);
-        let probe_res = self
-            .http_client
-            .get(&tags_url)
-            .timeout(PROBE_TIMEOUT)
-            .send()
-            .await;
+        if let Some(installed_models) = self.probe_installed_models().await {
+            let target_clean = self.model_tag.trim().to_ascii_lowercase();
+            let canonical_clean = self.canonical_tag.trim().to_ascii_lowercase();
+            let is_installed = installed_models.iter().any(|name| {
+                let norm = name.trim().to_ascii_lowercase();
+                norm == target_clean
+                    || norm == canonical_clean
+                    || norm.starts_with(&target_clean)
+                    || norm.starts_with(&canonical_clean)
+            });
 
-        match probe_res {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(val) = resp.json::<serde_json::Value>().await {
-                    let mut is_installed = false;
-                    if let Some(models) = val.get("models").and_then(|m| m.as_array()) {
-                        let target_clean = self.model_tag.trim().to_ascii_lowercase();
-                        let canonical_clean = self.canonical_tag.trim().to_ascii_lowercase();
-                        for m in models {
-                            if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
-                                let norm = name.trim().to_ascii_lowercase();
-                                if norm == target_clean
-                                    || norm == canonical_clean
-                                    || norm.starts_with(&target_clean)
-                                    || norm.starts_with(&canonical_clean)
-                                {
-                                    is_installed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    let mut w = self.state.write().await;
-                    if is_installed {
-                        *w = NimbleProvisionState::Ready;
-                        NimbleStatusResponse {
-                            state: "ready".to_string(),
-                            progress_pct: 100.0,
-                            completed_bytes: 5340000000,
-                            total_bytes: 5340000000,
-                            model_tag: self.model_tag.clone(),
-                            terminal_command: format!("ollama pull {}", self.canonical_tag),
-                            free_ram_gb,
-                            free_vram_mb,
-                            memory_sufficient: true,
-                        }
-                    } else {
-                        *w = NimbleProvisionState::NotInstalled;
-                        NimbleStatusResponse {
-                            state: "not_installed".to_string(),
-                            progress_pct: 0.0,
-                            completed_bytes: 0,
-                            total_bytes: 0,
-                            model_tag: self.model_tag.clone(),
-                            terminal_command: format!("ollama pull {}", self.canonical_tag),
-                            free_ram_gb,
-                            free_vram_mb,
-                            memory_sufficient: true,
-                        }
-                    }
-                } else {
-                    let mut w = self.state.write().await;
-                    *w = NimbleProvisionState::Offline;
-                    NimbleStatusResponse {
-                        state: "offline".to_string(),
-                        progress_pct: 0.0,
-                        completed_bytes: 0,
-                        total_bytes: 0,
-                        model_tag: self.model_tag.clone(),
-                        terminal_command: format!("ollama pull {}", self.canonical_tag),
-                        free_ram_gb,
-                        free_vram_mb,
-                        memory_sufficient,
-                    }
-                }
-            }
-            _ => {
-                let mut w = self.state.write().await;
-                *w = NimbleProvisionState::Offline;
+            let mut w = self.state.write().await;
+            if is_installed {
+                *w = NimbleProvisionState::Ready;
                 NimbleStatusResponse {
-                    state: "offline".to_string(),
+                    state: "ready".to_string(),
+                    progress_pct: 100.0,
+                    completed_bytes: 5340000000,
+                    total_bytes: 5340000000,
+                    model_tag: self.model_tag.clone(),
+                    terminal_command: format!("ollama pull {}", self.canonical_tag),
+                    free_ram_gb,
+                    free_vram_mb,
+                    memory_sufficient: true,
+                    fallback_model_tag,
+                    fallback_state: "not_needed".to_string(),
+                    fallback_progress_pct: 100.0,
+                    installed_models,
+                }
+            } else {
+                *w = NimbleProvisionState::NotInstalled;
+                NimbleStatusResponse {
+                    state: "not_installed".to_string(),
                     progress_pct: 0.0,
                     completed_bytes: 0,
                     total_bytes: 0,
@@ -432,8 +665,30 @@ impl NimbleProvisioner {
                     terminal_command: format!("ollama pull {}", self.canonical_tag),
                     free_ram_gb,
                     free_vram_mb,
-                    memory_sufficient,
+                    memory_sufficient: true,
+                    fallback_model_tag,
+                    fallback_state: "not_needed".to_string(),
+                    fallback_progress_pct: 0.0,
+                    installed_models,
                 }
+            }
+        } else {
+            let mut w = self.state.write().await;
+            *w = NimbleProvisionState::Offline;
+            NimbleStatusResponse {
+                state: "offline".to_string(),
+                progress_pct: 0.0,
+                completed_bytes: 0,
+                total_bytes: 0,
+                model_tag: self.model_tag.clone(),
+                terminal_command: format!("ollama pull {}", self.canonical_tag),
+                free_ram_gb,
+                free_vram_mb,
+                memory_sufficient,
+                fallback_model_tag,
+                fallback_state: "offline".to_string(),
+                fallback_progress_pct: 0.0,
+                installed_models: Vec::new(),
             }
         }
     }
@@ -442,8 +697,38 @@ impl NimbleProvisioner {
     /// Returns the immediate status response (`"downloading"` if started, or current status if already running/skipped).
     pub fn trigger_provision(self: &Arc<Self>) -> NimbleStatusResponse {
         let (free_ram_gb, free_vram_mb, memory_sufficient) = Self::check_memory_law();
+        let fallback_model_tag = Self::select_memory_fitted_fallback_model(free_ram_gb, free_vram_mb).to_string();
 
         if !memory_sufficient {
+            let started_fb = if !Self::is_autoinstall_disabled() {
+                self.spawn_fallback_pull(&fallback_model_tag)
+            } else {
+                false
+            };
+            let (fb_state, fb_pct) = if started_fb || self.is_pulling_fallback.load(Ordering::SeqCst) {
+                let pct = self
+                    .fallback_state
+                    .try_read()
+                    .ok()
+                    .and_then(|g| match &*g {
+                        NimbleProvisionState::Downloading { progress_pct, .. } => Some(progress_pct.clamp(0.0, 100.0)),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0);
+                ("downloading".to_string(), pct)
+            } else {
+                let ready = self
+                    .fallback_state
+                    .try_read()
+                    .ok()
+                    .map(|g| *g == NimbleProvisionState::Ready)
+                    .unwrap_or(false);
+                if ready {
+                    ("ready".to_string(), 100.0)
+                } else {
+                    ("not_installed".to_string(), 0.0)
+                }
+            };
             return NimbleStatusResponse {
                 state: "skipped_low_memory".to_string(),
                 progress_pct: 0.0,
@@ -454,6 +739,10 @@ impl NimbleProvisioner {
                 free_ram_gb,
                 free_vram_mb,
                 memory_sufficient: false,
+                fallback_model_tag,
+                fallback_state: fb_state,
+                fallback_progress_pct: fb_pct,
+                installed_models: Vec::new(),
             };
         }
 
@@ -474,6 +763,10 @@ impl NimbleProvisioner {
                 free_ram_gb,
                 free_vram_mb,
                 memory_sufficient: true,
+                fallback_model_tag,
+                fallback_state: "not_needed".to_string(),
+                fallback_progress_pct: 0.0,
+                installed_models: Vec::new(),
             }
         } else {
             // Already pulling in background
@@ -497,6 +790,10 @@ impl NimbleProvisioner {
                 free_ram_gb,
                 free_vram_mb,
                 memory_sufficient: true,
+                fallback_model_tag,
+                fallback_state: "not_needed".to_string(),
+                fallback_progress_pct: 0.0,
+                installed_models: Vec::new(),
             }
         }
     }
@@ -523,6 +820,25 @@ impl NimbleProvisioner {
             }
         }
 
+        // 1b. Re-calculate live host resources AFTER Ollama daemon is online and BEFORE sending /api/pull
+        let existing_models = self.probe_installed_models().await.unwrap_or_default();
+        let plan = self.calculate_provision_plan(&existing_models);
+        if plan.already_installed && !plan.downsized_for_resources {
+            let mut w = self.state.write().await;
+            *w = NimbleProvisionState::Ready;
+            return;
+        }
+        if plan.downsized_for_resources || !plan.disk_sufficient {
+            {
+                let mut w = self.state.write().await;
+                *w = NimbleProvisionState::SkippedLowMemory;
+            }
+            if plan.disk_sufficient && !plan.already_installed && !Self::is_autoinstall_disabled() {
+                let _ = self.spawn_fallback_pull(&plan.effective_tag);
+            }
+            return;
+        }
+
         // 2. Set downloading state
         {
             let mut w = self.state.write().await;
@@ -537,6 +853,7 @@ impl NimbleProvisioner {
         let pull_res = self
             .http_client
             .post(&pull_url)
+            .timeout(Duration::from_secs(3600))
             .json(&serde_json::json!({ "name": self.canonical_tag }))
             .send()
             .await;
@@ -693,6 +1010,10 @@ mod tests {
             free_ram_gb: 16.0,
             free_vram_mb: 8192.0,
             memory_sufficient: true,
+            fallback_model_tag: "qwen2.5:7b".to_string(),
+            fallback_state: "not_needed".to_string(),
+            fallback_progress_pct: 0.0,
+            installed_models: vec!["qwen2.5:7b".to_string()],
         };
         let json = serde_json::to_string(&resp).expect("must serialize");
         let deserialized: NimbleStatusResponse = serde_json::from_str(&json).expect("must deserialize");
@@ -715,10 +1036,166 @@ mod tests {
             free_ram_gb: 4.0,
             free_vram_mb: 1024.0,
             memory_sufficient: false,
+            fallback_model_tag: "qwen2.5:1.5b".to_string(),
+            fallback_state: "downloading".to_string(),
+            fallback_progress_pct: 35.0,
+            installed_models: Vec::new(),
         };
         assert_eq!(resp.state, "skipped_low_memory");
         assert!(!resp.memory_sufficient);
         assert_eq!(resp.progress_pct, 0.0);
+        assert_eq!(resp.fallback_model_tag, "qwen2.5:1.5b");
+    }
+
+    #[test]
+    fn test_select_memory_fitted_fallback_model_tiers() {
+        assert_eq!(
+            NimbleProvisioner::select_memory_fitted_fallback_model(2.6, 0.0),
+            "qwen2.5:1.5b"
+        );
+        assert_eq!(
+            NimbleProvisioner::select_memory_fitted_fallback_model(3.5, 0.0),
+            "qwen2.5:1.5b"
+        );
+        assert_eq!(
+            NimbleProvisioner::select_memory_fitted_fallback_model(6.5, 0.0),
+            "qwen2.5:3b"
+        );
+        assert_eq!(
+            NimbleProvisioner::select_memory_fitted_fallback_model(4.0, 2048.0),
+            "qwen2.5:3b"
+        );
+        assert_eq!(
+            NimbleProvisioner::select_memory_fitted_fallback_model(12.0, 0.0),
+            "qwen2.5:7b"
+        );
+        assert_eq!(
+            NimbleProvisioner::select_memory_fitted_fallback_model(28.0, 0.0),
+            "qwen2.5:14b"
+        );
+        assert_eq!(
+            NimbleProvisioner::select_memory_fitted_fallback_model(52.0, 0.0),
+            "qwen2.5:32b"
+        );
+    }
+
+    #[test]
+    fn test_pre_provisioning_resource_calculation_downsizes_before_pull() {
+        let low_ram_hw = HardwareTelemetry {
+            total_ram_gb: 8.0,
+            free_ram_gb: 3.5,
+            cpu_cores: 8,
+            gpu_name: None,
+            free_vram_mb: 0,
+            total_vram_mb: 0,
+            gpu_count: 0,
+        };
+
+        // 1. Nimble-9B requested on 3.5 GB free RAM -> calculated plan downsizes to qwen2.5:1.5b BEFORE pull
+        let plan_missing = AutoFusionRouter::calculate_provision_plan_with_hw(
+            CANONICAL_NIMBLE_GGUF,
+            &low_ram_hw,
+            40.0,
+            &["deepseek-r1:1.5b".to_string()],
+        );
+        assert!(plan_missing.downsized_for_resources);
+        assert_eq!(plan_missing.effective_tag, "qwen2.5:1.5b");
+        assert!(!plan_missing.already_installed);
+        assert!(plan_missing.disk_sufficient);
+
+        // 2. If qwen2.5:1.5b is ALREADY installed -> already_installed = true (zero redundant pull)
+        let plan_installed = AutoFusionRouter::calculate_provision_plan_with_hw(
+            CANONICAL_NIMBLE_GGUF,
+            &low_ram_hw,
+            40.0,
+            &["deepseek-r1:1.5b".to_string(), "qwen2.5:1.5b".to_string()],
+        );
+        assert!(plan_installed.downsized_for_resources);
+        assert_eq!(plan_installed.effective_tag, "qwen2.5:1.5b");
+        assert!(plan_installed.already_installed);
+
+        // 3. Gemma 4 26B requested on 3.5 GB free RAM -> downsizes to gemma2:2b BEFORE pull
+        let plan_gemma = AutoFusionRouter::calculate_provision_plan_with_hw(
+            "gemma4:26b",
+            &low_ram_hw,
+            40.0,
+            &[],
+        );
+        assert!(plan_gemma.downsized_for_resources);
+        assert_eq!(plan_gemma.effective_tag, "gemma2:2b");
+
+        // 4. Low disk (< 1.2 GB free) blocks provisioning cleanly
+        let plan_low_disk = AutoFusionRouter::calculate_provision_plan_with_hw(
+            "qwen2.5:1.5b",
+            &low_ram_hw,
+            0.5,
+            &[],
+        );
+        assert!(!plan_low_disk.disk_sufficient);
+    }
+
+    #[tokio::test]
+    async fn test_low_memory_fallback_auto_install_wire_mock() {
+        use axum::{routing::{get, post}, Json, Router};
+        use std::sync::Mutex;
+
+        let installed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let pull_calls = Arc::new(AtomicBool::new(false));
+
+        let app = {
+            let inst_tags = Arc::clone(&installed);
+            let inst_pull = Arc::clone(&installed);
+            let pflag = Arc::clone(&pull_calls);
+            Router::new()
+                .route(
+                    "/api/tags",
+                    get(move || {
+                        let tags = inst_tags.lock().unwrap().clone();
+                        async move {
+                            let models: Vec<_> = tags
+                                .into_iter()
+                                .map(|n| serde_json::json!({ "name": n }))
+                                .collect();
+                            Json(serde_json::json!({ "models": models }))
+                        }
+                    }),
+                )
+                .route(
+                    "/api/pull",
+                    post(move |Json(body): Json<serde_json::Value>| {
+                        let name = body
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("qwen2.5:1.5b")
+                            .to_string();
+                        pflag.store(true, Ordering::SeqCst);
+                        inst_pull.lock().unwrap().push(name);
+                        async move {
+                            "{\"completed\":500,\"total\":1000}\n{\"completed\":1000,\"total\":1000,\"status\":\"success\"}\n"
+                        }
+                    }),
+                )
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let prov = NimbleProvisioner::new(format!("http://{}", addr));
+        assert!(prov.spawn_fallback_pull("qwen2.5:1.5b"));
+
+        for _ in 0..40 {
+            if *prov.fallback_state.read().await == NimbleProvisionState::Ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(pull_calls.load(Ordering::SeqCst), "Fallback model pull must be invoked automatically");
+        assert_eq!(*prov.fallback_state.read().await, NimbleProvisionState::Ready);
+        srv.abort();
     }
 
     #[test]
@@ -743,7 +1220,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_provision_concurrent_calls_no_panic() {
-        let provisioner = Arc::new(NimbleProvisioner::default());
+        let provisioner = Arc::new(NimbleProvisioner::new("http://127.0.0.1:59997"));
         // Rapid repeated calls inside Tokio async runtime must never panic on blocking_read
         for _ in 0..20 {
             let resp = provisioner.trigger_provision();

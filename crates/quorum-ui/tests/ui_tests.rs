@@ -125,3 +125,46 @@ fn test_response_action_buttons_and_handlers() {
     assert!(css.contains(".response-action-btn.save-file-btn:hover"));
     assert!(css.contains(".response-action-btn.clear-btn:hover"));
 }
+
+#[test]
+fn test_nimble_guidance_card_confined_to_settings_and_auto_fallback() {
+    let html = get_index_html();
+    assert!(
+        html.contains("id=\"nimble-settings-staging\""),
+        "index.html must provide hidden Settings staging mount for nimble-guidance-card"
+    );
+
+    let (js_bytes, _) = get_asset("app.js").expect("app.js must exist");
+    let js = String::from_utf8_lossy(&js_bytes);
+
+    // Extract renderNimbleGuidanceCard body and verify it NEVER inserts into chatStream.parentElement
+    let fn_start = js
+        .find("function renderNimbleGuidanceCard(")
+        .expect("renderNimbleGuidanceCard must exist");
+    let fn_tail = &js[fn_start..];
+    let fn_end = fn_tail
+        .find("let _nimblePollTimer")
+        .expect("_nimblePollTimer marker must follow renderNimbleGuidanceCard");
+    let fn_body = &fn_tail[..fn_end];
+
+    assert!(
+        !fn_body.contains("chatStream.parentElement.insertBefore"),
+        "renderNimbleGuidanceCard must NEVER inject nimble-guidance-card into main chatStream viewport"
+    );
+    assert!(
+        fn_body.contains("nimble-settings-card-slot") && fn_body.contains("nimble-settings-staging"),
+        "renderNimbleGuidanceCard must mount strictly inside Settings"
+    );
+    assert!(
+        fn_body.contains("fallback_model_tag") && fn_body.contains("/api/models/pull"),
+        "renderNimbleGuidanceCard must auto-provision memory-fitted fallback model when memory gate triggers"
+    );
+    assert!(
+        js.contains("function modelFitsHardware(") && js.contains("hardware_recommendation"),
+        "app.js must evaluate hardware_recommendation / modelFitsHardware before attempting model pulls"
+    );
+    assert!(
+        js.contains(".join(' ')"),
+        "Model pills must be space-separated so adjacent fallback tags never concatenate"
+    );
+}
