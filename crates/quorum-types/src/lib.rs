@@ -402,6 +402,7 @@ impl CandidateChunkDto {
             score: self.score,
             access_tier: self.access_tier,
             content: self.content,
+            expanded_window: self.expanded_window,
         }
     }
 
@@ -667,7 +668,7 @@ pub struct FederatedQueryResponse {
 ///
 /// Implements `ZeroizeOnDrop` so that plaintext chunk content residing in memory
 /// is wiped with zeroes immediately when dropped, preventing heap leaks or paging to swap.
-#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop, Default)]
 pub struct VolatileRemoteChunk {
     #[zeroize(skip)]
     pub chunk_id: String,
@@ -692,6 +693,10 @@ pub struct VolatileRemoteChunk {
 
     /// Volatile plaintext content, scrubbed on drop.
     pub content: String,
+
+    /// Optional volatile expanded parent window, scrubbed on drop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_window: Option<String>,
 }
 
 impl VolatileRemoteChunk {

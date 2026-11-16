@@ -29,10 +29,14 @@ import hashlib
 import json
 import mimetypes
 import os
+import sys
+
+if sys.platform == "win32":
+    sys.modules.setdefault("_wmi", None)
+
 import platform
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.request

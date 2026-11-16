@@ -7,7 +7,7 @@ rem   quorumrag-uninstall.cmd           remove MSI, service, firewall rule
 rem   quorumrag-uninstall.cmd /purge    ...and delete all index data + logs
 rem
 rem Normal uninstall is Settings ^> Apps ^> "QuorumRAG P2P Agentic RAG" or
-rem   msiexec /x QuorumRAG-0.6.2-x86_64.msi [REMOVEDATA=1]
+rem   msiexec /x QuorumRAG-0.6.17-x86_64.msi [REMOVEDATA=1]
 rem This script also cleans up when the MSI entry is already gone.
 rem Never touches PATH or any environment variable.
 rem ------------------------------------------------------------------
@@ -21,9 +21,10 @@ rem Require elevation (service + Program Files removal need admin).
 net session >nul 2>&1
 if errorlevel 1 goto :elevate
 
-rem The MSI deletes the install folder this script lives in; run from a temp copy.
+rem Stage native GUI helper (`quorum-desktop.exe`) alongside the temp copy before MSI removes Program Files.
 if not defined QR_UNINSTALL_RELAUNCHED (
     set "QR_UNINSTALL_RELAUNCHED=1"
+    if exist "%~dp0quorum-desktop.exe" copy /y "%~dp0quorum-desktop.exe" "%TEMP%\quorum-desktop-uninstall.exe" >nul 2>&1
     copy /y "%~f0" "%TEMP%\quorumrag-uninstall.cmd" >nul
     "%TEMP%\quorumrag-uninstall.cmd" %*
 )
@@ -35,6 +36,10 @@ set "PS_FIND=$k='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','H
 for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "%PS_FIND%"`) do call :msi_remove %%G
 
 echo [2/4] Stopping and deleting the %SERVICE% service (if still present)...
+if exist "%TEMP%\quorum-desktop-uninstall.exe" (
+    "%TEMP%\quorum-desktop-uninstall.exe" --msi-stop-cleanup --delete-service
+    goto :firewall
+)
 sc.exe query "%SERVICE%" >nul 2>&1
 if errorlevel 1 (
     echo   service not installed.
@@ -50,17 +55,17 @@ set /a WAITED+=1
 timeout /t 1 /nobreak >nul
 goto :wait_stop
 :stopped
-taskkill /f /t /im quorumrag.exe >nul 2>&1
+powershell -NoProfile -Command "Get-Process -Name 'quorumrag','quorum-desktop' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue" >nul 2>&1
 sc.exe delete "%SERVICE%"
 
 :firewall
 echo [3/4] Removing firewall rules...
-netsh advfirewall firewall delete rule name="QuorumRAG P2P Mesh (Program-In)" >nul 2>&1
-netsh advfirewall firewall delete rule name="QuorumRAG LAN Discovery (UDP 5353-In)" >nul 2>&1
-netsh advfirewall firewall delete rule name="QuorumRAG LAN Discovery (UDP 5353-Out)" >nul 2>&1
-netsh advfirewall firewall delete rule name="QuorumRAG P2P Swarm (TCP 3032-In)" >nul 2>&1
-netsh advfirewall firewall delete rule name="QuorumRAG P2P Swarm (TCP 3032-Out)" >nul 2>&1
-netsh advfirewall firewall delete rule name="QuorumRAG P2P Mesh" >nul 2>&1
+if exist "%TEMP%\quorum-desktop-uninstall.exe" (
+    "%TEMP%\quorum-desktop-uninstall.exe" --msi-firewall-remove
+    del /f /q "%TEMP%\quorum-desktop-uninstall.exe" >nul 2>&1
+) else if exist "%ProgramFiles%\QuorumRAG\quorum-desktop.exe" (
+    "%ProgramFiles%\QuorumRAG\quorum-desktop.exe" --msi-firewall-remove
+)
 
 echo [4/4] Removing leftover files...
 if exist "%ProgramFiles%\QuorumRAG" rmdir /s /q "%ProgramFiles%\QuorumRAG"

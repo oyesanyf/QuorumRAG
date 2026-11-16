@@ -162,6 +162,7 @@ impl ResponseFormatterWatchdog {
         // 1a. Strip raw extractor / internal markers
         let internal_marker_patterns = [
             r"\[Document:\s*[^\]]*\]",
+            r"(?im)(?:^[^\[\]\n]{0,160}\x22\s*\|\s*)?(?:\|\s*)?(?:Title:\s*[^|\]]+\|\s*)?(?:Author:\s*[^|\]]+\|\s*)?(?:Rev:\s*[^|\]]+\|\s*)?Kind:\s*[A-Za-z0-9_-]+\s*\|\s*File:\s*[^\]]+\]",
             r"\[Section:\s*[^\]]*\]",
             r"(?i)Section:\s*Chapter\s*\d+[^.\n]*\.?",
             r"\[Parent Document Match\s*@[^\]]*\]",

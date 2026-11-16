@@ -565,9 +565,88 @@ impl DeterministicOfflineSynthesisEngine {
         s
     }
 
+    /// Checks whether `haystack_lower` contains whole-word alphanumeric tokens matching both `term_a` and `term_b`
+    /// separated by at most `max_char_gap` characters (in either order, e.g. `"angela davis"` or `"davis, angela"`).
+    pub fn contains_terms_within_char_window(
+        haystack_lower: &str,
+        term_a: &str,
+        term_b: &str,
+        max_char_gap: usize,
+    ) -> bool {
+        if term_a.is_empty() || term_b.is_empty() {
+            return false;
+        }
+        let mut pos_a: Vec<(usize, usize)> = Vec::new();
+        let mut pos_b: Vec<(usize, usize)> = Vec::new();
+        let mut cur_word = String::new();
+        let mut word_start = 0usize;
+
+        for (char_idx, ch) in haystack_lower.chars().enumerate() {
+            if ch.is_alphanumeric() {
+                if cur_word.is_empty() {
+                    word_start = char_idx;
+                }
+                cur_word.push(ch);
+            } else if !cur_word.is_empty() {
+                if cur_word == term_a {
+                    pos_a.push((word_start, char_idx));
+                }
+                if cur_word == term_b {
+                    pos_b.push((word_start, char_idx));
+                }
+                cur_word.clear();
+            }
+        }
+        if !cur_word.is_empty() {
+            let end_idx = word_start + cur_word.chars().count();
+            if cur_word == term_a {
+                pos_a.push((word_start, end_idx));
+            }
+            if cur_word == term_b {
+                pos_b.push((word_start, end_idx));
+            }
+        }
+
+        for &(sa, ea) in &pos_a {
+            for &(sb, eb) in &pos_b {
+                let gap = if sa <= sb {
+                    sb.saturating_sub(ea)
+                } else {
+                    sa.saturating_sub(eb)
+                };
+                if gap <= max_char_gap {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Cleans raw extracted document chunk text by stripping `[PDF Metadata]`, `[Page X]` markers,
     /// legacy `.doc` OLE/SmartTag noise, ChatGPT download boilerplate, and collapsing broken single-word-per-line PDF extraction.
     pub fn clean_chunk_text(raw: &str) -> String {
+        static INLINE_BANNER_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static LEADING_SLICED_BANNER_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static SLICED_BANNER_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let inline_banner_re = INLINE_BANNER_RE.get_or_init(|| {
+            regex::Regex::new(
+                r"\[(?:Document:|File:|Word/Document|PDF Document|Image Document:|Audio Document:|Video Document:|Section:|Parent Document Match)[^\]]*\]",
+            )
+            .expect("valid inline banner regex")
+        });
+        let leading_sliced_banner_re = LEADING_SLICED_BANNER_RE.get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)^\s*(?:[^\[\]\n]{0,240}\|\s*(?:Title:\s*[^|\]]+\|\s*)?(?:Author:\s*[^|\]]+\|\s*)?(?:Rev:\s*[^|\]]+\|\s*)?Kind:\s*[A-Za-z0-9_-]+\s*\|\s*File:\s*[^\]]+\]|\|\s*File:\s*[^\]]+\])",
+            )
+            .expect("valid leading sliced banner regex")
+        });
+        let sliced_banner_re = SLICED_BANNER_RE.get_or_init(|| {
+            regex::Regex::new(
+                r#"(?i)(?:^[^\[\]\n]{0,160}"\s*\|\s*)?(?:\|\s*)?(?:Title:\s*[^|\]]+\|\s*)?(?:Author:\s*[^|\]]+\|\s*)?(?:Rev:\s*[^|\]]+\|\s*)?Kind:\s*[A-Za-z0-9_-]+\s*\|\s*File:\s*[^\]]+\]"#,
+            )
+            .expect("valid sliced banner regex")
+        });
+
         let mut trimmed_raw = raw.trim();
         while trimmed_raw.starts_with("=== [Entity Cluster") {
             if let Some(nl) = trimmed_raw.find('\n') {
@@ -613,13 +692,22 @@ impl DeterministicOfflineSynthesisEngine {
             }
         };
 
+        let mut saw_first_nonempty_line = false;
         for line in raw.lines() {
             let pua_stripped: String = line
                 .chars()
                 .filter(|&ch| !('\u{E000}'..='\u{F8FF}').contains(&ch))
                 .collect();
             let markup_normalized = Self::normalize_inline_markup_artifacts(&pua_stripped);
-            let mut trimmed = markup_normalized.trim();
+            let inline_stripped = inline_banner_re.replace_all(&markup_normalized, "");
+            let lead_stripped = if !saw_first_nonempty_line && !inline_stripped.trim().is_empty() {
+                saw_first_nonempty_line = true;
+                leading_sliced_banner_re.replace(&inline_stripped, "")
+            } else {
+                inline_stripped
+            };
+            let banner_stripped = sliced_banner_re.replace_all(&lead_stripped, "");
+            let mut trimmed = banner_stripped.trim();
             if trimmed.is_empty() || trimmed.starts_with("=== [Entity Cluster") {
                 continue;
             }
@@ -1794,7 +1882,7 @@ impl DeterministicOfflineSynthesisEngine {
                 prompt_only_entities.len()
             };
             let count_prompt_matches = |scored: &ScoredChunk| -> usize {
-                let text_l = scored.chunk.text_content.to_ascii_lowercase();
+                let text_l = Self::clean_chunk_text(&scored.chunk.text_content).to_ascii_lowercase();
                 let file_l = scored.chunk.file_path.to_ascii_lowercase();
                 prompt_only_entities
                     .iter()
@@ -1808,6 +1896,38 @@ impl DeterministicOfflineSynthesisEngine {
                 scored_matches.retain(|(scored, _, _, _)| {
                     count_prompt_matches(scored) >= req_prompt_hits
                 });
+            }
+
+            let prompt_trim = prompt_lower.trim();
+            let is_two_word_person_query = (prompt_trim.starts_with("who is ")
+                || prompt_trim.starts_with("who was ")
+                || prompt_trim.starts_with("who's ")
+                || prompt_trim.starts_with("whos ")
+                || prompt_trim.starts_with("what do you know about ")
+                || prompt_trim.starts_with("tell me about "))
+                && prompt_only_entities.len() == 2;
+            if is_two_word_person_query {
+                let t0 = prompt_only_entities[0].as_str();
+                let t1 = prompt_only_entities[1].as_str();
+                let matches_person_proximity = |scored: &ScoredChunk| -> bool {
+                    let cleaned_l =
+                        Self::clean_chunk_text(&scored.chunk.text_content).to_ascii_lowercase();
+                    let file_l = scored
+                        .chunk
+                        .file_path
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(&scored.chunk.file_path)
+                        .to_ascii_lowercase();
+                    Self::contains_terms_within_char_window(&cleaned_l, t0, t1, 40)
+                        || Self::contains_terms_within_char_window(&file_l, t0, t1, 40)
+                };
+                if scored_matches
+                    .iter()
+                    .any(|(scored, _, _, _)| matches_person_proximity(scored))
+                {
+                    scored_matches.retain(|(scored, _, _, _)| matches_person_proximity(scored));
+                }
             }
         }
 
@@ -2257,15 +2377,26 @@ impl DeterministicOfflineSynthesisEngine {
                 .iter()
                 .copied()
                 .filter(|c| {
+                    if crate::answer_orchestrator::query_framing::is_lexical_distractor(
+                        prompt_eff,
+                        &c.chunk.file_path,
+                        &c.chunk.text_content,
+                    ) {
+                        return false;
+                    }
                     let att = crate::answer_orchestrator::NimbleRelevanceAttestation::from_chunk(&c.chunk, prompt_eff, &c.source_peer);
                     att.attested_relevant
                 })
                 .collect();
-            let effective_refs: Vec<&ScoredChunk> = if !attested_offline.is_empty() {
+            let raw_effective_refs: Vec<&ScoredChunk> = if !attested_offline.is_empty() {
                 attested_offline
             } else {
                 matched_chunk_refs.clone()
             };
+            let effective_refs: Vec<&ScoredChunk> = Self::deduplicate_refs_by_document_family(
+                &raw_effective_refs,
+                forensic_intent.is_some(),
+            );
 
             let prefix = Self::format_question_restated_prefix_with_chunks(prompt_eff, &effective_refs);
             let specific_clusters =
@@ -3927,6 +4058,77 @@ impl DeterministicOfflineSynthesisEngine {
         }
     }
 
+    /// Deduplicates `ScoredChunk` references down to 1 canonical document per `derive_document_family_key`
+    /// while preserving family first-appearance rank order (unless `preserve_distinct_forensic_paths` is true
+    /// or a chunk is an `artemis://` forensic record, where distinct paths are preserved).
+    pub fn deduplicate_refs_by_document_family<'a>(
+        matched_chunks: &[&'a ScoredChunk],
+        preserve_distinct_forensic_paths: bool,
+    ) -> Vec<&'a ScoredChunk> {
+        let filtered_chunks: Vec<&'a ScoredChunk> = if !preserve_distinct_forensic_paths {
+            let has_resume_or_bio = matched_chunks.iter().any(|c| {
+                let p = c.chunk.file_path.to_ascii_lowercase();
+                let t = c.chunk.text_content.to_ascii_lowercase();
+                p.contains("resume")
+                    || p.contains("cv")
+                    || p.contains("bio")
+                    || t.contains("professional summary")
+                    || t.contains("work experience")
+                    || t.contains("career summary")
+                    || t.contains("curriculum vitae")
+                    || t.contains("employment history")
+            });
+            if has_resume_or_bio {
+                let without_bp: Vec<&'a ScoredChunk> = matched_chunks
+                    .iter()
+                    .copied()
+                    .filter(|c| {
+                        !Self::is_g28_or_administrative_boilerplate(
+                            &c.chunk.file_path,
+                            &c.chunk.text_content,
+                        )
+                    })
+                    .collect();
+                if without_bp.is_empty() {
+                    matched_chunks.to_vec()
+                } else {
+                    without_bp
+                }
+            } else {
+                matched_chunks.to_vec()
+            }
+        } else {
+            matched_chunks.to_vec()
+        };
+
+        let mut families: Vec<String> = Vec::new();
+        let mut family_chunks: std::collections::HashMap<String, Vec<&'a ScoredChunk>> =
+            std::collections::HashMap::new();
+
+        for &c in &filtered_chunks {
+            let path_low = c.chunk.file_path.to_ascii_lowercase();
+            let family_key = if preserve_distinct_forensic_paths || path_low.starts_with("artemis://") {
+                path_low
+            } else {
+                Self::derive_document_family_key(&c.chunk.file_path)
+            };
+            if !family_chunks.contains_key(&family_key) {
+                families.push(family_key.clone());
+            }
+            family_chunks.entry(family_key).or_default().push(c);
+        }
+
+        let mut out: Vec<&'a ScoredChunk> = Vec::with_capacity(families.len());
+        for key in families {
+            if let Some(chunks) = family_chunks.get(&key) {
+                if let Some(canonical) = Self::pick_canonical_document_for_family(chunks) {
+                    out.push(canonical);
+                }
+            }
+        }
+        out
+    }
+
     pub fn deduplicated_chunks_with_scores<'a>(
         matched_chunks: &[&'a ScoredChunk],
     ) -> Vec<(&'a ScoredChunk, u32)> {
@@ -3966,7 +4168,12 @@ impl DeterministicOfflineSynthesisEngine {
             std::collections::HashMap::new();
 
         for &c in &filtered_chunks {
-            let family_key = Self::derive_document_family_key(&c.chunk.file_path);
+            let path_low = c.chunk.file_path.to_ascii_lowercase();
+            let family_key = if path_low.starts_with("artemis://") {
+                path_low
+            } else {
+                Self::derive_document_family_key(&c.chunk.file_path)
+            };
             if !family_chunks.contains_key(&family_key) {
                 families.push(family_key.clone());
             }
@@ -4063,9 +4270,11 @@ impl DeterministicOfflineSynthesisEngine {
         let mut block = String::from("\n\n---\n### 📚 Sources & Document Links\n");
 
         for (c, score_pct) in &deduped {
-            let file_name_base = std::path::Path::new(&c.chunk.file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
+            let file_name_base = c
+                .chunk
+                .file_path
+                .rsplit(['/', '\\'])
+                .next()
                 .unwrap_or(&c.chunk.file_path);
 
             let peer_suffix = if !c.source_peer.is_empty() && c.source_peer != "local" {
@@ -4291,7 +4500,8 @@ impl DeterministicOfflineSynthesisEngine {
     /// per family while preserving distinct document types and multimodal image/audio assets
     /// (e.g. `Checkmarx Social Media Assets - Femi Oyesanya.png`).
     pub fn derive_document_family_key(file_path: &str) -> String {
-        let path = std::path::Path::new(file_path);
+        let base_name = file_path.rsplit(['/', '\\']).next().unwrap_or(file_path);
+        let path = std::path::Path::new(base_name);
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -4305,7 +4515,7 @@ impl DeterministicOfflineSynthesisEngine {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(file_path);
+            .unwrap_or(base_name);
         let mut s = stem.to_ascii_lowercase();
 
         // 1. Strip file extension artifacts if double-dotted (e.g. file.docx.pdf)
@@ -7690,6 +7900,13 @@ impl DeterministicOfflineSynthesisEngine {
             .iter()
             .copied()
             .filter(|c| {
+                if crate::answer_orchestrator::query_framing::is_lexical_distractor(
+                    prompt,
+                    &c.chunk.file_path,
+                    &c.chunk.text_content,
+                ) {
+                    return false;
+                }
                 let att = crate::answer_orchestrator::NimbleRelevanceAttestation::from_chunk(&c.chunk, prompt, &c.source_peer);
                 att.attested_relevant
             })
@@ -7714,9 +7931,16 @@ impl DeterministicOfflineSynthesisEngine {
         });
 
         if (asks_profile_or_role || asks_author_works) && has_resume_or_bio {
-            pruned_chunks.retain(|c| {
-                !Self::is_g28_or_administrative_boilerplate(&c.chunk.file_path, &c.chunk.text_content)
-            });
+            let without_bp: Vec<&ScoredChunk> = pruned_chunks
+                .iter()
+                .copied()
+                .filter(|c| {
+                    !Self::is_g28_or_administrative_boilerplate(&c.chunk.file_path, &c.chunk.text_content)
+                })
+                .collect();
+            if !without_bp.is_empty() {
+                pruned_chunks = without_bp;
+            }
         }
         // For typed questions (where/when/how much/phone), excerpts holding the requested kind of fact go first
         // (stable sort keeps relevance order among equals), so a small model sees the answer in excerpt [1].
@@ -7757,21 +7981,44 @@ impl DeterministicOfflineSynthesisEngine {
         } else {
             24usize
         };
-        let active_excerpts: &[&ScoredChunk] = &pruned_chunks[..pruned_chunks.len().min(max_excerpts)];
+        let mut active_excerpts_vec: Vec<&ScoredChunk> =
+            pruned_chunks[..pruned_chunks.len().min(max_excerpts)].to_vec();
+        if pruned_chunks.len() > max_excerpts {
+            let mut added_remote = 0usize;
+            for &rc in &pruned_chunks[max_excerpts..] {
+                if rc.source_peer.is_empty() || rc.source_peer.eq_ignore_ascii_case("local") {
+                    continue;
+                }
+                let rc_fam = Self::derive_document_family_key(&rc.chunk.file_path);
+                if !active_excerpts_vec
+                    .iter()
+                    .any(|c| Self::derive_document_family_key(&c.chunk.file_path) == rc_fam)
+                {
+                    active_excerpts_vec.push(rc);
+                    added_remote += 1;
+                    if added_remote >= 4 {
+                        break;
+                    }
+                }
+            }
+        }
+        let active_excerpts: &[&ScoredChunk] = &active_excerpts_vec;
 
         // Assign 1-based citation numbers strictly by canonical document family across `active_excerpts`,
-        // so multiple chunks or revisions from the same document family share one `[doc_num]`.
+        // so multiple chunks, revisions, or cross-peer copies from the same document family share one `[doc_num]`.
         let mut unique_file_chunks: Vec<&ScoredChunk> = Vec::new();
         let mut file_to_doc_num: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
-        let mut canonical_file_for_family: std::collections::HashMap<(String, String), String> = std::collections::HashMap::new();
-        let mut families_seen: Vec<(String, String)> = Vec::new();
-        let mut family_to_chunks: std::collections::HashMap<(String, String), Vec<&ScoredChunk>> = std::collections::HashMap::new();
+        let mut canonical_file_for_family: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut families_seen: Vec<String> = Vec::new();
+        let mut family_to_chunks: std::collections::HashMap<String, Vec<&ScoredChunk>> = std::collections::HashMap::new();
 
         for &c in active_excerpts {
-            let fam_key = (
-                c.source_peer.to_ascii_lowercase(),
-                Self::derive_document_family_key(&c.chunk.file_path),
-            );
+            let path_low = c.chunk.file_path.to_ascii_lowercase();
+            let fam_key = if path_low.starts_with("artemis://") {
+                path_low
+            } else {
+                Self::derive_document_family_key(&c.chunk.file_path)
+            };
             if !family_to_chunks.contains_key(&fam_key) {
                 families_seen.push(fam_key.clone());
             }
@@ -7783,12 +8030,14 @@ impl DeterministicOfflineSynthesisEngine {
             let canonical = Self::pick_canonical_document_for_family(chunks).unwrap_or(chunks[0]);
             let next_num = unique_file_chunks.len() + 1;
             unique_file_chunks.push(canonical);
-            canonical_file_for_family.insert(fam_key.clone(), canonical.chunk.file_path.clone());
+            canonical_file_for_family.insert(fam_key, canonical.chunk.file_path.clone());
 
             for c in chunks {
-                let file_name = std::path::Path::new(&c.chunk.file_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
+                let file_name = c
+                    .chunk
+                    .file_path
+                    .rsplit(['/', '\\'])
+                    .next()
                     .unwrap_or(&c.chunk.file_path);
                 file_to_doc_num.insert((c.source_peer.to_ascii_lowercase(), file_name.to_ascii_lowercase()), next_num);
             }
@@ -7872,13 +8121,17 @@ impl DeterministicOfflineSynthesisEngine {
         let context_blocks = active_excerpts
             .iter()
             .map(|c| {
-                let fam_key = (
-                    c.source_peer.to_ascii_lowercase(),
-                    Self::derive_document_family_key(&c.chunk.file_path),
-                );
-                let file_name_base = std::path::Path::new(&c.chunk.file_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
+                let path_low = c.chunk.file_path.to_ascii_lowercase();
+                let fam_key = if path_low.starts_with("artemis://") {
+                    path_low
+                } else {
+                    Self::derive_document_family_key(&c.chunk.file_path)
+                };
+                let file_name_base = c
+                    .chunk
+                    .file_path
+                    .rsplit(['/', '\\'])
+                    .next()
                     .unwrap_or(&c.chunk.file_path);
                 let lookup_key = (c.source_peer.to_ascii_lowercase(), file_name_base.to_ascii_lowercase());
                 let doc_num = file_to_doc_num
@@ -7889,9 +8142,9 @@ impl DeterministicOfflineSynthesisEngine {
                     .get(&fam_key)
                     .map(|s| s.as_str())
                     .unwrap_or(&c.chunk.file_path);
-                let canon_name_base = std::path::Path::new(canon_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
+                let canon_name_base = canon_path
+                    .rsplit(['/', '\\'])
+                    .next()
                     .unwrap_or(canon_path);
                 let file_name = if !c.source_peer.is_empty() && !c.source_peer.eq_ignore_ascii_case("local") {
                     let short_peer: String = c.source_peer.chars().take(12).collect();
@@ -8304,7 +8557,7 @@ impl DeterministicOfflineSynthesisEngine {
                 // Feature 20: 100% Attested-Document Contribution Guarantee
                 // Coverage loop guarantees that every distinct document [1]..[K] that passed Nimble attestation
                 // actively contributes substantive grounded facts and carries an inline citation in the synthesized output.
-                let (compacted_prose, mut compacted_chunks) =
+                let (compacted_prose, compacted_chunks) =
                     crate::answer_orchestrator::enforce_attested_document_coverage_loop(&consolidated_prose, &unique_file_chunks);
 
                 // Feature 10: Post-Synthesis Groundedness Verification
@@ -8322,40 +8575,6 @@ impl DeterministicOfflineSynthesisEngine {
                     &compacted_chunks,
                 );
                 let compacted_prose = watchdog_report.cleaned_prose;
-                // Preserve remote peer sources (`source_peer != "local"`) even if the LLM only cited [1]..[4]
-                // so multi-computer evidence is always surfaced in the Sources panel and citation cards!
-                let remote_source_pool: Vec<&ScoredChunk> = {
-                    let pruned_remote: Vec<&ScoredChunk> = pruned_chunks
-                        .iter()
-                        .copied()
-                        .filter(|c| c.source_peer != "local")
-                        .take(4)
-                        .collect();
-                    if pruned_remote.is_empty() {
-                        matched_chunks
-                            .iter()
-                            .copied()
-                            .filter(|c| c.source_peer != "local")
-                            .take(4)
-                            .collect()
-                    } else {
-                        pruned_remote
-                    }
-                };
-                for rc in remote_source_pool {
-                    let rc_fam = Self::derive_document_family_key(&rc.chunk.file_path);
-                    if !compacted_chunks
-                        .iter()
-                        .any(|c| Self::derive_document_family_key(&c.chunk.file_path) == rc_fam)
-                    {
-                        compacted_chunks.push(rc);
-                    }
-                }
-                if (asks_profile_or_role || asks_author_works) && has_resume_or_bio {
-                    compacted_chunks.retain(|c| {
-                        !Self::is_g28_or_administrative_boilerplate(&c.chunk.file_path, &c.chunk.text_content)
-                    });
-                }
                 let sources_block = Self::format_sources_block(&compacted_chunks);
                 let final_with_sources = format!("{}{}", compacted_prose.trim(), sources_block);
                 let mut turn_citations = Self::build_deduplicated_citations(&compacted_chunks);

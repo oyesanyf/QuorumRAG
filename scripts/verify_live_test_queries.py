@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.16.
+"""End-to-end live HTTP `/api/query` verification suite for QuorumRAG v0.6.17.
 
 Spawns a real `quorumrag` release daemon against an isolated corpus containing
 homonym clusters, noisy ChatGPT export markers, and forensic distractors, then
@@ -212,7 +212,7 @@ def main() -> int:
                 time.sleep(0.5)
             require(ready, f"Daemon on 127.0.0.1:{args.port} did not become healthy within 30s")
 
-            # Nimble-9B Status & Non-Intrusive UI Asset Check (v0.6.16)
+            # Nimble-9B Status & Non-Intrusive UI Asset Check (v0.6.17)
             print("\n[E2E 2b/5] Verifying live GET /api/models/nimble/status & non-intrusive /assets/app.js...")
             st_nim, nim_status = http_json(args.port, "GET", "/api/models/nimble/status", timeout=15.0)
             require(st_nim == 200, f"HTTP {st_nim} on GET /api/models/nimble/status: {nim_status}")

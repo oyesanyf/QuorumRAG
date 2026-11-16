@@ -130,27 +130,45 @@ impl RrfCombiner {
                 }
 
                 let score = 1.0 / (k + (rank_0 + 1) as f32);
+                let CandidateChunkDto {
+                    chunk_id,
+                    file_path,
+                    line_start,
+                    line_end,
+                    content,
+                    score: cand_score,
+                    access_tier,
+                    expanded_window,
+                    ..
+                } = candidate;
+                let non_empty_window = expanded_window.filter(|w| !w.trim().is_empty());
                 let entry = rrf_map.entry(content_hash.clone()).or_insert_with(|| {
-                    let derived_doc_id = candidate
-                        .chunk_id
+                    let derived_doc_id = chunk_id
                         .rsplit_once(':')
                         .map(|(d, _)| d.to_string())
-                        .unwrap_or_else(|| format!("remote:{}", candidate.file_path));
+                        .unwrap_or_else(|| format!("remote:{}", file_path));
                     let doc_chunk = DocumentChunk {
-                        chunk_id: candidate.chunk_id.clone(),
+                        chunk_id,
                         document_id: derived_doc_id,
-                        file_path: candidate.file_path,
-                        line_start: candidate.line_start,
-                        line_end: candidate.line_end,
+                        file_path,
+                        line_start,
+                        line_end,
                         blake3_hash: content_hash,
-                        access_tier: candidate.access_tier,
+                        access_tier,
                         vector: vec![0.0; 768],
-                        text_content: candidate.content,
+                        text_content: non_empty_window.clone().unwrap_or(content),
                         metadata_json: "{}".to_string(),
                     };
-                    let scored = ScoredChunk::new(doc_chunk, candidate.score, peer_id.clone(), true);
+                    let scored = ScoredChunk::new(doc_chunk, cand_score, peer_id.clone(), true);
                     (0.0, scored, HashSet::new())
                 });
+                if entry.1.is_remote {
+                    if let Some(win) = non_empty_window {
+                        if win.len() > entry.1.chunk.text_content.len() {
+                            entry.1.chunk.text_content = win;
+                        }
+                    }
+                }
                 entry.0 += score;
                 entry.2.insert(remote_peer_numeric_id);
             }

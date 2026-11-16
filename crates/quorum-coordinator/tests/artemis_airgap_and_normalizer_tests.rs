@@ -272,6 +272,7 @@ fn test_dlp_mesh_enforce_inbound_remote_chunks() {
             score: 0.8,
             peer_id: "peer_remote".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
         VolatileRemoteChunk {
             chunk_id: "c_remote_2".to_string(),
@@ -282,6 +283,7 @@ fn test_dlp_mesh_enforce_inbound_remote_chunks() {
             score: 0.99,
             peer_id: "peer_byzantine".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
     ];
 

@@ -443,11 +443,11 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
                     }
                     let max_straggler_grace = if chunks_count > 0 {
                         got_non_empty = true;
-                        Duration::from_millis(800)
+                        Duration::from_millis(120)
                     } else if !got_non_empty {
-                        Duration::from_millis(1200)
+                        Duration::from_millis(200)
                     } else {
-                        Duration::from_millis(800)
+                        Duration::from_millis(120)
                     };
                     let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
                     if straggler_deadline < active_deadline {
@@ -846,7 +846,6 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
 
         let primary_deadline = tokio::time::Instant::now() + timeout;
         let mut active_deadline = primary_deadline;
-        let mut got_non_empty_peer = false;
         let mut responses = Vec::new();
 
         loop {
@@ -890,16 +889,19 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                         break;
                     }
 
-                    // 2. Once responses have arrived, activate adaptive two-tier straggler grace:
-                    // If non-empty chunks arrive, clamp straggler grace to 120ms.
-                    // If empty chunks arrive and no prior peer returned hits, clamp grace to 200ms.
-                    let max_straggler_grace = if chunks_len > 0 {
-                        got_non_empty_peer = true;
-                        Duration::from_millis(800)
-                    } else if !got_non_empty_peer {
-                        Duration::from_millis(1200)
+                    // 2. Once responses have arrived, activate health-aware straggler grace:
+                    // When healthy connected libp2p peers (`consecutive_failures == 0`, including million-chunk hosts)
+                    // are still in flight, allow up to 4500ms (bounded by `active_deadline`).
+                    // Clamp to 400ms ONLY when all remaining pending peers have `consecutive_failures > 0`.
+                    let has_healthy_pending = pending_peer_ids.iter().any(|pid| {
+                        registry
+                            .get(pid)
+                            .map_or(true, |s| s.consecutive_failures == 0)
+                    });
+                    let max_straggler_grace = if has_healthy_pending {
+                        Duration::from_millis(4500)
                     } else {
-                        Duration::from_millis(800)
+                        Duration::from_millis(400)
                     };
                     let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
                     if straggler_deadline < active_deadline {
@@ -934,6 +936,22 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                     );
                     if pending_peer_ids.is_empty() || (!responses.is_empty() && responses.len() >= max_peer_responses) {
                         break;
+                    }
+                    if !responses.is_empty() {
+                        let has_healthy_pending = pending_peer_ids.iter().any(|pid| {
+                            registry
+                                .get(pid)
+                                .map_or(true, |s| s.consecutive_failures == 0)
+                        });
+                        let max_straggler_grace = if has_healthy_pending {
+                            Duration::from_millis(4500)
+                        } else {
+                            Duration::from_millis(400)
+                        };
+                        let straggler_deadline = tokio::time::Instant::now() + max_straggler_grace;
+                        if straggler_deadline < active_deadline {
+                            active_deadline = straggler_deadline;
+                        }
                     }
                 }
                 Ok(Some(Err(join_err))) => {
@@ -1329,7 +1347,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     relayed_req.visited_peers.push(req.sender_peer_id.clone());
                 }
                 tokio::spawn(async move {
-                    disp.query_peers(&relayed_req, Duration::from_millis(3500))
+                    disp.query_peers(&relayed_req, Duration::from_millis(5500))
                         .await
                         .ok()
                 })
@@ -1404,21 +1422,35 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             });
         if content_words.len() >= 2 && scored.len() > 1 {
             scored.sort_by(|a, b| {
-                let count_hits = |sc: &quorum_types::ScoredChunk| -> usize {
-                    let tl = sc.chunk.text_content.to_ascii_lowercase();
+                let count_body_and_raw_hits = |sc: &quorum_types::ScoredChunk| -> (usize, usize) {
+                    let cleaned_tl = crate::offline_engine::DeterministicOfflineSynthesisEngine::clean_chunk_text(
+                        &sc.chunk.text_content,
+                    )
+                    .to_ascii_lowercase();
+                    let raw_tl = sc.chunk.text_content.to_ascii_lowercase();
                     let fl = sc.chunk.file_path.to_ascii_lowercase();
-                    let tokens: std::collections::HashSet<&str> = tl
+                    let body_tokens: std::collections::HashSet<&str> = cleaned_tl
                         .split(|c: char| !c.is_alphanumeric())
                         .chain(fl.split(|c: char| !c.is_alphanumeric()))
                         .filter(|w| !w.is_empty())
                         .collect();
-                    content_words
+                    let raw_tokens: std::collections::HashSet<&str> = raw_tl
+                        .split(|c: char| !c.is_alphanumeric())
+                        .chain(fl.split(|c: char| !c.is_alphanumeric()))
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    let body_hits = content_words
                         .iter()
-                        .filter(|w| tokens.contains(w.as_str()))
-                        .count()
+                        .filter(|w| body_tokens.contains(w.as_str()))
+                        .count();
+                    let raw_hits = content_words
+                        .iter()
+                        .filter(|w| raw_tokens.contains(w.as_str()))
+                        .count();
+                    (body_hits, raw_hits)
                 };
-                count_hits(b)
-                    .cmp(&count_hits(a))
+                count_body_and_raw_hits(b)
+                    .cmp(&count_body_and_raw_hits(a))
                     .then_with(|| {
                         b.score
                             .partial_cmp(&a.score)
@@ -1514,28 +1546,40 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
 
         scored.retain(|c| !crate::artemis_airgap::is_airgap_restricted_chunk(&c.chunk));
 
+        // Cap per-document-family candidates and bound total candidates to 48 before parent-window expansion,
+        // and expand 10KB parent windows only on the top 20 candidates so million-chunk peers respond in <600ms.
+        let mut scored =
+            crate::agentic::retrieve::RetrieveMeshNode::cap_document_families_federated(scored, 2);
+        scored.truncate(48);
+
         // RLM parent-document expansion up to 10,000 bytes BEFORE outbound DLP inspection
         let mut candidate_dtos = Vec::with_capacity(scored.len());
-        for c in scored {
+        for (idx, c) in scored.into_iter().enumerate() {
             let mut dto = CandidateChunkDto::from_scored_chunk(&c);
             dto.origin_peer_id = Some(self.local_peer_id.clone());
-            if let Some((_start, _end, expanded_text, _, _)) = self.local_storage.expand_parent_window(
-                &c.chunk.document_id,
-                &c.chunk.text_content,
-                10000,
-                effective_tier,
-            ) {
-                if !expanded_text.trim().is_empty() {
-                    dto.expanded_window = Some(expanded_text);
-                }
-            } else if let Some((_start, _end, expanded_text, _, _)) = self.local_storage.expand_parent_window(
-                &c.chunk.file_path,
-                &c.chunk.text_content,
-                10000,
-                effective_tier,
-            ) {
-                if !expanded_text.trim().is_empty() {
-                    dto.expanded_window = Some(expanded_text);
+            if idx < 20 {
+                if let Some((_start, _end, expanded_text, _, _)) =
+                    self.local_storage.expand_parent_window(
+                        &c.chunk.document_id,
+                        &c.chunk.text_content,
+                        10000,
+                        effective_tier,
+                    )
+                {
+                    if !expanded_text.trim().is_empty() {
+                        dto.expanded_window = Some(expanded_text);
+                    }
+                } else if let Some((_start, _end, expanded_text, _, _)) =
+                    self.local_storage.expand_parent_window(
+                        &c.chunk.file_path,
+                        &c.chunk.text_content,
+                        10000,
+                        effective_tier,
+                    )
+                {
+                    if !expanded_text.trim().is_empty() {
+                        dto.expanded_window = Some(expanded_text);
+                    }
                 }
             }
             candidate_dtos.push(dto);

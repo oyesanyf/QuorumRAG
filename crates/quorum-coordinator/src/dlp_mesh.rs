@@ -939,6 +939,20 @@ impl OsoosiMeshDlpController {
 
             if res.allowed_to_share {
                 chunk.content = res.scrubbed_text;
+                if let Some(ref win) = chunk.expanded_window {
+                    let win_res = self.inspect_and_enforce_text(
+                        win,
+                        &chunk.file_path,
+                        requester_peer_id,
+                        "OutboundMesh",
+                        shared_entry.dlp_mode_override,
+                        false,
+                    );
+                    if !win_res.allowed_to_share {
+                        continue;
+                    }
+                    chunk.expanded_window = Some(win_res.scrubbed_text);
+                }
                 allowed_chunks.push(chunk);
             }
         }
@@ -968,6 +982,21 @@ impl OsoosiMeshDlpController {
             );
             if res.allowed_to_share {
                 chunk.content = res.scrubbed_text;
+                if let Some(ref win) = chunk.expanded_window {
+                    let win_res = self.inspect_and_enforce_text(
+                        win,
+                        &chunk.file_path,
+                        &chunk.peer_id,
+                        "InboundMesh",
+                        None,
+                        false,
+                    );
+                    if win_res.allowed_to_share {
+                        chunk.expanded_window = Some(win_res.scrubbed_text);
+                    } else {
+                        chunk.expanded_window = None;
+                    }
+                }
                 clean.push(chunk);
             }
         }
