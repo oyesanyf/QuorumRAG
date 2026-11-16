@@ -31,6 +31,159 @@ for gdir in [
 
 SIGNER_NAME = "OpenOsoosi Release Signer"
 SIGNER_EMAIL = "security@oshoosiclaw.dev"
+DEFAULT_WIN_CERT_THUMBPRINT = "9A6D3B509500813058EC63183476464FAC8F015B"
+
+
+def locate_signtool() -> str | None:
+    found = shutil.which("signtool.exe")
+    if found and os.path.exists(found):
+        return found
+    kits = Path(r"C:\Program Files (x86)\Windows Kits\10\bin")
+    if kits.exists():
+        matches = sorted(kits.rglob("x64/signtool.exe"), reverse=True)
+        if matches:
+            return str(matches[0])
+    return None
+
+
+def ensure_windows_authenticode_signed(root: Path, version: str, trust_local: bool = False) -> None:
+    """Ensure Windows .exe and .msi release artifacts carry an RFC 3161 timestamped
+    Authenticode signature with a friendly UAC product description, and verify/install
+    LocalMachine publisher trust when available."""
+    if sys.platform != "win32":
+        return
+
+    signtool = locate_signtool()
+    if not signtool:
+        print("[!] signtool.exe not found; skipping Windows Authenticode step.")
+        return
+
+    v_clean = version.lstrip("v")
+    msi_path = root / "deploy" / "windows" / f"QuorumRAG-{v_clean}-x86_64.msi"
+    if not msi_path.exists():
+        return
+
+    thumb = os.environ.get("WINDOWS_CODESIGN_THUMBPRINT", DEFAULT_WIN_CERT_THUMBPRINT).strip()
+    chk = subprocess.run(
+        ["certutil.exe", "-user", "-store", "My", thumb],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if chk.returncode != 0:
+        chk_m = subprocess.run(
+            ["certutil.exe", "-store", "My", thumb],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if chk_m.returncode != 0:
+            print(f"[i] Certificate {thumb} not in local store; keeping existing MSI signature.")
+            return
+
+    targets = [
+        p
+        for p in [
+            root / "target" / "release" / "quorumrag.exe",
+            root / "target" / "release" / "quorum-desktop.exe",
+            msi_path,
+        ]
+        if p.exists()
+    ]
+    for target in targets:
+        ver_res = subprocess.run(
+            [signtool, "verify", "/pa", "/v", str(target)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        has_sig = thumb.upper() in ver_res.stdout.upper()
+        has_ts = "The signature is timestamped:" in ver_res.stdout
+        if has_sig and has_ts and target.suffix.lower() != ".msi":
+            continue
+
+        sign_cmd = [
+            signtool,
+            "sign",
+            "/sha1",
+            thumb,
+            "/fd",
+            "SHA256",
+            "/tr",
+            "http://timestamp.digicert.com",
+            "/td",
+            "SHA256",
+            "/d",
+            "QuorumRAG P2P Agentic RAG",
+            "/du",
+            "https://github.com/oyesanyf/QuorumRAG",
+            "/q",
+            str(target),
+        ]
+        sr = subprocess.run(
+            sign_cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if sr.returncode == 0:
+            print(f"[+] Authenticode signed + timestamped ({thumb[:12]}...): {target.name}")
+        else:
+            print(f"[!] signtool warning on {target.name}: {sr.stderr.strip()}")
+
+    # Export public .cer (never private keys) to deploy/windows/OshoosiDeveloper.cer
+    cer_out = root / "deploy" / "windows" / "OshoosiDeveloper.cer"
+    if not cer_out.exists():
+        subprocess.run(
+            ["certutil.exe", "-user", "-store", "My", thumb, str(cer_out)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+        )
+
+    # Check LocalMachine\Root & TrustedPublisher so UAC shows Verified Publisher instead of Unknown Publisher
+    in_root = (
+        subprocess.run(
+            ["certutil.exe", "-store", "Root", thumb],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+    in_pub = (
+        subprocess.run(
+            ["certutil.exe", "-store", "TrustedPublisher", thumb],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+    if in_root and in_pub:
+        print(f"[+] LocalMachine\\Root & TrustedPublisher verified for {thumb[:12]}... (Verified Publisher active).")
+    elif trust_local and cer_out.exists():
+        r_root = subprocess.run(["certutil.exe", "-addstore", "Root", str(cer_out)], stdin=subprocess.DEVNULL, capture_output=True)
+        r_pub = subprocess.run(["certutil.exe", "-addstore", "TrustedPublisher", str(cer_out)], stdin=subprocess.DEVNULL, capture_output=True)
+        if r_root.returncode == 0 and r_pub.returncode == 0:
+            print(f"[+] Installed {cer_out.name} into LocalMachine\\Root & TrustedPublisher.")
+        else:
+            print(
+                f"[i] Exported {cer_out}; run `powershell -ExecutionPolicy Bypass -File scripts/trust_publisher_cert.ps1` "
+                "once as Admin to complete LocalMachine trust."
+            )
+    else:
+        print(
+            "[i] Note: LocalMachine\\Root does not yet contain Oshoosi Developer cert on this host; "
+            "run `powershell -ExecutionPolicy Bypass -File scripts/trust_publisher_cert.ps1` once as Admin "
+            "(or configure Azure Trusted Signing secrets for universal public CA trust)."
+        )
 
 
 def sha256_file(path: Path) -> str:
@@ -159,24 +312,111 @@ def try_gpg_sign_artifacts(deploy_root: Path, artifacts: list[Path], sums_path: 
     print(f"[+] Signed and verified {len(targets)} release file(s) with OpenPGP.")
 
 
+def prune_superseded_local_and_remote_releases(root: Path, version: str, prune_remote: bool = True) -> None:
+    """Remove superseded local package copies in dist/ and target/wix/ so only `version` remains,
+    and optionally remove older GitHub Releases on oyesanyf/QuorumRAG so only the most recent
+    multi-OS release (`quorumrag-v<version>`) is published."""
+    v_clean = version.lstrip("v")
+    keep_tag = f"quorumrag-v{v_clean}"
+
+    for rel_dir in ["dist", "target/wix", "deploy/windows", "deploy/linux", "deploy/linux-arm64", "deploy/macos"]:
+        d = root / rel_dir
+        if not d.exists():
+            continue
+        for f in list(d.iterdir()):
+            if not f.is_file():
+                continue
+            if f.name in ("SHA256SUMS.txt", "OshoosiDeveloper.cer"):
+                continue
+            if v_clean not in f.name:
+                f.unlink(missing_ok=True)
+
+    if not prune_remote:
+        return
+
+    import json
+    import urllib.error
+    import urllib.request
+
+    p = subprocess.Popen(
+        ["git", "credential", "fill"],
+        cwd=str(root),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    out, _ = p.communicate("protocol=https\nhost=github.com\n\n")
+    token = dict(l.split("=", 1) for l in out.splitlines() if "=" in l).get("password", "")
+    if not token:
+        return
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "QuorumRAG-Release-Pruner",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        rels = json.loads(
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"https://api.github.com/repos/{EXPECTED_REPO_SLUG}/releases?per_page=100",
+                    headers=headers,
+                ),
+                timeout=20,
+            ).read().decode("utf-8")
+        )
+    except Exception:
+        return
+
+    # Only prune older releases once keep_tag itself is already published on GitHub
+    if not any(r.get("tag_name") == keep_tag and not r.get("draft") for r in rels):
+        return
+
+    for r in rels:
+        old_tag = r.get("tag_name") or ""
+        rel_id = r.get("id")
+        if old_tag and old_tag != keep_tag and rel_id:
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"https://api.github.com/repos/{EXPECTED_REPO_SLUG}/releases/{rel_id}",
+                        method="DELETE",
+                        headers=headers,
+                    ),
+                    timeout=20,
+                )
+                subprocess.run(
+                    ["git", "-C", str(root), "push", "origin", "--delete", old_tag],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    check=False,
+                )
+                subprocess.run(
+                    ["git", "-C", str(root), "tag", "-d", old_tag],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    check=False,
+                )
+                print(f"[+] Pruned superseded GitHub release & tag: {old_tag}")
+            except urllib.error.HTTPError as exc:
+                print(f"[!] Could not prune old release {old_tag}: HTTP {exc.code}")
+
+
 def collect_canonical_artifacts(root: Path, version: str) -> list[Path]:
     v_clean = version.lstrip("v")
     expected_patterns = [
         f"deploy/windows/QuorumRAG-{v_clean}-x86_64.msi",
         f"deploy/windows/QuorumRAG-{v_clean}-windows-x86_64.zip",
-        f"dist/QuorumRAG-{v_clean}-x86_64.msi",
-        f"dist/QuorumRAG-windows-x86_64.zip",
-        f"deploy/windows/QuorumRAG-{version}-x86_64.msi",
-        f"deploy/windows/QuorumRAG-{version}-windows-x86_64.zip",
-        f"deploy/linux/quorumrag_{version}_amd64.deb",
-        f"deploy/linux/quorumrag-{version}-1.x86_64.rpm",
-        f"deploy/linux/quorumrag-{version}-linux-x86_64.tar.gz",
-        f"deploy/linux-arm64/quorumrag_{version}_arm64.deb",
-        f"deploy/linux-arm64/quorumrag-{version}-1.aarch64.rpm",
-        f"deploy/linux-arm64/quorumrag-{version}-linux-aarch64.tar.gz",
-        f"deploy/macos/QuorumRAG-{version}-macos-universal.pkg",
-        f"deploy/macos/QuorumRAG-{version}-macos-universal.dmg",
-        f"deploy/macos/quorumrag-{version}-macos-universal.tar.gz",
+        f"deploy/linux/quorumrag_{v_clean}_amd64.deb",
+        f"deploy/linux/quorumrag-{v_clean}-1.x86_64.rpm",
+        f"deploy/linux/quorumrag-{v_clean}-linux-x86_64.tar.gz",
+        f"deploy/linux-arm64/quorumrag_{v_clean}_arm64.deb",
+        f"deploy/linux-arm64/quorumrag-{v_clean}-1.aarch64.rpm",
+        f"deploy/linux-arm64/quorumrag-{v_clean}-linux-aarch64.tar.gz",
+        f"deploy/macos/QuorumRAG-{v_clean}-macos-universal.pkg",
+        f"deploy/macos/QuorumRAG-{v_clean}-macos-universal.dmg",
+        f"deploy/macos/quorumrag-{v_clean}-macos-universal.tar.gz",
     ]
     found = []
     seen: set[Path] = set()
@@ -344,12 +584,25 @@ def main() -> int:
         action="store_true",
         help="Tag HEAD as quorumrag-v<version> and push to origin",
     )
+    parser.add_argument(
+        "--trust-local-cert",
+        action="store_true",
+        help="Install public developer certificate into LocalMachine\\Root and TrustedPublisher",
+    )
+    parser.add_argument(
+        "--keep-old-releases",
+        action="store_true",
+        help="Retain superseded releases instead of pruning to keep only the most recent release",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
     assert_repo_boundary(root)
     deploy_root = root / "deploy"
     deploy_root.mkdir(parents=True, exist_ok=True)
+
+    prune_superseded_local_and_remote_releases(root, args.version, prune_remote=not args.keep_old_releases)
+    ensure_windows_authenticode_signed(root, args.version, trust_local=args.trust_local_cert)
 
     artifacts = collect_canonical_artifacts(root, args.version)
     if not artifacts:

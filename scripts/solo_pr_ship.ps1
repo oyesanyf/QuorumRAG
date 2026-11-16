@@ -4,6 +4,7 @@ param(
     [string]$BodyFile = "",
     [switch]$SkipTest = $false,
     [switch]$BuildInstallers = $false,
+    [switch]$TrustPublisher = $false,
     [switch]$StageRepoWorkflows = $false,
     # Optional local RAPTOR pentest before opening the PR (D:\docker\raptor\Invoke-RaptorScan.ps1)
     [switch]$RunRaptorLocal = $false,
@@ -83,6 +84,12 @@ if ($BuildInstallers -and (Test-Path "scripts\package.ps1")) {
         Write-Error "Installer packaging failed. Aborting PR shipping."
         exit $LASTEXITCODE
     }
+}
+
+if (($BuildInstallers -or $TrustPublisher) -and (Test-Path "scripts\trust_publisher_cert.ps1")) {
+    $trustArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\trust_publisher_cert.ps1")
+    if (-not $TrustPublisher) { $trustArgs += "-NoElevate" }
+    & powershell @trustArgs
 }
 
 # [0/5] Optional local RAPTOR pentest gate (same model as the OsoosiEDR repo).
