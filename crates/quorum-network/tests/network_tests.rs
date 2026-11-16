@@ -26,6 +26,7 @@ impl InboundQueryHandler for TestQueryHandler {
                 score: 0.95,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
             synthesis_response: None,
             warm_llm_available: false,

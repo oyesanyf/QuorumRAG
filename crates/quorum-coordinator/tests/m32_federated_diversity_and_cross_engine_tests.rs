@@ -152,6 +152,7 @@ fn test_rrf_combiner_guaranteed_federated_diversity_slots() {
             access_tier: 0,
             content: format!("Vital remote peer intelligence segment {}", j),
             origin_peer_id: None,
+            expanded_window: None,
         });
     }
 

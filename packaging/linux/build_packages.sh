@@ -9,6 +9,7 @@ VERSION="${2:-0.6.16}"
 INPUT_ARCH="${3:-amd64}"
 DIST_DIR="${4:-deploy/linux}"
 PACKAGE_NAME="${5:-quorumrag}"
+DESKTOP_PATH="${6:-$(dirname "${BINARY_PATH}")/quorum-desktop}"
 
 case "$INPUT_ARCH" in
     x86_64|amd64)
@@ -34,6 +35,12 @@ if [ ! -f "$BINARY_PATH" ]; then
 fi
 
 BINARY_PATH="$(cd "$(dirname "${BINARY_PATH}")" && pwd)/$(basename "${BINARY_PATH}")"
+if [ -f "$DESKTOP_PATH" ]; then
+    DESKTOP_PATH="$(cd "$(dirname "${DESKTOP_PATH}")" && pwd)/$(basename "${DESKTOP_PATH}")"
+    echo "[*] Desktop helper source: ${DESKTOP_PATH}"
+else
+    echo "[!] Desktop helper not found at ${DESKTOP_PATH}; proceeding without embedded desktop binary"
+fi
 mkdir -p "${DIST_DIR}"
 DIST_DIR="$(cd "${DIST_DIR}" && pwd)"
 
@@ -58,6 +65,10 @@ mkdir -p "${TAR_STAGING}"
 
 cp -f "${BINARY_PATH}" "${TAR_STAGING}/quorumrag"
 chmod 755 "${TAR_STAGING}/quorumrag"
+if [ -f "${DESKTOP_PATH}" ]; then
+    cp -f "${DESKTOP_PATH}" "${TAR_STAGING}/quorum-desktop"
+    chmod 755 "${TAR_STAGING}/quorum-desktop"
+fi
 cp -f "${SERVICE_FILE}" "${TAR_STAGING}/quorumrag.service"
 chmod 644 "${TAR_STAGING}/quorumrag.service"
 cp -f "${CTL_FILE}" "${TAR_STAGING}/quorumrag-ctl"
@@ -81,6 +92,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p /usr/bin /lib/systemd/system /usr/lib/quorumrag /usr/share/applications \
          /var/lib/quorumrag/data /var/lib/quorumrag/docs /var/log/quorumrag
 install -m 755 "${SCRIPT_DIR}/quorumrag" /usr/bin/quorumrag
+if [ -f "${SCRIPT_DIR}/quorum-desktop" ]; then
+    install -m 755 "${SCRIPT_DIR}/quorum-desktop" /usr/lib/quorumrag/quorum-desktop
+fi
 install -m 644 "${SCRIPT_DIR}/quorumrag.service" /lib/systemd/system/quorumrag.service
 install -m 755 "${SCRIPT_DIR}/quorumrag-ctl" /usr/lib/quorumrag/quorumrag-ctl
 install -m 644 "${SCRIPT_DIR}/quorumrag.desktop" /usr/share/applications/quorumrag.desktop
@@ -190,6 +204,10 @@ chmod 755 "${DEB_STAGING}/DEBIAN/postrm"
 
 cp -f "${BINARY_PATH}" "${DEB_STAGING}/usr/bin/quorumrag"
 chmod 755 "${DEB_STAGING}/usr/bin/quorumrag"
+if [ -f "${DESKTOP_PATH}" ]; then
+    cp -f "${DESKTOP_PATH}" "${DEB_STAGING}/usr/lib/quorumrag/quorum-desktop"
+    chmod 755 "${DEB_STAGING}/usr/lib/quorumrag/quorum-desktop"
+fi
 cp -f "${SERVICE_FILE}" "${DEB_STAGING}/lib/systemd/system/quorumrag.service"
 chmod 644 "${DEB_STAGING}/lib/systemd/system/quorumrag.service"
 cp -f "${CTL_FILE}" "${DEB_STAGING}/usr/lib/quorumrag/quorumrag-ctl"
@@ -253,6 +271,13 @@ if command -v rpmbuild >/dev/null 2>&1; then
     RPM_TOP="${RPM_TMP}/rpmtop"
     mkdir -p "${RPM_TOP}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
 
+    DESKTOP_RPM_INSTALL=""
+    DESKTOP_RPM_FILE=""
+    if [ -f "${DESKTOP_PATH}" ]; then
+        DESKTOP_RPM_INSTALL="install -m 755 \"${DESKTOP_PATH}\" %{buildroot}/usr/lib/quorumrag/quorum-desktop"
+        DESKTOP_RPM_FILE="/usr/lib/quorumrag/quorum-desktop"
+    fi
+
     cat <<EOF > "${RPM_TOP}/SPECS/${PACKAGE_NAME}.spec"
 Name:           ${PACKAGE_NAME}
 Version:        ${VERSION}
@@ -283,6 +308,7 @@ install -m 755 "${BINARY_PATH}" %{buildroot}/usr/bin/quorumrag
 install -m 644 "${SERVICE_FILE}" %{buildroot}/usr/lib/systemd/system/quorumrag.service
 install -m 755 "${CTL_FILE}" %{buildroot}/usr/lib/quorumrag/quorumrag-ctl
 install -m 644 "${DESKTOP_FILE}" %{buildroot}/usr/share/applications/quorumrag.desktop
+${DESKTOP_RPM_INSTALL}
 
 %pre
 # Upgrade path ($1 >= 2): cleanly stop older running service/processes before binary replacement.
@@ -320,6 +346,7 @@ fi
 /usr/lib/systemd/system/quorumrag.service
 %dir /usr/lib/quorumrag
 /usr/lib/quorumrag/quorumrag-ctl
+${DESKTOP_RPM_FILE}
 /usr/share/applications/quorumrag.desktop
 %dir /var/lib/quorumrag
 %dir /var/lib/quorumrag/data

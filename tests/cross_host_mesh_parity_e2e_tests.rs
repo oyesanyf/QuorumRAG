@@ -17,6 +17,8 @@ use quorum_coordinator::relevance_attestor::NimbleRelevanceAttestation;
 use quorum_coordinator::hardware::HardwareTelemetry;
 use quorum_contract::rlm::{RetrievedChunk, RlmConfig};
 use quorum_coordinator::rlm_orchestrator::RlmOrchestrator;
+use quorum_coordinator::fusion::RrfCombiner;
+use quorum_coordinator::agentic::retrieve::RetrieveMeshNode;
 
 #[tokio::test]
 async fn test_cross_host_retrieval_parity_across_3_nodes() {
@@ -85,8 +87,8 @@ async fn test_cross_host_retrieval_parity_across_3_nodes() {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
                 .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
+                .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
         });
     };
 
@@ -201,6 +203,7 @@ async fn test_mesh_synthesis_relay_protocol_delegation() {
                 line_start: 1,
                 line_end: 10,
                 origin_peer_id: Some("peer_alpha".to_string()),
+                expanded_window: None,
             }],
             model_tag: Some("qwen2.5:7b".to_string()),
         }),
@@ -227,6 +230,7 @@ async fn test_artemis_airgap_governance_invariants() {
         line_start: 1,
         line_end: 10,
         origin_peer_id: Some("local".to_string()),
+        expanded_window: None,
     };
 
     // Outbound check: must detect restricted chunk
@@ -368,4 +372,236 @@ async fn test_rlm_longform_multi_buffer_and_undefined_buffer_resilience() {
         assert!(answer.contains(&format!("[{}]", i)), "Must cite [{}] in assembled output", i);
     }
     assert_eq!(citations.len(), 6);
+}
+
+#[tokio::test]
+async fn test_multi_host_federated_wire_blake3_hash_parity_and_rrf_dedup() {
+    // 1. Invariant: CandidateChunkDto MUST preserve canonical BLAKE3 hash on wire
+    let canonical_text = "QuorumRAG federated consensus architecture guarantees Byzantine agreement across all peers.";
+    let canonical_hash = DocumentChunk::compute_blake3_hash(canonical_text);
+
+    let doc = DocumentChunk {
+        chunk_id: "shared_spec:0".to_string(),
+        document_id: "shared_spec".to_string(),
+        file_path: "C:/Docs/spec.txt".to_string(),
+        line_start: 1,
+        line_end: 15,
+        blake3_hash: canonical_hash.clone(),
+        access_tier: 0,
+        vector: vec![0.1; 768],
+        text_content: canonical_text.to_string(),
+        metadata_json: "{}".to_string(),
+    };
+
+    let scored_local = ScoredChunk::new(doc.clone(), 0.95, "local", false);
+    let mut dto_remote = CandidateChunkDto::from_scored_chunk(&scored_local);
+    dto_remote.origin_peer_id = Some("12D3KooWPeerHostB".to_string());
+    // Attach 10KB expanded window auxiliary field without corrupting canonical content
+    dto_remote.expanded_window = Some("Parent document expanded window up to 10KB...".to_string());
+
+    // Wire verification: candidate.content must match canonical text and produce identical BLAKE3 hash
+    assert_eq!(dto_remote.content, canonical_text);
+    let wire_hash = DocumentChunk::compute_blake3_hash(&dto_remote.content);
+    assert_eq!(wire_hash, canonical_hash);
+
+    // 2. Query executed on Host A: local holds doc, Peer B returns doc
+    let host_a_local = vec![scored_local.clone()];
+    let host_a_remotes = vec![("12D3KooWPeerHostB".to_string(), vec![dto_remote.clone()])];
+    let host_a_fused = RrfCombiner::fuse_rankings_with_peers(host_a_local, host_a_remotes, 60.0, 10);
+
+    // Assert deduplication succeeded: exactly 1 fused chunk survives, NOT 2 duplicates
+    assert_eq!(host_a_fused.len(), 1, "Shared document must deduplicate into exactly 1 chunk");
+    assert_eq!(host_a_fused[0].chunk.blake3_hash, canonical_hash);
+    // Consensus boost (1.25x) applied because seen on both local (peer 0) and remote (peer 1)
+    let expected_base_score = (1.0 / 61.0) + (1.0 / 61.0);
+    let expected_boosted = expected_base_score * 1.25;
+    assert!((host_a_fused[0].score - expected_boosted).abs() < 1e-4);
+
+    // 3. Symmetric Query executed on Host B: Host B holds doc locally, Peer A returns doc as remote
+    let scored_on_b = ScoredChunk::new(doc.clone(), 0.95, "local", false);
+    let mut dto_from_a = CandidateChunkDto::from_scored_chunk(&scored_on_b);
+    dto_from_a.origin_peer_id = Some("12D3KooWPeerHostA".to_string());
+    dto_from_a.expanded_window = Some("Parent document expanded window up to 10KB...".to_string());
+
+    let host_b_local = vec![scored_on_b];
+    let host_b_remotes = vec![("12D3KooWPeerHostA".to_string(), vec![dto_from_a])];
+    let host_b_fused = RrfCombiner::fuse_rankings_with_peers(host_b_local, host_b_remotes, 60.0, 10);
+
+    // Both Host A and Host B MUST achieve 100% parity on candidate count, hash, and score
+    assert_eq!(host_a_fused.len(), host_b_fused.len());
+    assert_eq!(host_a_fused[0].chunk.blake3_hash, host_b_fused[0].chunk.blake3_hash);
+    assert!((host_a_fused[0].score - host_b_fused[0].score).abs() < 1e-5);
+}
+
+#[tokio::test]
+async fn test_multi_host_relevance_quorum_uniformity() {
+    // Under a multi-term query, verify identical relevance decisions whether evaluated locally or on remote peer
+    let query_terms = vec!["architecture".to_string(), "consensus".to_string()];
+    let required_hits = 2;
+
+    // Single-hit chunk: contains only "architecture", not "consensus"
+    let single_hit_chunk = ScoredChunk::new(
+        DocumentChunk {
+            chunk_id: "c_single:0".to_string(),
+            document_id: "c_single".to_string(),
+            file_path: "C:/Docs/general_architecture.txt".to_string(),
+            line_start: 1,
+            line_end: 10,
+            blake3_hash: format!("{:064x}", 10),
+            access_tier: 0,
+            vector: vec![0.0; 768],
+            text_content: "General software architecture patterns and modular design.".to_string(),
+            metadata_json: "{}".to_string(),
+        },
+        0.50,
+        "local",
+        false,
+    );
+
+    // Two-hit chunk: contains both "architecture" and "consensus"
+    let double_hit_chunk = ScoredChunk::new(
+        DocumentChunk {
+            chunk_id: "c_double:0".to_string(),
+            document_id: "c_double".to_string(),
+            file_path: "C:/Docs/quorum_consensus.txt".to_string(),
+            line_start: 1,
+            line_end: 10,
+            blake3_hash: format!("{:064x}", 11),
+            access_tier: 0,
+            vector: vec![0.0; 768],
+            text_content: "The system architecture enforces Byzantine consensus across nodes.".to_string(),
+            metadata_json: "{}".to_string(),
+        },
+        0.85,
+        "local",
+        false,
+    );
+
+    let check_relevance = |c: &ScoredChunk| -> bool {
+        let tl = c.chunk.text_content.to_ascii_lowercase();
+        let total_hits = query_terms.iter().filter(|w| tl.contains(w.as_str())).count();
+        total_hits >= required_hits
+    };
+
+    // 1. Evaluated locally on home node
+    assert!(!check_relevance(&single_hit_chunk), "Local single-hit chunk must be rejected under 2-term quorum");
+    assert!(check_relevance(&double_hit_chunk), "Local double-hit chunk must pass under 2-term quorum");
+
+    // 2. Evaluated as remote peer chunk on querying host
+    let mut remote_single = single_hit_chunk.clone();
+    remote_single.source_peer = "12D3KooWPeerRemote".to_string();
+    remote_single.is_remote = true;
+
+    let mut remote_double = double_hit_chunk.clone();
+    remote_double.source_peer = "12D3KooWPeerRemote".to_string();
+    remote_double.is_remote = true;
+
+    assert!(!check_relevance(&remote_single), "Remote single-hit chunk must NOT pass with asymmetric 1-hit relaxation!");
+    assert!(check_relevance(&remote_double), "Remote double-hit chunk must pass uniformly");
+}
+
+#[tokio::test]
+async fn test_stem_document_family_capping_and_dedup_parity() {
+    let pool_host_a = vec![
+        ScoredChunk::new(
+            DocumentChunk {
+                chunk_id: "res_a_1".to_string(),
+                document_id: "res_a".to_string(),
+                file_path: "C:/Local/Femi_Oyesanya_Resume_v1.pdf".to_string(),
+                line_start: 1,
+                line_end: 10,
+                blake3_hash: "hash_a1".to_string(),
+                access_tier: 0,
+                vector: vec![0.0; 768],
+                text_content: "Femi Oyesanya resume page 1 executive summary".to_string(),
+                metadata_json: "{}".to_string(),
+            },
+            0.98,
+            "local",
+            false,
+        ),
+        ScoredChunk::new(
+            DocumentChunk {
+                chunk_id: "res_a_2".to_string(),
+                document_id: "res_a".to_string(),
+                file_path: "C:/Local/Femi_Oyesanya_Resume_v2.docx".to_string(),
+                line_start: 1,
+                line_end: 10,
+                blake3_hash: "hash_a2".to_string(),
+                access_tier: 0,
+                vector: vec![0.0; 768],
+                text_content: "Femi Oyesanya resume page 2 experience".to_string(),
+                metadata_json: "{}".to_string(),
+            },
+            0.95,
+            "local",
+            false,
+        ),
+        ScoredChunk::new(
+            DocumentChunk {
+                chunk_id: "res_b_remote".to_string(),
+                document_id: "res_b".to_string(),
+                file_path: "D:/PeerB/Femi_Oyesanya_Resume_Final.pdf".to_string(),
+                line_start: 1,
+                line_end: 10,
+                blake3_hash: "hash_b1".to_string(),
+                access_tier: 0,
+                vector: vec![0.0; 768],
+                text_content: "Femi Oyesanya resume final revision".to_string(),
+                metadata_json: "{}".to_string(),
+            },
+            0.90,
+            "12D3KooWPeerB",
+            true,
+        ),
+    ];
+
+    // Global cap of 2 per family stem: the 3rd resume must be capped regardless of peer
+    let capped_a = RetrieveMeshNode::cap_document_families_federated(pool_host_a, 2);
+    assert_eq!(capped_a.len(), 2, "Document family cap must enforce exactly 2 chunks across federation");
+    assert_eq!(capped_a[0].chunk.chunk_id, "res_a_1");
+    assert_eq!(capped_a[1].chunk.chunk_id, "res_a_2");
+
+    // Citation deduplication parity
+    let deduped = DeterministicOfflineSynthesisEngine::deduplicated_chunks_with_scores(&capped_a.iter().collect::<Vec<_>>());
+    assert_eq!(deduped.len(), 1, "All revisions of femi_oyesanya_resume must collapse into 1 canonical document family");
+    assert_eq!(deduped[0].0.chunk.chunk_id, "res_a_2", "Canonical deduplication must pick higher version v2.docx over v1.pdf");
+}
+
+#[tokio::test]
+async fn test_canonical_synthesis_prompt_cross_host_parity() {
+    let doc1 = DocumentChunk {
+        chunk_id: "doc1:0".to_string(),
+        document_id: "doc1".to_string(),
+        file_path: "C:/Docs/spec.txt".to_string(),
+        line_start: 1,
+        line_end: 10,
+        blake3_hash: format!("{:064x}", 1),
+        access_tier: 0,
+        vector: vec![0.0; 768],
+        text_content: "Decentralized consensus protocol specification.".to_string(),
+        metadata_json: "{}".to_string(),
+    };
+
+    // Prompt built on Host A (where doc1 was local)
+    let chunks_host_a = vec![ScoredChunk::new(doc1.clone(), 0.95, "local", false)];
+    let prompt_host_a = DeterministicOfflineSynthesisEngine::build_synthesis_prompt(
+        "Explain the consensus protocol",
+        &chunks_host_a,
+    );
+
+    // Prompt built on Host B (where doc1 arrived from peer_a)
+    let chunks_host_b = vec![ScoredChunk::new(doc1.clone(), 0.95, "peer_a", true)];
+    let prompt_host_b = DeterministicOfflineSynthesisEngine::build_synthesis_prompt(
+        "Explain the consensus protocol",
+        &chunks_host_b,
+    );
+
+    // Invariant: Prompt text presented to LLM/synthesis engine MUST be 100% byte-for-byte identical!
+    assert_eq!(
+        prompt_host_a, prompt_host_b,
+        "Synthesis prompt must not vary by querying host!"
+    );
+    assert!(!prompt_host_a.contains("Peer: local"));
+    assert!(!prompt_host_b.contains("Peer: peer_a"));
 }

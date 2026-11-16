@@ -483,6 +483,12 @@ pub async fn chat_sse_handler(
                 Err(e) => {
                     if !task.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                         error!("Error in query_agentic_with_history: {}", e);
+                        if let Ok(hist_store) = state_for_history.history_store() {
+                            let _ = hist_store.record_cancelled_turn(
+                                &session_id_task,
+                                &format!("*[Query execution stopped: {}]*", e),
+                            );
+                        }
                         let _ = task_tx
                             .send(AgenticTelemetryEvent::ExecutionError {
                                 failed_state: quorum_coordinator::types::AgenticStateName::SynthesizeWithCitations,

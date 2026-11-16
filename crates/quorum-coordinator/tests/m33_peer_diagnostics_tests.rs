@@ -192,6 +192,7 @@ async fn test_peer_diagnostics_timed_out_peer() {
                 score: 0.95,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         })
         .await;
@@ -294,6 +295,7 @@ async fn test_peer_diagnostics_omitted_when_remote_chunks_cited() {
                 score: 0.99,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         })
         .await;

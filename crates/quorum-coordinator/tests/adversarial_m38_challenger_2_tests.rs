@@ -133,6 +133,7 @@ async fn test_adversarial_mesh_zero_responsive_ten_hanging_peers_scatter_gather(
                 score: 0.99,
                 content: "Stale data that should never be returned".to_string(),
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         });
     }
@@ -181,6 +182,7 @@ async fn test_adversarial_mesh_one_responsive_five_dead_peers_immediate_return()
                 score: 0.92,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         })
         .await;
@@ -254,6 +256,7 @@ async fn test_adversarial_mesh_saturated_response_threshold_immediate_break() {
                     score: 0.85,
                     access_tier: 0,
                     origin_peer_id: None,
+                    expanded_window: None,
                 }],
             })
             .await;

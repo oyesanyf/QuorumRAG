@@ -14,6 +14,8 @@ pub mod shutdown;
 pub mod state;
 pub mod wan_mesh;
 #[cfg(windows)]
+pub mod win_native;
+#[cfg(windows)]
 pub mod win_service;
 
 use cli::{Cli, Commands};

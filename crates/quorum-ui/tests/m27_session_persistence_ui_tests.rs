@@ -72,6 +72,38 @@ fn test_session_persistence_and_routing_invariants() {
         js.contains("window.getActiveSessionId"),
         "app.js must export getActiveSessionId to window"
     );
+
+    // 7. Data Controls & Unrestricted Deletion invariants (Milestone M2)
+    assert!(
+        js.contains("deleteSingleHistorySession(activeSessionId)"),
+        "Data Controls 'clear-chat-history' must delete only the active session, not all sessions"
+    );
+    assert!(
+        !js.contains("case 'clear-archived-chats':\n          e.preventDefault();\n          await saveUiSettingsPatch({ archived_chats: [] });\n          await clearAllHistorySessions();"),
+        "Data Controls 'clear-archived-chats' must NOT wipe all database sessions"
+    );
+    assert!(
+        js.contains("saveUiSettingsPatch({ archived_chats: [] })"),
+        "Data Controls 'clear-archived-chats' must clear the archived chats preference array"
+    );
+    assert!(
+        js.contains("promptAndClearAllHistory()"),
+        "Sidebar trash button must prompt user before clearing all history"
+    );
+    assert!(
+        js.contains("fetch('/api/history', { method: 'DELETE' })"),
+        "User-initiated Clear All must issue DELETE /api/history cleanly"
+    );
+
+    // 8. Startup Warmup & Session Protection invariants
+    assert!(
+        js.contains("Startup warmup protection: if /api/history fails, times out, or returns 0 sessions"),
+        "restoreActiveSessionOnStartup must protect active session during startup warmup"
+    );
+    assert!(
+        js.contains("targetSessionId = urlSession || storedSession;"),
+        "restoreActiveSessionOnStartup must retain stored/URL session when /api/history is delayed or empty"
+    );
 }
 
 #[test]

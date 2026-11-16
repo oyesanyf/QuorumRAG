@@ -866,6 +866,7 @@ fn test_tier1_f10_p2p_outbound_airgap_blocking() {
         score: 0.99,
         access_tier: 3,
         origin_peer_id: None,
+        expanded_window: None,
     };
     assert!(AirgapMeshRouter::is_airgap_restricted_chunk_dto(&chunk_artemis));
 
@@ -879,6 +880,7 @@ fn test_tier1_f10_p2p_outbound_airgap_blocking() {
         score: 0.95,
         access_tier: 3,
         origin_peer_id: None,
+        expanded_window: None,
     };
     assert!(AirgapMeshRouter::is_airgap_restricted_chunk_dto(&chunk_tier3));
 
@@ -892,6 +894,7 @@ fn test_tier1_f10_p2p_outbound_airgap_blocking() {
         score: 0.85,
         access_tier: 0,
         origin_peer_id: None,
+        expanded_window: None,
     };
     assert!(!AirgapMeshRouter::is_airgap_restricted_chunk_dto(&chunk_public));
 
@@ -939,6 +942,7 @@ fn test_tier1_f11_p2p_inbound_airgap_rejection() {
             score: 0.9,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         },
         CandidateChunkDto {
             chunk_id: "rc2".to_string(),
@@ -949,6 +953,7 @@ fn test_tier1_f11_p2p_inbound_airgap_rejection() {
             score: 0.8,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         },
     ];
     let sanitized = AirgapMeshRouter::sanitize_inbound_remote_chunks(remote_chunks);
@@ -1836,6 +1841,7 @@ fn test_tier3_c06_pair_scatter_gather_remote_peer_returns_artemis_chunk_dropped(
             score: 0.99,
             access_tier: 0, // Maliciously forged tier 0,
             origin_peer_id: None,
+            expanded_window: None,
         },
         CandidateChunkDto {
             chunk_id: "clean_chunk".to_string(),
@@ -1846,6 +1852,7 @@ fn test_tier3_c06_pair_scatter_gather_remote_peer_returns_artemis_chunk_dropped(
             score: 0.85,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         },
     ];
 
@@ -2252,6 +2259,7 @@ fn test_tier4_scenario_2_host_airgap_enforcement_against_adversarial_p2p_mesh_pr
         score: 0.99,
         access_tier: 3,
         origin_peer_id: None,
+        expanded_window: None,
     };
     let outbound = AirgapMeshRouter::filter_outbound_mesh_chunks(vec![leaked_candidate]);
     assert!(outbound.is_empty(), "Outbound airgap filter must be fail-closed");

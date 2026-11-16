@@ -29,6 +29,10 @@ if [ -f "${SCRIPT_DIR}/quorumrag" ]; then
     install -m 755 "${SCRIPT_DIR}/quorumrag" /usr/local/bin/quorumrag
     echo "[+] Installed /usr/local/bin/quorumrag"
 fi
+if [ -f "${SCRIPT_DIR}/quorum-desktop" ]; then
+    install -m 755 "${SCRIPT_DIR}/quorum-desktop" /usr/local/bin/quorum-desktop
+    echo "[+] Installed /usr/local/bin/quorum-desktop"
+fi
 if [ -f "${SCRIPT_DIR}/uninstall.sh" ]; then
     install -m 755 "${SCRIPT_DIR}/uninstall.sh" /usr/local/share/quorumrag/uninstall.sh
 fi

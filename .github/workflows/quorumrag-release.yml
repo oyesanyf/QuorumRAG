@@ -167,10 +167,10 @@ jobs:
         run: |
           VERSION="${INPUT_VERSION:-0.6.16}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
-          cargo build --release -p quorum-daemon --bin quorumrag
+          cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop
           ./target/release/quorumrag --version
           python3 scripts/verify_live_test_queries.py --bin ./target/release/quorumrag
-          bash packaging/linux/build_packages.sh target/release/quorumrag "${VERSION}" amd64 deploy/linux quorumrag
+          bash packaging/linux/build_packages.sh target/release/quorumrag "${VERSION}" amd64 deploy/linux quorumrag target/release/quorum-desktop
           dpkg-deb --info "deploy/linux/quorumrag_${VERSION}_amd64.deb"
           rpm -qip "deploy/linux/quorumrag-${VERSION}-1.x86_64.rpm"
 
@@ -248,9 +248,9 @@ jobs:
         run: |
           VERSION="${INPUT_VERSION:-0.6.16}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
-          cargo build --release -p quorum-daemon --bin quorumrag
+          cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop
           ./target/release/quorumrag --version
-          bash packaging/linux/build_packages.sh target/release/quorumrag "${VERSION}" arm64 deploy/linux-arm64 quorumrag
+          bash packaging/linux/build_packages.sh target/release/quorumrag "${VERSION}" arm64 deploy/linux-arm64 quorumrag target/release/quorum-desktop
           dpkg-deb --info "deploy/linux-arm64/quorumrag_${VERSION}_arm64.deb"
           rpm -qip "deploy/linux-arm64/quorumrag-${VERSION}-1.aarch64.rpm"
 
@@ -311,16 +311,20 @@ jobs:
         run: |
           VERSION="${INPUT_VERSION:-0.6.16}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
-          cargo build --release -p quorum-daemon --bin quorumrag --target aarch64-apple-darwin
-          cargo build --release -p quorum-daemon --bin quorumrag --target x86_64-apple-darwin
+          cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target aarch64-apple-darwin
+          cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target x86_64-apple-darwin
           mkdir -p target/release
           lipo -create -output target/release/quorumrag \
             target/aarch64-apple-darwin/release/quorumrag \
             target/x86_64-apple-darwin/release/quorumrag
+          lipo -create -output target/release/quorum-desktop \
+            target/aarch64-apple-darwin/release/quorum-desktop \
+            target/x86_64-apple-darwin/release/quorum-desktop
           lipo -info target/release/quorumrag
           lipo -info target/release/quorumrag | grep -E "x86_64.*arm64|arm64.*x86_64"
+          lipo -info target/release/quorum-desktop | grep -E "x86_64.*arm64|arm64.*x86_64"
           ./target/release/quorumrag --version
-          bash packaging/macos/build_packages.sh target/release/quorumrag "${VERSION}" universal deploy/macos quorumrag
+          bash packaging/macos/build_packages.sh target/release/quorumrag "${VERSION}" universal deploy/macos quorumrag target/release/quorum-desktop
           pkgutil --payload-files "deploy/macos/QuorumRAG-${VERSION}-macos-universal.pkg" | head -n 20
           hdiutil imageinfo "deploy/macos/QuorumRAG-${VERSION}-macos-universal.dmg" | head -n 20
 
@@ -384,16 +388,20 @@ jobs:
         run: |
           VERSION="${INPUT_VERSION:-0.6.16}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
-          cargo build --release -p quorum-daemon --bin quorumrag --target aarch64-apple-darwin
-          cargo build --release -p quorum-daemon --bin quorumrag --target x86_64-apple-darwin
+          cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target aarch64-apple-darwin
+          cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target x86_64-apple-darwin
           mkdir -p target/release
           lipo -create -output target/release/quorumrag \
             target/aarch64-apple-darwin/release/quorumrag \
             target/x86_64-apple-darwin/release/quorumrag
+          lipo -create -output target/release/quorum-desktop \
+            target/aarch64-apple-darwin/release/quorum-desktop \
+            target/x86_64-apple-darwin/release/quorum-desktop
           lipo -info target/release/quorumrag
           lipo -info target/release/quorumrag | grep -E "x86_64.*arm64|arm64.*x86_64"
+          lipo -info target/release/quorum-desktop | grep -E "x86_64.*arm64|arm64.*x86_64"
           ./target/release/quorumrag --version
-          bash packaging/macos/build_packages.sh target/release/quorumrag "${VERSION}" universal deploy/macos quorumrag
+          bash packaging/macos/build_packages.sh target/release/quorumrag "${VERSION}" universal deploy/macos quorumrag target/release/quorum-desktop
           pkgutil --payload-files "deploy/macos/QuorumRAG-${VERSION}-macos-universal.pkg" | head -n 20
           hdiutil imageinfo "deploy/macos/QuorumRAG-${VERSION}-macos-universal.dmg" | head -n 20
 

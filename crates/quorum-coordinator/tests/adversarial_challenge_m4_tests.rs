@@ -73,6 +73,7 @@ async fn challenge_slow_peer_first_must_not_drop_fast_peer() {
             score: 0.99,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     });
 
@@ -90,6 +91,7 @@ async fn challenge_slow_peer_first_must_not_drop_fast_peer() {
             score: 0.88,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     });
 
@@ -144,6 +146,7 @@ async fn challenge_scatter_gather_engine_slow_peer_first() {
                 score: 0.99,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         })
         .await;
@@ -163,6 +166,7 @@ async fn challenge_scatter_gather_engine_slow_peer_first() {
                 score: 0.88,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         })
         .await;
@@ -433,6 +437,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
                 score: 0.9,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "chunk_same_peer_dup".to_string(),
@@ -443,6 +448,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
                 score: 0.7,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "chunk_same_peer_dup".to_string(),
@@ -453,6 +459,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
                 score: 0.6,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             },
         ],
         vec![CandidateChunkDto {
@@ -464,6 +471,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
             score: 0.9,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     ];
 
@@ -540,6 +548,7 @@ fn challenge_rrf_combiner_consensus_boost_adversarial_math() {
             score: 0.5,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }]],
         60.0,
         2,
@@ -697,6 +706,7 @@ async fn challenge_scatter_gather_interleaved_fast_and_slow_peers() {
                     score: 0.85,
                     access_tier: 0,
                     origin_peer_id: None,
+                    expanded_window: None,
                 }],
             })
             .await;

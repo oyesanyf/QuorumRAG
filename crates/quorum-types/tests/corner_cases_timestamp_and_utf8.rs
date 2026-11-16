@@ -252,6 +252,7 @@ fn test_into_volatile_remote_chunk_zeroize_on_drop_stress() {
         score: 0.95,
         access_tier: 2,
         origin_peer_id: None,
+        expanded_window: None,
     };
 
     // Consume DTO by value into VolatileRemoteChunk

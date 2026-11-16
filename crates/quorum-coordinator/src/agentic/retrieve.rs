@@ -80,13 +80,13 @@ pub const STOPWORDS: &[&str] = &[
 pub struct RetrieveMeshNode;
 
 impl RetrieveMeshNode {
-    /// Capping helper: Caps excerpts per document stem per peer across the federation (max 2 per document family per peer),
-    /// keying on (source_peer, stem) so local document families do not evict remote peer chunks from the same document family.
+    /// Capping helper: Caps excerpts per document stem across the federation (max 2 per document family),
+    /// keying on stem so document families are capped uniformly regardless of peer origin.
     pub fn cap_document_families_federated(
         chunks: Vec<quorum_types::ScoredChunk>,
         max_per_family: usize,
     ) -> Vec<quorum_types::ScoredChunk> {
-        let mut stem_counts: std::collections::HashMap<(String, String), usize> =
+        let mut stem_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut stem_deduped: Vec<quorum_types::ScoredChunk> = Vec::with_capacity(chunks.len());
         for c in chunks {
@@ -97,7 +97,7 @@ impl RetrieveMeshNode {
                     &c.chunk.file_path,
                 )
             };
-            let key = (c.source_peer.to_ascii_lowercase(), stem);
+            let key = stem;
             let count = stem_counts.entry(key).or_insert(0);
             if *count < max_per_family {
                 *count += 1;
@@ -494,23 +494,28 @@ impl RetrieveMeshNode {
             }
 
             if should_run_supplemental {
-                for (idx, mut hit) in entity_hits.into_iter().enumerate() {
-                    // Normalize supplemental BM25 scores to [0.0, 1.0] RRF scale (1.0 / (60.0 + rank))
-                    hit.score = 1.0 / (60.0 + idx as f32);
+                let max_supp = if peer_count > 0 { 4 } else { 96 };
+                let supp_denom = if peer_count > 0 { 120.0 } else { 60.0 };
+                for (idx, mut hit) in entity_hits.into_iter().take(max_supp).enumerate() {
+                    // Harmonized supplemental score scale prevents local text from skewing
+                    // candidate ranks over remote peers when connected to mesh.
+                    hit.score = 1.0 / (supp_denom + idx as f32);
                     if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                         chunks.push(hit);
                     }
                 }
 
-                for (idx, mut hit) in prompt_hits.into_iter().enumerate() {
-                    hit.score = 1.0 / (60.0 + idx as f32);
+                let max_prompt = if peer_count > 0 { 4 } else { 64 };
+                for (idx, mut hit) in prompt_hits.into_iter().take(max_prompt).enumerate() {
+                    hit.score = 1.0 / (supp_denom + idx as f32);
                     if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                         chunks.push(hit);
                     }
                 }
 
-                for (idx, mut hit) in cue_hits.into_iter().enumerate() {
-                    hit.score = 1.0 / (60.0 + idx as f32);
+                let max_cue = if peer_count > 0 { 4 } else { 48 };
+                for (idx, mut hit) in cue_hits.into_iter().take(max_cue).enumerate() {
+                    hit.score = 1.0 / (supp_denom + idx as f32);
                     if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                         chunks.push(hit);
                     }
@@ -580,8 +585,7 @@ impl RetrieveMeshNode {
                     || file_l.ends_with(".xlsx")
                     || file_l.ends_with(".rtf")
                     || file_l.ends_with(".odt");
-                if !c.is_remote
-                    && !is_media
+                if !is_media
                     && !is_user_doc
                     && (path_l.contains("\\harfile\\") || path_l.contains("/harfile/"))
                 {
@@ -1271,7 +1275,8 @@ impl RetrieveMeshNode {
                 .map(|c| c.chunk.chunk_id.clone())
                 .collect();
             let mut top_local_docs: Vec<(String, f32)> = Vec::new();
-            for item in chunks.iter().filter(|c| c.source_peer == "local") {
+            let max_scan = if peer_count > 0 { 8 } else { chunks.len() };
+            for item in chunks.iter().take(max_scan).filter(|c| c.source_peer == "local") {
                 let doc_prefix = if !item.chunk.document_id.is_empty() {
                     item.chunk.document_id.clone()
                 } else if let Some((prefix, _)) = item.chunk.chunk_id.rsplit_once(':') {
@@ -1585,6 +1590,7 @@ mod tests {
                 score: 0.96,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "remote_pdf_doc:1".to_string(),
@@ -1595,6 +1601,7 @@ mod tests {
                 score: 0.91,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "remote_docx_doc:0".to_string(),
@@ -1605,6 +1612,7 @@ mod tests {
                 score: 0.93,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "remote_docx_doc:1".to_string(),
@@ -1615,6 +1623,7 @@ mod tests {
                 score: 0.89,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             },
         ];
 
@@ -1754,6 +1763,7 @@ mod tests {
             score: 0.93,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         };
         let remote_mock = MockMeshDispatcher::new();
         remote_mock

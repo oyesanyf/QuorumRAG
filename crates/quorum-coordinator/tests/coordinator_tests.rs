@@ -243,6 +243,7 @@ fn test_rrf_combiner_consensus_boost() {
             score: 0.9,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
         vec![CandidateChunkDto {
             chunk_id: "c_shared".to_string(),
@@ -253,6 +254,7 @@ fn test_rrf_combiner_consensus_boost() {
             score: 0.9,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     ];
 
@@ -291,6 +293,7 @@ fn test_volatile_memory_scrubbing() {
         score: 0.9,
         access_tier: 2,
         origin_peer_id: None,
+        expanded_window: None,
     };
 
     let mut volatile = dto.into_volatile_remote_chunk("peer_1");
@@ -337,6 +340,7 @@ async fn test_scatter_gather_400ms_timeout_aborts_slow_peer() {
             score: 0.88,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     });
 
@@ -354,6 +358,7 @@ async fn test_scatter_gather_400ms_timeout_aborts_slow_peer() {
             score: 0.99,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     });
 

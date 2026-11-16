@@ -1374,7 +1374,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 &req.query_text,
                 &query_embedding,
                 effective_tier,
-                req.top_k.clamp(16, 32),
+                req.top_k.clamp(16, 128),
             ),
             self.local_storage
                 .search_text(&req.query_text, effective_tier, 24),
@@ -1526,7 +1526,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 effective_tier,
             ) {
                 if !expanded_text.trim().is_empty() {
-                    dto.content = expanded_text;
+                    dto.expanded_window = Some(expanded_text);
                 }
             } else if let Some((_start, _end, expanded_text, _, _)) = self.local_storage.expand_parent_window(
                 &c.chunk.file_path,
@@ -1535,7 +1535,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 effective_tier,
             ) {
                 if !expanded_text.trim().is_empty() {
-                    dto.content = expanded_text;
+                    dto.expanded_window = Some(expanded_text);
                 }
             }
             candidate_dtos.push(dto);

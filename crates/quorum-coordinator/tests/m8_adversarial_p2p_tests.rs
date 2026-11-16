@@ -773,6 +773,7 @@ fn test_adv_byzantine_sybil_score_stuffing_100_chunks() {
             score: 0.99,
             content: malicious_text.to_string(),
             origin_peer_id: None,
+            expanded_window: None,
         });
     }
 

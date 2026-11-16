@@ -146,6 +146,7 @@ async fn test_empirical_mesh_latency_single_peer_resolves_immediately_under_200m
                     score: 0.92,
                     access_tier: 0,
                     origin_peer_id: None,
+                    expanded_window: None,
                 },
                 CandidateChunkDto {
                     chunk_id: "chunk_remote_2".to_string(),
@@ -156,6 +157,7 @@ async fn test_empirical_mesh_latency_single_peer_resolves_immediately_under_200m
                     score: 0.88,
                     access_tier: 0,
                     origin_peer_id: None,
+                    expanded_window: None,
                 },
             ],
         })
@@ -214,6 +216,7 @@ async fn test_empirical_scatter_gather_single_peer_immediate_resolution() {
                 score: 0.90,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         })
         .await;
@@ -275,6 +278,7 @@ async fn test_empirical_dead_peer_straggler_early_resolution_with_fast_responder
                     score: 0.95,
                     access_tier: 0,
                     origin_peer_id: None,
+                    expanded_window: None,
                 },
                 CandidateChunkDto {
                     chunk_id: "c_fast_2".to_string(),
@@ -285,6 +289,7 @@ async fn test_empirical_dead_peer_straggler_early_resolution_with_fast_responder
                     score: 0.89,
                     access_tier: 0,
                     origin_peer_id: None,
+                    expanded_window: None,
                 },
             ],
         })
@@ -305,6 +310,7 @@ async fn test_empirical_dead_peer_straggler_early_resolution_with_fast_responder
                 score: 0.50,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         })
         .await;
@@ -394,6 +400,7 @@ async fn test_empirical_dead_peer_straggler_with_zero_chunks_fast_peer() {
                 score: 0.1,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         })
         .await;
@@ -873,6 +880,7 @@ async fn test_empirical_semaphore_bounded_dlp_concurrent_chunk_streams_stress() 
                 score: 0.90,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             });
         }
 

@@ -417,6 +417,7 @@ async fn test_cross_platform_concurrency_stress_and_end_to_end_benchmarks() {
                     score: 0.91,
                     access_tier: 0,
                     origin_peer_id: None,
+                    expanded_window: None,
                 }],
             })
             .await;

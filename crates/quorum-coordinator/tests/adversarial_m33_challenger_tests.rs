@@ -93,6 +93,7 @@ async fn test_adversarial_timeout_sub_budget_scaling_reproduction() {
                 score: 0.9,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         })
         .await;

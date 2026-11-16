@@ -9,6 +9,7 @@ VERSION="${2:-0.6.16}"
 INPUT_ARCH="${3:-universal}"
 DIST_DIR="${4:-deploy/macos}"
 PACKAGE_NAME="${5:-quorumrag}"
+DESKTOP_PATH="${6:-$(dirname "${BINARY_PATH}")/quorum-desktop}"
 
 case "$INPUT_ARCH" in
     aarch64|arm64)
@@ -31,6 +32,12 @@ if [ ! -f "$BINARY_PATH" ]; then
 fi
 
 BINARY_PATH="$(cd "$(dirname "${BINARY_PATH}")" && pwd)/$(basename "${BINARY_PATH}")"
+if [ -f "$DESKTOP_PATH" ]; then
+    DESKTOP_PATH="$(cd "$(dirname "${DESKTOP_PATH}")" && pwd)/$(basename "${DESKTOP_PATH}")"
+    echo "[*] Desktop helper source: ${DESKTOP_PATH}"
+else
+    echo "[!] Desktop helper not found at ${DESKTOP_PATH}; proceeding without desktop binary"
+fi
 mkdir -p "${DIST_DIR}"
 DIST_DIR="$(cd "${DIST_DIR}" && pwd)"
 
@@ -53,6 +60,10 @@ mkdir -p "${TAR_STAGING}"
 
 cp -f "${BINARY_PATH}" "${TAR_STAGING}/quorumrag"
 chmod 755 "${TAR_STAGING}/quorumrag"
+if [ -f "${DESKTOP_PATH}" ]; then
+    cp -f "${DESKTOP_PATH}" "${TAR_STAGING}/quorum-desktop"
+    chmod 755 "${TAR_STAGING}/quorum-desktop"
+fi
 cp -f "${PLIST_FILE}" "${TAR_STAGING}/dev.quorumrag.daemon.plist"
 chmod 644 "${TAR_STAGING}/dev.quorumrag.daemon.plist"
 cp -f "${INSTALL_SH}" "${TAR_STAGING}/install.sh"
@@ -75,7 +86,11 @@ mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
 cp -f "${BINARY_PATH}" "${APP_BUNDLE}/Contents/MacOS/quorumrag-bin"
 chmod 755 "${APP_BUNDLE}/Contents/MacOS/quorumrag-bin"
 
-cat <<'EOF' > "${APP_BUNDLE}/Contents/MacOS/QuorumRAG"
+if [ -f "${DESKTOP_PATH}" ]; then
+    cp -f "${DESKTOP_PATH}" "${APP_BUNDLE}/Contents/MacOS/QuorumRAG"
+    chmod 755 "${APP_BUNDLE}/Contents/MacOS/QuorumRAG"
+else
+    cat <<'EOF' > "${APP_BUNDLE}/Contents/MacOS/QuorumRAG"
 #!/usr/bin/env bash
 # If the QuorumRAG LaunchDaemon is installed (pkg / install.sh), just open the Web UI.
 # Otherwise (drag-installed from the .dmg) run a per-user instance, which opens the browser itself.
@@ -97,7 +112,8 @@ DATA_DIR="${HOME}/Library/Application Support/QuorumRAG/data"
 mkdir -p "${DATA_DIR}"
 exec "${APP_MACOS_DIR}/quorumrag-bin" --host 0.0.0.0 --port 3031 --p2p-port 3032 --data-dir "${DATA_DIR}"
 EOF
-chmod 755 "${APP_BUNDLE}/Contents/MacOS/QuorumRAG"
+    chmod 755 "${APP_BUNDLE}/Contents/MacOS/QuorumRAG"
+fi
 
 cat <<EOF > "${APP_BUNDLE}/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -143,6 +159,9 @@ if [ "$(uname -s)" = "Darwin" ] && command -v pkgbuild >/dev/null 2>&1; then
              "${PKG_SCRIPTS}"
 
     install -m 755 "${BINARY_PATH}" "${PKG_ROOT}/usr/local/bin/quorumrag"
+    if [ -f "${DESKTOP_PATH}" ]; then
+        install -m 755 "${DESKTOP_PATH}" "${PKG_ROOT}/usr/local/bin/quorum-desktop"
+    fi
     install -m 644 "${PLIST_FILE}" "${PKG_ROOT}/Library/LaunchDaemons/dev.quorumrag.daemon.plist"
     install -m 755 "${UNINSTALL_SH}" "${PKG_ROOT}/usr/local/share/quorumrag/uninstall.sh"
     cp -R "${APP_BUNDLE}" "${PKG_ROOT}/Applications/QuorumRAG.app"
@@ -155,7 +174,7 @@ launchctl bootout system/${LABEL} 2>/dev/null || true
 launchctl unload "/Library/LaunchDaemons/${LABEL}.plist" 2>/dev/null || true
 pkill -9 -f "quorumrag" 2>/dev/null || true
 rm -rf "/Applications/QuorumRAG.app" 2>/dev/null || true
-rm -f "/usr/local/bin/quorumrag" 2>/dev/null || true
+rm -f "/usr/local/bin/quorumrag" "/usr/local/bin/quorum-desktop" 2>/dev/null || true
 exit 0
 EOF
     chmod 755 "${PKG_SCRIPTS}/preinstall"

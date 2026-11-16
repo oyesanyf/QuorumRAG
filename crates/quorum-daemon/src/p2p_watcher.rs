@@ -329,29 +329,24 @@ pub fn format_socket_from_multiaddr(addr: &str) -> Option<String> {
     None
 }
 
-/// Parses the OS ARP neighbor table (`arp -a`) to immediately discover active RFC1918 LAN hosts
-/// across `/8`, `/16`, and `/24` private networks without waiting for full subnet sweeps.
-pub fn discover_arp_private_lan_neighbors(self_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+/// Parses Linux `/proc/net/arp` kernel table text to extract reachable RFC1918 LAN IPv4 neighbors
+/// without invoking external `arp` (`net-tools`) binaries. Skips incomplete (`0x0`) entries.
+pub fn parse_linux_proc_net_arp(proc_arp: &str, self_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
     let mut neighbors = BTreeSet::new();
-    let mut cmd = std::process::Command::new("arp");
-    cmd.arg("-a");
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    for token in text.split(|c: char| {
-        c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '<' | '>')
-    }) {
-        if token.chars().filter(|&c| c == '.').count() != 3 {
+    for (idx, line) in proc_arp.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || (idx == 0 && trimmed.starts_with("IP address")) {
             continue;
         }
-        if let Ok(ip) = token.parse::<Ipv4Addr>() {
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        // Column 2 is ARP flags (`0x2` = ATF_COM complete, `0x6` = permanent, `0x0` = incomplete).
+        if cols[2].eq_ignore_ascii_case("0x0") || cols[3] == "00:00:00:00:00:00" {
+            continue;
+        }
+        if let Ok(ip) = cols[0].parse::<Ipv4Addr>() {
             let oct = ip.octets();
             if oct[3] == 0 || oct[3] == 255 {
                 continue;
@@ -362,6 +357,71 @@ pub fn discover_arp_private_lan_neighbors(self_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr
         }
     }
     neighbors.into_iter().collect()
+}
+
+/// Reads the OS ARP neighbor table using native kernel APIs (`GetIpNetTable` on Windows,
+/// `/proc/net/arp` on Linux, `/usr/sbin/arp -an` on macOS) to discover active RFC1918 LAN hosts
+/// across `/8`, `/16`, and `/24` private networks with zero console window spawns.
+pub fn discover_arp_private_lan_neighbors(self_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut neighbors = BTreeSet::new();
+        for ip in crate::win_native::get_windows_arp_ipv4_neighbors() {
+            let oct = ip.octets();
+            if oct[3] == 0 || oct[3] == 255 {
+                continue;
+            }
+            if is_private_lan_ipv4(&ip) && !self_ips.contains(&ip) {
+                neighbors.insert(ip);
+            }
+        }
+        return neighbors.into_iter().collect();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(proc_arp) = std::fs::read_to_string("/proc/net/arp") {
+            return parse_linux_proc_net_arp(&proc_arp, self_ips);
+        }
+        return Vec::new();
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let mut neighbors = BTreeSet::new();
+        let arp_bin = if std::path::Path::new("/usr/sbin/arp").exists() {
+            "/usr/sbin/arp"
+        } else {
+            "arp"
+        };
+        let output = match std::process::Command::new(arp_bin)
+            .args(["-a", "-n"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        for token in text.split(|c: char| {
+            c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '<' | '>')
+        }) {
+            if token.chars().filter(|&c| c == '.').count() != 3 {
+                continue;
+            }
+            if let Ok(ip) = token.parse::<Ipv4Addr>() {
+                let oct = ip.octets();
+                if oct[3] == 0 || oct[3] == 255 {
+                    continue;
+                }
+                if is_private_lan_ipv4(&ip) && !self_ips.contains(&ip) {
+                    neighbors.insert(ip);
+                }
+            }
+        }
+        neighbors.into_iter().collect()
+    }
 }
 
 /// Probes candidate IPv4 hosts in parallel for an open TCP `p2p_port` (`140ms` connect timeout).
@@ -792,61 +852,16 @@ pub async fn post_p2p_watcher_heal_handler(
     Json(build_watcher_status_dto(&state).await)
 }
 
-/// Re-asserts Windows Firewall inbound rules for the running QuorumRAG binary and LAN P2P ports.
+/// Re-asserts Windows Firewall inbound/outbound rules for the running QuorumRAG binary and LAN P2P ports
+/// via native Windows Firewall COM (`INetFwPolicy2` / `INetFwRule`) — zero `netsh.exe` console spawns.
 #[cfg(target_os = "windows")]
 pub fn ensure_windows_p2p_firewall_rules(http_port: u16, p2p_port: u16) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    if let Ok(exe_path) = std::env::current_exe() {
-        let exe_str = exe_path.to_string_lossy().to_string();
-        let _ = std::process::Command::new("netsh")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                "name=QuorumRAG P2P Mesh (All Profiles)",
-                "dir=in",
-                "action=allow",
-                &format!("program={}", exe_str),
-                "enable=yes",
-                "profile=any",
-            ])
-            .output();
-        let _ = std::process::Command::new("netsh")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                "name=QuorumRAG LAN Ports (TCP 3031-3032)",
-                "dir=in",
-                "action=allow",
-                "protocol=TCP",
-                &format!("localport={},{}", http_port, p2p_port),
-                "enable=yes",
-                "profile=any",
-            ])
-            .output();
-        let _ = std::process::Command::new("netsh")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                "name=QuorumRAG LAN Ports (UDP 3032,5353)",
-                "dir=in",
-                "action=allow",
-                "protocol=UDP",
-                &format!("localport={},5353", p2p_port),
-                "enable=yes",
-                "profile=any",
-            ])
-            .output();
-    }
+    let exe_path = std::env::current_exe().ok();
+    let _ = crate::win_native::ensure_quorum_firewall_rules(
+        exe_path.as_deref(),
+        http_port,
+        p2p_port,
+    );
 }
 
 /// Spawns `quorumrag watch-p2p` as an independent OS child process and supervises it continuously,
@@ -1030,23 +1045,25 @@ fn attempt_platform_service_restart(data_dir: &Path) {
     );
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("sc.exe")
-            .creation_flags(0x0800_0000)
-            .args(["start", "QuorumRAGDaemon"])
-            .output();
+        let _ = crate::win_native::start_windows_service("QuorumRAGDaemon");
     }
     #[cfg(target_os = "linux")]
     {
         let _ = std::process::Command::new("systemctl")
-            .args(["start", "quorumrag"])
-            .output();
+            .args(["--quiet", "start", "quorumrag"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("launchctl")
             .args(["kickstart", "-k", "system/dev.quorumrag.daemon"])
-            .output();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 

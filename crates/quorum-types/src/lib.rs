@@ -269,13 +269,18 @@ impl ScoredChunk {
             self.chunk.text_content.clone()
         };
 
-        let is_ext = self.is_remote && !self.source_peer.is_empty() && !self.source_peer.eq_ignore_ascii_case("local");
-        let node_id = if is_ext { Some(self.source_peer.clone()) } else { None };
+        let effective_peer = if self.source_peer.is_empty() {
+            "local".to_string()
+        } else {
+            self.source_peer.clone()
+        };
+        let is_ext = self.is_remote && !effective_peer.eq_ignore_ascii_case("local");
+        let node_id = if is_ext { Some(effective_peer.clone()) } else { None };
         let origin_label = if is_ext { Some("Mesh Peer".to_string()) } else { Some("local".to_string()) };
         let node_alias = if is_ext { Some("(Mesh Peer)".to_string()) } else { Some("(local)".to_string()) };
 
         Citation {
-            peer_id: self.source_peer.clone(),
+            peer_id: effective_peer,
             file_path: self.chunk.file_path.clone(),
             line_start: self.chunk.line_start,
             line_end: self.chunk.line_end,
@@ -339,7 +344,7 @@ pub struct Citation {
 }
 
 /// Data transfer object for transmitting candidate chunks across the network or between layers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Zeroize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Zeroize, Default)]
 pub struct CandidateChunkDto {
     #[zeroize(skip)]
     pub chunk_id: String,
@@ -357,6 +362,8 @@ pub struct CandidateChunkDto {
     #[serde(default)]
     #[zeroize(skip)]
     pub origin_peer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_window: Option<String>,
 }
 
 impl CandidateChunkDto {
@@ -378,6 +385,7 @@ impl CandidateChunkDto {
             } else {
                 None
             },
+            expanded_window: None,
         }
     }
 
@@ -1191,6 +1199,7 @@ mod tests {
             score: 0.99,
             access_tier: 2,
             origin_peer_id: None,
+            expanded_window: None,
         };
 
         let mut volatile = dto.to_volatile_remote_chunk("peer-x");
