@@ -312,24 +312,111 @@ def try_gpg_sign_artifacts(deploy_root: Path, artifacts: list[Path], sums_path: 
     print(f"[+] Signed and verified {len(targets)} release file(s) with OpenPGP.")
 
 
+def prune_superseded_local_and_remote_releases(root: Path, version: str, prune_remote: bool = True) -> None:
+    """Remove superseded local package copies in dist/ and target/wix/ so only `version` remains,
+    and optionally remove older GitHub Releases on oyesanyf/QuorumRAG so only the most recent
+    multi-OS release (`quorumrag-v<version>`) is published."""
+    v_clean = version.lstrip("v")
+    keep_tag = f"quorumrag-v{v_clean}"
+
+    for rel_dir in ["dist", "target/wix", "deploy/windows", "deploy/linux", "deploy/linux-arm64", "deploy/macos"]:
+        d = root / rel_dir
+        if not d.exists():
+            continue
+        for f in list(d.iterdir()):
+            if not f.is_file():
+                continue
+            if f.name in ("SHA256SUMS.txt", "OshoosiDeveloper.cer"):
+                continue
+            if v_clean not in f.name:
+                f.unlink(missing_ok=True)
+
+    if not prune_remote:
+        return
+
+    import json
+    import urllib.error
+    import urllib.request
+
+    p = subprocess.Popen(
+        ["git", "credential", "fill"],
+        cwd=str(root),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    out, _ = p.communicate("protocol=https\nhost=github.com\n\n")
+    token = dict(l.split("=", 1) for l in out.splitlines() if "=" in l).get("password", "")
+    if not token:
+        return
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "QuorumRAG-Release-Pruner",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        rels = json.loads(
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"https://api.github.com/repos/{EXPECTED_REPO_SLUG}/releases?per_page=100",
+                    headers=headers,
+                ),
+                timeout=20,
+            ).read().decode("utf-8")
+        )
+    except Exception:
+        return
+
+    # Only prune older releases once keep_tag itself is already published on GitHub
+    if not any(r.get("tag_name") == keep_tag and not r.get("draft") for r in rels):
+        return
+
+    for r in rels:
+        old_tag = r.get("tag_name") or ""
+        rel_id = r.get("id")
+        if old_tag and old_tag != keep_tag and rel_id:
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"https://api.github.com/repos/{EXPECTED_REPO_SLUG}/releases/{rel_id}",
+                        method="DELETE",
+                        headers=headers,
+                    ),
+                    timeout=20,
+                )
+                subprocess.run(
+                    ["git", "-C", str(root), "push", "origin", "--delete", old_tag],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    check=False,
+                )
+                subprocess.run(
+                    ["git", "-C", str(root), "tag", "-d", old_tag],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    check=False,
+                )
+                print(f"[+] Pruned superseded GitHub release & tag: {old_tag}")
+            except urllib.error.HTTPError as exc:
+                print(f"[!] Could not prune old release {old_tag}: HTTP {exc.code}")
+
+
 def collect_canonical_artifacts(root: Path, version: str) -> list[Path]:
     v_clean = version.lstrip("v")
     expected_patterns = [
         f"deploy/windows/QuorumRAG-{v_clean}-x86_64.msi",
         f"deploy/windows/QuorumRAG-{v_clean}-windows-x86_64.zip",
-        f"dist/QuorumRAG-{v_clean}-x86_64.msi",
-        f"dist/QuorumRAG-windows-x86_64.zip",
-        f"deploy/windows/QuorumRAG-{version}-x86_64.msi",
-        f"deploy/windows/QuorumRAG-{version}-windows-x86_64.zip",
-        f"deploy/linux/quorumrag_{version}_amd64.deb",
-        f"deploy/linux/quorumrag-{version}-1.x86_64.rpm",
-        f"deploy/linux/quorumrag-{version}-linux-x86_64.tar.gz",
-        f"deploy/linux-arm64/quorumrag_{version}_arm64.deb",
-        f"deploy/linux-arm64/quorumrag-{version}-1.aarch64.rpm",
-        f"deploy/linux-arm64/quorumrag-{version}-linux-aarch64.tar.gz",
-        f"deploy/macos/QuorumRAG-{version}-macos-universal.pkg",
-        f"deploy/macos/QuorumRAG-{version}-macos-universal.dmg",
-        f"deploy/macos/quorumrag-{version}-macos-universal.tar.gz",
+        f"deploy/linux/quorumrag_{v_clean}_amd64.deb",
+        f"deploy/linux/quorumrag-{v_clean}-1.x86_64.rpm",
+        f"deploy/linux/quorumrag-{v_clean}-linux-x86_64.tar.gz",
+        f"deploy/linux-arm64/quorumrag_{v_clean}_arm64.deb",
+        f"deploy/linux-arm64/quorumrag-{v_clean}-1.aarch64.rpm",
+        f"deploy/linux-arm64/quorumrag-{v_clean}-linux-aarch64.tar.gz",
+        f"deploy/macos/QuorumRAG-{v_clean}-macos-universal.pkg",
+        f"deploy/macos/QuorumRAG-{v_clean}-macos-universal.dmg",
+        f"deploy/macos/quorumrag-{v_clean}-macos-universal.tar.gz",
     ]
     found = []
     seen: set[Path] = set()
@@ -502,6 +589,11 @@ def main() -> int:
         action="store_true",
         help="Install public developer certificate into LocalMachine\\Root and TrustedPublisher",
     )
+    parser.add_argument(
+        "--keep-old-releases",
+        action="store_true",
+        help="Retain superseded releases instead of pruning to keep only the most recent release",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
@@ -509,6 +601,7 @@ def main() -> int:
     deploy_root = root / "deploy"
     deploy_root.mkdir(parents=True, exist_ok=True)
 
+    prune_superseded_local_and_remote_releases(root, args.version, prune_remote=not args.keep_old_releases)
     ensure_windows_authenticode_signed(root, args.version, trust_local=args.trust_local_cert)
 
     artifacts = collect_canonical_artifacts(root, args.version)

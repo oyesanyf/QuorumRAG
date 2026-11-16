@@ -601,3 +601,17 @@ jobs:
           files: release_assets/*
           draft: false
           prerelease: false
+          make_latest: true
+
+      - name: Prune Superseded Releases (Keep Only Most Recent Multi-OS Release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          KEEP_TAG: ${{ steps.release_meta.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          OLD_TAGS=$(gh release list --repo "${REPO}" --limit 100 --json tagName --jq ".[] | select(.tagName != \"${KEEP_TAG}\") | .tagName" || true)
+          for old_tag in ${OLD_TAGS}; do
+            echo "Removing superseded release & tag: ${old_tag}"
+            gh release delete "${old_tag}" --repo "${REPO}" --cleanup-tag --yes || true
+          done
