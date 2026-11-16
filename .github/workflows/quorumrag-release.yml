@@ -339,15 +339,18 @@ jobs:
         id: done
         run: echo "built=true" >> "$GITHUB_OUTPUT"
 
-  # 4b. Automatic macOS-14 Fallback if macos-15 runner pool is unavailable
+  # 4b. Automatic macOS-latest Fallback if initial macos-15 runner acquisition times out
   build-macos-fallback:
-    name: macOS Universal Fallback (macOS 14)
+    name: macOS Universal Fallback (macos-latest)
     needs: [build-macos]
     if: always() && needs.build-macos.outputs.built != 'true'
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 120
+    continue-on-error: true
     permissions:
       contents: read
+    outputs:
+      built: ${{ steps.done.outputs.built }}
     steps:
       - name: Checkout commit
         shell: bash
@@ -378,7 +381,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.7.5
         with:
           workspaces: .
-          key: quorumrag-macos-universal-m14
+          key: quorumrag-macos-universal
           cache-on-failure: "true"
 
       - name: Build Universal Binary & Native .pkg / .dmg / .tar.gz
@@ -412,17 +415,94 @@ jobs:
           path: deploy/macos/*
           if-no-files-found: error
 
+      - name: Mark macOS Fallback Build Complete
+        id: done
+        run: echo "built=true" >> "$GITHUB_OUTPUT"
+
+  # 4c. Third-attempt macOS-15 Retry if hosted Apple Silicon runner queue experienced back-to-back contention
+  build-macos-retry:
+    name: macOS Universal Retry (macOS 15)
+    needs: [build-macos, build-macos-fallback]
+    if: always() && needs.build-macos.outputs.built != 'true' && needs.build-macos-fallback.outputs.built != 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout commit
+        shell: bash
+        env:
+          REPO_URL: https://github.com/${{ github.repository }}.git
+          SHA: ${{ github.sha }}
+        run: |
+          git init -q .
+          git remote add origin "$REPO_URL"
+          git -c protocol.version=2 fetch --no-tags --depth 1 origin "$SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Ensure protobuf & cmake on macOS
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            brew install protobuf
+          fi
+          if ! command -v cmake >/dev/null 2>&1; then
+            brew install cmake
+          fi
+
+      - name: Install Rust stable (arm64 + x86_64)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo registry & target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.7.5
+        with:
+          workspaces: .
+          key: quorumrag-macos-universal
+          cache-on-failure: "true"
+
+      - name: Build Universal Binary & Native .pkg / .dmg / .tar.gz
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${INPUT_VERSION:-0.6.17}"
+          if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
+          cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target aarch64-apple-darwin
+          cargo build --release -p quorum-daemon --bin quorum-desktop --bin quorumrag --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/quorumrag \
+            target/aarch64-apple-darwin/release/quorumrag \
+            target/x86_64-apple-darwin/release/quorumrag
+          lipo -create -output target/release/quorum-desktop \
+            target/aarch64-apple-darwin/release/quorum-desktop \
+            target/x86_64-apple-darwin/release/quorum-desktop
+          lipo -info target/release/quorumrag
+          lipo -info target/release/quorumrag | grep -E "x86_64.*arm64|arm64.*x86_64"
+          lipo -info target/release/quorum-desktop | grep -E "x86_64.*arm64|arm64.*x86_64"
+          ./target/release/quorumrag --version
+          bash packaging/macos/build_packages.sh target/release/quorumrag "${VERSION}" universal deploy/macos quorumrag target/release/quorum-desktop
+          pkgutil --payload-files "deploy/macos/QuorumRAG-${VERSION}-macos-universal.pkg" | head -n 20
+          hdiutil imageinfo "deploy/macos/QuorumRAG-${VERSION}-macos-universal.dmg" | head -n 20
+
+      - name: Upload macOS Universal Artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: quorumrag-macos-universal
+          path: deploy/macos/*
+          if-no-files-found: error
+
   # 5. SLSA Build Provenance, Witness DSSE Attestation, GPG Signing & GitHub Release
   release:
     name: SLSA Provenance, Witness DSSE & GitHub Release
-    needs: [build-windows, build-linux-x64, build-linux-arm64, build-macos, build-macos-fallback]
+    needs: [build-windows, build-linux-x64, build-linux-arm64, build-macos, build-macos-fallback, build-macos-retry]
     if: >-
       always() &&
       (startsWith(github.ref, 'refs/tags/quorumrag-v') || github.event_name == 'workflow_dispatch') &&
       needs.build-windows.result == 'success' &&
       needs.build-linux-x64.result == 'success' &&
       needs.build-linux-arm64.result == 'success' &&
-      (needs.build-macos.outputs.built == 'true' || needs.build-macos-fallback.result == 'success')
+      (needs.build-macos.outputs.built == 'true' || needs.build-macos-fallback.outputs.built == 'true' || needs.build-macos-retry.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       id-token: write
