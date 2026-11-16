@@ -605,3 +605,316 @@ async fn test_canonical_synthesis_prompt_cross_host_parity() {
     assert!(!prompt_host_a.contains("Peer: local"));
     assert!(!prompt_host_b.contains("Peer: peer_a"));
 }
+
+struct DelayedInboundHandler {
+    delay: Duration,
+    inner: Arc<quorum_coordinator::OsoosiMeshInboundHandler>,
+}
+
+#[async_trait::async_trait]
+impl quorum_network::InboundQueryHandler for DelayedInboundHandler {
+    async fn handle_query(
+        &self,
+        request: quorum_types::FederatedQueryRequest,
+    ) -> quorum_types::FederatedQueryResponse {
+        tokio::time::sleep(self.delay).await;
+        self.inner.handle_query(request).await
+    }
+}
+
+#[tokio::test]
+async fn test_swarm_mesh_dispatcher_3_peer_parity_with_1_8s_million_chunk_peer() {
+    use quorum_coordinator::{
+        global_mesh_dlp_controller, global_peer_health_registry, CoordinatorConfig,
+        OsoosiMeshInboundHandler, PeerAclManager, QueryCoordinator, ScatterGatherEngine,
+        SwarmMeshDispatcher, SynthesisModelFamily,
+    };
+    use quorum_network::{start_network_node, NetworkConfig};
+    use quorum_storage::{StorageConfig, StorageEngine};
+
+    {
+        let ctrl = global_mesh_dlp_controller();
+        let mut g = ctrl.settings.write().unwrap();
+        g.mesh.p2p_enabled = true;
+        g.mesh.require_explicit_folder_share = false;
+        g.mesh.shared_folders.clear();
+    }
+
+    let dir_wdrdl = tempfile::tempdir().expect("dir_wdrdl");
+    let dir_wkhc3 = tempfile::tempdir().expect("dir_wkhc3");
+    let dir_wecnh = tempfile::tempdir().expect("dir_wecnh");
+
+    let storage_wdrdl = Arc::new(
+        StorageEngine::open(StorageConfig::new(dir_wdrdl.path().to_path_buf()))
+            .await
+            .expect("storage_wdrdl"),
+    );
+    let storage_wkhc3 = Arc::new(
+        StorageEngine::open(StorageConfig::new(dir_wkhc3.path().to_path_buf()))
+            .await
+            .expect("storage_wkhc3"),
+    );
+    let storage_wecnh = Arc::new(
+        StorageEngine::open(StorageConfig::new(dir_wecnh.path().to_path_buf()))
+            .await
+            .expect("storage_wecnh"),
+    );
+
+    let emb = vec![0.07f32; 768];
+
+    // Host WDRDL: Academic document
+    storage_wdrdl
+        .insert_chunks(&[DocumentChunk::new(
+            "wdrdl_acad:0",
+            "wdrdl_acad",
+            "C:/WDRDL/Women Race Class Summary.docx",
+            1,
+            25,
+            0,
+            emb.clone(),
+            "Women, Race & Class is a landmark critical theory work by Angela Davis, first published in 1981.",
+            None,
+        )
+        .unwrap()])
+        .await
+        .unwrap();
+
+    // Host WKHc3 (fast peer ~15ms): Lease document
+    storage_wkhc3
+        .insert_chunks(&[DocumentChunk::new(
+            "wkhc3_lease:0",
+            "wkhc3_lease",
+            "C:/WKHc3/Susan MONTH TO MONTH LEASE AGREEMENT.doc",
+            1,
+            25,
+            0,
+            emb.clone(),
+            "SIMPLE LEASE AGREEMENT between Angela Davis (landlord) and Casey Ringgold (tenant) at 2913 Castiglione St., New Orleans, LA 70119.",
+            None,
+        )
+        .unwrap()])
+        .await
+        .unwrap();
+
+    // Host WEcNh (1.8s million-chunk peer): Ministry document + copy of Women Race Class Summary.docx
+    storage_wecnh
+        .insert_chunks(&[
+            DocumentChunk::new(
+                "wecnh_ministry:0",
+                "wecnh_ministry",
+                "D:/WEcNh/Unity_Ministry_Steward.docx",
+                1,
+                25,
+                0,
+                emb.clone(),
+                "Reverend Angela Davis serves on the STEWARD ministry board leading New Thought spiritual teaching and metaphysical affirmations.",
+                None,
+            )
+            .unwrap(),
+            DocumentChunk::new(
+                "wecnh_wrc_dup:0",
+                "wecnh_wrc_dup",
+                "D:/WEcNh/Women Race Class Summary.docx",
+                1,
+                25,
+                0,
+                emb,
+                "Women, Race & Class is a landmark critical theory work by Angela Davis, first published in 1981.",
+                None,
+            )
+            .unwrap(),
+        ])
+        .await
+        .unwrap();
+
+    let derive_pid = |seed: [u8; 32]| -> String {
+        let sk = quorum_network::libp2p::identity::ed25519::SecretKey::try_from_bytes(seed).unwrap();
+        let kp = quorum_network::libp2p::identity::ed25519::Keypair::from(sk);
+        quorum_network::libp2p::identity::Keypair::from(kp)
+            .public()
+            .to_peer_id()
+            .to_string()
+    };
+
+    let seed_wdrdl = [0x61u8; 32];
+    let seed_wkhc3 = [0x62u8; 32];
+    let seed_wecnh = [0x63u8; 32];
+
+    let pid_wdrdl = derive_pid(seed_wdrdl);
+    let pid_wkhc3 = derive_pid(seed_wkhc3);
+    let pid_wecnh = derive_pid(seed_wecnh);
+
+    let registry = global_peer_health_registry();
+    registry.clear_peer_failures(&pid_wdrdl);
+    registry.clear_peer_failures(&pid_wkhc3);
+    registry.clear_peer_failures(&pid_wecnh);
+
+    let handler_wdrdl = Arc::new(OsoosiMeshInboundHandler::new(
+        Arc::clone(&storage_wdrdl) as Arc<dyn quorum_coordinator::StorageSearcher>,
+        pid_wdrdl.clone(),
+    ));
+    let handler_wkhc3 = Arc::new(OsoosiMeshInboundHandler::new(
+        Arc::clone(&storage_wkhc3) as Arc<dyn quorum_coordinator::StorageSearcher>,
+        pid_wkhc3.clone(),
+    ));
+    let handler_wecnh = Arc::new(DelayedInboundHandler {
+        delay: Duration::from_millis(1800),
+        inner: Arc::new(OsoosiMeshInboundHandler::new(
+            Arc::clone(&storage_wecnh) as Arc<dyn quorum_coordinator::StorageSearcher>,
+            pid_wecnh.clone(),
+        )),
+    });
+
+    let mut cfg_net_wdrdl = NetworkConfig::new_localhost();
+    cfg_net_wdrdl.ed25519_seed = Some(seed_wdrdl);
+    let (_jh1, handle_wdrdl) = start_network_node(cfg_net_wdrdl, Some(handler_wdrdl))
+        .await
+        .expect("start wdrdl");
+
+    let mut cfg_net_wkhc3 = NetworkConfig::new_localhost();
+    cfg_net_wkhc3.ed25519_seed = Some(seed_wkhc3);
+    let (_jh2, handle_wkhc3) = start_network_node(cfg_net_wkhc3, Some(handler_wkhc3))
+        .await
+        .expect("start wkhc3");
+
+    let mut cfg_net_wecnh = NetworkConfig::new_localhost();
+    cfg_net_wecnh.ed25519_seed = Some(seed_wecnh);
+    let (_jh3, handle_wecnh) = start_network_node(cfg_net_wecnh, Some(handler_wecnh))
+        .await
+        .expect("start wecnh");
+
+    let tcp_addr_wkhc3 = handle_wkhc3
+        .listen_addresses()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.to_string().contains("/tcp/"))
+        .unwrap();
+    let tcp_addr_wecnh = handle_wecnh
+        .listen_addresses()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.to_string().contains("/tcp/"))
+        .unwrap();
+
+    // Form full 3-peer mesh
+    handle_wdrdl.dial(tcp_addr_wkhc3.clone()).await.unwrap();
+    handle_wdrdl.dial(tcp_addr_wecnh).await.unwrap();
+    handle_wecnh.dial(tcp_addr_wkhc3).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(450)).await;
+
+    assert_eq!(handle_wdrdl.connected_peers().await.unwrap().len(), 2);
+    assert_eq!(handle_wecnh.connected_peers().await.unwrap().len(), 2);
+
+    let default_cfg = CoordinatorConfig::default();
+    assert_eq!(default_cfg.timeout_ms, 8000);
+
+    let coord_wdrdl = QueryCoordinator::new(
+        Arc::new(ScatterGatherEngine::new(
+            Arc::clone(&storage_wdrdl) as Arc<dyn quorum_coordinator::StorageSearcher>,
+            Arc::new(SwarmMeshDispatcher::new(handle_wdrdl.clone())),
+            Arc::new(tokio::sync::RwLock::new(PeerAclManager::default())),
+            default_cfg.clone(),
+            seed_wdrdl,
+            pid_wdrdl.clone(),
+        )),
+        default_cfg.clone(),
+    );
+
+    let coord_wecnh = QueryCoordinator::new(
+        Arc::new(ScatterGatherEngine::new(
+            Arc::clone(&storage_wecnh) as Arc<dyn quorum_coordinator::StorageSearcher>,
+            Arc::new(SwarmMeshDispatcher::new(handle_wecnh.clone())),
+            Arc::new(tokio::sync::RwLock::new(PeerAclManager::default())),
+            default_cfg.clone(),
+            seed_wecnh,
+            pid_wecnh.clone(),
+        )),
+        default_cfg,
+    );
+
+    // Query from WDRDL (must wait for 1.8s healthy WEcNh peer even after fast WKHc3 responds in ~15ms!)
+    let res_wdrdl = coord_wdrdl
+        .query_agentic_with_history_and_session(
+            "Who is Angela Davis",
+            Vec::new(),
+            SynthesisModelFamily::AutoFusion,
+            12,
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("query from wdrdl");
+
+    // Query from WEcNh
+    let res_wecnh = coord_wecnh
+        .query_agentic_with_history_and_session(
+            "Who is Angela Davis",
+            Vec::new(),
+            SynthesisModelFamily::AutoFusion,
+            12,
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("query from wecnh");
+
+    // Both WDRDL and WEcNh must see BOTH remote peers and produce the exact same 3 unique canonical document families!
+    let diag_wdrdl = res_wdrdl.peer_diagnostics.as_ref().expect("diag_wdrdl");
+    assert!(
+        diag_wdrdl.contributing_peer_ids.contains(&pid_wkhc3)
+            && diag_wdrdl.contributing_peer_ids.contains(&pid_wecnh),
+        "WDRDL must receive chunks from BOTH fast peer WKHc3 and 1.8s million-chunk peer WEcNh! Got: {:?}",
+        diag_wdrdl
+    );
+
+    assert_eq!(
+        res_wdrdl.sources_cited.len(),
+        3,
+        "WDRDL must collapse duplicate Women Race Class Summary and cite all 3 unique families: {:?}",
+        res_wdrdl.sources_cited
+    );
+    assert_eq!(
+        res_wecnh.sources_cited.len(),
+        3,
+        "WEcNh must achieve 100% 3-source parity with WDRDL: {:?}",
+        res_wecnh.sources_cited
+    );
+
+    // Also verify unhealthy-peer fast clamping: if WEcNh has consecutive_failures > 0, straggler grace clamps to 400ms
+    registry.record_failure(&pid_wecnh, "simulated prior timeout");
+    let mut direct_req = FederatedQueryRequest {
+        query_id: uuid::Uuid::new_v4(),
+        sender_peer_id: pid_wdrdl.clone(),
+        sender_pubkey: [0u8; 32],
+        query_text: "Who is Angela Davis".to_string(),
+        embedding: vec![0.07f32; 768],
+        top_k: 12,
+        timestamp: chrono::Utc::now().timestamp(),
+        signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
+        synthesis_relay: None,
+    };
+    quorum_coordinator::crypto::sign_request(
+        &seed_wdrdl,
+        &mut direct_req,
+        quorum_types::AccessTier::Tier0Public,
+    );
+    let disp_wdrdl = SwarmMeshDispatcher::new(handle_wdrdl);
+    let t0 = std::time::Instant::now();
+    let (unhealthy_resps, _) = disp_wdrdl
+        .query_peers_with_diagnostics(&direct_req, Duration::from_millis(8000))
+        .await
+        .expect("unhealthy straggler clamp query");
+    let clamp_elapsed = t0.elapsed();
+    assert!(
+        clamp_elapsed < Duration::from_millis(1200),
+        "When remaining pending peer has consecutive_failures > 0, SwarmMeshDispatcher must clamp straggler grace to 400ms (took {:?})",
+        clamp_elapsed
+    );
+    assert_eq!(unhealthy_resps.len(), 1, "Fast peer WKHc3 still returned immediately");
+    registry.clear_peer_failures(&pid_wecnh);
+}

@@ -710,7 +710,27 @@ fn cite_list(cites: &[usize]) -> String {
 pub fn classify_entity_domain_cluster(path: &str, text: &str) -> &'static str {
     let tl = text.to_ascii_lowercase();
     let fl = path.to_ascii_lowercase();
-    if tl.contains("critical theory")
+    if !fl.contains("lease")
+        && !tl.contains("lease agreement")
+        && (tl.contains("new thought")
+            || tl.contains("ma'at")
+            || tl.contains("ma\u{2019}at")
+            || tl.contains("divine intelligence")
+            || tl.contains("planetary human")
+            || tl.contains("yarnspinner")
+            || tl.contains("yarn spinner")
+            || tl.contains("reverend")
+            || tl.contains("ministry")
+            || tl.contains("sermon")
+            || tl.contains("divine presence")
+            || tl.contains("metaphysical")
+            || tl.contains("affirmations")
+            || fl.contains("yarnspinner")
+            || fl.contains("yarn spinner")
+            || fl.contains("planetary human"))
+    {
+        "Religious Ministry, Spiritual Teaching & Organizational Stewardship"
+    } else if tl.contains("critical theory")
         || tl.contains("philosophy")
         || tl.contains("scholar")
         || tl.contains("professor")
@@ -719,6 +739,7 @@ pub fn classify_entity_domain_cluster(path: &str, text: &str) -> &'static str {
         || tl.contains("landmark work")
         || tl.contains("landmark book")
         || tl.contains("dissertation")
+        || tl.contains("thesis")
         || tl.contains("peer-reviewed")
         || tl.contains("historiograph")
         || tl.contains("sociolog")
@@ -902,7 +923,7 @@ pub fn render_disambiguated_multi_cluster_report(
     }
 
     let mut cluster_map: BTreeMap<&'static str, Vec<ClusterItem<'_>>> = BTreeMap::new();
-    for (idx, &c) in chunks.iter().enumerate().take(16) {
+    for (idx, &c) in chunks.iter().enumerate().take(28) {
         if crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(
             &c.chunk.text_content,
         ) {
@@ -1011,10 +1032,13 @@ pub fn render_disambiguated_multi_cluster_report(
         if items.len() >= 2 {
             md.push_str("| Ref | Source Document | Origin Node | Grounded Context Summary |\n");
             md.push_str("|---|---|---|---|\n");
-            for it in items.iter().take(10) {
-                let doc_name = std::path::Path::new(&it.scored.chunk.file_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
+            for it in items.iter().take(20) {
+                let doc_name = it
+                    .scored
+                    .chunk
+                    .file_path
+                    .rsplit(['/', '\\'])
+                    .next()
                     .unwrap_or(&it.scored.chunk.file_path)
                     .replace('|', "\\|");
                 let origin = if it.scored.is_remote
@@ -1039,17 +1063,20 @@ pub fn render_disambiguated_multi_cluster_report(
             md.push('\n');
         }
 
-        for it in items.iter().take(8) {
-            let doc_name = std::path::Path::new(&it.scored.chunk.file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
+        for it in items.iter().take(16) {
+            let doc_name = it
+                .scored
+                .chunk
+                .file_path
+                .rsplit(['/', '\\'])
+                .next()
                 .unwrap_or(&it.scored.chunk.file_path);
             let origin_badge = if it.scored.is_remote
                 && !it.scored.source_peer.is_empty()
                 && !it.scored.source_peer.eq_ignore_ascii_case("local")
             {
                 let short_peer: String = it.scored.source_peer.chars().take(12).collect();
-                format!(" *(Mesh Peer `{}`)*", short_peer)
+                format!(" (Mesh Peer `{}`)", short_peer)
             } else {
                 String::new()
             };
@@ -1133,9 +1160,11 @@ pub fn render_homonym_cluster_summary_table(chunks: &[&ScoredChunk]) -> String {
             continue;
         }
         let cluster = classify_entity_domain_cluster(&c.chunk.file_path, &cleaned);
-        let doc_name = std::path::Path::new(&c.chunk.file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
+        let doc_name = c
+            .chunk
+            .file_path
+            .rsplit(['/', '\\'])
+            .next()
             .unwrap_or(&c.chunk.file_path)
             .replace('|', "\\|");
         let origin = if c.is_remote

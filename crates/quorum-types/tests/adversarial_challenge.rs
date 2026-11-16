@@ -34,6 +34,7 @@ fn test_volatile_memory_zeroize_inspection() {
         score: 0.999,
         access_tier: 3,
         content: secret,
+        expanded_window: None,
     };
 
     // 1. Confirm before zeroize/drop that content contains sensitive plaintext
@@ -359,6 +360,7 @@ fn test_unicode_and_citation_boundary_fuzzing() {
         score: 0.8,
         access_tier: 0,
         content: "中".repeat(85), // 85 * 3 = 255 bytes (multi-byte UTF-8)
+        expanded_window: None,
     };
     let cit_v = volatile.to_citation();
     assert!(cit_v.snippet.ends_with("..."));

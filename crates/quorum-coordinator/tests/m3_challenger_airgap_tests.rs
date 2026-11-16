@@ -505,6 +505,7 @@ fn test_adversarial_byzantine_peer_response_dropping() {
             score: 0.99,
             peer_id: "12D3KooWByzantinePeerAlpha".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
         VolatileRemoteChunk {
             chunk_id: "byzantine_chunk_2".to_string(),
@@ -515,6 +516,7 @@ fn test_adversarial_byzantine_peer_response_dropping() {
             score: 0.98,
             peer_id: "12D3KooWByzantinePeerBeta".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
         VolatileRemoteChunk {
             chunk_id: "byzantine_chunk_3".to_string(),
@@ -525,6 +527,7 @@ fn test_adversarial_byzantine_peer_response_dropping() {
             score: 0.97,
             peer_id: "12D3KooWByzantinePeerGamma".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
         VolatileRemoteChunk {
             chunk_id: "legitimate_peer_chunk".to_string(),
@@ -535,6 +538,7 @@ fn test_adversarial_byzantine_peer_response_dropping() {
             score: 0.85,
             peer_id: "12D3KooWHonestPeer".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
     ];
 
@@ -955,6 +959,7 @@ async fn test_adversarial_windows_backslash_and_percent_encoded_mesh_pipeline() 
             score: 0.99,
             peer_id: "12D3KooWPeer1".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
         VolatileRemoteChunk {
             chunk_id: "chunk_win_2".to_string(),
@@ -965,6 +970,7 @@ async fn test_adversarial_windows_backslash_and_percent_encoded_mesh_pipeline() 
             score: 0.99,
             peer_id: "12D3KooWPeer2".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
         VolatileRemoteChunk {
             chunk_id: "chunk_win_3".to_string(),
@@ -975,6 +981,7 @@ async fn test_adversarial_windows_backslash_and_percent_encoded_mesh_pipeline() 
             score: 0.99,
             peer_id: "12D3KooWPeer3".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
         VolatileRemoteChunk {
             chunk_id: "chunk_win_4".to_string(),
@@ -985,6 +992,7 @@ async fn test_adversarial_windows_backslash_and_percent_encoded_mesh_pipeline() 
             score: 0.99,
             peer_id: "12D3KooWPeer4".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
         VolatileRemoteChunk {
             chunk_id: "legit_chunk".to_string(),
@@ -995,6 +1003,7 @@ async fn test_adversarial_windows_backslash_and_percent_encoded_mesh_pipeline() 
             score: 0.85,
             peer_id: "12D3KooWHonestPeer".to_string(),
             access_tier: 0,
+            expanded_window: None,
         },
     ];
 

@@ -758,7 +758,17 @@ impl ScatterGatherEngine {
                         None,
                         false,
                     );
-                    (resp_idx, chunk_idx, p_id, chunk, dlp_res)
+                    let win_dlp_res = chunk.expanded_window.as_ref().map(|win| {
+                        c_ctrl.inspect_and_enforce_text(
+                            win,
+                            &chunk.file_path,
+                            &p_id,
+                            "InboundMesh",
+                            None,
+                            false,
+                        )
+                    });
+                    (resp_idx, chunk_idx, p_id, chunk, dlp_res, win_dlp_res)
                 }));
             }
         }
@@ -769,12 +779,12 @@ impl ScatterGatherEngine {
                 inspected_items.push(item);
             }
         }
-        inspected_items.sort_by_key(|(resp_idx, chunk_idx, _, _, _)| (*resp_idx, *chunk_idx));
+        inspected_items.sort_by_key(|(resp_idx, chunk_idx, _, _, _, _)| (*resp_idx, *chunk_idx));
 
         let mut volatile_chunks = Vec::with_capacity(inspected_items.len());
         let mut remote_lists: Vec<(String, Vec<quorum_types::CandidateChunkDto>)> = Vec::new();
 
-        for (_resp_idx, _, peer_id, mut chunk, dlp_res) in inspected_items {
+        for (_resp_idx, _, peer_id, mut chunk, dlp_res, win_dlp_res) in inspected_items {
             if dlp_res.allowed_to_share {
                 let effective_peer = chunk
                     .origin_peer_id
@@ -783,6 +793,13 @@ impl ScatterGatherEngine {
                     .unwrap_or_else(|| peer_id.clone());
                 chunk.origin_peer_id = Some(effective_peer.clone());
                 chunk.content = dlp_res.scrubbed_text;
+                if let Some(w_res) = win_dlp_res {
+                    if w_res.allowed_to_share {
+                        chunk.expanded_window = Some(w_res.scrubbed_text);
+                    } else {
+                        chunk.expanded_window = None;
+                    }
+                }
                 volatile_chunks.push(chunk.to_volatile_remote_chunk(&effective_peer));
                 if let Some((_existing_peer, list)) =
                     remote_lists.iter_mut().find(|(p, _)| p == &effective_peer)
@@ -1030,7 +1047,17 @@ impl ScatterGatherEngine {
                             None,
                             false,
                         );
-                        (resp_idx, chunk_idx, p_id, chunk, dlp_res)
+                        let win_dlp_res = chunk.expanded_window.as_ref().map(|win| {
+                            c_ctrl.inspect_and_enforce_text(
+                                win,
+                                &chunk.file_path,
+                                &p_id,
+                                "InboundMesh",
+                                None,
+                                false,
+                            )
+                        });
+                        (resp_idx, chunk_idx, p_id, chunk, dlp_res, win_dlp_res)
                     }));
                 }
             }
@@ -1041,9 +1068,9 @@ impl ScatterGatherEngine {
                     evaluated.push(item);
                 }
             }
-            evaluated.sort_by_key(|(r_idx, c_idx, _, _, _)| (*r_idx, *c_idx));
+            evaluated.sort_by_key(|(r_idx, c_idx, _, _, _, _)| (*r_idx, *c_idx));
 
-            for (_, _, peer_id, mut chunk, dlp_res) in evaluated {
+            for (_, _, peer_id, mut chunk, dlp_res, win_dlp_res) in evaluated {
                 if dlp_res.allowed_to_share {
                     let effective_peer = chunk
                         .origin_peer_id
@@ -1052,6 +1079,13 @@ impl ScatterGatherEngine {
                         .unwrap_or_else(|| peer_id.clone());
                     chunk.origin_peer_id = Some(effective_peer.clone());
                     chunk.content = dlp_res.scrubbed_text.clone();
+                    if let Some(w_res) = win_dlp_res {
+                        if w_res.allowed_to_share {
+                            chunk.expanded_window = Some(w_res.scrubbed_text);
+                        } else {
+                            chunk.expanded_window = None;
+                        }
+                    }
                     volatile.push(chunk.to_volatile_remote_chunk(&effective_peer));
                     let derived_doc_id = chunk
                         .chunk_id
@@ -1069,7 +1103,10 @@ impl ScatterGatherEngine {
                         ),
                         access_tier: chunk.access_tier,
                         vector: vec![0.0; 768],
-                        text_content: dlp_res.scrubbed_text,
+                        text_content: chunk
+                            .expanded_window
+                            .filter(|w| !w.trim().is_empty())
+                            .unwrap_or(dlp_res.scrubbed_text),
                         metadata_json: "{}".to_string(),
                     };
                     results.push(ScoredChunk::new(

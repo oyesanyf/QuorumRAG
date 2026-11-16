@@ -121,9 +121,23 @@ impl GradeRelevanceNode {
         let reasoning = if is_empty {
             "Empty chunks retrieved. Scheduling query rewrite or fallback.".to_string()
         } else if is_early_sufficient {
+            let threshold_clause = if max_score >= effective_threshold {
+                format!(
+                    "Top chunk score {:.3} meets threshold {:.3}{}; ",
+                    max_score,
+                    effective_threshold,
+                    if has_content_match && max_score <= 0.1 {
+                        " (RRF content verified)"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "Context sufficiency high-confidence early stopping: P(SufficientAsIs) = {:.3} >= 0.90 across retrieved local and 1-hop mesh chunks",
-                p_sufficient
+                "{}Context sufficiency high-confidence early stopping: P(SufficientAsIs) = {:.3} >= 0.90 across retrieved local and 1-hop mesh chunks",
+                threshold_clause, p_sufficient
             )
         } else if satisfactory {
             format!(

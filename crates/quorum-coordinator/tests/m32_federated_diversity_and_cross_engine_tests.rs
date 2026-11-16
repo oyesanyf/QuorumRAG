@@ -109,11 +109,11 @@ fn test_cross_engine_canonical_contract_handshake() {
     assert!(verify_federated_contract_handshake_hex(rogue_hex, &gemma_hex).is_err());
 }
 
-/// 2. Verifies that default timeout_ms in CoordinatorConfig is 5000ms.
+/// 2. Verifies that default timeout_ms in CoordinatorConfig is 8000ms.
 #[test]
 fn test_coordinator_config_default_timeout() {
     let config = CoordinatorConfig::default();
-    assert_eq!(config.timeout_ms, 5000, "Default timeout_ms must be 5000ms for LAN/WAN reliability");
+    assert_eq!(config.timeout_ms, 8000, "Default timeout_ms must be 8000ms for LAN/WAN million-chunk reliability");
 }
 
 /// 3. Verifies that RrfCombiner guarantees at least min(remote.len(), max(2, top_k / 3)) diversity slots

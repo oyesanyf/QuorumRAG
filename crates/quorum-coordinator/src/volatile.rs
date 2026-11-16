@@ -16,5 +16,9 @@ pub fn wrap_candidates(
 pub fn scrub_volatile(chunks: &mut [VolatileRemoteChunk]) {
     for chunk in chunks.iter_mut() {
         chunk.content.zeroize();
+        if let Some(ref mut win) = chunk.expanded_window {
+            win.zeroize();
+        }
+        chunk.expanded_window = None;
     }
 }

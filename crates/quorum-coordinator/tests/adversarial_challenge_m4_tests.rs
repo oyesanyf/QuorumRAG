@@ -289,6 +289,7 @@ fn challenge_volatile_remote_chunk_zeroizes_buffer() {
         score: 0.95,
         access_tier: 3,
         content: secret,
+        expanded_window: None,
     };
 
     assert_eq!(chunk.content(), "VERY_CONFIDENTIAL_REMOTE_CONTENT_CANARY_123456789");
@@ -321,6 +322,7 @@ fn challenge_volatile_remote_chunk_implicit_drop_zeroizes() {
             score: 0.95,
             access_tier: 3,
             content: secret,
+            expanded_window: None,
         };
         assert_eq!(chunk.content(), "VERY_CONFIDENTIAL_IMPLICIT_DROP_CANARY_987654321");
     } // chunk dropped here; ZeroizeOnDrop must overwrite memory at ptr with zeroes
@@ -636,6 +638,7 @@ fn challenge_volatile_remote_chunk_stress_zeroize_vectors() {
                 score: 0.9,
                 access_tier: 1,
                 content: secret,
+                expanded_window: None,
             });
         }
 

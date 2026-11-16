@@ -872,6 +872,25 @@ impl RetrieveMeshNode {
                     .count();
 
                 let mut intent_bonus = (prompt_entity_hits as i32) * 320;
+                if is_explicit_person_lookup && !asks_authorship && prompt_only_entities.len() == 2 {
+                    let cleaned_tl = crate::offline_engine::DeterministicOfflineSynthesisEngine::clean_chunk_text(
+                        &c.chunk.text_content,
+                    )
+                    .to_ascii_lowercase();
+                    if crate::offline_engine::DeterministicOfflineSynthesisEngine::contains_terms_within_char_window(
+                        &cleaned_tl,
+                        &prompt_only_entities[0],
+                        &prompt_only_entities[1],
+                        40,
+                    ) || crate::offline_engine::DeterministicOfflineSynthesisEngine::contains_terms_within_char_window(
+                        &file_name_l,
+                        &prompt_only_entities[0],
+                        &prompt_only_entities[1],
+                        40,
+                    ) {
+                        intent_bonus += 240;
+                    }
+                }
 
                 // Boost chunks whose filename directly matches query terms (e.g. "African Churches and Gang Violence.docx")
                 let file_tokens: std::collections::HashSet<&str> = file_name_l

@@ -97,39 +97,57 @@ fn wix_manifest_enforces_ice63_error_2613_prevention_and_zero_touch_path() {
         "InstallExecute must flush StopDeleteQuorumServiceUpgrade immediately before RemoveExistingProducts"
     );
 
-    // 3. Process-tree kill (/t) so watch-p2p child processes never hold data locks during upgrade.
+    // 3. Native zero-console MSI execution invariant:
+    // Every MSI CustomAction must bind to the native GUI-subsystem `QuorumDesktopHelper` binary
+    // (`quorum-desktop.exe`), never spawning `cmd.exe`, `netsh.exe`, `taskkill.exe`, `powershell`,
+    // or anchoring to `INSTALLFOLDER` before CreateFolders / after RemoveFiles.
     assert!(
-        wxs.contains("taskkill.exe /f /t /im quorumrag.exe")
-            || wxs.contains(r#"taskkill.exe&quot; /f /t /im quorumrag.exe"#),
-        "taskkill.exe must pass /t to terminate watch-p2p child processes cleanly"
+        wxs.contains(r#"<Binary Id="QuorumDesktopHelper" SourceFile="target\release\quorum-desktop.exe" />"#),
+        "wix/QuorumRAG.wxs must embed target\\release\\quorum-desktop.exe as QuorumDesktopHelper"
     );
-    assert!(
-        !wxs.contains("taskkill.exe /f /im quorumrag.exe"),
-        "Found taskkill.exe without /t tree-termination flag in wix/QuorumRAG.wxs"
-    );
-
-    // 4. System-utility custom actions must anchor to System64Folder, not INSTALLFOLDER
-    // (INSTALLFOLDER does not exist yet on fresh install before CreateFolders and is deleted after RemoveFiles).
-    for system_ca in [
-        "StopDeleteQuorumServiceUpgrade",
-        "StopDeleteQuorumServiceUninstall",
-        "KillQuorumOrphans",
-        "RemoveQuorumData",
-        "AddQuorumFirewallRule_In_Program",
-        "RemoveQuorumFirewallRule_In_Program",
+    for forbidden_cli in [
+        "netsh",
+        "taskkill",
+        "tasklist",
+        "wmic",
+        "cmd.exe",
+        "powershell",
     ] {
-        let marker = format!(r#"<CustomAction Id="{system_ca}""#);
+        assert!(
+            !wxs.to_ascii_lowercase().contains(forbidden_cli),
+            "Zero-console packaging violation: `{forbidden_cli}` found in wix/QuorumRAG.wxs"
+        );
+    }
+
+    for (ca_id, expected_flag) in [
+        ("StopDeleteQuorumServiceUpgrade", "--msi-stop-cleanup --delete-service"),
+        ("StopDeleteQuorumServiceUninstall", "--msi-stop-cleanup --delete-service"),
+        ("KillQuorumOrphans", "--msi-kill-orphans"),
+        ("AddQuorumFirewallRules", "--msi-firewall-add"),
+        ("RemoveQuorumFirewallRules", "--msi-firewall-remove"),
+        ("RemoveQuorumData", "--msi-remove-data"),
+        ("LaunchQuorumWebUi", "--open-ui"),
+    ] {
+        let marker = format!(r#"<CustomAction Id="{ca_id}""#);
         let idx = wxs
             .find(&marker)
-            .unwrap_or_else(|| panic!("missing CustomAction {system_ca}"));
+            .unwrap_or_else(|| panic!("missing CustomAction {ca_id}"));
         let snippet_end = wxs[idx..]
             .find("/>")
             .map(|rel| idx + rel)
             .unwrap_or(wxs.len());
         let snippet = &wxs[idx..snippet_end];
         assert!(
-            snippet.contains(r#"Directory="System64Folder""#),
-            "CustomAction {system_ca} must use Directory=\"System64Folder\", got: {snippet}"
+            snippet.contains(r#"BinaryRef="QuorumDesktopHelper""#),
+            "CustomAction {ca_id} must use BinaryRef=\"QuorumDesktopHelper\", got: {snippet}"
+        );
+        assert!(
+            !snippet.contains(r#"Directory="INSTALLFOLDER""#),
+            "CustomAction {ca_id} must never anchor to Directory=\"INSTALLFOLDER\", got: {snippet}"
+        );
+        assert!(
+            snippet.contains(expected_flag),
+            "CustomAction {ca_id} must invoke `{expected_flag}`, got: {snippet}"
         );
     }
 }

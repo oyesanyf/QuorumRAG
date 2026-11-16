@@ -94,6 +94,7 @@ fn test_volatile_remote_chunk_zeroization() {
         score: 0.95,
         access_tier: 2,
         content: "TOP SECRET CONFIDENTIAL CONTENT".to_string(),
+        expanded_window: None,
     };
 
     assert_eq!(chunk.content(), "TOP SECRET CONFIDENTIAL CONTENT");
