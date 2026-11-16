@@ -80,6 +80,7 @@ fn test_volatile_memory_concurrency_stress() {
                         score: 0.85,
                         access_tier: 1,
                         origin_peer_id: None,
+                        expanded_window: None,
                     };
 
                     let volatile = dto.to_volatile_remote_chunk(format!("peer-{}", t_idx));
@@ -531,6 +532,7 @@ fn test_federated_query_roundtrip_serialization() {
                 score: 0.98,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             },
         ],
         synthesis_response: None,

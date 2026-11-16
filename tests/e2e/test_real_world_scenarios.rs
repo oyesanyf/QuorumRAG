@@ -51,6 +51,7 @@ async fn test_scenario_1_multi_node_federated_research_query() {
             score: 0.94,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     };
 
@@ -68,6 +69,7 @@ async fn test_scenario_1_multi_node_federated_research_query() {
             score: 0.70,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     };
 

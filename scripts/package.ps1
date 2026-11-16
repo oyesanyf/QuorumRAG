@@ -53,10 +53,11 @@ if ($WxsNoComments -match '<\s*Environment\b') {
 }
 Write-Host "[0/5] Zero-Touch PATH static manifest audit: PASS (0 Environment tags)" -ForegroundColor Green
 
-# Step 1: Build Release Binary (target\release\quorumrag.exe) with WDAC build-script signing support
+# Step 1: Build Release Binaries (quorumrag.exe & quorum-desktop.exe) with WDAC build-script signing support
 $ReleaseExe = Join-Path $ProjectRoot "target\release\quorumrag.exe"
+$DesktopExe = Join-Path $ProjectRoot "target\release\quorum-desktop.exe"
 if (-not $SkipBuild) {
-    Write-Host "[1/5] Building release binary (quorum-daemon -> quorumrag.exe)..." -ForegroundColor Cyan
+    Write-Host "[1/5] Building release binaries (quorum-daemon -> quorumrag.exe, quorum-desktop.exe)..." -ForegroundColor Cyan
     if (Test-Path $ReleaseExe) {
         try {
             Remove-Item -Path $ReleaseExe -Force -ErrorAction Stop
@@ -66,7 +67,17 @@ if (-not $SkipBuild) {
             Move-Item -Path $ReleaseExe -Destination $lockedCopy -Force
         }
     }
+    if (Test-Path $DesktopExe) {
+        try {
+            Remove-Item -Path $DesktopExe -Force -ErrorAction Stop
+        } catch {
+            $lockedCopy = "$DesktopExe.locked." + (Get-Random)
+            Write-Host "  target\release\quorum-desktop.exe is in use; renaming to $lockedCopy..." -ForegroundColor Yellow
+            Move-Item -Path $DesktopExe -Destination $lockedCopy -Force
+        }
+    }
     Remove-Item -Path (Join-Path $ProjectRoot "target\release\deps\quorumrag*") -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Join-Path $ProjectRoot "target\release\deps\quorum_desktop*") -Force -ErrorAction SilentlyContinue
 
     $env:CARGO_INCREMENTAL = "0"
     $env:VSCMD_SKIP_SENDTELEMETRY = "1"
@@ -78,7 +89,7 @@ if (-not $SkipBuild) {
         # such as the MSVC linker's vctip.exe telemetry helper, which can stall packaging indefinitely.
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
-        $cargoLines = & $CargoExe build --release -p quorum-daemon --bin quorumrag 2>&1 | ForEach-Object {
+        $cargoLines = & $CargoExe build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop 2>&1 | ForEach-Object {
             $line = "$_"
             Write-Host $line
             $line
@@ -189,23 +200,27 @@ if (-not (Test-Path $ReleaseExe)) {
     }
 }
 
-# Break Cargo NTFS hardlink between target\release\quorumrag.exe and target\release\deps\quorumrag*.exe before Authenticode signing
-$hlOut = & fsutil hardlink list $ReleaseExe 2>$null
-if ($hlOut -and ($hlOut.Count -gt 1)) {
-    $targetFull = [System.IO.Path]::GetFullPath($ReleaseExe)
-    $driveRoot = [System.IO.Path]::GetPathRoot($targetFull).TrimEnd('\')
-    foreach ($hlRel in $hlOut) {
-        $hlCandidate = "$driveRoot$hlRel"
-        if ([System.IO.Path]::GetFullPath($hlCandidate) -ne $targetFull) {
-            Remove-Item -Path $hlCandidate -Force -ErrorAction SilentlyContinue
+# Break Cargo NTFS hardlink between release binaries and deps before Authenticode signing
+foreach ($targetBin in @($ReleaseExe, $DesktopExe)) {
+    if (Test-Path $targetBin) {
+        $hlOut = & fsutil hardlink list $targetBin 2>$null
+        if ($hlOut -and ($hlOut.Count -gt 1)) {
+            $targetFull = [System.IO.Path]::GetFullPath($targetBin)
+            $driveRoot = [System.IO.Path]::GetPathRoot($targetFull).TrimEnd('\')
+            foreach ($hlRel in $hlOut) {
+                $hlCandidate = "$driveRoot$hlRel"
+                if ([System.IO.Path]::GetFullPath($hlCandidate) -ne $targetFull) {
+                    Remove-Item -Path $hlCandidate -Force -ErrorAction SilentlyContinue
+                }
+            }
         }
     }
 }
 
-# Pre-sign target\release\quorumrag.exe before embedding into MSI & ZIP so installed binary carries Authenticode signature
+# Pre-sign target\release\quorumrag.exe and quorum-desktop.exe before embedding into MSI & ZIP so installed binaries carry Authenticode signature
 $SubmitScript = Join-Path $ProjectRoot "scripts\submit_to_microsoft.ps1"
 if (Test-Path $SubmitScript) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $SubmitScript -Version $Version -SkipDefenderScan -Files $ReleaseExe
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $SubmitScript -Version $Version -SkipDefenderScan -Files $ReleaseExe, $DesktopExe
 }
 
 # Step 2: Stage deploy\windows Portable Bundle (.zip)
@@ -223,6 +238,9 @@ if (Test-Path $PortableStageBase) {
 $PortableStage = Join-Path $PortableStageBase "QuorumRAG-$Version-windows-x86_64"
 New-Item -ItemType Directory -Force -Path $PortableStage | Out-Null
 Copy-Item -Path $ReleaseExe -Destination (Join-Path $PortableStage "quorumrag.exe") -Force
+if (Test-Path $DesktopExe) {
+    Copy-Item -Path $DesktopExe -Destination (Join-Path $PortableStage "quorum-desktop.exe") -Force
+}
 Copy-Item -Path (Join-Path $ProjectRoot "packaging\windows\quorumrag-launch.cmd") -Destination (Join-Path $PortableStage "quorumrag-launch.cmd") -Force
 Copy-Item -Path (Join-Path $ProjectRoot "packaging\windows\README_INSTALL.txt") -Destination (Join-Path $PortableStage "README_INSTALL.txt") -Force
 Copy-Item -Path (Join-Path $ProjectRoot "packaging\windows\quorumrag-open-ui.cmd") -Destination (Join-Path $PortableStage "quorumrag-open-ui.cmd") -Force

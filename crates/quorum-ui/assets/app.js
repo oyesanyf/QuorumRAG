@@ -669,7 +669,12 @@ function secureRandomIndex(n) {
     try {
       const res = await fetchWithTimeout('/api/history/' + encodeURIComponent(sessionId), {}, 2500);
       if (!res || !res.ok) {
-        if (!activeTask) return;
+        if (!activeTask) {
+          if (res && res.status === 404) {
+            syncSessionPersistence(null);
+          }
+          return;
+        }
       }
       const data = res && res.ok ? await res.json() : {};
       const messages = Array.isArray(data.messages) ? data.messages : [];
@@ -6063,15 +6068,17 @@ function secureRandomIndex(n) {
 
         case 'clear-chat-history':
           e.preventDefault();
-          await clearAllHistorySessions();
+          if (activeSessionId) {
+            await deleteSingleHistorySession(activeSessionId);
+            showSettingsToast('Active chat session cleared');
+          }
           break;
 
         case 'clear-archived-chats':
           e.preventDefault();
           await saveUiSettingsPatch({ archived_chats: [] });
-          await clearAllHistorySessions();
           renderSettingsTabContent('archived', '');
-          showSettingsToast('All saved and archived chats cleared');
+          showSettingsToast('Archived chats cleared');
           break;
 
         case 'mkt-save-optin-general': {
@@ -10286,12 +10293,14 @@ function secureRandomIndex(n) {
       ]);
 
       let sessions = [];
+      let historyLoaded = false;
       if (historyRes.status === 'fulfilled' && historyRes.value && historyRes.value.ok) {
         try {
           const histData = await historyRes.value.json();
           sessions = Array.isArray(histData.sessions) ? histData.sessions : [];
           sidebarSessionsCache = sessions;
           renderSidebarHistoryList(sidebarSessionsCache);
+          historyLoaded = true;
         } catch (_) {}
       }
 
@@ -10314,11 +10323,18 @@ function secureRandomIndex(n) {
         targetSessionId = storedSession;
       } else if (runningSession) {
         targetSessionId = runningSession;
+      } else if (!historyLoaded || sessions.length === 0) {
+        // Startup warmup protection: if /api/history fails, times out, or returns 0 sessions,
+        // preserve the stored or URL session and do NOT purge localStorage.
+        targetSessionId = urlSession || storedSession;
       }
 
       if (!targetSessionId) {
         activeSessionId = generateNewSessionId();
-        syncSessionPersistence(null);
+        // Only clear if the session is verified gone after a successful 200 response with sessions
+        if (historyLoaded && sessions.length > 0 && storedSession) {
+          syncSessionPersistence(null);
+        }
         return;
       }
 

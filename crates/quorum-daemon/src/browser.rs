@@ -1,24 +1,19 @@
 use tracing::{info, warn};
 
-/// Cross-platform browser auto-launcher with Windows native fallback.
+/// Cross-platform browser auto-launcher using native OS APIs (zero console/shell spawns).
 pub fn launch_browser(url: &str) {
     info!("Auto-opening default web browser to {}", url);
 
     #[cfg(windows)]
     {
-        // 1. Try 'open' crate
-        if let Err(e) = open::that(url) {
-            warn!("open::that failed ({}), falling back to Windows 'cmd /c start'...", e);
-            use std::os::windows::process::CommandExt;
-            use std::process::Command;
-
-            let status = Command::new("cmd")
-                .args(["/c", "start", "", url])
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                .spawn();
-
-            if let Err(e2) = status {
-                warn!("Windows cmd fallback failed to open browser: {}", e2);
+        // Primary: native Win32 ShellExecuteW (zero cmd.exe / shell process creation).
+        if let Err(e) = crate::win_native::shell_open_url(url) {
+            warn!(
+                "Win32 ShellExecuteW failed ({}), attempting open::that fallback...",
+                e
+            );
+            if let Err(e2) = open::that(url) {
+                warn!("open::that fallback also failed to open browser: {}", e2);
             }
         }
     }

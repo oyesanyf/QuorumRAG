@@ -93,6 +93,7 @@ fn test_byzantine_consensus_anti_stuffing() {
         score: 0.9,
         content: "malicious duplicated payload".to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     };
 
     // Peer 1 sends identical content 5 times under different or identical chunk IDs
@@ -150,6 +151,7 @@ fn test_multi_peer_consensus_boost() {
         score: 0.9,
         content: content.to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
 
     let peer2 = vec![CandidateChunkDto {
@@ -161,6 +163,7 @@ fn test_multi_peer_consensus_boost() {
         score: 0.88,
         content: content.to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
 
     let fused = RrfCombiner::fuse_rankings(local, vec![peer1, peer2], 60.0, 10);
@@ -432,6 +435,7 @@ async fn test_mesh_early_resolution_single_peer_latency() {
             score: 0.85,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     };
     dispatcher.add_peer(peer).await;

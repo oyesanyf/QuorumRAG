@@ -104,6 +104,15 @@ pub async fn execute_graceful_shutdown(state: Arc<DaemonState>) {
         }
     }
 
+    // 3b. Checkpoint persistent SQLite chat history database
+    if let Ok(hist_store) = state.history_store() {
+        if let Err(e) = hist_store.checkpoint() {
+            warn!("Failed to checkpoint SQLite chat history during shutdown: {}", e);
+        } else {
+            info!("Persisted SQLite chat history WAL checkpoint cleanly committed");
+        }
+    }
+
     // 4. Persist Level-1 deduplication catalog to disk
     let catalog_path = state.data_dir.join("dedup_catalog.json");
     if let Err(e) = state.dedup.save_catalog_to_file(&catalog_path) {

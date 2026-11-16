@@ -23,11 +23,17 @@ if [ -f "${PLIST}" ]; then
 fi
 
 pkill -TERM -f "/usr/local/bin/quorumrag" 2>/dev/null || true
+pkill -TERM -f "/usr/local/bin/quorum-desktop" 2>/dev/null || true
 pkill -TERM -f "QuorumRAG.app/Contents/MacOS/quorumrag-bin" 2>/dev/null || true
+pkill -TERM -f "QuorumRAG.app/Contents/MacOS/QuorumRAG" 2>/dev/null || true
 
 if [ -f /usr/local/bin/quorumrag ]; then
     rm -f /usr/local/bin/quorumrag
     echo "[+] Removed /usr/local/bin/quorumrag"
+fi
+if [ -f /usr/local/bin/quorum-desktop ]; then
+    rm -f /usr/local/bin/quorum-desktop
+    echo "[+] Removed /usr/local/bin/quorum-desktop"
 fi
 
 if [ -d "/Applications/QuorumRAG.app" ]; then

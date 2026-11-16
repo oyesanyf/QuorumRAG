@@ -1342,7 +1342,7 @@ impl OsoosiMeshDlpController {
                 text,
                 &mut spans,
                 &mut categories,
-                r"(?i)\b(?:Age|Gender|Ethnicity|Demographic|Discharge\s+Location)\s*[:#-]?\s*[A-Za-z0-9\s,-]{3,30}\b",
+                r"(?i)\b(?:Age|Gender|Ethnicity|Demographic|Discharge\s+Location)\s*[:#-]\s*[A-Za-z0-9#\'-]+(?:\s+[A-Za-z0-9#\'-]+){0,4}\b",
                 "VAULTGEMMA_QUASI_ID",
                 "[REDACTED:VAULTGEMMA_QUASI_ID]",
                 0.94,

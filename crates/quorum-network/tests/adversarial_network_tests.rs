@@ -29,6 +29,7 @@ impl InboundQueryHandler for EchoQueryHandler {
                 score: 0.99,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
             synthesis_response: None,
             warm_llm_available: false,

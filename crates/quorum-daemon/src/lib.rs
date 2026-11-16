@@ -8,6 +8,8 @@ pub mod server;
 pub mod shutdown;
 pub mod state;
 pub mod wan_mesh;
+#[cfg(windows)]
+pub mod win_native;
 
 pub use chat_history_db::{
     ChatHistoryStore, ChatSessionDetail, ChatSessionSummary, StoredChatMessage,
@@ -15,8 +17,8 @@ pub use chat_history_db::{
 pub use cli::{Cli, Commands};
 pub use nimble_provisioner::{NimbleProvisionState, NimbleProvisioner, NimbleStatusResponse};
 pub use p2p_watcher::{
-    discover_local_private_ipv4_addresses, is_private_lan_ipv4, P2pWatcherRuntime,
-    P2pWatcherStatusDto,
+    discover_local_private_ipv4_addresses, is_private_lan_ipv4, parse_linux_proc_net_arp,
+    P2pWatcherRuntime, P2pWatcherStatusDto,
 };
 pub use server::build_router;
 pub use state::{

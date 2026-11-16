@@ -459,6 +459,13 @@ impl ChatHistoryStore {
         tx.commit()?;
         Ok(removed)
     }
+
+    /// Flushes and truncates the SQLite WAL write-ahead log to disk.
+    pub fn checkpoint(&self) -> rusqlite::Result<()> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -82,10 +82,13 @@ impl RrfCombiner {
     /// preserving the actual peer identity in `ScoredChunk.source_peer`.
     pub fn fuse_rankings_with_peers(
         local_results: Vec<ScoredChunk>,
-        remote_peer_lists: Vec<(String, Vec<CandidateChunkDto>)>,
+        mut remote_peer_lists: Vec<(String, Vec<CandidateChunkDto>)>,
         k: f32,
         top_k: usize,
     ) -> Vec<ScoredChunk> {
+        // Sort remote peer lists deterministically by peer_id ASC before iteration
+        remote_peer_lists.sort_by(|a, b| a.0.cmp(&b.0));
+
         // Map from cryptographic blake3_hash to (base_rrf_score, ScoredChunk, HashSet of distinct peer IDs)
         // Local is peer 0; remote peers are indexed 1..=N
         let mut rrf_map: HashMap<String, (f32, ScoredChunk, HashSet<usize>)> = HashMap::new();
@@ -172,8 +175,8 @@ impl RrfCombiner {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
                 .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
+                .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
         });
 
         fused.truncate(top_k);

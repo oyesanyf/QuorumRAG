@@ -564,7 +564,7 @@ impl VaultGemmaPolicyEngine {
         // Quasi-identifier pattern: demographic + rare professional title + location
         static QUASI_ID_RE: OnceLock<Regex> = OnceLock::new();
         let re = QUASI_ID_RE.get_or_init(|| {
-            Regex::new(r"(?i)\b(?:Age|Gender|Ethnicity|Demographic|Discharge\s+Location)\s*[:#-]?\s*[A-Za-z0-9\s,-]{3,30}\b")
+            Regex::new(r"(?i)\b(?:Age|Gender|Ethnicity|Demographic|Discharge\s+Location)\s*[:#-]\s*[A-Za-z0-9#\'-]+(?:\s+[A-Za-z0-9#\'-]+){0,4}\b")
                 .expect("valid quasi-id regex")
         });
         for mat in re.find_iter(text) {

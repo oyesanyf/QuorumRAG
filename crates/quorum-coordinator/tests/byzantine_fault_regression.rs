@@ -75,6 +75,7 @@ fn test_byzantine_sybil_score_stuffing_under_high_load() {
             score: 0.999, // Artificially inflated
             content: sybil_text.to_string(),
             origin_peer_id: None,
+            expanded_window: None,
         });
     }
 
@@ -88,6 +89,7 @@ fn test_byzantine_sybil_score_stuffing_under_high_load() {
         score: 0.92,
         content: "Official verified corporate financial statement and audit.".to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
 
     // Execute RRF Fusion: Local + Rogue Peer A + Honest Peer B
@@ -151,6 +153,7 @@ fn test_byzantine_merkle_root_and_chunk_hash_tampering() {
         score: 0.99,
         content: "Malicious payload under legitimate ID".to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     };
 
     let fused = RrfCombiner::fuse_rankings(
@@ -293,6 +296,7 @@ async fn test_byzantine_network_partition_and_silent_drop_400ms_deadline() {
             score: 0.90,
             content: "Fast remote peer document".to_string(),
             origin_peer_id: None,
+            expanded_window: None,
         }],
     });
 
@@ -311,6 +315,7 @@ async fn test_byzantine_network_partition_and_silent_drop_400ms_deadline() {
                 score: 0.99,
                 content: format!("Partitioned peer {} data should be discarded", i),
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         });
     }

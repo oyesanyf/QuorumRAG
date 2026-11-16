@@ -77,6 +77,7 @@ fn test_peer_and_filename_disambiguation() {
         access_tier: 0,
         content: "Peer A exclusive addendum to agreement.".to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     };
 
     let chunk_b = CandidateChunkDto {
@@ -88,6 +89,7 @@ fn test_peer_and_filename_disambiguation() {
         access_tier: 0,
         content: "Peer B specialized commercial riders.".to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     };
 
     let remote_lists = vec![
@@ -129,6 +131,7 @@ async fn test_max_peer_responses_capping() {
             access_tier: 0,
             content: format!("Content from peer {}", i),
             origin_peer_id: None,
+            expanded_window: None,
         };
         mock_disp.add_peer(MockRemotePeer {
             peer_id,

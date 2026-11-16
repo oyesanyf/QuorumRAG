@@ -144,6 +144,7 @@ fn test_adv_byzantine_sybil_score_stuffing_and_honest_peer_superiority() {
             score: 0.99 - (rank as f32 * 0.001),
             content: rogue_text.to_string(),
             origin_peer_id: None,
+            expanded_window: None,
         });
     }
 
@@ -157,6 +158,7 @@ fn test_adv_byzantine_sybil_score_stuffing_and_honest_peer_superiority() {
         score: 0.95,
         content: "Consensus verified data across honest nodes".to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
 
     // Fuse rankings: Local + Rogue Peer (peer 1) + Honest Remote Peer (peer 2)
@@ -240,6 +242,7 @@ fn test_adv_aggregation_key_blake3_hash_anti_malleability() {
         score: 0.95,
         content: rogue_content.to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
 
     let fused = RrfCombiner::fuse_rankings(local_results, vec![rogue_peer_list], 60.0, 10);
@@ -277,6 +280,7 @@ fn test_adv_aggregation_key_blake3_hash_anti_malleability() {
         score: 0.90,
         content: consensus_text.to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
     let peer2_list = vec![CandidateChunkDto {
         chunk_id: "peer2_uuid_2222".to_string(), // Different chunk_id!
@@ -287,6 +291,7 @@ fn test_adv_aggregation_key_blake3_hash_anti_malleability() {
         score: 0.88,
         content: consensus_text.to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
 
     let fused_consensus = RrfCombiner::fuse_rankings(vec![], vec![peer1_list, peer2_list], 60.0, 10);
@@ -316,6 +321,7 @@ fn test_adv_independent_honest_peers_accumulate_consensus_boost() {
         score: 0.9,
         content: shared_content.to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
 
     let peer2 = vec![CandidateChunkDto {
@@ -327,6 +333,7 @@ fn test_adv_independent_honest_peers_accumulate_consensus_boost() {
         score: 0.9,
         content: shared_content.to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
 
     let peer3 = vec![CandidateChunkDto {
@@ -338,6 +345,7 @@ fn test_adv_independent_honest_peers_accumulate_consensus_boost() {
         score: 0.9,
         content: shared_content.to_string(),
         origin_peer_id: None,
+        expanded_window: None,
     }];
 
     let fused = RrfCombiner::fuse_rankings(vec![], vec![peer1, peer2, peer3], 60.0, 10);
@@ -383,6 +391,7 @@ async fn test_adv_remote_chunk_access_tier_clamping_to_requested() {
                 score: 0.99,
                 content: "Confidential document text requiring tier 5".to_string(),
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "chunk_pub_0".to_string(),
@@ -393,6 +402,7 @@ async fn test_adv_remote_chunk_access_tier_clamping_to_requested() {
                 score: 0.85,
                 content: "Public document text accessible to all".to_string(),
                 origin_peer_id: None,
+                expanded_window: None,
             },
         ],
         synthesis_response: None,
@@ -468,6 +478,7 @@ async fn test_adv_remote_chunk_inverted_lines_rejected() {
                 score: 0.99,
                 content: "Malformed chunk with inverted line range".to_string(),
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "malformed_inverted_100_1".to_string(),
@@ -478,6 +489,7 @@ async fn test_adv_remote_chunk_inverted_lines_rejected() {
                 score: 0.98,
                 content: "Malformed chunk 2 with inverted line range".to_string(),
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "valid_chunk_10_50".to_string(),
@@ -488,6 +500,7 @@ async fn test_adv_remote_chunk_inverted_lines_rejected() {
                 score: 0.85,
                 content: "Valid chunk with proper line ranges".to_string(),
                 origin_peer_id: None,
+                expanded_window: None,
             },
         ],
         synthesis_response: None,
@@ -545,6 +558,7 @@ async fn test_adv_remote_chunk_inverted_lines_rejected() {
                 score: 0.99,
                 content: "Bad chunk".to_string(),
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "good_chunk".to_string(),
@@ -555,6 +569,7 @@ async fn test_adv_remote_chunk_inverted_lines_rejected() {
                 score: 0.80,
                 content: "Good chunk".to_string(),
                 origin_peer_id: None,
+                expanded_window: None,
             },
         ],
     });

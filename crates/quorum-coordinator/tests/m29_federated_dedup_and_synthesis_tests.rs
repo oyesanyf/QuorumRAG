@@ -108,36 +108,29 @@ fn test_federated_document_family_deduplication_cross_nodes() {
     // Cap document families federated (global cap = 2 per family stem)
     let capped = RetrieveMeshNode::cap_document_families_federated(candidate_pool, 2);
 
-    let mut peer_family_counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+    let mut stem_family_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for c in &capped {
         let stem = DeterministicOfflineSynthesisEngine::normalize_file_stem(&c.chunk.file_path);
-        let key = (c.source_peer.clone(), stem);
-        *peer_family_counts.entry(key).or_insert(0) += 1;
+        *stem_family_counts.entry(stem).or_insert(0) += 1;
     }
 
-    // Verify local is capped at 2 and remote peers are not evicted
+    // Verify document families are capped globally at 2 across all peers
     assert_eq!(
-        peer_family_counts.get(&("local".to_string(), "femi_oyesanya_resume".to_string())),
+        stem_family_counts.get("femi_oyesanya_resume"),
         Some(&2),
-        "Local resume family must be capped at 2"
+        "Resume family must be capped globally at 2 across all peers"
     );
     assert_eq!(
-        peer_family_counts.get(&("12D3KooWPeerAlice".to_string(), "femi_oyesanya_resume".to_string())),
-        Some(&1),
-        "Remote peer Alice resume must not be evicted by local"
+        stem_family_counts.get("redactx_technical_report"),
+        Some(&2),
+        "RedactX report family must be capped globally at 2 across all peers"
     );
     assert_eq!(
-        peer_family_counts.get(&("12D3KooWPeerBob".to_string(), "femi_oyesanya_resume".to_string())),
-        Some(&1),
-        "Remote peer Bob resume must not be evicted by local"
-    );
-
-    // Verify independent family is preserved
-    assert_eq!(
-        peer_family_counts.get(&("12D3KooWPeerCharlie".to_string(), "autonomous_consensus_spec".to_string())),
+        stem_family_counts.get("autonomous_consensus_spec"),
         Some(&1),
         "Independent document family must be retained"
     );
+    assert_eq!(capped.len(), 5, "Total capped chunks must be exactly 2 + 2 + 1 = 5");
 }
 
 #[test]

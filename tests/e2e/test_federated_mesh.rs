@@ -63,6 +63,7 @@ async fn test_federated_scatter_gather_400ms_timeout_aborts_slow_peer() {
             score: 0.85,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     };
 
@@ -80,6 +81,7 @@ async fn test_federated_scatter_gather_400ms_timeout_aborts_slow_peer() {
             score: 0.99,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     };
 
@@ -126,6 +128,7 @@ async fn test_federated_access_tier_blocks_remote_confidential_documents() {
                 score: 0.80,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             },
             CandidateChunkDto {
                 chunk_id: "c_conf".to_string(),
@@ -136,6 +139,7 @@ async fn test_federated_access_tier_blocks_remote_confidential_documents() {
                 score: 0.99,
                 access_tier: 2,
                 origin_peer_id: None,
+                expanded_window: None,
             },
         ],
     };
@@ -183,6 +187,7 @@ async fn test_federated_rrf_combines_local_and_remote_rankings() {
             score: 0.90,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         }],
     };
     coordinator.add_peer(peer);
@@ -213,6 +218,7 @@ fn test_federated_volatile_remote_chunk_zeroizes_on_drop() {
         score: 0.95,
         access_tier: 2,
         origin_peer_id: None,
+        expanded_window: None,
     };
 
     let mut volatile = dto.to_volatile_remote_chunk("peer_test");
@@ -312,6 +318,7 @@ async fn test_federated_boundary_multi_peer_consensus_boost() {
                 score: 0.90,
                 access_tier: 0,
                 origin_peer_id: None,
+                expanded_window: None,
             }],
         };
         coordinator.add_peer(peer);

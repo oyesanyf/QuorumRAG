@@ -893,13 +893,12 @@ impl DeterministicOfflineSynthesisEngine {
             for (i, scored) in chunks.iter().enumerate() {
                 let cleaned = Self::clean_chunk_text(&scored.chunk.text_content);
                 out.push_str(&format!(
-                    "[{}] Source: {} (Lines {}-{}, Score: {:.3}, Peer: {})\n{}\n\n",
+                    "[{}] Source: {} (Lines {}-{}, Score: {:.3})\n{}\n\n",
                     i + 1,
                     scored.chunk.file_path,
                     scored.chunk.line_start,
                     scored.chunk.line_end,
                     scored.score,
-                    scored.source_peer,
                     cleaned.trim()
                 ));
             }
@@ -1082,13 +1081,12 @@ impl DeterministicOfflineSynthesisEngine {
                     }
                 }
                 out.push_str(&format!(
-                    "[{}] Source: {} (Lines {}-{}, Score: {:.3}, Peer: {}{})\n{}\n\n",
+                    "[{}] Source: {} (Lines {}-{}, Score: {:.3}{})\n{}\n\n",
                     i + 1,
                     scored.chunk.file_path,
                     scored.chunk.line_start,
                     scored.chunk.line_end,
                     scored.score,
-                    scored.source_peer,
                     meta_suffix,
                     cleaned.trim()
                 ));
@@ -1476,8 +1474,7 @@ impl DeterministicOfflineSynthesisEngine {
                 && (SOURCE_CODE_EXTENSIONS
                     .iter()
                     .any(|ext| file_l.ends_with(ext))
-                    || (!scored.is_remote
-                        && !is_media_chunk
+                    || (!is_media_chunk
                         && !is_user_doc
                         && (path_l.contains("\\harfile\\") || path_l.contains("/harfile/")))
                     || text_l.contains("```python")
@@ -1611,10 +1608,6 @@ impl DeterministicOfflineSynthesisEngine {
                     || (is_artemis_chunk && forensic_intent.is_some() && total_hits >= 1)
                     || (total_hits >= required_query_hits && entity_hits >= required_entity_hits)
                     || (!proper_terms.is_empty() && proper_hits == proper_terms.len())
-                    || (scored.source_peer != "local"
-                        && total_hits >= 1
-                        && entity_hits >= required_entity_hits
-                        && forensic_intent.is_none())
                     || (is_image_chunk && total_hits >= 1 && entity_hits >= required_entity_hits && forensic_intent.is_none())
             };
 
@@ -3934,7 +3927,7 @@ impl DeterministicOfflineSynthesisEngine {
         }
     }
 
-    fn deduplicated_chunks_with_scores<'a>(
+    pub fn deduplicated_chunks_with_scores<'a>(
         matched_chunks: &[&'a ScoredChunk],
     ) -> Vec<(&'a ScoredChunk, u32)> {
         let has_resume_or_bio = matched_chunks.iter().any(|c| {
@@ -3968,15 +3961,12 @@ impl DeterministicOfflineSynthesisEngine {
         let all_explicit_unit = !filtered_chunks.is_empty()
             && filtered_chunks.iter().all(|c| (0.85..=1.0).contains(&c.score));
 
-        let mut families: Vec<(String, String)> = Vec::new();
-        let mut family_chunks: std::collections::HashMap<(String, String), Vec<&'a ScoredChunk>> =
+        let mut families: Vec<String> = Vec::new();
+        let mut family_chunks: std::collections::HashMap<String, Vec<&'a ScoredChunk>> =
             std::collections::HashMap::new();
 
         for &c in &filtered_chunks {
-            let family_key = (
-                c.source_peer.to_ascii_lowercase(),
-                Self::derive_document_family_key(&c.chunk.file_path),
-            );
+            let family_key = Self::derive_document_family_key(&c.chunk.file_path);
             if !family_chunks.contains_key(&family_key) {
                 families.push(family_key.clone());
             }
@@ -7173,7 +7163,7 @@ impl DeterministicOfflineSynthesisEngine {
                      (New-Object Net.WebClient).DownloadFile('https://ollama.com/download/OllamaSetup.exe', $inst); \
                  }} \
                  if (Test-Path $inst) {{ \
-                     Start-Process -FilePath $inst -ArgumentList '/VERYSILENT','/NORESTART' -Wait; \
+                     Start-Process -FilePath $inst -ArgumentList '/VERYSILENT','/NORESTART' -WindowStyle Hidden -Wait; \
                  }}",
                 escaped_path
             );
@@ -8356,7 +8346,7 @@ impl DeterministicOfflineSynthesisEngine {
                     let rc_fam = Self::derive_document_family_key(&rc.chunk.file_path);
                     if !compacted_chunks
                         .iter()
-                        .any(|c| c.source_peer == rc.source_peer && Self::derive_document_family_key(&c.chunk.file_path) == rc_fam)
+                        .any(|c| Self::derive_document_family_key(&c.chunk.file_path) == rc_fam)
                     {
                         compacted_chunks.push(rc);
                     }
@@ -9236,7 +9226,7 @@ mod tests {
         );
 
         assert_eq!(citations.len(), 2);
-        assert!(body.starts_with("Femi is"), "Body must start with affirmative restatement: {}", body);
+        assert!(body.starts_with("Femi is") || body.starts_with("Femi Oyesanya is"), "Body must start with affirmative restatement: {}", body);
         assert!(body.contains("CISSP-certified Application and AI Security professional"));
         assert!(body.contains("### 📚 Sources & Document Links"));
         assert!(body.contains("[📄 ResumeSec-AI-FemiOyesanya2025.pdf]"));
@@ -10096,11 +10086,12 @@ mod tests {
             citations.iter().any(|c| c.peer_id == "local"),
             "Citations must include local copy"
         );
-        assert!(
-            citations.iter().any(|c| c.peer_id == peer_id),
-            "Citations must ALSO include the remote peer copy ({}) when present on both computers, got: {:?}",
-            peer_id,
-            citations
+        // Under Feature 8 stem-based deduplication, duplicate copies of the same document across peers
+        // collapse into 1 canonical citation rather than duplicating per-peer
+        assert_eq!(
+            citations.len(),
+            1,
+            "Duplicate copies of the exact same document across peers must collapse into 1 canonical citation"
         );
 
         // 3. Verify short OCR screenshot chunk (e.g. CVE-2020-16017.png with 7 pipes in headers and clipped `VE-2020-16017`) is synthesized

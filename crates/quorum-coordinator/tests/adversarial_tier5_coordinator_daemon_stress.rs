@@ -339,6 +339,7 @@ fn challenge_tier5_zeroize_on_drop_remote_peer_memory_clearing() {
         score: 0.97,
         access_tier: 1,
         origin_peer_id: None,
+        expanded_window: None,
     };
 
     let mut volatile_chunks = wrap_candidates("remote_peer_bob", vec![dto]);

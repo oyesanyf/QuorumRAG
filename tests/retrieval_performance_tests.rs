@@ -266,6 +266,7 @@ pub async fn benchmark_3_concurrent_federated_fan_out(
             score: 0.96,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         },
         CandidateChunkDto {
             chunk_id: "remote_pdf_doc:1".to_string(),
@@ -276,6 +277,7 @@ pub async fn benchmark_3_concurrent_federated_fan_out(
             score: 0.91,
             access_tier: 0,
             origin_peer_id: None,
+            expanded_window: None,
         },
     ];
 
