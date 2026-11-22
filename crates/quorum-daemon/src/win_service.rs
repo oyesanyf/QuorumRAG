@@ -37,12 +37,12 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Set once the service has reported STOPPED and no further work is pending.
 static STOP_COMPLETED: AtomicBool = AtomicBool::new(false);
 
-/// Hard deadline for the entire graceful shutdown path. The SCM kill-window is
-/// roughly the first `dwWaitHint` (30s) after the STOP control arrives; the
-/// MSI's `ServiceControl` (Wait=yes) fails the whole install with Error 1921
-/// if the service cannot stop in that window. Orphaned/hung shutdown paths are
-/// therefore force-exited at the deadline so installs can never wedge again.
-const STOP_DEADLINE: Duration = Duration::from_secs(25);
+/// Hard deadline for the entire graceful shutdown path. The MSI's
+/// `ServiceControl` (Wait=yes) fails installs with Error 1921 if the service
+/// hangs or vanishes without reporting `SERVICE_STOPPED`. We keep the runtime
+/// drain short (2s) and force-report `SERVICE_STOPPED` before exiting if any
+/// orphaned blocking task exceeds `STOP_DEADLINE` (10s).
+const STOP_DEADLINE: Duration = Duration::from_secs(10);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -90,8 +90,9 @@ fn arm_stop_watchdog() {
             if !STOP_COMPLETED.load(Ordering::SeqCst) {
                 tracing::error!(
                     "Graceful shutdown did not complete within {STOP_DEADLINE:?} of the SCM stop request; \
-                     force-exiting so service stop cannot wedge an installation."
+                     reporting SERVICE_STOPPED and exiting cleanly so service stop cannot wedge an installation."
                 );
+                report_stopped(NO_ERROR);
                 std::process::exit(0);
             }
         })
@@ -154,8 +155,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
             ERROR_EXCEPTION_IN_SERVICE
         }
     };
-    report(SERVICE_STOP_PENDING, 0, 2, 15_000, exit_code);
-    runtime.shutdown_timeout(Duration::from_secs(10));
+    report(SERVICE_STOP_PENDING, 0, 2, 5_000, exit_code);
+    runtime.shutdown_timeout(Duration::from_secs(2));
     report_stopped(exit_code);
 }
 

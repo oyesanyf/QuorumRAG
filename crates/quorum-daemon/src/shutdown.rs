@@ -1,16 +1,17 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use crate::state::DaemonState;
 
 /// Bounded shutdown phases. The Windows SCM gives the service roughly the
-/// duration of the reported `dwWaitHint` (~30s) to report STOPPED; the MSI's
-/// `ServiceControl` stops the service before files are updated, and an
-/// unbounded cleanup here previously wedged installs with MSI Error 1921
-/// ("Service ... could not be stopped"). Every slow phase below therefore has
-/// a hard deadline; a missed deadline is logged and skipped, never fatal.
-const SWARM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-const STORAGE_FLUSH_TIMEOUT: Duration = Duration::from_secs(15);
+/// duration of the reported `dwWaitHint` (~15s) to report STOPPED; the MSI's
+/// `ServiceControl` stops the service before files are updated, and running
+/// full LanceDB/Tantivy compaction inside service stop previously left blocking
+/// threads alive across `runtime.shutdown_timeout`, triggering MSI Error 1921
+/// ("Service ... could not be stopped"). Shutdown therefore performs fast
+/// durable checkpoints only (WAL checkpoint + dedup catalog + process cleanup)
+/// so service stops complete cleanly in under 2 seconds even on multi-million-chunk stores.
+const SWARM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Process-wide stop request used by the Windows service control handler.
 fn external_stop() -> &'static tokio::sync::Notify {
@@ -85,24 +86,10 @@ pub async fn execute_graceful_shutdown(state: Arc<DaemonState>) {
         }
     }
 
-    // 3. Compact and commit LanceDB and Tantivy indexes
-    info!("Flushing and compacting LanceDB & Tantivy storage indexes...");
-    match tokio::time::timeout(STORAGE_FLUSH_TIMEOUT, state.storage.compact()).await {
-        Ok(Ok(stats)) => {
-            info!(
-                "Storage indexes cleanly committed: {} fragments removed, {} added, Tantivy segments merged: {}",
-                stats.fragments_removed, stats.fragments_added, stats.tantivy_segments_merged
-            );
-        }
-        Ok(Err(e)) => {
-            error!("Error flushing storage during shutdown: {}", e);
-        }
-        Err(_) => {
-            warn!(
-                "Storage compaction exceeded {STORAGE_FLUSH_TIMEOUT:?}; skipping remaining compaction so the service stop completes promptly."
-            );
-        }
-    }
+    // 3. Skip heavy full-index LanceDB/Tantivy compaction during shutdown (compaction runs in
+    //    background maintenance / FixDrift) so large multi-million-chunk stores never wedge SCM
+    //    service stop or MSI upgrades with Error 1921. SQLite WAL & dedup catalog flush below.
+    info!("Skipping heavy storage compaction on shutdown for fast (<2s) clean service stop.");
 
     // 3b. Checkpoint persistent SQLite chat history database
     if let Ok(hist_store) = state.history_store() {

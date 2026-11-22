@@ -70,6 +70,12 @@ fn wix_manifest_enforces_ice63_error_2613_prevention_and_zero_touch_path() {
         "Zero-Touch PATH violation: <Environment element found in wix/QuorumRAG.wxs"
     );
 
+    // 1b. Fast MSI install/upgrade invariant: disable slow VSS System Restore point stalls.
+    assert!(
+        wxs.contains(r#"<Property Id="MSIFASTINSTALL" Value="7" />"#),
+        "wix/QuorumRAG.wxs must set MSIFASTINSTALL=7 so upgrades never stall 30+ minutes in VSS"
+    );
+
     // 2. MSI Error 2613 / ICE63 invariant:
     // MajorUpgrade must use Schedule="afterInstallExecute", with StopDeleteQuorumServiceUpgrade
     // scheduled After="InstallInitialize" and <InstallExecute After="StopDeleteQuorumServiceUpgrade" />
@@ -121,6 +127,7 @@ fn wix_manifest_enforces_ice63_error_2613_prevention_and_zero_touch_path() {
 
     for (ca_id, expected_flag) in [
         ("StopDeleteQuorumServiceUpgrade", "--msi-stop-cleanup --delete-service"),
+        ("EnsureQuorumServiceStopped", "--msi-stop-cleanup"),
         ("StopDeleteQuorumServiceUninstall", "--msi-stop-cleanup --delete-service"),
         ("KillQuorumOrphans", "--msi-kill-orphans"),
         ("AddQuorumFirewallRules", "--msi-firewall-add"),

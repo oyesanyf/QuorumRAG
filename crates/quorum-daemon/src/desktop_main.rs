@@ -294,12 +294,24 @@ fn run_default_desktop_launcher() -> i32 {
     {
         match win_native::query_windows_service_status("QuorumRAGDaemon") {
             win_native::ServiceStateSummary::Running
-            | win_native::ServiceStateSummary::StartPending => {
+            | win_native::ServiceStateSummary::StartPending
+            | win_native::ServiceStateSummary::ContinuePending => {
                 let _ = wait_for_daemon_health(port, 90);
                 open_browser_native(&url);
                 return 0;
             }
+            win_native::ServiceStateSummary::StopPending => {
+                // Allow an in-progress stop to finish briefly before attempting a clean start.
+                std::thread::sleep(Duration::from_secs(2));
+                let _ = win_native::start_windows_service("QuorumRAGDaemon");
+                if wait_for_daemon_health(port, 45) {
+                    open_browser_native(&url);
+                    return 0;
+                }
+            }
             win_native::ServiceStateSummary::Stopped
+            | win_native::ServiceStateSummary::Paused
+            | win_native::ServiceStateSummary::PausePending
             | win_native::ServiceStateSummary::Other(_) => {
                 let _ = win_native::start_windows_service("QuorumRAGDaemon");
                 if wait_for_daemon_health(port, 45) {
@@ -426,7 +438,7 @@ fn main() {
                 let _ = win_native::stop_and_cleanup_windows_service(
                     "QuorumRAGDaemon",
                     delete_service,
-                    Duration::from_secs(10),
+                    Duration::from_secs(5),
                 );
             }
             std::process::exit(0);
