@@ -884,7 +884,27 @@ pub fn annotate_chunk_entity_cluster(chunk: &mut DocumentChunk) {
     }
 }
 
-/// Returns the distinct specific (non-generic) domain cluster labels present across `chunks`.
+/// Deterministic rank for canonical domain cluster labels so multi-host reports emit sections and
+/// assign `[1]..[N]` citations in identical order across all peers.
+pub fn entity_cluster_rank(cluster: &str) -> usize {
+    match cluster {
+        "Academic Scholarship, Published Works & Critical Theory" => 0,
+        "Residential Property Leasing & Real Estate Management" => 1,
+        "Religious Ministry, Spiritual Teaching & Organizational Stewardship" => 2,
+        "Software Engineering, Architecture & Cybersecurity" => 3,
+        "Sports Science & Athletics Coaching" => 4,
+        "Classical Music & Solo Performance" => 5,
+        "Marine Engineering & Subsea Robotics" => 6,
+        "Clinical & Healthcare Records" => 7,
+        "Population Genetics & Mathematical Modeling" => 8,
+        "Corporate Finance, Banking & Tax Records" => 9,
+        "Software Source Code" => 10,
+        _ => 99,
+    }
+}
+
+/// Returns the distinct specific (non-generic) domain cluster labels present across `chunks`,
+/// ordered deterministically by `entity_cluster_rank`.
 pub fn distinct_specific_entity_clusters(chunks: &[&ScoredChunk]) -> Vec<&'static str> {
     let mut set: BTreeSet<&'static str> = BTreeSet::new();
     for c in chunks {
@@ -901,7 +921,83 @@ pub fn distinct_specific_entity_clusters(chunks: &[&ScoredChunk]) -> Vec<&'stati
             set.insert(label);
         }
     }
-    set.into_iter().collect()
+    let mut out: Vec<&'static str> = set.into_iter().collect();
+    out.sort_by_key(|&label| (entity_cluster_rank(label), label));
+    out
+}
+
+/// Synthesizes a structured analytical paragraph and extracted grounded facts for a single attested
+/// document using an entity-anchored `3,200`-char window rather than a raw prefix dump.
+pub fn synthesize_grounded_document_analysis(
+    prompt: &str,
+    subject: Option<&str>,
+    doc_name: &str,
+    origin_badge: &str,
+    cleaned_text: &str,
+    global_cite: usize,
+) -> String {
+    let clean_lines: Vec<String> = cleaned_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_contact_bar_or_header(l)
+                && !l.chars().all(|ch| ch == '_' || ch == '-' || ch == ' ')
+        })
+        .map(|l| {
+            if let Some(rest) = l
+                .strip_prefix('•')
+                .or_else(|| l.strip_prefix('●'))
+                .or_else(|| l.strip_prefix('▪'))
+            {
+                format!("- {}", rest.trim())
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    let joined = clean_lines.join("\n");
+    let window = crate::offline_engine::DeterministicOfflineSynthesisEngine::answer_focused_window(
+        prompt,
+        joined.trim(),
+        3200,
+    );
+    if window.trim().is_empty() {
+        return String::new();
+    }
+
+    let doc_facts = extract_grounded_facts(
+        subject,
+        &[(String::new(), doc_name.to_string(), window.clone())],
+    );
+    let mut fact_notes: Vec<String> = Vec::new();
+    for f in &doc_facts {
+        let note = format!("{}: {}", f.class, f.value);
+        if !fact_notes.contains(&note) {
+            fact_notes.push(note);
+        }
+        if fact_notes.len() >= 6 {
+            break;
+        }
+    }
+
+    let prose_summary = window.trim();
+    if fact_notes.is_empty() {
+        format!(
+            "**Document `{}`{}:** {} **[{}]**",
+            doc_name, origin_badge, prose_summary, global_cite
+        )
+    } else {
+        format!(
+            "**Document `{}`{}:** {} **[{}]**\n  - *Extracted grounded facts:* {} [{}]",
+            doc_name,
+            origin_badge,
+            prose_summary,
+            global_cite,
+            fact_notes.join("; "),
+            global_cite
+        )
+    }
 }
 
 /// Renders an exhaustive, cleanly formatted, disambiguated multi-cluster report when retrieved documents
@@ -923,7 +1019,7 @@ pub fn render_disambiguated_multi_cluster_report(
     }
 
     let mut cluster_map: BTreeMap<&'static str, Vec<ClusterItem<'_>>> = BTreeMap::new();
-    for (idx, &c) in chunks.iter().enumerate().take(28) {
+    for (idx, &c) in chunks.iter().enumerate() {
         if crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(
             &c.chunk.text_content,
         ) {
@@ -947,12 +1043,13 @@ pub fn render_disambiguated_multi_cluster_report(
         return None;
     }
 
-    // Emit specific domain clusters first in deterministic order, followed by General Document Context if present
+    // Emit specific domain clusters first in deterministic rank order, followed by General Document Context if present
     let mut ordered_labels: Vec<&'static str> = cluster_map
         .keys()
         .copied()
         .filter(|&l| l != "General Document Context")
         .collect();
+    ordered_labels.sort_by_key(|&label| (entity_cluster_rank(label), label));
     if cluster_map.contains_key("General Document Context") {
         ordered_labels.push("General Document Context");
     }
@@ -977,16 +1074,21 @@ pub fn render_disambiguated_multi_cluster_report(
         let cluster_texts: Vec<(String, String, String)> = items
             .iter()
             .map(|it| {
+                let anchored = crate::offline_engine::DeterministicOfflineSynthesisEngine::answer_focused_window(
+                    prompt,
+                    &it.cleaned_text,
+                    3200,
+                );
                 (
                     it.scored.chunk.chunk_id.clone(),
                     it.scored.chunk.file_path.clone(),
-                    it.cleaned_text.clone(),
+                    anchored,
                 )
             })
             .collect();
 
         let facts = extract_grounded_facts(subject, &cluster_texts);
-        let passages = key_passages(prompt, subject, &cluster_texts, 4);
+        let passages = key_passages(prompt, subject, &cluster_texts, 6);
 
         const ORDER: &[&str] = &[
             "Role",
@@ -1006,10 +1108,8 @@ pub fn render_disambiguated_multi_cluster_report(
         if !grouped.is_empty() {
             for (_, (class, mut fact_items)) in grouped {
                 fact_items.sort_by(|a, b| b.cites.len().cmp(&a.cites.len()));
-                let limit = if class == "Amounts" { 8 } else { 6 };
                 let rendered: Vec<String> = fact_items
                     .iter()
-                    .take(limit)
                     .map(|f| {
                         let mapped_cites: Vec<usize> = f
                             .cites
@@ -1032,7 +1132,7 @@ pub fn render_disambiguated_multi_cluster_report(
         if items.len() >= 2 {
             md.push_str("| Ref | Source Document | Origin Node | Grounded Context Summary |\n");
             md.push_str("|---|---|---|---|\n");
-            for it in items.iter().take(20) {
+            for it in items.iter() {
                 let doc_name = it
                     .scored
                     .chunk
@@ -1063,7 +1163,7 @@ pub fn render_disambiguated_multi_cluster_report(
             md.push('\n');
         }
 
-        for it in items.iter().take(16) {
+        for it in items.iter() {
             let doc_name = it
                 .scored
                 .chunk
@@ -1080,39 +1180,17 @@ pub fn render_disambiguated_multi_cluster_report(
             } else {
                 String::new()
             };
-            let clean_lines: Vec<String> = it
-                .cleaned_text
-                .lines()
-                .map(str::trim)
-                .filter(|l| {
-                    !l.is_empty()
-                        && !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_contact_bar_or_header(l)
-                        && !l.chars().all(|ch| ch == '_' || ch == '-' || ch == ' ')
-                })
-                .map(|l| {
-                    if let Some(rest) = l
-                        .strip_prefix('•')
-                        .or_else(|| l.strip_prefix('●'))
-                        .or_else(|| l.strip_prefix('▪'))
-                    {
-                        format!("- {}", rest.trim())
-                    } else {
-                        l.to_string()
-                    }
-                })
-                .collect();
-            let joined = clean_lines.join("\n");
-            let excerpt = crate::offline_engine::DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(
-                joined.trim(),
-                1600,
+            let analysis = synthesize_grounded_document_analysis(
+                prompt,
+                subject,
+                doc_name,
+                &origin_badge,
+                &it.cleaned_text,
+                it.global_cite,
             );
-            if !excerpt.is_empty() {
-                md.push_str(&format!(
-                    "**Source Record `{}`{}:** {}\n\n",
-                    doc_name,
-                    origin_badge,
-                    format!("{} **[{}]**", excerpt.trim(), it.global_cite)
-                ));
+            if !analysis.is_empty() {
+                md.push_str(&analysis);
+                md.push_str("\n\n");
             }
         }
 
@@ -1128,7 +1206,7 @@ pub fn render_disambiguated_multi_cluster_report(
         }
     }
 
-    if !md.contains("\n|---|---|---|---|\n") {
+    if !md.contains("### Identity & Domain Cluster Summary") {
         let matrix = render_homonym_cluster_summary_table(chunks);
         if !matrix.is_empty() {
             md.push_str("\n\n");
@@ -1147,7 +1225,7 @@ pub fn render_disambiguated_multi_cluster_report(
 /// Renders a 4-column Markdown summary matrix across all distinct homonym identity/context clusters.
 pub fn render_homonym_cluster_summary_table(chunks: &[&ScoredChunk]) -> String {
     let mut rows = Vec::new();
-    for (idx, &c) in chunks.iter().enumerate().take(16) {
+    for (idx, &c) in chunks.iter().enumerate() {
         if crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(
             &c.chunk.text_content,
         ) {
@@ -1208,8 +1286,9 @@ pub fn render_homonym_cluster_summary_table(chunks: &[&ScoredChunk]) -> String {
 }
 
 /// Ensures live LLM multi-domain homonym synthesis preserves exact canonical `### <Cluster>` headings,
-/// upfront multi-entity disambiguation framing, 100% cluster section coverage, and an intact Markdown summary table.
-pub fn enforce_multi_cluster_homonym_structure(
+/// upfront multi-entity disambiguation framing, and 100% cluster section coverage (without appending
+/// the summary table yet so callers can run `enforce_attested_document_coverage_loop` beforehand).
+pub fn enforce_multi_cluster_homonym_sections(
     prompt: &str,
     subject: Option<&str>,
     llm_prose: &str,
@@ -1220,8 +1299,24 @@ pub fn enforce_multi_cluster_homonym_structure(
         return llm_prose.to_string();
     }
 
-    // 1. Snap approximate `##` / `###` LLM headings (e.g. singular/typo variants) to exact canonical cluster labels
+    let significant_tokens = |s: &str| -> BTreeSet<String> {
+        s.to_ascii_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| {
+                w.len() >= 4
+                    && !matches!(
+                        *w,
+                        "with" | "from" | "that" | "this" | "into" | "records" | "context"
+                    )
+            })
+            .map(|w| w.to_string())
+            .collect()
+    };
+
+    // 1. Snap approximate or partial `##` / `###` LLM headings to exact canonical cluster labels
+    // via Levenshtein similarity OR keyword/prefix overlap, deduplicating any repeated cluster heading.
     let mut normalized_lines: Vec<String> = Vec::new();
+    let mut seen_snapped: BTreeSet<&'static str> = BTreeSet::new();
     for line in llm_prose.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("##") {
@@ -1230,19 +1325,41 @@ pub fn enforce_multi_cluster_homonym_structure(
                 .trim()
                 .trim_matches(['*', ':', ' ']);
             let raw_lower = raw_heading.to_ascii_lowercase();
+            let raw_toks = significant_tokens(&raw_lower);
             let mut snapped: Option<&'static str> = None;
-            let mut best_dist = usize::MAX;
+            let mut best_score = 0usize;
             for &canon in &specific_clusters {
                 let canon_lower = canon.to_ascii_lowercase();
                 let d = crate::response_formatter_watchdog::levenshtein_distance(&raw_lower, &canon_lower);
                 let max_len = raw_lower.len().max(canon_lower.len()).max(1);
-                if (d <= 10 || (max_len.saturating_sub(d)) * 100 / max_len >= 75) && d < best_dist {
-                    best_dist = d;
-                    snapped = Some(canon);
+                let lev_pct = (max_len.saturating_sub(d)) * 100 / max_len;
+                let lev_match = d <= 10 || lev_pct >= 75;
+
+                let canon_toks = significant_tokens(&canon_lower);
+                let shared = raw_toks.iter().filter(|t| canon_toks.contains(*t)).count();
+                let min_toks = raw_toks.len().min(canon_toks.len()).max(1);
+                let overlap_pct = (shared * 100) / min_toks;
+                let prefix_match = raw_lower.len() >= 8
+                    && (canon_lower.starts_with(&raw_lower) || raw_lower.starts_with(&canon_lower));
+                let keyword_match =
+                    raw_toks.len() >= 2 && (prefix_match || (shared >= 2 && overlap_pct >= 50));
+
+                if lev_match || keyword_match {
+                    let candidate_score = (if raw_lower == canon_lower { 10_000 } else { 0 })
+                        + (if prefix_match { 2_000 } else { 0 })
+                        + shared * 200
+                        + overlap_pct * 2
+                        + lev_pct;
+                    if candidate_score > best_score {
+                        best_score = candidate_score;
+                        snapped = Some(canon);
+                    }
                 }
             }
             if let Some(canon_heading) = snapped {
-                normalized_lines.push(format!("### {}", canon_heading));
+                if seen_snapped.insert(canon_heading) {
+                    normalized_lines.push(format!("### {}", canon_heading));
+                }
                 continue;
             }
         }
@@ -1256,7 +1373,7 @@ pub fn enforce_multi_cluster_homonym_structure(
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| prompt.trim());
         let cluster_summary = specific_clusters.join("; ");
-        let all_cites = (1..=chunks.len().min(8))
+        let all_cites = (1..=chunks.len())
             .map(|n| format!("[{n}]"))
             .collect::<Vec<_>>()
             .join(", ");
@@ -1266,7 +1383,7 @@ pub fn enforce_multi_cluster_homonym_structure(
         out = format!("{}\n\n{}", banner, out);
     }
 
-    // 3. Append grounded `### <Cluster>` sections for any canonical cluster omitted by the LLM
+    // 3. Append structured grounded `### <Cluster>` sections for any canonical cluster omitted by the LLM
     for &cluster_label in &specific_clusters {
         let expected_heading = format!("### {}", cluster_label);
         if !out.contains(&expected_heading) {
@@ -1288,25 +1405,53 @@ pub fn enforce_multi_cluster_homonym_structure(
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or(&c.chunk.file_path);
-                    let stripped_body = strip_leading_title(cleaned.trim());
-                    let excerpt = crate::offline_engine::DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(
-                        stripped_body.trim(),
-                        900,
-                    );
-                    out.push_str(&format!(
-                        "**Source Record `{}`:** {} [{}]\n\n",
+                    let origin_badge = if c.is_remote
+                        && !c.source_peer.is_empty()
+                        && !c.source_peer.eq_ignore_ascii_case("local")
+                    {
+                        let short_peer: String = c.source_peer.chars().take(12).collect();
+                        format!(" (Mesh Peer `{}`)", short_peer)
+                    } else {
+                        String::new()
+                    };
+                    let analysis = synthesize_grounded_document_analysis(
+                        prompt,
+                        subject,
                         doc_name,
-                        excerpt.trim(),
-                        cite_num
-                    ));
+                        &origin_badge,
+                        &cleaned,
+                        cite_num,
+                    );
+                    if !analysis.is_empty() {
+                        out.push_str(&analysis);
+                        out.push_str("\n\n");
+                    }
                 }
                 out = out.trim_end().to_string();
             }
         }
     }
 
-    // 4. Ensure an intact multi-line 4-column Markdown cluster summary table is present
-    if !out.contains("\n|---|---|---|---|\n") {
+    out
+}
+
+/// Ensures live LLM multi-domain homonym synthesis preserves exact canonical `### <Cluster>` headings,
+/// upfront multi-entity disambiguation framing, 100% cluster section coverage, and an intact Markdown summary table.
+pub fn enforce_multi_cluster_homonym_structure(
+    prompt: &str,
+    subject: Option<&str>,
+    llm_prose: &str,
+    chunks: &[&ScoredChunk],
+) -> String {
+    let specific_clusters = distinct_specific_entity_clusters(chunks);
+    if specific_clusters.len() < 2 {
+        return llm_prose.to_string();
+    }
+
+    let mut out = enforce_multi_cluster_homonym_sections(prompt, subject, llm_prose, chunks);
+
+    // 4. Ensure an intact unified 4-column Markdown cluster summary table is present
+    if !out.contains("### Identity & Domain Cluster Summary") {
         let matrix = render_homonym_cluster_summary_table(chunks);
         if !matrix.is_empty() {
             out.push_str("\n\n");
@@ -1327,9 +1472,6 @@ pub fn render_grounded_sections(prompt: &str, subject: Option<&str>, chunks: &[&
     let mut local_to_global: Vec<usize> = Vec::new();
     let mut texts: Vec<(String, String, String)> = Vec::new();
     for (idx, c) in chunks.iter().enumerate() {
-        if texts.len() >= 10 {
-            break;
-        }
         if crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(
             &c.chunk.text_content,
         ) {
@@ -1619,17 +1761,29 @@ pub fn enforce_attested_document_coverage_loop<'a>(
         return (initial_prose.to_string(), Vec::new());
     }
 
-    // Pass 1: Parse which of the 1..=k attested documents were cited in the initial prose
-    let bytes = initial_prose.as_bytes();
+    // Pass 1: Parse which of the 1..=k attested documents were cited in the prose body
+    // strictly *before* any existing `### Identity & Domain Cluster Summary` table so table rows
+    // never mask a document omitted from the prose body.
+    let summary_pos = initial_prose
+        .find("\n### Identity & Domain Cluster Summary")
+        .or_else(|| {
+            if initial_prose.starts_with("### Identity & Domain Cluster Summary") {
+                Some(0)
+            } else {
+                None
+            }
+        });
+    let cite_scan_slice = summary_pos.map_or(initial_prose, |p| &initial_prose[..p]);
+    let bytes = cite_scan_slice.as_bytes();
     let mut cited_set = BTreeSet::new();
     let mut pos = 0usize;
     while pos < bytes.len() {
         if bytes[pos] == b'[' {
-            if let Some(rel_end) = initial_prose[pos + 1..].find(']') {
+            if let Some(rel_end) = cite_scan_slice[pos + 1..].find(']') {
                 let close_pos = pos + 1 + rel_end;
                 let followed_by_paren = close_pos + 1 < bytes.len() && bytes[close_pos + 1] == b'(';
                 if !followed_by_paren {
-                    let inner = &initial_prose[pos + 1..close_pos];
+                    let inner = &cite_scan_slice[pos + 1..close_pos];
                     for part in inner.split(',') {
                         let p = part.trim();
                         if let Some((a_str, b_str)) = p.split_once('-').or_else(|| p.split_once('–')) {
@@ -1653,13 +1807,12 @@ pub fn enforce_attested_document_coverage_loop<'a>(
                 }
             }
         }
-        let ch_len = initial_prose[pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let ch_len = cite_scan_slice[pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
         pos += ch_len;
     }
 
-    let mut consolidated_prose = initial_prose.to_string();
-
-    // Coverage Loop: For any attested document not yet cited, append targeted grounded contribution
+    // Coverage Loop: For any attested document not yet cited in prose, build targeted grounded contribution
+    let mut additional_sections: Vec<String> = Vec::new();
     for i in 1..=k {
         if !cited_set.contains(&i) {
             let chunk = attested_chunks[i - 1];
@@ -1676,16 +1829,44 @@ pub fn enforce_attested_document_coverage_loop<'a>(
                 clean_contrib.trim(),
                 600,
             );
-            let additional_section = format!(
-                "\n\nAdditionally, evidence from `{}` [{}] confirms: {}",
-                doc_name,
-                i,
-                excerpt.trim()
-            );
-            consolidated_prose.push_str(&additional_section);
+            let trimmed_excerpt = excerpt.trim();
+            let additional_section = if trimmed_excerpt.is_empty() {
+                format!(
+                    "Relevant source record `{}` [{}] was retrieved and attested for this query.",
+                    doc_name, i
+                )
+            } else {
+                format!(
+                    "Additionally, evidence from `{}` [{}] confirms: {}",
+                    doc_name, i, trimmed_excerpt
+                )
+            };
+            additional_sections.push(additional_section);
             cited_set.insert(i);
         }
     }
+
+    let consolidated_prose = if additional_sections.is_empty() {
+        initial_prose.to_string()
+    } else {
+        let addition_block = additional_sections.join("\n\n");
+        if let Some(pos) = summary_pos {
+            let before = initial_prose[..pos].trim_end();
+            let after = initial_prose[pos..].trim_start_matches('\n');
+            if before.is_empty() {
+                format!("{}\n\n{}", addition_block, after)
+            } else {
+                format!("{}\n\n{}\n\n{}", before, addition_block, after)
+            }
+        } else {
+            let base = initial_prose.trim_end();
+            if base.is_empty() {
+                addition_block
+            } else {
+                format!("{}\n\n{}", base, addition_block)
+            }
+        }
+    };
 
     // Pass 2: Remap and compact citations with filter_uncited = true
     crate::offline_engine::DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
@@ -1821,6 +2002,181 @@ Submit completed form to: 111 Massachusetts Avenue, NW, Washington, DC 20529. OM
         assert!(
             addresses.iter().any(|a| a.contains("2913 Castiglione St")),
             "Genuine residential address missing: {addresses:?}"
+        );
+    }
+
+    #[test]
+    fn test_r2_partial_heading_snapping_no_duplicates_and_no_28_doc_cap() {
+        let mut chunks = Vec::new();
+        for i in 0..16 {
+            chunks.push(ScoredChunk::new(
+                DocumentChunk::new(
+                    format!("acad_{i}:0"),
+                    format!("acad_{i}"),
+                    format!("C:/Academic/Book_{i}.docx"),
+                    1,
+                    20,
+                    0,
+                    vec![0.0; 768],
+                    format!("Critical theory work #{i} by Angela Davis published in 198{} analyzing race and class.", i % 9),
+                    None,
+                )
+                .unwrap(),
+                0.9,
+                "local",
+                false,
+            ));
+        }
+        for i in 0..16 {
+            chunks.push(ScoredChunk::new(
+                DocumentChunk::new(
+                    format!("min_{i}:0"),
+                    format!("min_{i}"),
+                    format!("C:/Ministry/Sermon_{i}.docx"),
+                    1,
+                    20,
+                    0,
+                    vec![0.0; 768],
+                    format!("Unity sermon #{i} on spiritual renewal and New Thought ministry by Rev. Angela Davis."),
+                    None,
+                )
+                .unwrap(),
+                0.88,
+                "local",
+                false,
+            ));
+        }
+        let refs: Vec<&ScoredChunk> = chunks.iter().collect();
+
+        // 1. Offline multi-cluster report must cover all 32 documents (>28 cap removed, >16 table cap removed)
+        let report = render_disambiguated_multi_cluster_report(
+            "Who is Angela Davis",
+            Some("Angela Davis"),
+            &refs,
+        )
+        .expect("multi-cluster report");
+        assert!(report.contains("### Identity & Domain Cluster Summary"), "{report}");
+        assert!(report.contains("**[32]**"), "Table & sections must include all 32 docs without .take(28)/.take(16) truncation");
+        assert!(!report.contains("**Source Record "), "Must emit structured analysis rather than raw Source Record dumps");
+
+        // 2. Partial headings must snap cleanly without appending duplicate cluster sections
+        let partial_llm = "The retrieved corpus references multiple distinct individuals named Angela Davis [1], [17].\n\n\
+            ### Academic Scholarship & Published Works\n\
+            Angela Davis authored critical theory works [1].\n\n\
+            ### Religious Ministry & Spiritual Teaching\n\
+            Rev. Angela Davis led Unity ministry services [17].";
+        let enforced = enforce_multi_cluster_homonym_structure(
+            "Who is Angela Davis",
+            Some("Angela Davis"),
+            partial_llm,
+            &refs,
+        );
+        assert_eq!(
+            enforced.matches("### Academic Scholarship, Published Works & Critical Theory").count(),
+            1,
+            "Partial Academic heading must snap exactly once without duplicate section:\n{enforced}"
+        );
+        assert_eq!(
+            enforced.matches("### Religious Ministry, Spiritual Teaching & Organizational Stewardship").count(),
+            1,
+            "Partial Ministry heading must snap exactly once without duplicate section:\n{enforced}"
+        );
+        assert!(!enforced.contains("### Academic Scholarship & Published Works\n"));
+        assert!(!enforced.contains("### Religious Ministry & Spiritual Teaching\n"));
+    }
+
+    #[test]
+    fn test_r2_coverage_loop_fallback_precedes_summary_table_and_handles_empty_cleaned_text() {
+        let c1 = ScoredChunk::new(
+            DocumentChunk::new(
+                "cov1:0",
+                "cov1",
+                "C:/Academic/Women_Race_Class.docx",
+                1,
+                10,
+                0,
+                vec![0.0; 768],
+                "Angela Davis authored Women, Race & Class in 1981.",
+                None,
+            )
+            .unwrap(),
+            0.95,
+            "local",
+            false,
+        );
+        let c2 = ScoredChunk::new(
+            DocumentChunk::new(
+                "cov2:0",
+                "cov2",
+                "C:/Leases/Castiglione_Lease.docx",
+                1,
+                10,
+                0,
+                vec![0.0; 768],
+                "Angela Davis leased 2913 Castiglione St. for $725.00 per month.",
+                None,
+            )
+            .unwrap(),
+            0.92,
+            "local",
+            false,
+        );
+        let c3 = ScoredChunk::new(
+            DocumentChunk::new(
+                "cov3:0",
+                "cov3",
+                "C:/Ministry/Scan_Only.docx",
+                1,
+                10,
+                0,
+                vec![0.0; 768],
+                "   ",
+                None,
+            )
+            .unwrap(),
+            0.88,
+            "local",
+            false,
+        );
+        let refs = vec![&c1, &c2, &c3];
+
+        // Prose omits [2] (even though **[2]** appears in the summary table) and omits [3] (empty cleaned text)
+        let draft_with_table = "### Academic Scholarship, Published Works & Critical Theory\n\n\
+            Angela Davis authored Women, Race & Class [1].\n\n\
+            ### Identity & Domain Cluster Summary\n\n\
+            | Ref | Source Document | Origin Node | Grounded Context Summary |\n\
+            |---|---|---|---|\n\
+            | **[1]** | `Women_Race_Class.docx` | Local Host | Angela Davis authored Women, Race & Class |\n\
+            | **[2]** | `Castiglione_Lease.docx` | Local Host | Angela Davis leased 2913 Castiglione St. |";
+
+        let (healed, kept) = enforce_attested_document_coverage_loop(draft_with_table, &refs);
+        assert_eq!(kept.len(), 3, "All 3 attested chunks must remain cited");
+
+        let table_pos = healed
+            .find("### Identity & Domain Cluster Summary")
+            .expect("Summary table heading must remain present");
+        let fallback_2_pos = healed
+            .find("Castiglione_Lease.docx")
+            .expect("Fallback for omitted [2] must be inserted");
+        let fallback_3_pos = healed
+            .find("Scan_Only.docx")
+            .expect("Fallback for empty-text [3] must be inserted");
+
+        assert!(
+            fallback_2_pos < table_pos,
+            "Coverage-loop fallback for [2] must precede summary table:\n{healed}"
+        );
+        assert!(
+            fallback_3_pos < table_pos,
+            "Coverage-loop fallback for [3] must precede summary table:\n{healed}"
+        );
+        assert!(
+            !healed.contains("confirms: \n") && !healed.ends_with("confirms:"),
+            "Empty cleaned text must not emit trailing 'confirms: ' stub:\n{healed}"
+        );
+        assert!(
+            healed.contains("Relevant source record `Scan_Only.docx` [3] was retrieved and attested"),
+            "Empty cleaned text must emit clean attested notice:\n{healed}"
         );
     }
 }

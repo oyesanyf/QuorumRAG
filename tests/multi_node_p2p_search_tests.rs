@@ -107,7 +107,11 @@ async fn test_multi_node_p2p_wire_query_aggregation() {
     );
 
     // 3. Assemble Node A's QueryCoordinator with real SwarmMeshDispatcher
-    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(handle_a.clone()));
+    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(
+        handle_a.clone(),
+        peer_id_a_str.clone(),
+        seed_a,
+    ));
 
     let mut coord_cfg = CoordinatorConfig::default();
     coord_cfg.max_peer_responses = 8;
@@ -281,7 +285,11 @@ async fn test_multi_node_bidirectional_hybrid_fusion() {
     handle_a.dial(tcp_addr_b).await.unwrap();
     tokio::time::sleep(Duration::from_millis(350)).await;
 
-    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(handle_a.clone()));
+    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(
+        handle_a.clone(),
+        peer_id_a.to_string(),
+        seed_a,
+    ));
 
     let mut coord_cfg = CoordinatorConfig::default();
     coord_cfg.max_peer_responses = 8;
@@ -385,7 +393,11 @@ async fn test_fresh_install_untrusted_peer_access_tier_parity() {
     handle_a.dial(tcp_addr_b).await.unwrap();
     tokio::time::sleep(Duration::from_millis(350)).await;
 
-    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(handle_a.clone()));
+    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(
+        handle_a.clone(),
+        peer_id_a.to_string(),
+        seed_a,
+    ));
 
     let mut coord_cfg = CoordinatorConfig::default();
     coord_cfg.max_peer_responses = 8;
@@ -581,7 +593,11 @@ async fn test_p2p_watcher_450ms_peer_query_and_disconnect_auto_heal() {
         "NetworkSwarmHandle must record real connected Multiaddr for Peer B"
     );
 
-    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(handle_a.clone()));
+    let mesh_dispatcher = Arc::new(SwarmMeshDispatcher::new(
+        handle_a.clone(),
+        peer_id_a.to_string(),
+        seed_a,
+    ));
     let mut coord_cfg = CoordinatorConfig::default();
     coord_cfg.timeout_ms = 6000;
 

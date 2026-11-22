@@ -451,12 +451,16 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 .iter()
                 .map(|b| format!("{:02x}", b))
                 .collect(),
-            request_timeout: std::time::Duration::from_secs(15),
+            request_timeout: std::time::Duration::from_secs(120),
             ..Default::default()
         };
         match quorum_network::start_network_node(net_config, Some(inbound_handler)).await {
             Ok((_join, handle)) => {
-                let disp = Arc::new(quorum_coordinator::SwarmMeshDispatcher::new(handle.clone()));
+                let disp = Arc::new(quorum_coordinator::SwarmMeshDispatcher::new(
+                    handle.clone(),
+                    persistent_peer_id_str.clone(),
+                    node_seed,
+                ));
                 inbound_obj.set_dispatcher(disp.clone());
                 (disp, Some(handle))
             }

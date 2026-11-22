@@ -1,4 +1,4 @@
-use crate::agentic::retrieve::STOPWORDS;
+use crate::agentic::retrieve::{GENERIC_ATTRIBUTE_TERMS, STOPWORDS};
 use crate::telemetry::AgenticTelemetryEvent;
 use crate::types::ChatTurnMessage;
 use quorum_contract::EmbeddingGenerator;
@@ -620,6 +620,346 @@ impl DeterministicOfflineSynthesisEngine {
             }
         }
         false
+    }
+
+    /// Tokenizes `text` into lowercase alphanumeric tokens along with their byte spans `(token_lower, start, end)`.
+    fn tokenize_with_spans(text: &str) -> Vec<(String, usize, usize)> {
+        let mut tokens: Vec<(String, usize, usize)> = Vec::new();
+        let mut cur = String::new();
+        let mut start = 0usize;
+        for (idx, ch) in text.char_indices() {
+            if ch.is_alphanumeric() {
+                if cur.is_empty() {
+                    start = idx;
+                }
+                for lc in ch.to_lowercase() {
+                    cur.push(lc);
+                }
+            } else if !cur.is_empty() {
+                tokens.push((std::mem::take(&mut cur), start, idx));
+            }
+        }
+        if !cur.is_empty() {
+            tokens.push((cur, start, text.len()));
+        }
+        tokens
+    }
+
+    const UNRELATED_SURNAME_TITLES: &'static [&'static str] = &[
+        "alderman",
+        "senator",
+        "governor",
+        "officer",
+        "detective",
+        "mayor",
+        "judge",
+        "general",
+        "captain",
+        "mr",
+        "mrs",
+        "ms",
+    ];
+
+    /// Returns `true` if `text` contains `<unrelated_title> <last>` (e.g. `"Alderman Davis"`).
+    pub fn body_has_unrelated_titled_surname(text: &str, last: &str) -> bool {
+        let last_l = last.trim().to_ascii_lowercase();
+        if last_l.is_empty() {
+            return false;
+        }
+        let tokens = Self::tokenize_with_spans(text);
+        for i in 1..tokens.len() {
+            if tokens[i].0 == last_l
+                && Self::UNRELATED_SURNAME_TITLES.contains(&tokens[i - 1].0.as_str())
+            {
+                let sep = &text[tokens[i - 1].2..tokens[i].1];
+                if !sep.contains('\n') && !sep.contains(';') && !sep.contains('!') && !sep.contains('?') {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Strict person-name adjacency check for 2-word person queries (`"<first> <last>"`).
+    /// Accepts `"<first> <last>"`, `"<last>, <first>"`, `"<first> <1-2 name/initial tokens> <last>"`,
+    /// and `"(<first> <last>)"`, while rejecting surname hits immediately preceded by an unrelated
+    /// title/honorific (e.g. `"Alderman Davis"`).
+    pub fn matches_strict_person_name_adjacency(text: &str, first: &str, last: &str) -> bool {
+        Self::matches_strict_person_name_adjacency_inner(text, first, last, false)
+    }
+
+    /// Same as `matches_strict_person_name_adjacency` for normalized filenames (where `_`, `-`, `.`
+    /// have been normalized to spaces and `<last> <first>` without a comma is also valid).
+    pub fn matches_strict_person_name_adjacency_in_filename(
+        file_name: &str,
+        first: &str,
+        last: &str,
+    ) -> bool {
+        let normalized: String = file_name
+            .chars()
+            .map(|c| if matches!(c, '_' | '-' | '.') { ' ' } else { c })
+            .collect();
+        Self::matches_strict_person_name_adjacency_inner(&normalized, first, last, true)
+    }
+
+    fn matches_strict_person_name_adjacency_inner(
+        text: &str,
+        first: &str,
+        last: &str,
+        allow_reversed_without_comma: bool,
+    ) -> bool {
+        const NON_MIDDLE_WORDS: &[&str] = &[
+            "and", "or", "but", "the", "a", "an", "of", "in", "on", "at", "to", "for", "with",
+            "by", "from", "is", "was", "are", "were", "be", "been", "being", "has", "have",
+            "had", "said", "told", "met", "saw", "asked", "wrote", "called", "named", "vs",
+            "versus", "that", "this", "who", "whom", "whose", "which", "while", "when", "where",
+            "arrived", "left", "entered", "signed", "alderman", "senator", "governor", "officer",
+            "detective", "mayor", "judge", "general", "captain", "mr", "mrs", "ms", "dr", "prof",
+            "sir", "president", "king", "queen",
+        ];
+
+        let first_l = first.trim().to_ascii_lowercase();
+        let last_l = last.trim().to_ascii_lowercase();
+        if first_l.is_empty() || last_l.is_empty() {
+            return false;
+        }
+        let tokens = Self::tokenize_with_spans(text);
+        if tokens.len() < 2 {
+            return false;
+        }
+        let has_mixed_case =
+            text.chars().any(|c| c.is_uppercase()) && text.chars().any(|c| c.is_lowercase());
+
+        for i in 0..tokens.len() {
+            if tokens[i].0 != last_l {
+                continue;
+            }
+            // Reject surname occurrence if immediately preceded by an unrelated title/honorific
+            if i > 0 && Self::UNRELATED_SURNAME_TITLES.contains(&tokens[i - 1].0.as_str()) {
+                let title_sep = &text[tokens[i - 1].2..tokens[i].1];
+                if !title_sep.contains('\n') && !title_sep.contains(';') {
+                    continue;
+                }
+            }
+
+            // 1. "<first> <last>" or "(<first> <last>)"
+            if i >= 1 && tokens[i - 1].0 == first_l {
+                let sep = &text[tokens[i - 1].2..tokens[i].1];
+                if !sep.contains('.')
+                    && !sep.contains('!')
+                    && !sep.contains('?')
+                    && !sep.contains(';')
+                    && !sep.contains(',')
+                    && !sep.contains(':')
+                    && !sep.contains('\n')
+                    && !sep.contains('\r')
+                {
+                    return true;
+                }
+            }
+
+            // 2. "<first> <1-2 name/initial tokens> <last>"
+            for mid_count in 1..=2 {
+                if i < mid_count + 1 {
+                    continue;
+                }
+                let first_idx = i - mid_count - 1;
+                if tokens[first_idx].0 != first_l {
+                    continue;
+                }
+                let mut valid_mid = true;
+                for m_idx in (first_idx + 1)..i {
+                    let m_tok = &tokens[m_idx].0;
+                    let orig_m_tok = &text[tokens[m_idx].1..tokens[m_idx].2];
+                    let starts_upper = orig_m_tok.chars().next().is_some_and(|c| c.is_uppercase());
+                    let is_dotted_initial = m_tok.chars().count() == 1
+                        && text[tokens[m_idx].2..tokens[m_idx + 1].1].contains('.');
+                    let case_ok = !has_mixed_case || starts_upper || is_dotted_initial;
+                    if !m_tok.chars().all(|c| c.is_ascii_alphabetic())
+                        || !case_ok
+                        || NON_MIDDLE_WORDS.contains(&m_tok.as_str())
+                        || m_tok == &first_l
+                        || m_tok == &last_l
+                    {
+                        valid_mid = false;
+                        break;
+                    }
+                }
+                if !valid_mid {
+                    continue;
+                }
+                let mut valid_seps = true;
+                for k in first_idx..i {
+                    let sep = &text[tokens[k].2..tokens[k + 1].1];
+                    let has_apostrophe = sep.contains('\'') || sep.contains('\u{2019}');
+                    if has_apostrophe && (k == first_idx || tokens[k + 1].0 == "s") {
+                        valid_seps = false;
+                        break;
+                    }
+                    let prev_is_initial = k > first_idx && tokens[k].0.len() == 1;
+                    let sep_ok = sep.chars().all(|c| {
+                        c == ' ' || c == '\t' || c == '-' || c == '\'' || (prev_is_initial && c == '.')
+                    });
+                    if !sep_ok {
+                        valid_seps = false;
+                        break;
+                    }
+                }
+                if valid_seps {
+                    return true;
+                }
+            }
+
+            // 3. "<last>, <first>" (or "<last> <first>" in normalized filenames)
+            if i + 1 < tokens.len() && tokens[i + 1].0 == first_l {
+                let sep = &text[tokens[i].2..tokens[i + 1].1];
+                let clean_sep = !sep.contains('.')
+                    && !sep.contains('!')
+                    && !sep.contains('?')
+                    && !sep.contains(';')
+                    && !sep.contains('\n')
+                    && !sep.contains('\r');
+                if clean_sep && (sep.contains(',') || allow_reversed_without_comma) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Extracts `(first, last)` for 2-word person queries (`"Who is <First> <Last>"`, `"WhO is ..."`,
+    /// `"who was ..."`, `"who's ..."`, `"whos ..."`, `"what do you know about ..."`, `"tell me about ..."`).
+    pub fn extract_two_word_person_query_terms(
+        prompt_lower: &str,
+        prompt_only_entities: &[String],
+    ) -> Option<(String, String)> {
+        const PERSON_PREFIXES: &[&str] = &[
+            "who is ",
+            "who was ",
+            "who's ",
+            "whos ",
+            "what do you know about ",
+            "tell me about ",
+        ];
+        let trimmed = prompt_lower
+            .split(" (subject context:")
+            .next()
+            .unwrap_or(prompt_lower)
+            .trim();
+        let rest = PERSON_PREFIXES
+            .iter()
+            .find_map(|pfx| trimmed.strip_prefix(pfx))?;
+        let cleaned_tokens: Vec<String> = rest
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| {
+                t.len() >= 2
+                    && !STOPWORDS.contains(&t.as_str())
+                    && !GENERIC_ATTRIBUTE_TERMS.contains(&t.as_str())
+            })
+            .collect();
+        if cleaned_tokens.len() == 2 {
+            return Some((cleaned_tokens[0].clone(), cleaned_tokens[1].clone()));
+        }
+        if prompt_only_entities.len() == 2 {
+            return Some((
+                prompt_only_entities[0].clone(),
+                prompt_only_entities[1].clone(),
+            ));
+        }
+        None
+    }
+
+    /// Returns `true` if `prompt` is a biography / entity lookup query (`"who is ..."`, `"tell me about ..."`, etc.).
+    pub fn is_biography_or_entity_query(prompt: &str) -> bool {
+        let low = prompt
+            .split(" (Subject context:")
+            .next()
+            .unwrap_or(prompt)
+            .trim()
+            .to_ascii_lowercase();
+        low.starts_with("who is ")
+            || low.starts_with("who was ")
+            || low.starts_with("who are ")
+            || low.starts_with("who's ")
+            || low.starts_with("whos ")
+            || low.starts_with("what do you know about ")
+            || low.starts_with("tell me about ")
+            || Self::is_profile_or_role_query(&low)
+    }
+
+    /// Returns `true` if `chunk`'s cleaned text or normalized filename has an exact full-name / query-subject hit.
+    pub fn has_exact_full_name_hit(prompt: &str, chunk: &ScoredChunk) -> bool {
+        let clean_prompt = prompt
+            .split(" (Subject context:")
+            .next()
+            .unwrap_or(prompt)
+            .trim()
+            .to_ascii_lowercase();
+        let cleaned_text = Self::clean_chunk_text(&chunk.chunk.text_content);
+        let file_base = chunk
+            .chunk
+            .file_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&chunk.chunk.file_path);
+        let terms = Self::question_content_terms(&clean_prompt);
+        if terms.len() == 2 {
+            return Self::matches_strict_person_name_adjacency(&cleaned_text, &terms[0], &terms[1])
+                || Self::matches_strict_person_name_adjacency_in_filename(
+                    file_base,
+                    &terms[0],
+                    &terms[1],
+                );
+        }
+        if terms.is_empty() {
+            return false;
+        }
+        let phrase = terms.join(" ");
+        let text_l = cleaned_text.to_ascii_lowercase();
+        let file_norm: String = file_base
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if matches!(c, '_' | '-' | '.') { ' ' } else { c })
+            .collect();
+        text_l.contains(&phrase) || file_norm.contains(&phrase)
+    }
+
+    /// Deterministically sorts canonical deduplicated documents across hosts by
+    /// `(entity_cluster_rank, exact_full_name_hit DESC, canonical_family_key ASC)` for multi-cluster
+    /// or biography queries so every host assigns identical `[1]..[N]` indices regardless of arrival order.
+    pub fn sort_canonical_chunks_deterministically(
+        prompt: &str,
+        chunks: &mut Vec<&ScoredChunk>,
+    ) {
+        if chunks.len() <= 1 {
+            return;
+        }
+        let specific_clusters = crate::answer_orchestrator::distinct_specific_entity_clusters(chunks);
+        if specific_clusters.len() < 2 && !Self::is_biography_or_entity_query(prompt) {
+            return;
+        }
+        chunks.sort_by(|a, b| {
+            let ca = crate::answer_orchestrator::classify_entity_domain_cluster(
+                &a.chunk.file_path,
+                &Self::clean_chunk_text(&a.chunk.text_content),
+            );
+            let cb = crate::answer_orchestrator::classify_entity_domain_cluster(
+                &b.chunk.file_path,
+                &Self::clean_chunk_text(&b.chunk.text_content),
+            );
+            let rank_a = crate::answer_orchestrator::entity_cluster_rank(ca);
+            let rank_b = crate::answer_orchestrator::entity_cluster_rank(cb);
+            let exact_a = Self::has_exact_full_name_hit(prompt, a);
+            let exact_b = Self::has_exact_full_name_hit(prompt, b);
+            let fam_a = Self::derive_document_family_key(&a.chunk.file_path);
+            let fam_b = Self::derive_document_family_key(&b.chunk.file_path);
+            rank_a
+                .cmp(&rank_b)
+                .then_with(|| exact_b.cmp(&exact_a))
+                .then_with(|| fam_a.cmp(&fam_b))
+                .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
+        });
     }
 
     /// Cleans raw extracted document chunk text by stripping `[PDF Metadata]`, `[Page X]` markers,
@@ -1898,29 +2238,32 @@ impl DeterministicOfflineSynthesisEngine {
                 });
             }
 
-            let prompt_trim = prompt_lower.trim();
-            let is_two_word_person_query = (prompt_trim.starts_with("who is ")
-                || prompt_trim.starts_with("who was ")
-                || prompt_trim.starts_with("who's ")
-                || prompt_trim.starts_with("whos ")
-                || prompt_trim.starts_with("what do you know about ")
-                || prompt_trim.starts_with("tell me about "))
-                && prompt_only_entities.len() == 2;
-            if is_two_word_person_query {
-                let t0 = prompt_only_entities[0].as_str();
-                let t1 = prompt_only_entities[1].as_str();
+            if let Some((t0, t1)) =
+                Self::extract_two_word_person_query_terms(&prompt_lower, &prompt_only_entities)
+            {
+                let t0_s = t0.as_str();
+                let t1_s = t1.as_str();
+                // Unconditionally reject chunks whose body contains `<unrelated_title> <last>`
+                // (e.g. `"Alderman Davis"`) without valid `<first> ... <last>` adjacency in the body.
+                scored_matches.retain(|(scored, _, _, _)| {
+                    let cleaned = Self::clean_chunk_text(&scored.chunk.text_content);
+                    let body_adj = Self::matches_strict_person_name_adjacency(&cleaned, t0_s, t1_s);
+                    body_adj || !Self::body_has_unrelated_titled_surname(&cleaned, t1_s)
+                });
                 let matches_person_proximity = |scored: &ScoredChunk| -> bool {
-                    let cleaned_l =
-                        Self::clean_chunk_text(&scored.chunk.text_content).to_ascii_lowercase();
-                    let file_l = scored
+                    let cleaned = Self::clean_chunk_text(&scored.chunk.text_content);
+                    let file_name = scored
                         .chunk
                         .file_path
                         .rsplit(['/', '\\'])
                         .next()
-                        .unwrap_or(&scored.chunk.file_path)
-                        .to_ascii_lowercase();
-                    Self::contains_terms_within_char_window(&cleaned_l, t0, t1, 40)
-                        || Self::contains_terms_within_char_window(&file_l, t0, t1, 40)
+                        .unwrap_or(&scored.chunk.file_path);
+                    let body_adj = Self::matches_strict_person_name_adjacency(&cleaned, t0_s, t1_s);
+                    let file_adj = Self::matches_strict_person_name_adjacency_in_filename(
+                        file_name, t0_s, t1_s,
+                    );
+                    body_adj
+                        || (file_adj && !Self::body_has_unrelated_titled_surname(&cleaned, t1_s))
                 };
                 if scored_matches
                     .iter()
@@ -2041,19 +2384,45 @@ impl DeterministicOfflineSynthesisEngine {
             .map(|g| g.ui.clone())
             .unwrap_or_default();
 
-        let chunk_limit = if ui.max_output_tokens >= 16384 || ui.agentic_loop_enabled {
-            36
+        let chunk_limit = if ui.max_output_tokens >= 16384
+            || ui.agentic_loop_enabled
+            || ui.sizing_strategy.eq_ignore_ascii_case("runtime_ram")
+        {
+            64
         } else if ui.max_output_tokens > 4096 {
             24
         } else {
             12
         };
 
-        let mut candidate_chunks: Vec<ScoredChunk> = scored_matches
-            .iter()
-            .take(chunk_limit)
-            .map(|(c, _, _, _)| (*c).clone())
-            .collect();
+        let mut candidate_chunks: Vec<ScoredChunk> = if forensic_intent.is_some() {
+            scored_matches
+                .iter()
+                .take(chunk_limit)
+                .map(|(c, _, _, _)| (*c).clone())
+                .collect()
+        } else {
+            let mut seen_families: std::collections::HashSet<String> =
+                std::collections::HashSet::with_capacity(chunk_limit);
+            let raw_ceiling = chunk_limit.saturating_mul(3);
+            let mut selected = Vec::with_capacity(chunk_limit);
+            for (c, _, _, _) in &scored_matches {
+                let path_low = c.chunk.file_path.to_ascii_lowercase();
+                let fam = if path_low.starts_with("artemis://") {
+                    path_low
+                } else {
+                    Self::derive_document_family_key(&c.chunk.file_path)
+                };
+                if seen_families.contains(&fam) || seen_families.len() < chunk_limit {
+                    seen_families.insert(fam);
+                    selected.push((*c).clone());
+                    if selected.len() >= raw_ceiling {
+                        break;
+                    }
+                }
+            }
+            selected
+        };
 
         if forensic_intent == Some(ForensicQueryIntent::DnsTraffic) {
             candidate_chunks.retain(|c| {
@@ -2249,6 +2618,43 @@ impl DeterministicOfflineSynthesisEngine {
                         text
                     };
 
+                let daemon_runtime_active = crate::dlp_mesh::global_mesh_dlp_controller()
+                    .settings_file_path
+                    .read()
+                    .map(|p| p.is_some())
+                    .unwrap_or(false);
+
+                let hw_telemetry = crate::hardware::HardwareTelemetry::probe();
+                let local_installed_models = if daemon_runtime_active {
+                    Self::probe_installed_ollama_models_default()
+                } else {
+                    Vec::new()
+                };
+                let prefer_mesh_relay_upfront = daemon_runtime_active
+                    && !matched_chunk_refs.is_empty()
+                    && crate::mesh::get_global_mesh_dispatcher()
+                        .map(|d| d.peer_count() > 0)
+                        .unwrap_or(false)
+                    && Self::should_prefer_mesh_relay_upfront(
+                        &hw_telemetry,
+                        &local_installed_models,
+                    );
+
+                if prefer_mesh_relay_upfront {
+                    if let Some((relayed_text, relayed_cits)) = Self::try_mesh_synthesis_relay(
+                        &effective_question,
+                        history,
+                        &matched_chunk_refs,
+                        model_tag,
+                        telemetry_tx,
+                    ) {
+                        return (
+                            maybe_append_forensics_disabled_notice(relayed_text, true),
+                            relayed_cits,
+                        );
+                    }
+                }
+
                 if let Some((llm_orchestrated, llm_citations)) = Self::query_local_ollama_chat(
                     &effective_question,
                     history,
@@ -2265,18 +2671,23 @@ impl DeterministicOfflineSynthesisEngine {
                 // 1b. Fast-model retry: the primary model (often 26B+ on CPU) timed out or failed, so retry only with
                 // a genuinely small (<=3B) installed model over the strongest excerpts before giving up on LLM synthesis.
                 if !matched_chunk_refs.is_empty() {
-                    let installed = Self::probe_installed_ollama_models_default();
-                    if !installed.is_empty() {
-                        let hw = crate::hardware::HardwareTelemetry::probe();
-                        let failed_model = Self::resolve_ollama_model_tag(model_tag, &hw, &installed);
+                    if !local_installed_models.is_empty() {
+                        let failed_model = Self::resolve_ollama_model_tag(
+                            model_tag,
+                            &hw_telemetry,
+                            &local_installed_models,
+                        );
                         let top_refs = &matched_chunk_refs[..matched_chunk_refs.len().min(6)];
-                        for fast in crate::answer_orchestrator::fast_fallback_models(&installed, &failed_model)
-                            .into_iter()
-                            .filter(|m| {
-                                let ml = m.to_ascii_lowercase();
-                                ml.contains("1.5b") || ml.contains("0.5b") || ml.contains("2b") || ml.contains("3b")
-                            })
-                            .take(1)
+                        for fast in crate::answer_orchestrator::fast_fallback_models(
+                            &local_installed_models,
+                            &failed_model,
+                        )
+                        .into_iter()
+                        .filter(|m| {
+                            let ml = m.to_ascii_lowercase();
+                            ml.contains("1.5b") || ml.contains("0.5b") || ml.contains("2b") || ml.contains("3b")
+                        })
+                        .take(1)
                         {
                             tracing::warn!(failed = %failed_model, retry = %fast, "Primary synthesis failed; retrying with faster local model");
                             if let Some((text, cits)) =
@@ -2291,82 +2702,20 @@ impl DeterministicOfflineSynthesisEngine {
                     }
                 }
 
-                // 1c. Mesh Synthesis Relay Delegation: if local node lacks warm LLM inside active daemon runtime,
+                // 1c. Mesh Synthesis Relay Delegation fallback: if local node lacks warm LLM inside active daemon runtime,
                 // delegate evidence synthesis to an authenticated peer with an active LLM over the mesh wire.
-                let daemon_runtime_active = crate::dlp_mesh::global_mesh_dlp_controller()
-                    .settings_file_path
-                    .read()
-                    .map(|p| p.is_some())
-                    .unwrap_or(false);
-                if daemon_runtime_active && !matched_chunk_refs.is_empty() {
-                    if let Some(dispatcher) = crate::mesh::get_global_mesh_dispatcher() {
-                        if dispatcher.peer_count() > 0 {
-                            let candidate_dtos: Vec<quorum_types::CandidateChunkDto> = matched_chunk_refs
-                                .iter()
-                                .map(|sc| quorum_types::CandidateChunkDto::from_scored_chunk(sc))
-                                .collect();
-
-                            let mut relay_req = quorum_types::FederatedQueryRequest {
-                                query_id: uuid::Uuid::new_v4(),
-                                sender_peer_id: "local".to_string(),
-                                sender_pubkey: [0u8; 32],
-                                query_text: effective_question.clone(),
-                                embedding: vec![0.0; 768],
-                                top_k: matched_chunk_refs.len().max(16),
-                                timestamp: chrono::Utc::now().timestamp(),
-                                signature: [0u8; 64],
-                                origin_peer_id: None,
-                                relay_hops: 0,
-                                visited_peers: Vec::new(),
-                                synthesis_relay: Some(quorum_types::MeshSynthesisRelayPayload {
-                                    prompt: effective_question.clone(),
-                                    history: history.to_vec(),
-                                    evidence_chunks: candidate_dtos,
-                                    model_tag: Some(model_tag.to_string()),
-                                }),
-                            };
-                            let secret_seed = [0x5au8; 32];
-                            crate::crypto::sign_request(&secret_seed, &mut relay_req, quorum_types::AccessTier::Tier0Public);
-
-                            let timeout_dur = std::time::Duration::from_millis(4000);
-                            let responses = match tokio::runtime::Handle::try_current() {
-                                Ok(handle)
-                                    if handle.runtime_flavor()
-                                        == tokio::runtime::RuntimeFlavor::MultiThread =>
-                                {
-                                    tokio::task::block_in_place(|| {
-                                        handle.block_on(dispatcher.query_peers(&relay_req, timeout_dur))
-                                    })
-                                }
-                                _ => std::thread::scope(|s| {
-                                    s.spawn(|| {
-                                        tokio::runtime::Builder::new_current_thread()
-                                            .enable_all()
-                                            .build()
-                                            .map_err(|_| crate::CoordinatorError::Timeout(4000))
-                                            .and_then(|rt| {
-                                                rt.block_on(dispatcher.query_peers(&relay_req, timeout_dur))
-                                            })
-                                    })
-                                    .join()
-                                    .unwrap_or_else(|_| Err(crate::CoordinatorError::Timeout(4000)))
-                                }),
-                            };
-
-                            if let Ok(resps) = responses {
-                                for resp in resps {
-                                    if let Some(synthesis) = resp.synthesis_response {
-                                        if !synthesis.synthesized_text.trim().is_empty() {
-                                            tracing::info!(peer = %resp.responder_peer_id, model = %synthesis.model_tag, "Received synthesized answer from mesh peer via synthesis relay");
-                                            return (
-                                                maybe_append_forensics_disabled_notice(synthesis.synthesized_text, false),
-                                                synthesis.citations,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                if daemon_runtime_active && !matched_chunk_refs.is_empty() && !prefer_mesh_relay_upfront {
+                    if let Some((relayed_text, relayed_cits)) = Self::try_mesh_synthesis_relay(
+                        &effective_question,
+                        history,
+                        &matched_chunk_refs,
+                        model_tag,
+                        telemetry_tx,
+                    ) {
+                        return (
+                            maybe_append_forensics_disabled_notice(relayed_text, true),
+                            relayed_cits,
+                        );
                     }
                 }
             }
@@ -2393,10 +2742,13 @@ impl DeterministicOfflineSynthesisEngine {
             } else {
                 matched_chunk_refs.clone()
             };
-            let effective_refs: Vec<&ScoredChunk> = Self::deduplicate_refs_by_document_family(
+            let mut effective_refs: Vec<&ScoredChunk> = Self::deduplicate_refs_by_document_family(
                 &raw_effective_refs,
                 forensic_intent.is_some(),
             );
+            if forensic_intent.is_none() {
+                Self::sort_canonical_chunks_deterministically(prompt_eff, &mut effective_refs);
+            }
 
             let prefix = Self::format_question_restated_prefix_with_chunks(prompt_eff, &effective_refs);
             let specific_clusters =
@@ -2404,7 +2756,7 @@ impl DeterministicOfflineSynthesisEngine {
             let is_multi_persona = specific_clusters.len() >= 2 && forensic_intent.is_none();
 
             let mut body_paragraphs: Vec<String> = Vec::new();
-            for (idx, c) in effective_refs.iter().enumerate().take(36) {
+            for (idx, c) in effective_refs.iter().enumerate() {
                 let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
                 // Strip residual artifacts, ChatGPT export markers, and dividers
                 let mut chunk_lines: Vec<String> = Vec::new();
@@ -2580,7 +2932,7 @@ impl DeterministicOfflineSynthesisEngine {
                         .filter(|s| !s.is_empty())
                         .unwrap_or(prompt_eff);
                     let cluster_summary = specific_clusters.join("; ");
-                    let all_cites = (1..=effective_refs.len().min(8))
+                    let all_cites = (1..=effective_refs.len())
                         .map(|n| format!("**[{n}]**"))
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -2754,6 +3106,206 @@ impl DeterministicOfflineSynthesisEngine {
         }
     }
 
+    /// Checks whether the configured loopback Ollama HTTP endpoint is accepting connections (fast 250ms probe).
+    pub fn is_ollama_endpoint_reachable() -> bool {
+        use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+        use std::time::Duration;
+        let ui = crate::dlp_mesh::global_mesh_dlp_controller()
+            .settings
+            .read()
+            .map(|g| g.ui.clone())
+            .unwrap_or_default();
+        let raw_url = if ui.ollama_url.trim().is_empty() {
+            "http://127.0.0.1:11434"
+        } else {
+            ui.ollama_url.trim()
+        };
+        let host_port = raw_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("127.0.0.1:11434");
+        let addr = host_port
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 11434)));
+        if !addr.ip().is_loopback() {
+            return false;
+        }
+        TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+    }
+
+    /// Returns `true` when the local node should delegate synthesis upfront via `MeshSynthesisRelayPayload`:
+    /// free RAM `< 6.0 GB` (and free VRAM `< 4,500 MB`) OR no local model installed / Ollama endpoint unreachable.
+    pub fn should_prefer_mesh_relay_upfront(
+        hw: &crate::hardware::HardwareTelemetry,
+        installed_models: &[String],
+    ) -> bool {
+        let low_local_memory = hw.free_ram_gb < 6.0 && hw.free_vram_mb < 4_500;
+        low_local_memory || installed_models.is_empty() || !Self::is_ollama_endpoint_reachable()
+    }
+
+    /// Builds and signs a `FederatedQueryRequest` carrying `MeshSynthesisRelayPayload` using the
+    /// dispatcher's real `(sender_peer_id, secret_seed)` credentials and attributes requester-local
+    /// `CandidateChunkDto` entries (`origin_peer_id.is_none()` or `"local"`) to `Some(sender_peer_id)`.
+    pub fn build_mesh_synthesis_relay_request(
+        effective_question: &str,
+        history: &[ChatTurnMessage],
+        matched_chunk_refs: &[&ScoredChunk],
+        model_tag: &str,
+        signing_creds: Option<(String, [u8; 32])>,
+    ) -> quorum_types::FederatedQueryRequest {
+        let (sender_peer_id, secret_seed) = signing_creds.unwrap_or_else(|| {
+            let fallback_seed = [0x5au8; 32];
+            let fallback_id = quorum_network::derive_peer_id_from_pubkey(
+                &ed25519_dalek::SigningKey::from_bytes(&fallback_seed)
+                    .verifying_key()
+                    .to_bytes(),
+            )
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| "local".to_string());
+            (fallback_id, fallback_seed)
+        });
+
+        let candidate_dtos: Vec<quorum_types::CandidateChunkDto> = matched_chunk_refs
+            .iter()
+            .map(|sc| {
+                let mut dto = quorum_types::CandidateChunkDto::from_scored_chunk(sc);
+                if dto.origin_peer_id.is_none()
+                    || dto
+                        .origin_peer_id
+                        .as_deref()
+                        .map(|p| p.eq_ignore_ascii_case("local"))
+                        .unwrap_or(false)
+                {
+                    dto.origin_peer_id = Some(sender_peer_id.clone());
+                }
+                dto
+            })
+            .collect();
+
+        let mut relay_req = quorum_types::FederatedQueryRequest {
+            query_id: uuid::Uuid::new_v4(),
+            sender_peer_id,
+            sender_pubkey: [0u8; 32],
+            query_text: effective_question.to_string(),
+            embedding: vec![0.0; 768],
+            top_k: matched_chunk_refs.len().max(16),
+            timestamp: chrono::Utc::now().timestamp(),
+            signature: [0u8; 64],
+            origin_peer_id: None,
+            relay_hops: 0,
+            visited_peers: Vec::new(),
+            synthesis_relay: Some(quorum_types::MeshSynthesisRelayPayload {
+                prompt: effective_question.to_string(),
+                history: history.to_vec(),
+                evidence_chunks: candidate_dtos,
+                model_tag: Some(model_tag.to_string()),
+            }),
+        };
+        crate::crypto::sign_request(
+            &secret_seed,
+            &mut relay_req,
+            quorum_types::AccessTier::Tier0Public,
+        );
+        relay_req
+    }
+
+    /// Attempts authenticated mesh synthesis delegation (`90,000 ms` timeout) over the active global dispatcher.
+    pub fn try_mesh_synthesis_relay(
+        effective_question: &str,
+        history: &[ChatTurnMessage],
+        matched_chunk_refs: &[&ScoredChunk],
+        model_tag: &str,
+        telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
+    ) -> Option<(String, Vec<Citation>)> {
+        let dispatcher = crate::mesh::get_global_mesh_dispatcher()?;
+        Self::try_mesh_synthesis_relay_with_dispatcher(
+            dispatcher.as_ref(),
+            effective_question,
+            history,
+            matched_chunk_refs,
+            model_tag,
+            telemetry_tx,
+        )
+    }
+
+    /// Attempts authenticated mesh synthesis delegation (`90,000 ms` timeout) over an explicit dispatcher.
+    pub fn try_mesh_synthesis_relay_with_dispatcher(
+        dispatcher: &dyn crate::mesh::MeshQueryDispatcher,
+        effective_question: &str,
+        history: &[ChatTurnMessage],
+        matched_chunk_refs: &[&ScoredChunk],
+        model_tag: &str,
+        telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
+    ) -> Option<(String, Vec<Citation>)> {
+        if dispatcher.peer_count() == 0 || matched_chunk_refs.is_empty() {
+            return None;
+        }
+        let relay_req = Self::build_mesh_synthesis_relay_request(
+            effective_question,
+            history,
+            matched_chunk_refs,
+            model_tag,
+            dispatcher.signing_credentials(),
+        );
+        let timeout_dur = std::time::Duration::from_millis(90_000);
+        let responses = match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(dispatcher.query_peers(&relay_req, timeout_dur))
+                })
+            }
+            _ => std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| crate::CoordinatorError::Timeout(90_000))
+                        .and_then(|rt| rt.block_on(dispatcher.query_peers(&relay_req, timeout_dur)))
+                })
+                .join()
+                .unwrap_or_else(|_| Err(crate::CoordinatorError::Timeout(90_000)))
+            }),
+        };
+
+        if let Ok(resps) = responses {
+            for resp in resps {
+                if let Some(synthesis) = resp.synthesis_response {
+                    if !synthesis.synthesized_text.trim().is_empty() {
+                        tracing::info!(
+                            peer = %resp.responder_peer_id,
+                            model = %synthesis.model_tag,
+                            "Received synthesized answer from mesh peer via synthesis relay"
+                        );
+                        if let Some(tx) = telemetry_tx {
+                            for word in synthesis.synthesized_text.split_inclusive(' ') {
+                                if tx.is_closed() {
+                                    break;
+                                }
+                                if !Self::send_telemetry(
+                                    tx,
+                                    AgenticTelemetryEvent::TokenDelta {
+                                        delta: word.to_string(),
+                                    },
+                                ) {
+                                    break;
+                                }
+                            }
+                        }
+                        return Some((synthesis.synthesized_text, synthesis.citations));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Runtime-safe non-panicking telemetry sender with backpressure retry.
     /// Avoids `blocking_send` panics on single-threaded `#[tokio::test]` runtimes while guaranteeing zero dropped tokens.
     pub fn send_telemetry(
@@ -2785,7 +3337,7 @@ impl DeterministicOfflineSynthesisEngine {
             return None;
         }
         let mut counts: Vec<(String, Vec<usize>)> = Vec::new();
-        for (idx, c) in chunks.iter().enumerate().take(8) {
+        for (idx, c) in chunks.iter().enumerate() {
             let text = &c.chunk.text_content;
             let low = text.to_ascii_lowercase();
             let mut from = 0;
@@ -6311,73 +6863,240 @@ impl DeterministicOfflineSynthesisEngine {
             pos += ch.len_utf8();
         }
 
-        (rewritten, kept_chunks)
+        let cleaned_rewritten =
+            crate::response_formatter_watchdog::clean_dangling_citation_prepositions(&rewritten);
+        (cleaned_rewritten, kept_chunks)
     }
 
     /// Returns a `max_chars` window of `text`. For typed questions the window starts shortly before the first
     /// occurrence of the requested fact type (5-digit ZIP for location, `$` for amounts, a month/year for dates,
-    /// "phone"/"@" for contact) instead of always taking the opening characters.
+    /// "phone"/"@" for contact). For entity/biography or untyped queries whose queried entity terms appear beyond
+    /// the leading half, constructs an entity-anchored window combining the document lead with centered windows
+    /// around entity occurrences (preserving bottom-of-document signatures like `"Rev. Angela Davis"`).
     pub fn answer_focused_window(prompt: &str, text: &str, max_chars: usize) -> String {
         let chars: Vec<char> = text.chars().collect();
-        if chars.len() <= max_chars {
+        if chars.len() <= max_chars || max_chars == 0 {
             return text.to_string();
         }
         let cues = Self::answer_type_cue_terms(prompt);
-        if cues.is_empty() {
-            let slice: String = chars[..max_chars].iter().collect();
-            return Self::truncate_to_sentence_boundary(&slice, max_chars).to_string();
-        }
         let lower: String = text.to_ascii_lowercase();
         let lower_chars: Vec<char> = lower.chars().collect();
         let mut anchor: Option<usize> = None;
         let find = |needle: &str| -> Option<usize> {
             lower.find(needle).map(|byte_i| lower[..byte_i].chars().count())
         };
-        let q = prompt.to_ascii_lowercase();
-        if cues.contains(&"address") {
-            // first 5-digit token (ZIP) that is not an agency ZIP
-            let mut run = 0usize;
-            for (i, c) in lower_chars.iter().enumerate() {
-                if c.is_ascii_digit() {
-                    run += 1;
-                } else {
-                    if run == 5 {
-                        let zip_str: String = lower_chars[i - 5..i].iter().collect();
-                        if zip_str != "20529" && zip_str != "20530" && zip_str != "20210" && zip_str != "20588" {
-                            anchor = Some(i - 5);
-                            break;
+        if !cues.is_empty() {
+            let q = prompt.to_ascii_lowercase();
+            if cues.contains(&"address") {
+                // first 5-digit token (ZIP) that is not an agency ZIP
+                let mut run = 0usize;
+                for (i, c) in lower_chars.iter().enumerate() {
+                    if c.is_ascii_digit() {
+                        run += 1;
+                    } else {
+                        if run == 5 {
+                            let zip_str: String = lower_chars[i - 5..i].iter().collect();
+                            if zip_str != "20529"
+                                && zip_str != "20530"
+                                && zip_str != "20210"
+                                && zip_str != "20588"
+                            {
+                                anchor = Some(i - 5);
+                                break;
+                            }
+                        }
+                        run = 0;
+                    }
+                }
+                if anchor.is_none() {
+                    anchor = find("address")
+                        .or_else(|| find("street"))
+                        .or_else(|| find("avenue"));
+                }
+            }
+            if anchor.is_none()
+                && (cues.contains(&"phone") || q.contains("phone") || q.contains("email"))
+            {
+                anchor = find("phone").or_else(|| find("@")).or_else(|| find("email"));
+            }
+            if anchor.is_none() && cues.contains(&"rent") {
+                anchor = find("$");
+            }
+            if anchor.is_none() && cues.contains(&"dated") {
+                const MONTHS: &[&str] = &[
+                    "january", "february", "march", "april", "may ", "june", "july", "august",
+                    "september", "october", "november", "december",
+                ];
+                anchor = MONTHS.iter().filter_map(|m| find(m)).min();
+            }
+            if anchor.is_some() {
+                let start = anchor.map(|a| a.saturating_sub(200)).unwrap_or(0);
+                let start = start.min(chars.len().saturating_sub(max_chars));
+                let end = (start + max_chars).min(chars.len());
+                let slice: String = chars[start..end].iter().collect();
+                let mut text_slice = slice.as_str();
+                if start > 0 {
+                    if let Some(first_ws) = text_slice.find(char::is_whitespace) {
+                        if first_ws < 60 {
+                            text_slice = text_slice[first_ws..].trim_start();
                         }
                     }
-                    run = 0;
+                }
+                return Self::truncate_to_sentence_boundary(text_slice, max_chars).to_string();
+            }
+        }
+
+        // Entity-anchored multi-span windowing: preserve document lead + entity occurrences beyond lead
+        let entity_terms = Self::question_content_terms(prompt);
+        let tokens = Self::tokenize_with_spans(&lower);
+        let mut char_offsets_by_byte: Vec<(usize, usize)> = Vec::new();
+        let mut char_pos = 0usize;
+        for (b_pos, _) in lower.char_indices() {
+            char_offsets_by_byte.push((b_pos, char_pos));
+            char_pos += 1;
+        }
+        let byte_to_char = |b: usize| -> usize {
+            char_offsets_by_byte
+                .binary_search_by_key(&b, |(bp, _)| *bp)
+                .map(|idx| char_offsets_by_byte[idx].1)
+                .unwrap_or_else(|idx| {
+                    if idx == 0 {
+                        0
+                    } else {
+                        char_offsets_by_byte[idx - 1].1
+                    }
+                })
+        };
+
+        let mut hit_positions: Vec<(usize, bool)> = Vec::new();
+        for (i, (tok, b_start, _)) in tokens.iter().enumerate() {
+            if entity_terms.iter().any(|t| t == tok) {
+                let c_pos = byte_to_char(*b_start);
+                let is_multi_hit = entity_terms.len() >= 2
+                    && i + 1 < tokens.len()
+                    && entity_terms.iter().any(|t| t == &tokens[i + 1].0)
+                    && &tokens[i + 1].0 != tok;
+                hit_positions.push((c_pos, is_multi_hit));
+            }
+        }
+
+        let lead_cutoff = (max_chars / 2).max(1);
+        let post_lead_hits: Vec<(usize, bool)> = hit_positions
+            .into_iter()
+            .filter(|(pos, _)| *pos >= lead_cutoff)
+            .collect();
+
+        if post_lead_hits.is_empty() {
+            let slice: String = chars[..max_chars].iter().collect();
+            return Self::truncate_to_sentence_boundary(&slice, max_chars).to_string();
+        }
+
+        let lead_budget = (max_chars / 4).clamp(400, 1500).min(max_chars / 2);
+        let raw_lead: String = chars[..lead_budget].iter().collect();
+        let lead_trimmed = Self::truncate_to_sentence_boundary(&raw_lead, lead_budget);
+        let lead_char_end = lead_trimmed.chars().count();
+
+        let rem_budget = max_chars.saturating_sub(lead_char_end + 8);
+        if rem_budget < 120 {
+            let slice: String = chars[..max_chars].iter().collect();
+            return Self::truncate_to_sentence_boundary(&slice, max_chars).to_string();
+        }
+
+        // Prioritize full-entity hits + always include the last post-lead hit (tail signatures)
+        let mut prioritized: Vec<usize> = post_lead_hits
+            .iter()
+            .filter(|(_, multi)| *multi)
+            .map(|(pos, _)| *pos)
+            .collect();
+        if prioritized.is_empty() {
+            prioritized = post_lead_hits.iter().map(|(pos, _)| *pos).collect();
+        } else if let Some(&(last_pos, _)) = post_lead_hits.last() {
+            if !prioritized.contains(&last_pos) {
+                prioritized.push(last_pos);
+            }
+        }
+
+        let max_spans = 5usize.min(prioritized.len().max(1));
+        let min_gap = (rem_budget / max_spans).max(300);
+        let mut selected: Vec<usize> = Vec::with_capacity(max_spans);
+        for &pos in &prioritized {
+            if selected.is_empty() || pos.saturating_sub(*selected.last().unwrap()) >= min_gap {
+                selected.push(pos);
+                if selected.len() >= max_spans {
+                    break;
                 }
             }
-            if anchor.is_none() {
-                anchor = find("address").or_else(|| find("street")).or_else(|| find("avenue"));
+        }
+        if let Some(&last_pos) = prioritized.last() {
+            if selected.last().copied() != Some(last_pos) {
+                if selected.len() >= max_spans {
+                    selected.pop();
+                }
+                selected.push(last_pos);
             }
         }
-        if anchor.is_none() && (cues.contains(&"phone") || q.contains("phone") || q.contains("email")) {
-            anchor = find("phone").or_else(|| find("@")).or_else(|| find("email"));
-        }
-        if anchor.is_none() && cues.contains(&"rent") {
-            anchor = find("$");
-        }
-        if anchor.is_none() && cues.contains(&"dated") {
-            const MONTHS: &[&str] = &["january", "february", "march", "april", "may ", "june", "july", "august", "september", "october", "november", "december"];
-            anchor = MONTHS.iter().filter_map(|m| find(m)).min();
-        }
-        let start = anchor.map(|a| a.saturating_sub(200)).unwrap_or(0);
-        let start = start.min(chars.len().saturating_sub(max_chars));
-        let end = (start + max_chars).min(chars.len());
-        let slice: String = chars[start..end].iter().collect();
-        let mut text_slice = slice.as_str();
-        if start > 0 {
-            if let Some(first_ws) = text_slice.find(char::is_whitespace) {
-                if first_ws < 60 {
-                    text_slice = text_slice[first_ws..].trim_start();
+
+        let per_span = (rem_budget / selected.len().max(1)).saturating_sub(6);
+        let mut intervals: Vec<(usize, usize)> = Vec::new();
+        for pos in selected {
+            let half = per_span / 2;
+            let end = (pos + half + 80).min(chars.len());
+            let mut start = end.saturating_sub(per_span).max(lead_char_end);
+            if end - start < per_span && end == chars.len() {
+                start = chars.len().saturating_sub(per_span).max(lead_char_end);
+            }
+            if let Some(prev) = intervals.last_mut() {
+                if start <= prev.1 + 24 {
+                    prev.1 = prev.1.max(end);
+                    continue;
                 }
             }
+            intervals.push((start, end));
         }
-        Self::truncate_to_sentence_boundary(text_slice, max_chars).to_string()
+
+        let mut parts: Vec<String> = Vec::new();
+        let mut total_used = 0usize;
+        if !lead_trimmed.trim().is_empty() {
+            let l = lead_trimmed.trim().to_string();
+            total_used += l.chars().count();
+            parts.push(l);
+        }
+        for (start, end) in intervals {
+            if start >= end || total_used + 16 >= max_chars {
+                continue;
+            }
+            let avail = max_chars.saturating_sub(total_used + 6);
+            let mut slice: String = chars[start..end].iter().collect();
+            if start > 0 {
+                if let Some(first_ws) = slice.find(char::is_whitespace) {
+                    if first_ws < 40 {
+                        slice = slice[first_ws..].trim_start().to_string();
+                    }
+                }
+            }
+            let final_span = if end == chars.len() && slice.chars().count() <= avail {
+                slice.trim().to_string()
+            } else {
+                let s_chars: Vec<char> = slice.chars().collect();
+                let clipped: String = if s_chars.len() > avail {
+                    s_chars[..avail].iter().collect()
+                } else {
+                    slice
+                };
+                Self::truncate_to_sentence_boundary(&clipped, avail).to_string()
+            };
+            if !final_span.trim().is_empty() {
+                total_used += final_span.chars().count() + 5;
+                parts.push(final_span.trim().to_string());
+            }
+        }
+
+        if parts.is_empty() {
+            let slice: String = chars[..max_chars].iter().collect();
+            Self::truncate_to_sentence_boundary(&slice, max_chars).to_string()
+        } else {
+            parts.join("\n...\n")
+        }
     }
 
     /// Byte index just past the last sentence terminator that is followed by whitespace (or a paragraph break).
@@ -7692,6 +8411,442 @@ impl DeterministicOfflineSynthesisEngine {
         format!("{}{}", base_system, voice_directive)
     }
 
+    /// Plans deterministic per-cluster batches of at most `6` canonical `[k]` documents for multi-pass
+    /// synthesis (`has_multi_domain_homonyms` or `unique_file_chunks.len() >= 5`).
+    pub fn plan_multipass_cluster_batches<'a>(
+        unique_file_chunks: &[&'a ScoredChunk],
+        has_multi_domain_homonyms: bool,
+    ) -> Vec<(&'static str, Vec<(usize, &'a ScoredChunk)>)> {
+        use std::collections::BTreeMap;
+        if unique_file_chunks.is_empty() {
+            return Vec::new();
+        }
+        if !has_multi_domain_homonyms {
+            let docs: Vec<(usize, &'a ScoredChunk)> = unique_file_chunks
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| (i + 1, c))
+                .collect();
+            return docs
+                .chunks(6)
+                .map(|batch| ("", batch.to_vec()))
+                .collect();
+        }
+
+        let mut cluster_groups: BTreeMap<(usize, &'static str), Vec<(usize, &'a ScoredChunk)>> =
+            BTreeMap::new();
+        for (idx, &c) in unique_file_chunks.iter().enumerate() {
+            let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
+            let label =
+                crate::answer_orchestrator::classify_entity_domain_cluster(&c.chunk.file_path, &cleaned);
+            let rank = crate::answer_orchestrator::entity_cluster_rank(label);
+            cluster_groups
+                .entry((rank, label))
+                .or_default()
+                .push((idx + 1, c));
+        }
+
+        let mut planned = Vec::new();
+        for ((_, label), docs) in cluster_groups {
+            for batch in docs.chunks(6) {
+                planned.push((label, batch.to_vec()));
+            }
+        }
+        planned
+    }
+
+    /// Parses all valid `1..=max_doc_num` bracketed citation indices present in `prose`.
+    pub fn parse_cited_doc_indices(
+        prose: &str,
+        max_doc_num: usize,
+    ) -> std::collections::BTreeSet<usize> {
+        let mut cited = std::collections::BTreeSet::new();
+        if max_doc_num == 0 || prose.is_empty() {
+            return cited;
+        }
+        let bytes = prose.as_bytes();
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            if bytes[pos] == b'[' {
+                if let Some(rel_end) = prose[pos + 1..].find(']') {
+                    let close_pos = pos + 1 + rel_end;
+                    let followed_by_paren =
+                        close_pos + 1 < bytes.len() && bytes[close_pos + 1] == b'(';
+                    if !followed_by_paren {
+                        let inner = &prose[pos + 1..close_pos];
+                        for part in inner.split(',') {
+                            let p = part.trim();
+                            if let Some((a_s, b_s)) =
+                                p.split_once('-').or_else(|| p.split_once('–'))
+                            {
+                                if let (Ok(a), Ok(b)) =
+                                    (a_s.trim().parse::<usize>(), b_s.trim().parse::<usize>())
+                                {
+                                    if a >= 1 && b >= a && b - a <= 20 {
+                                        for n in a..=b {
+                                            if n <= max_doc_num {
+                                                cited.insert(n);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Ok(n) = p.parse::<usize>() {
+                                if (1..=max_doc_num).contains(&n) {
+                                    cited.insert(n);
+                                }
+                            }
+                        }
+                        pos = close_pos + 1;
+                        continue;
+                    }
+                }
+            }
+            let ch_len = prose[pos..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            pos += ch_len;
+        }
+        cited
+    }
+
+    /// Detects shortcut refusal or premature truncation disclaimers emitted by an LLM instead of
+    /// analyzing every document in a batch.
+    pub fn is_shortcut_refusal_prose(text: &str) -> bool {
+        let low = text.to_ascii_lowercase();
+        const REFUSALS: &[&str] = &[
+            "this response will focus on",
+            "due to space",
+            "due to length constraints",
+            "for brevity",
+            "remaining documents are omitted",
+            "cannot cover all documents",
+            "not all documents can be covered",
+            "i will summarize only a subset",
+            "the remaining sources will be omitted",
+        ];
+        REFUSALS.iter().any(|r| low.contains(r))
+    }
+
+    /// Evaluates batch completeness and word depth (`>= 150` words per document in `batch_doc_nums`,
+    /// zero omitted `[k]` citations, and zero shortcut refusals).
+    pub fn find_missing_or_shallow_batch_docs(
+        batch_prose: &str,
+        batch_doc_nums: &[usize],
+    ) -> (Vec<usize>, bool) {
+        let max_doc = batch_doc_nums.iter().copied().max().unwrap_or(0);
+        let cited = Self::parse_cited_doc_indices(batch_prose, max_doc);
+        let missing: Vec<usize> = batch_doc_nums
+            .iter()
+            .copied()
+            .filter(|n| !cited.contains(n))
+            .collect();
+        let words = batch_prose.split_whitespace().count();
+        let min_words = batch_doc_nums.len().saturating_mul(150);
+        let is_shallow = words < min_words || Self::is_shortcut_refusal_prose(batch_prose);
+        (missing, is_shallow)
+    }
+
+    /// Formats the upfront disambiguation / corpus overview paragraph naming all distinct clusters
+    /// and every attested document `[1]..[N]`.
+    pub fn format_multipass_overview_banner(
+        prompt: &str,
+        unique_file_chunks: &[&ScoredChunk],
+        specific_clusters: &[&'static str],
+    ) -> String {
+        let clean_prompt = prompt.split(" (Subject context:").next().unwrap_or(prompt).trim();
+        let expected_prefix = Self::format_question_restated_prefix_with_chunks(
+            clean_prompt,
+            unique_file_chunks,
+        );
+        let subject_label = expected_prefix
+            .trim_end()
+            .strip_suffix(" is")
+            .or_else(|| expected_prefix.trim_end().strip_suffix(" was"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(clean_prompt);
+        let total = unique_file_chunks.len();
+        let all_cites = (1..=total)
+            .map(|n| format!("[{n}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if specific_clusters.len() >= 2 {
+            let cluster_list = specific_clusters.join("; ");
+            format!(
+                "The retrieved documents across the federated corpus reference multiple distinct individuals or contexts sharing **{subject_label}** across {} domain clusters ({cluster_list}), spanning {total} attested documents {all_cites}, each analyzed separately below with strict corpus grounding.",
+                specific_clusters.len()
+            )
+        } else {
+            format!(
+                "Across the federated corpus for **{subject_label}**, {total} attested source documents {all_cites} provide grounded evidence detailed systematically below."
+            )
+        }
+    }
+
+    /// Builds a strict per-cluster / per-batch Ollama user prompt covering only `batch_doc_nums`.
+    pub fn build_multipass_batch_prompt(
+        prompt: &str,
+        cluster_label: &str,
+        batch_doc_nums: &[usize],
+        batch_context_blocks: &str,
+        is_enrichment_pass: bool,
+    ) -> String {
+        let cite_list = batch_doc_nums
+            .iter()
+            .map(|n| format!("[{n}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cluster_note = if cluster_label.is_empty() {
+            String::new()
+        } else {
+            format!(" within the domain cluster `{}`", cluster_label)
+        };
+        let depth_directive = if is_enrichment_pass {
+            format!(
+                "TARGETED CONTINUATION & ENRICHMENT PASS: Your previous pass omitted or under-detailed documents {cite_list}. Write an exhaustive, concrete multi-paragraph analysis (at least 180 words per document) covering EVERY SINGLE document {cite_list}{cluster_note}."
+            )
+        } else {
+            format!(
+                "EXHAUSTIVE BATCH SYNTHESIS{cluster_note}: Write a thorough, multi-paragraph analytical section covering EVERY SINGLE document in this batch ({cite_list})."
+            )
+        };
+        format!(
+            "Batch Reference Excerpts (cite ONLY these document numbers {cite_list}):\n{}\n\nUser Question: {}\n\n\
+            INSTRUCTION: {}\n\
+            - You MUST cite EVERY document number {cite_list} inline in your prose.\n\
+            - Include ALL concrete details literally present in each document: named parties and roles, exact dates, street addresses, dollar amounts and fee clauses, board/steward responsibilities, published works, arguments, and themes (at least 150-200+ words per document).\n\
+            - FORBIDDEN: Never output shortcut refusals (never write \"This response will focus on...\", \"Due to space...\", \"For brevity...\", or omit any document in {cite_list}). Do NOT emit `#` headings or a `Sources` footer.",
+            batch_context_blocks,
+            prompt,
+            depth_directive
+        )
+    }
+
+    /// Executes a single streaming `/api/chat` conversation (including `done_reason == "length"`
+    /// continuation hops and repetition detection) and returns the raw generated text.
+    fn stream_ollama_chat_messages(
+        addr: &std::net::SocketAddr,
+        host_port: &str,
+        target_model: &str,
+        initial_messages: &[serde_json::Value],
+        temp: f32,
+        per_hop_predict: usize,
+        num_ctx: usize,
+        max_hops: usize,
+        max_output_tokens: usize,
+        prior_answer_text: &str,
+        telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
+    ) -> Option<String> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let mut current_messages = initial_messages.to_vec();
+        let mut full_text = String::new();
+        let mut accumulated_tokens = 0usize;
+        let mut hop_count = 0usize;
+
+        while hop_count < max_hops && accumulated_tokens < max_output_tokens {
+            hop_count += 1;
+            let mut stream = TcpStream::connect_timeout(addr, Duration::from_millis(800)).ok()?;
+            let read_timeout = Self::socket_read_timeout_for_model(target_model);
+            let _ = stream.set_read_timeout(Some(read_timeout));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+
+            let mut payload_val = serde_json::json!({
+                "model": target_model,
+                "messages": current_messages,
+                "stream": true,
+                "keep_alive": "24h",
+                "options": Self::build_ollama_chat_options(temp, per_hop_predict, num_ctx)
+            });
+            if Self::model_uses_thinking_flag(target_model) {
+                if let Some(obj) = payload_val.as_object_mut() {
+                    obj.insert("think".to_string(), serde_json::Value::Bool(false));
+                }
+            }
+            let payload = payload_val.to_string();
+
+            let request = format!(
+                "POST /api/chat HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                host_port,
+                payload.len(),
+                payload
+            );
+
+            stream.write_all(request.as_bytes()).ok()?;
+
+            let mut reader = BufReader::new(stream);
+            let mut header_line = String::new();
+            loop {
+                header_line.clear();
+                let n = reader.read_line(&mut header_line).ok()?;
+                if n == 0 || header_line == "\r\n" || header_line == "\n" {
+                    break;
+                }
+            }
+
+            let mut hop_text = String::new();
+            let mut pending_emit = String::new();
+            let mut line_buf = String::new();
+            let mut done_reason = String::new();
+            let mut hop_eval_count = 0usize;
+            let mut repetition_detected = false;
+
+            loop {
+                if let Some(tx) = telemetry_tx {
+                    if tx.is_closed() {
+                        break;
+                    }
+                }
+                line_buf.clear();
+                let n = match reader.read_line(&mut line_buf) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line_buf.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if val.get("error").is_some() {
+                        return None;
+                    }
+                    if let Some(tok) = val
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        if !tok.is_empty() {
+                            full_text.push_str(tok);
+                            hop_text.push_str(tok);
+                            pending_emit.push_str(tok);
+
+                            if let Some(cut_pos) = Self::has_repeated_passage(&full_text) {
+                                let emitted_len =
+                                    full_text.len().saturating_sub(pending_emit.len());
+                                let safe_cut = cut_pos.max(emitted_len);
+                                if full_text.is_char_boundary(safe_cut) {
+                                    full_text.truncate(safe_cut);
+                                }
+                                pending_emit.clear();
+                                repetition_detected = true;
+                                break;
+                            }
+
+                            if !prior_answer_text.is_empty() {
+                                if let Some(cut) = Self::last_sentence_boundary(&pending_emit) {
+                                    let ready: String = pending_emit[..cut].to_string();
+                                    pending_emit = pending_emit[cut..].to_string();
+                                    let novel =
+                                        Self::filter_repeating_segments(&ready, prior_answer_text);
+                                    if !novel.is_empty() {
+                                        if let Some(tx) = telemetry_tx {
+                                            if !Self::send_telemetry(
+                                                tx,
+                                                AgenticTelemetryEvent::TokenDelta { delta: novel },
+                                            ) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if pending_emit.len() >= 56 {
+                                let flush_chunk = std::mem::take(&mut pending_emit);
+                                if let Some(tx) = telemetry_tx {
+                                    if !Self::send_telemetry(
+                                        tx,
+                                        AgenticTelemetryEvent::TokenDelta { delta: flush_chunk },
+                                    ) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(reason) = val.get("done_reason").and_then(|r| r.as_str()) {
+                        done_reason = reason.to_string();
+                    }
+                    if let Some(eval) = val.get("eval_count").and_then(|c| c.as_u64()) {
+                        hop_eval_count = eval as usize;
+                    }
+                    if val.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                        break;
+                    }
+                }
+            }
+
+            if !pending_emit.is_empty() && !repetition_detected {
+                let raw_tail = std::mem::take(&mut pending_emit);
+                let flush_chunk = if prior_answer_text.is_empty() {
+                    raw_tail
+                } else {
+                    Self::filter_repeating_segments(&raw_tail, prior_answer_text)
+                };
+                if let Some(tx) = telemetry_tx {
+                    let _ = Self::send_telemetry(
+                        tx,
+                        AgenticTelemetryEvent::TokenDelta { delta: flush_chunk },
+                    );
+                }
+            }
+
+            if repetition_detected {
+                break;
+            }
+            if let Some(tx) = telemetry_tx {
+                if tx.is_closed() {
+                    break;
+                }
+            }
+
+            accumulated_tokens += if hop_eval_count > 0 {
+                hop_eval_count
+            } else {
+                hop_text.len() / 4
+            };
+
+            if done_reason == "length"
+                && accumulated_tokens < max_output_tokens
+                && hop_count < max_hops
+            {
+                let rolling_summary: String = if hop_text.len() > 1500 {
+                    let start = hop_text.len() - 1500;
+                    let safe_start = hop_text
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .find(|&i| i >= start)
+                        .unwrap_or(start);
+                    hop_text[safe_start..].to_string()
+                } else {
+                    hop_text.clone()
+                };
+
+                current_messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": rolling_summary
+                }));
+                current_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": "Continue immediately from where you stopped. Maintain the exact same analytical depth and Markdown structure. Do not repeat earlier text, do not emit conversational filler, and seamlessly complete the analysis."
+                }));
+            } else {
+                break;
+            }
+        }
+
+        if full_text.trim().is_empty() {
+            None
+        } else {
+            Some(full_text)
+        }
+    }
+
     /// Multi-turn real-time streaming orchestration via local Ollama `POST /api/chat` (100% offline, zero internet access).
     /// Strictly orchestrates answers over non-empty `matched_chunks` and streams tokens directly to `telemetry_tx`.
     pub fn query_local_ollama_chat(
@@ -7701,9 +8856,7 @@ impl DeterministicOfflineSynthesisEngine {
         requested_model_tag: &str,
         telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
     ) -> Option<(String, Vec<Citation>)> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-        use std::time::Duration;
+        use std::net::{SocketAddr, ToSocketAddrs};
 
         if matched_chunks.is_empty() {
             return None;
@@ -7805,6 +8958,62 @@ impl DeterministicOfflineSynthesisEngine {
         }
         let resolved_model_owned =
             Self::resolve_ollama_model_tag(requested_model_tag, &hw, &installed_models);
+        let res = Self::query_local_ollama_chat_at(
+            addr,
+            host_port,
+            prompt,
+            history,
+            matched_chunks,
+            &resolved_model_owned,
+            &hw,
+            &ui,
+            &installed_models,
+            telemetry_tx,
+        )?;
+
+        if let Ok(mut guard) = crate::dlp_mesh::global_mesh_dlp_controller().settings.write() {
+            if guard.ui.restrl_daemon_running {
+                guard.ui.restrl_processed_tasks = guard.ui.restrl_processed_tasks.saturating_add(1);
+            }
+        }
+        Some(res)
+    }
+
+    /// Zero-global-state local Ollama orchestration helper used by `query_local_ollama_chat`
+    /// and deterministic mock-Ollama / 2-node relay tests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_local_ollama_chat_at(
+        addr: std::net::SocketAddr,
+        host_port: &str,
+        prompt: &str,
+        history: &[ChatTurnMessage],
+        matched_chunks: &[&ScoredChunk],
+        requested_model_tag: &str,
+        hw: &crate::hardware::HardwareTelemetry,
+        ui: &crate::dlp_mesh::ChatGptUiSettings,
+        installed_models: &[String],
+        telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
+    ) -> Option<(String, Vec<Citation>)> {
+        use std::time::Duration;
+
+        if matched_chunks.is_empty() || installed_models.is_empty() {
+            return None;
+        }
+        if !addr.ip().is_loopback() {
+            tracing::warn!(
+                "Ollama address {} is not loopback; failing closed under air-gap policy",
+                addr
+            );
+            return None;
+        }
+        if let Some(tx) = telemetry_tx {
+            if tx.is_closed() {
+                return None;
+            }
+        }
+
+        let resolved_model_owned =
+            Self::resolve_ollama_model_tag(requested_model_tag, hw, installed_models);
         let model: &str = resolved_model_owned.as_str();
 
         let temp = ui.sampling_temperature.clamp(0.05, 0.20);
@@ -7812,12 +9021,12 @@ impl DeterministicOfflineSynthesisEngine {
         let _agentic_loop_enabled = ui.agentic_loop_enabled;
 
         // Keep KV cache inside GPU VRAM when a mid-tier discrete GPU (<16 GB VRAM) is active,
-        // Milestone M29: Enforce at least 16K context window (num_ctx >= 16384) and at least 1500 predict tokens
-        // (num_predict >= 1500) so large multi-document evidence context is fully ingested and answers are thorough.
+        // Milestone M29/R2.5: Allow 32K context window whenever free VRAM >= 16 GB OR free RAM >= 48 GB
+        // (never penalize high-RAM machines with a smaller discrete GPU), and enforce >= 16K context everywhere.
         let (raw_predict, raw_ctx) =
-            if hw.free_vram_mb >= 16_000 || (hw.gpu_count == 0 && hw.free_ram_gb >= 48.0) {
-                (max_output_tokens.clamp(1500, 16384), 32768usize)
-            } else if hw.free_vram_mb >= 6_000 || (hw.gpu_count == 0 && hw.free_ram_gb >= 18.0) {
+            if hw.free_vram_mb >= 16_000 || hw.free_ram_gb >= 48.0 {
+                (max_output_tokens.clamp(4096, 16384), 32768usize)
+            } else if hw.free_vram_mb >= 6_000 || hw.free_ram_gb >= 18.0 {
                 (max_output_tokens.clamp(1500, 8192), 16384usize)
             } else if hw.free_ram_gb >= 12.0 || hw.free_vram_mb >= 4_500 {
                 (max_output_tokens.clamp(1500, 4096), 16384usize)
@@ -7979,21 +9188,46 @@ impl DeterministicOfflineSynthesisEngine {
         let max_excerpts = if ui.deep_research_iterative_rag || ui.map_reduce_fact_extraction {
             64usize
         } else {
-            24usize
+            48usize
         };
-        let mut active_excerpts_vec: Vec<&ScoredChunk> =
-            pruned_chunks[..pruned_chunks.len().min(max_excerpts)].to_vec();
-        if pruned_chunks.len() > max_excerpts {
+        let mut seen_excerpt_families: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(max_excerpts);
+        let raw_excerpt_ceiling = max_excerpts.saturating_mul(2);
+        let mut active_excerpts_vec: Vec<&ScoredChunk> = Vec::with_capacity(max_excerpts);
+        let mut first_skipped_idx: Option<usize> = None;
+        for (idx, &c) in pruned_chunks.iter().enumerate() {
+            let path_low = c.chunk.file_path.to_ascii_lowercase();
+            let fam = if path_low.starts_with("artemis://") {
+                path_low
+            } else {
+                Self::derive_document_family_key(&c.chunk.file_path)
+            };
+            if seen_excerpt_families.contains(&fam) || seen_excerpt_families.len() < max_excerpts {
+                seen_excerpt_families.insert(fam);
+                active_excerpts_vec.push(c);
+                if active_excerpts_vec.len() >= raw_excerpt_ceiling {
+                    if first_skipped_idx.is_none() && idx + 1 < pruned_chunks.len() {
+                        first_skipped_idx = Some(idx + 1);
+                    }
+                    break;
+                }
+            } else if first_skipped_idx.is_none() {
+                first_skipped_idx = Some(idx);
+            }
+        }
+        if let Some(rescue_start) = first_skipped_idx {
             let mut added_remote = 0usize;
-            for &rc in &pruned_chunks[max_excerpts..] {
+            for &rc in &pruned_chunks[rescue_start..] {
                 if rc.source_peer.is_empty() || rc.source_peer.eq_ignore_ascii_case("local") {
                     continue;
                 }
-                let rc_fam = Self::derive_document_family_key(&rc.chunk.file_path);
-                if !active_excerpts_vec
-                    .iter()
-                    .any(|c| Self::derive_document_family_key(&c.chunk.file_path) == rc_fam)
-                {
+                let rc_path_low = rc.chunk.file_path.to_ascii_lowercase();
+                let rc_fam = if rc_path_low.starts_with("artemis://") {
+                    rc_path_low
+                } else {
+                    Self::derive_document_family_key(&rc.chunk.file_path)
+                };
+                if seen_excerpt_families.insert(rc_fam) {
                     active_excerpts_vec.push(rc);
                     added_remote += 1;
                     if added_remote >= 4 {
@@ -8005,12 +9239,13 @@ impl DeterministicOfflineSynthesisEngine {
         let active_excerpts: &[&ScoredChunk] = &active_excerpts_vec;
 
         // Assign 1-based citation numbers strictly by canonical document family across `active_excerpts`,
-        // so multiple chunks, revisions, or cross-peer copies from the same document family share one `[doc_num]`.
+        // sorting canonical documents deterministically across hosts by
+        // `(entity_cluster_rank, exact_full_name_hit DESC, canonical_family_key ASC)` before assigning `[1]..[N]`.
         let mut unique_file_chunks: Vec<&ScoredChunk> = Vec::new();
         let mut file_to_doc_num: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
         let mut canonical_file_for_family: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut families_seen: Vec<String> = Vec::new();
         let mut family_to_chunks: std::collections::HashMap<String, Vec<&ScoredChunk>> = std::collections::HashMap::new();
+        let mut family_order: Vec<String> = Vec::new();
 
         for &c in active_excerpts {
             let path_low = c.chunk.file_path.to_ascii_lowercase();
@@ -8020,26 +9255,45 @@ impl DeterministicOfflineSynthesisEngine {
                 Self::derive_document_family_key(&c.chunk.file_path)
             };
             if !family_to_chunks.contains_key(&fam_key) {
-                families_seen.push(fam_key.clone());
+                family_order.push(fam_key.clone());
             }
             family_to_chunks.entry(fam_key).or_default().push(c);
         }
 
-        for fam_key in families_seen {
-            let chunks = family_to_chunks.get(&fam_key).unwrap();
-            let canonical = Self::pick_canonical_document_for_family(chunks).unwrap_or(chunks[0]);
+        let mut canonical_pairs: Vec<(String, &ScoredChunk)> = Vec::with_capacity(family_order.len());
+        for fam_key in family_order {
+            if let Some(chunks) = family_to_chunks.get(&fam_key) {
+                let canonical = Self::pick_canonical_document_for_family(chunks).unwrap_or(chunks[0]);
+                canonical_pairs.push((fam_key, canonical));
+            }
+        }
+        let mut sorted_canonicals: Vec<&ScoredChunk> =
+            canonical_pairs.iter().map(|(_, c)| *c).collect();
+        Self::sort_canonical_chunks_deterministically(prompt, &mut sorted_canonicals);
+
+        for canonical in sorted_canonicals {
+            let path_low = canonical.chunk.file_path.to_ascii_lowercase();
+            let fam_key = if path_low.starts_with("artemis://") {
+                path_low
+            } else {
+                Self::derive_document_family_key(&canonical.chunk.file_path)
+            };
             let next_num = unique_file_chunks.len() + 1;
             unique_file_chunks.push(canonical);
-            canonical_file_for_family.insert(fam_key, canonical.chunk.file_path.clone());
-
-            for c in chunks {
-                let file_name = c
-                    .chunk
-                    .file_path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(&c.chunk.file_path);
-                file_to_doc_num.insert((c.source_peer.to_ascii_lowercase(), file_name.to_ascii_lowercase()), next_num);
+            canonical_file_for_family.insert(fam_key.clone(), canonical.chunk.file_path.clone());
+            if let Some(chunks) = family_to_chunks.get(&fam_key) {
+                for c in chunks {
+                    let file_name = c
+                        .chunk
+                        .file_path
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(&c.chunk.file_path);
+                    file_to_doc_num.insert(
+                        (c.source_peer.to_ascii_lowercase(), file_name.to_ascii_lowercase()),
+                        next_num,
+                    );
+                }
             }
         }
 
@@ -8107,26 +9361,84 @@ impl DeterministicOfflineSynthesisEngine {
         let active_specific_clusters =
             crate::answer_orchestrator::distinct_specific_entity_clusters(active_excerpts);
         let has_multi_domain_homonyms = active_specific_clusters.len() >= 2;
+        let use_multipass =
+            prior_answer_text.is_empty() && (has_multi_domain_homonyms || unique_file_chunks.len() >= 5);
 
-        // Expand evidence window proportionally with num_ctx
+        let format_doc_excerpt = |doc_num: usize, c: &ScoredChunk, window_chars: usize| -> String {
+            let path_low = c.chunk.file_path.to_ascii_lowercase();
+            let fam_key = if path_low.starts_with("artemis://") {
+                path_low
+            } else {
+                Self::derive_document_family_key(&c.chunk.file_path)
+            };
+            let canon_path = canonical_file_for_family
+                .get(&fam_key)
+                .map(|s| s.as_str())
+                .unwrap_or(&c.chunk.file_path);
+            let canon_name_base = canon_path
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(canon_path);
+            let file_name = if !c.source_peer.is_empty() && !c.source_peer.eq_ignore_ascii_case("local") {
+                let short_peer: String = c.source_peer.chars().take(12).collect();
+                format!("{} (Mesh Peer: {})", canon_name_base, short_peer)
+            } else {
+                canon_name_base.to_string()
+            };
+            let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
+            let cluster_tag = if has_multi_domain_homonyms {
+                let stored_cluster = serde_json::from_str::<serde_json::Value>(&c.chunk.metadata_json)
+                    .ok()
+                    .and_then(|v| v.get("entity_cluster").and_then(|s| s.as_str()).map(|s| s.to_string()));
+                let label = stored_cluster.unwrap_or_else(|| {
+                    crate::answer_orchestrator::classify_entity_domain_cluster(&c.chunk.file_path, &cleaned)
+                        .to_string()
+                });
+                format!(" | Entity Domain Cluster: {}", label)
+            } else {
+                String::new()
+            };
+            let compact_text: String = if !prior_answer_text.is_empty() {
+                let win = Self::least_covered_window(&cleaned, &prior_answer_text, window_chars);
+                Self::scrub_prior_covered_clauses(&win, &prior_answer_text)
+            } else {
+                Self::answer_focused_window(prompt, &cleaned, window_chars)
+            };
+            let compact_text = match vision_notes.get(&c.chunk.chunk_id) {
+                Some(v) => format!(
+                    "{}\nVisual Content (what the image actually shows, from a local vision model): {}",
+                    compact_text.trim(),
+                    v
+                ),
+                None => compact_text,
+            };
+            format!(
+                "[{}] Source File: {}{}\n{}",
+                doc_num,
+                file_name,
+                cluster_tag,
+                compact_text.trim()
+            )
+        };
+
+        // Expand evidence window proportionally with num_ctx; ensure >= 6,000 chars per doc for batches <= 6
         let total_evidence_chars = if num_ctx >= 32768 {
             64_000usize
         } else if num_ctx >= 16384 {
-            32_000usize
+            36_000usize
         } else {
             12_000usize
         };
         let excerpt_count = active_excerpts.len().max(1);
-        let per_excerpt_chars = (total_evidence_chars / excerpt_count).clamp(1200, 9000);
-        let context_blocks = active_excerpts
+        let single_pass_excerpt_chars = if excerpt_count <= 6 && num_ctx >= 16384 {
+            (total_evidence_chars / excerpt_count).clamp(6000, 9000)
+        } else {
+            (total_evidence_chars / excerpt_count).clamp(1200, 9000)
+        };
+
+        let mut numbered_excerpts: Vec<(usize, String)> = active_excerpts
             .iter()
             .map(|c| {
-                let path_low = c.chunk.file_path.to_ascii_lowercase();
-                let fam_key = if path_low.starts_with("artemis://") {
-                    path_low
-                } else {
-                    Self::derive_document_family_key(&c.chunk.file_path)
-                };
                 let file_name_base = c
                     .chunk
                     .file_path
@@ -8134,59 +9446,14 @@ impl DeterministicOfflineSynthesisEngine {
                     .next()
                     .unwrap_or(&c.chunk.file_path);
                 let lookup_key = (c.source_peer.to_ascii_lowercase(), file_name_base.to_ascii_lowercase());
-                let doc_num = file_to_doc_num
-                    .get(&lookup_key)
-                    .copied()
-                    .unwrap_or(1);
-                let canon_path = canonical_file_for_family
-                    .get(&fam_key)
-                    .map(|s| s.as_str())
-                    .unwrap_or(&c.chunk.file_path);
-                let canon_name_base = canon_path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(canon_path);
-                let file_name = if !c.source_peer.is_empty() && !c.source_peer.eq_ignore_ascii_case("local") {
-                    let short_peer: String = c.source_peer.chars().take(12).collect();
-                    format!("{} (Mesh Peer: {})", canon_name_base, short_peer)
-                } else {
-                    canon_name_base.to_string()
-                };
-                let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
-                let cluster_tag = if has_multi_domain_homonyms {
-                    let stored_cluster = serde_json::from_str::<serde_json::Value>(&c.chunk.metadata_json)
-                        .ok()
-                        .and_then(|v| v.get("entity_cluster").and_then(|s| s.as_str()).map(|s| s.to_string()));
-                    let label = stored_cluster.unwrap_or_else(|| {
-                        crate::answer_orchestrator::classify_entity_domain_cluster(&c.chunk.file_path, &cleaned)
-                            .to_string()
-                    });
-                    format!(" | Entity Domain Cluster: {}", label)
-                } else {
-                    String::new()
-                };
-                let compact_text: String = if !prior_answer_text.is_empty() {
-                    let win = Self::least_covered_window(&cleaned, &prior_answer_text, per_excerpt_chars);
-                    Self::scrub_prior_covered_clauses(&win, &prior_answer_text)
-                } else {
-                    Self::answer_focused_window(prompt, &cleaned, per_excerpt_chars)
-                };
-                let compact_text = match vision_notes.get(&c.chunk.chunk_id) {
-                    Some(v) => format!(
-                        "{}\nVisual Content (what the image actually shows, from a local vision model): {}",
-                        compact_text.trim(),
-                        v
-                    ),
-                    None => compact_text,
-                };
-                format!(
-                    "[{}] Source File: {}{}\n{}",
-                    doc_num,
-                    file_name,
-                    cluster_tag,
-                    compact_text.trim()
-                )
+                let doc_num = file_to_doc_num.get(&lookup_key).copied().unwrap_or(1);
+                (doc_num, format_doc_excerpt(doc_num, c, single_pass_excerpt_chars))
             })
+            .collect();
+        numbered_excerpts.sort_by_key(|(doc_num, _)| *doc_num);
+        let context_blocks = numbered_excerpts
+            .into_iter()
+            .map(|(_, block)| block)
             .collect::<Vec<_>>()
             .join("\n\n");
 
@@ -8268,205 +9535,326 @@ impl DeterministicOfflineSynthesisEngine {
             "content": user_content
         }));
 
+        let homonym_subject_opt = expected_prefix
+            .trim_end()
+            .strip_suffix(" is")
+            .or_else(|| expected_prefix.trim_end().strip_suffix(" was"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
         let send_chat_request = |target_model: &str| -> Option<(String, Vec<Citation>)> {
             let max_hops = if ui.agentic_loop_enabled { 3usize } else { 1usize };
 
-            let mut current_messages = messages.clone();
-            let mut full_text = String::new();
-            let mut accumulated_tokens = 0usize;
-            let mut hop_count = 0usize;
-
-            // Unified real-time NDJSON streaming mode with 56-char lookahead repetition loop breaker
-            while hop_count < max_hops && accumulated_tokens < max_output_tokens {
-                hop_count += 1;
-                let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(800)).ok()?;
-                let read_timeout = Self::socket_read_timeout_for_model(target_model);
-                let _ = stream.set_read_timeout(Some(read_timeout));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
-
-                let mut payload_val = serde_json::json!({
-                    "model": target_model,
-                    "messages": current_messages,
-                    "stream": true,
-                    "keep_alive": "24h",
-                    "options": Self::build_ollama_chat_options(temp, per_hop_predict, num_ctx)
-                });
-                if Self::model_uses_thinking_flag(target_model) {
-                    if let Some(obj) = payload_val.as_object_mut() {
-                        obj.insert("think".to_string(), serde_json::Value::Bool(false));
-                    }
-                }
-                let payload = payload_val.to_string();
-
-                let request = format!(
-                    "POST /api/chat HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    host_port,
-                    payload.len(),
-                    payload
+            let mut full_text = if use_multipass {
+                let batch_excerpt_chars = if num_ctx >= 16384 { 6000usize } else { 3200usize };
+                let batch_predict = per_hop_predict.max(4096);
+                let planned_batches = Self::plan_multipass_cluster_batches(
+                    &unique_file_chunks,
+                    has_multi_domain_homonyms,
                 );
+                let overview_banner = Self::format_multipass_overview_banner(
+                    clean_prompt_for_prefix,
+                    &unique_file_chunks,
+                    &active_specific_clusters,
+                );
+                if let Some(tx) = telemetry_tx {
+                    let _ = Self::send_telemetry(
+                        tx,
+                        AgenticTelemetryEvent::TokenDelta {
+                            delta: format!("{}\n\n", overview_banner),
+                        },
+                    );
+                }
 
-                stream.write_all(request.as_bytes()).ok()?;
+                // Group batches sequentially by cluster_label
+                let mut cluster_sections: Vec<(&'static str, Vec<(usize, &ScoredChunk)>, String)> = Vec::new();
+                let mut first_batch_attempted = false;
 
-                let mut reader = BufReader::new(stream);
-                let mut header_line = String::new();
-                // Skip HTTP headers until blank line
-                loop {
-                    header_line.clear();
-                    let n = reader.read_line(&mut header_line).ok()?;
-                    if n == 0 || header_line == "\r\n" || header_line == "\n" {
-                        break;
+                for (cluster_label, batch_docs) in planned_batches {
+                    let need_heading = cluster_sections
+                        .last()
+                        .map(|(prev_lbl, _, _)| *prev_lbl != cluster_label)
+                        .unwrap_or(true);
+                    if need_heading {
+                        if !cluster_label.is_empty() {
+                            let heading = if cluster_label == "General Document Context" {
+                                "Additional Grounded Document Records"
+                            } else {
+                                cluster_label
+                            };
+                            if let Some(tx) = telemetry_tx {
+                                let _ = Self::send_telemetry(
+                                    tx,
+                                    AgenticTelemetryEvent::TokenDelta {
+                                        delta: format!("### {}\n\n", heading),
+                                    },
+                                );
+                            }
+                        }
+                        cluster_sections.push((cluster_label, Vec::new(), String::new()));
+                    }
+
+                    let batch_doc_nums: Vec<usize> = batch_docs.iter().map(|(n, _)| *n).collect();
+                    let batch_blocks = batch_docs
+                        .iter()
+                        .map(|&(doc_num, sc)| format_doc_excerpt(doc_num, sc, batch_excerpt_chars))
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let batch_prompt = Self::build_multipass_batch_prompt(
+                        clean_prompt_for_prefix,
+                        cluster_label,
+                        &batch_doc_nums,
+                        &batch_blocks,
+                        false,
+                    );
+                    let batch_messages = vec![
+                        serde_json::json!({
+                            "role": "system",
+                            "content": system_prompt
+                        }),
+                        serde_json::json!({
+                            "role": "user",
+                            "content": batch_prompt
+                        }),
+                    ];
+
+                    let raw_batch = Self::stream_ollama_chat_messages(
+                        &addr,
+                        host_port,
+                        target_model,
+                        &batch_messages,
+                        temp,
+                        batch_predict,
+                        num_ctx,
+                        max_hops,
+                        max_output_tokens,
+                        "",
+                        telemetry_tx,
+                    );
+                    let mut batch_prose = match raw_batch {
+                        Some(txt) => {
+                            first_batch_attempted = true;
+                            txt
+                        }
+                        None => {
+                            if !first_batch_attempted {
+                                return None;
+                            }
+                            String::new()
+                        }
+                    };
+
+                    // Active completeness and word-depth continuation gate (runs even on done_reason == "stop")
+                    let (missing_docs, is_shallow) =
+                        Self::find_missing_or_shallow_batch_docs(&batch_prose, &batch_doc_nums);
+                    if !missing_docs.is_empty() || is_shallow {
+                        let target_nums: Vec<usize> = if !missing_docs.is_empty() {
+                            missing_docs
+                        } else {
+                            batch_doc_nums.clone()
+                        };
+                        let target_docs: Vec<(usize, &ScoredChunk)> = batch_docs
+                            .iter()
+                            .copied()
+                            .filter(|(n, _)| target_nums.contains(n))
+                            .collect();
+                        let enrich_blocks = target_docs
+                            .iter()
+                            .map(|&(doc_num, sc)| format_doc_excerpt(doc_num, sc, batch_excerpt_chars))
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        let enrich_prompt = Self::build_multipass_batch_prompt(
+                            clean_prompt_for_prefix,
+                            cluster_label,
+                            &target_nums,
+                            &enrich_blocks,
+                            true,
+                        );
+                        let mut enrich_messages = batch_messages;
+                        if !batch_prose.trim().is_empty() {
+                            enrich_messages.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": batch_prose.trim()
+                            }));
+                        }
+                        enrich_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": enrich_prompt
+                        }));
+                        if let Some(enriched) = Self::stream_ollama_chat_messages(
+                            &addr,
+                            host_port,
+                            target_model,
+                            &enrich_messages,
+                            temp,
+                            batch_predict,
+                            num_ctx,
+                            max_hops,
+                            max_output_tokens,
+                            "",
+                            telemetry_tx,
+                        ) {
+                            if Self::is_shortcut_refusal_prose(&batch_prose) {
+                                batch_prose = enriched;
+                            } else if !enriched.trim().is_empty() {
+                                if !batch_prose.trim().is_empty() {
+                                    batch_prose.push_str("\n\n");
+                                }
+                                batch_prose.push_str(enriched.trim());
+                            }
+                        }
+                    }
+
+                    // Clean & ground this batch's prose, then ensure 100% batch doc coverage INSIDE this cluster section
+                    let (deduped_batch, _) = Self::deduplicate_repeated_paragraphs(&batch_prose);
+                    let mut cleaned_batch = Self::drop_ungrounded_sentences(&deduped_batch, &source_corpus);
+                    let cited_in_batch =
+                        Self::parse_cited_doc_indices(&cleaned_batch, unique_file_chunks.len());
+                    for (doc_num, sc) in &batch_docs {
+                        if !cited_in_batch.contains(doc_num) {
+                            let doc_name = sc
+                                .chunk
+                                .file_path
+                                .rsplit(['/', '\\'])
+                                .next()
+                                .unwrap_or(&sc.chunk.file_path);
+                            let origin_badge = if sc.is_remote
+                                && !sc.source_peer.is_empty()
+                                && !sc.source_peer.eq_ignore_ascii_case("local")
+                            {
+                                let short_peer: String = sc.source_peer.chars().take(12).collect();
+                                format!(" (Mesh Peer `{}`)", short_peer)
+                            } else {
+                                String::new()
+                            };
+                            let cleaned_doc = Self::clean_chunk_text(&sc.chunk.text_content);
+                            let fallback_para =
+                                crate::answer_orchestrator::synthesize_grounded_document_analysis(
+                                    clean_prompt_for_prefix,
+                                    homonym_subject_opt.as_deref(),
+                                    doc_name,
+                                    &origin_badge,
+                                    &cleaned_doc,
+                                    *doc_num,
+                                );
+                            if !fallback_para.is_empty() {
+                                if !cleaned_batch.trim().is_empty() {
+                                    cleaned_batch.push_str("\n\n");
+                                }
+                                cleaned_batch.push_str(&fallback_para);
+                            }
+                        }
+                    }
+
+                    if let Some((_, docs_acc, prose_acc)) = cluster_sections.last_mut() {
+                        docs_acc.extend(batch_docs);
+                        if !cleaned_batch.trim().is_empty() {
+                            if !prose_acc.trim().is_empty() {
+                                prose_acc.push_str("\n\n");
+                            }
+                            prose_acc.push_str(cleaned_batch.trim());
+                        }
                     }
                 }
 
-                let mut hop_text = String::new();
-                let mut pending_emit = String::new();
-                let mut line_buf = String::new();
-                let mut done_reason = String::new();
-                let mut hop_eval_count = 0usize;
-                let mut repetition_detected = false;
-
-                loop {
-                    if let Some(tx) = telemetry_tx {
-                        if tx.is_closed() {
-                            break;
-                        }
-                    }
-                    line_buf.clear();
-                    let n = match reader.read_line(&mut line_buf) {
-                        Ok(n) => n,
-                        Err(_) => break,
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                    let trimmed = line_buf.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                        if val.get("error").is_some() {
-                            return None;
-                        }
-                        if let Some(tok) = val
-                            .get("message")
-                            .and_then(|m| m.get("content"))
-                            .and_then(|c| c.as_str())
+                // Multi-cluster corpus-level depth gate (>= 1,500 words across multi-cluster / >=5-doc corpus)
+                if unique_file_chunks.len() >= 5 {
+                    let total_words: usize = cluster_sections
+                        .iter()
+                        .map(|(_, _, p)| p.split_whitespace().count())
+                        .sum();
+                    if total_words < 1500 {
+                        if let Some((cluster_label, docs_acc, prose_acc)) = cluster_sections
+                            .iter_mut()
+                            .min_by_key(|(_, docs, p)| {
+                                p.split_whitespace().count() / docs.len().max(1)
+                            })
                         {
-                            if !tok.is_empty() {
-                                full_text.push_str(tok);
-                                hop_text.push_str(tok);
-                                pending_emit.push_str(tok);
-
-                                if let Some(cut_pos) = Self::has_repeated_passage(&full_text) {
-                                    let emitted_len = full_text.len().saturating_sub(pending_emit.len());
-                                    let safe_cut = cut_pos.max(emitted_len);
-                                    if full_text.is_char_boundary(safe_cut) {
-                                        full_text.truncate(safe_cut);
+                            let target_docs: Vec<(usize, &ScoredChunk)> =
+                                docs_acc.iter().copied().take(6).collect();
+                            let target_nums: Vec<usize> =
+                                target_docs.iter().map(|(n, _)| *n).collect();
+                            let enrich_blocks = target_docs
+                                .iter()
+                                .map(|&(doc_num, sc)| format_doc_excerpt(doc_num, sc, batch_excerpt_chars))
+                                .collect::<Vec<_>>()
+                                .join("\n\n");
+                            let enrich_prompt = Self::build_multipass_batch_prompt(
+                                clean_prompt_for_prefix,
+                                cluster_label,
+                                &target_nums,
+                                &enrich_blocks,
+                                true,
+                            );
+                            let enrich_messages = vec![
+                                serde_json::json!({ "role": "system", "content": system_prompt }),
+                                serde_json::json!({ "role": "user", "content": enrich_prompt }),
+                            ];
+                            if let Some(extra) = Self::stream_ollama_chat_messages(
+                                &addr,
+                                host_port,
+                                target_model,
+                                &enrich_messages,
+                                temp,
+                                batch_predict,
+                                num_ctx,
+                                max_hops,
+                                max_output_tokens,
+                                "",
+                                telemetry_tx,
+                            ) {
+                                let grounded_extra =
+                                    Self::drop_ungrounded_sentences(&extra, &source_corpus);
+                                if !grounded_extra.trim().is_empty() {
+                                    if !prose_acc.trim().is_empty() {
+                                        prose_acc.push_str("\n\n");
                                     }
-                                    pending_emit.clear();
-                                    repetition_detected = true;
-                                    break;
-                                }
-
-                                if !prior_answer_text.is_empty() {
-                                    // Continuation turn: release only complete sentences, skipping ones that repeat
-                                    // the previous answer, so the user never sees the restatement stream by.
-                                    if let Some(cut) = Self::last_sentence_boundary(&pending_emit) {
-                                        let ready: String = pending_emit[..cut].to_string();
-                                        pending_emit = pending_emit[cut..].to_string();
-                                        let novel = Self::filter_repeating_segments(&ready, &prior_answer_text);
-                                        if !novel.is_empty() {
-                                            if let Some(tx) = telemetry_tx {
-                                                if !Self::send_telemetry(tx, AgenticTelemetryEvent::TokenDelta { delta: novel }) {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else if pending_emit.len() >= 56 {
-                                    let flush_chunk = std::mem::take(&mut pending_emit);
-                                    if let Some(tx) = telemetry_tx {
-                                        if !Self::send_telemetry(
-                                            tx,
-                                            AgenticTelemetryEvent::TokenDelta {
-                                                delta: flush_chunk,
-                                            },
-                                        ) {
-                                            break;
-                                        }
-                                    }
+                                    prose_acc.push_str(grounded_extra.trim());
                                 }
                             }
                         }
-                        if let Some(reason) = val.get("done_reason").and_then(|r| r.as_str()) {
-                            done_reason = reason.to_string();
-                        }
-                        if let Some(eval) = val.get("eval_count").and_then(|c| c.as_u64()) {
-                            hop_eval_count = eval as usize;
-                        }
-                        if val.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-                            break;
-                        }
                     }
                 }
 
-                if !pending_emit.is_empty() && !repetition_detected {
-                    let raw_tail = std::mem::take(&mut pending_emit);
-                    let flush_chunk = if prior_answer_text.is_empty() {
-                        raw_tail
-                    } else {
-                        Self::filter_repeating_segments(&raw_tail, &prior_answer_text)
-                    };
-                    if let Some(tx) = telemetry_tx {
-                        let _ = Self::send_telemetry(
-                            tx,
-                            AgenticTelemetryEvent::TokenDelta {
-                                delta: flush_chunk,
-                            },
-                        );
+                let mut assembled = String::new();
+                assembled.push_str(&overview_banner);
+                for (cluster_label, _, prose_acc) in cluster_sections {
+                    if prose_acc.trim().is_empty() {
+                        continue;
                     }
-                }
-
-                if repetition_detected {
-                    break;
-                }
-                if let Some(tx) = telemetry_tx {
-                    if tx.is_closed() {
-                        break;
+                    assembled.push_str("\n\n");
+                    if !cluster_label.is_empty() {
+                        let heading = if cluster_label == "General Document Context" {
+                            "Additional Grounded Document Records"
+                        } else {
+                            cluster_label
+                        };
+                        assembled.push_str(&format!("### {}\n\n", heading));
                     }
+                    assembled.push_str(prose_acc.trim());
                 }
+                assembled
+            } else {
+                let mut raw = Self::stream_ollama_chat_messages(
+                    &addr,
+                    host_port,
+                    target_model,
+                    &messages,
+                    temp,
+                    per_hop_predict,
+                    num_ctx,
+                    max_hops,
+                    max_output_tokens,
+                    &prior_answer_text,
+                    telemetry_tx,
+                )?;
+                let (deduped, _) = Self::deduplicate_repeated_paragraphs(&raw);
+                raw = deduped;
+                raw = Self::drop_ungrounded_sentences(&raw, &source_corpus);
+                raw
+            };
 
-                accumulated_tokens += if hop_eval_count > 0 {
-                    hop_eval_count
-                } else {
-                    hop_text.len() / 4
-                };
-
-                if done_reason == "length" && accumulated_tokens < max_output_tokens && hop_count < max_hops {
-                    let rolling_summary: String = if hop_text.len() > 1500 {
-                        let start = hop_text.len() - 1500;
-                        let safe_start = hop_text.char_indices().map(|(i, _)| i).find(|&i| i >= start).unwrap_or(start);
-                        hop_text[safe_start..].to_string()
-                    } else {
-                        hop_text.clone()
-                    };
-
-                    current_messages.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": rolling_summary
-                    }));
-                    current_messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": "Continue immediately from where you stopped. Maintain the exact same analytical depth and Markdown structure. Do not repeat earlier text, do not emit conversational filler, and seamlessly complete the analysis."
-                    }));
-                } else {
-                    break;
-                }
-            }
-
-            let (deduped, _) = Self::deduplicate_repeated_paragraphs(&full_text);
-            full_text = deduped;
-            full_text = Self::drop_ungrounded_sentences(&full_text, &source_corpus);
             if !prior_answer_text.is_empty() {
                 full_text = Self::drop_sentences_repeating_prior(&full_text, &prior_answer_text);
             }
@@ -8538,16 +9926,10 @@ impl DeterministicOfflineSynthesisEngine {
                 };
 
                 let consolidated_raw = Self::consolidate_duplicate_entity_statements(&prose_with_prefix);
-                let consolidated_prose = if has_multi_domain_homonyms {
-                    let homonym_subject = expected_prefix
-                        .trim_end()
-                        .strip_suffix(" is")
-                        .or_else(|| expected_prefix.trim_end().strip_suffix(" was"))
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty());
-                    crate::answer_orchestrator::enforce_multi_cluster_homonym_structure(
+                let sections_prose = if has_multi_domain_homonyms {
+                    crate::answer_orchestrator::enforce_multi_cluster_homonym_sections(
                         clean_prompt_for_prefix,
-                        homonym_subject,
+                        homonym_subject_opt.as_deref(),
                         &consolidated_raw,
                         &unique_file_chunks,
                     )
@@ -8555,10 +9937,24 @@ impl DeterministicOfflineSynthesisEngine {
                     consolidated_raw
                 };
                 // Feature 20: 100% Attested-Document Contribution Guarantee
-                // Coverage loop guarantees that every distinct document [1]..[K] that passed Nimble attestation
-                // actively contributes substantive grounded facts and carries an inline citation in the synthesized output.
-                let (compacted_prose, compacted_chunks) =
-                    crate::answer_orchestrator::enforce_attested_document_coverage_loop(&consolidated_prose, &unique_file_chunks);
+                // Coverage loop runs BEFORE appending `### Identity & Domain Cluster Summary` so
+                // any fallback contributions land inside the body before the summary table and Sources block.
+                let (mut compacted_prose, compacted_chunks) =
+                    crate::answer_orchestrator::enforce_attested_document_coverage_loop(
+                        &sections_prose,
+                        &unique_file_chunks,
+                    );
+                if has_multi_domain_homonyms
+                    && !compacted_prose.contains("### Identity & Domain Cluster Summary")
+                {
+                    let matrix = crate::answer_orchestrator::render_homonym_cluster_summary_table(
+                        &compacted_chunks,
+                    );
+                    if !matrix.is_empty() {
+                        compacted_prose =
+                            format!("{}\n\n{}", compacted_prose.trim_end(), matrix.trim());
+                    }
+                }
 
                 // Feature 10: Post-Synthesis Groundedness Verification
                 let groundedness = crate::answer_orchestrator::verify_post_synthesis_groundedness(&compacted_prose, &compacted_chunks);
@@ -8601,11 +9997,6 @@ impl DeterministicOfflineSynthesisEngine {
             }
         };
 
-        if let Ok(mut guard) = crate::dlp_mesh::global_mesh_dlp_controller().settings.write() {
-            if guard.ui.restrl_daemon_running {
-                guard.ui.restrl_processed_tasks = guard.ui.restrl_processed_tasks.saturating_add(1);
-            }
-        }
         Some((synthesized, turn_citations))
     }
 
@@ -10546,6 +11937,928 @@ Angela Davis is documented as the lessor in New Orleans [2].";
             out.contains("- **Role:** landlord [2], [3]\n- **Amounts:** $725.00 [2]"),
             "Markdown bullet list must preserve newlines, got:\n{}",
             out
+        );
+    }
+
+    #[test]
+    fn test_r2_strict_person_name_adjacency_filter_and_case_insensitivity() {
+        // Positive cases
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Women, Race & Class by Angela Davis.",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Delivered by Rev. Angela Davis at Unity.",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Authored by Angela Y. Davis in 1981.",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Lessor Angela Davis Breure signed the lease.",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Lease between Firldeal (Angela Davis) Breure (lessor) and Ava Davis.",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Record: Davis, Angela (landlord).",
+            "angela",
+            "davis"
+        ));
+
+        // Negative cases: unrelated title + surname even within 40 chars of "Angela"
+        assert!(!DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Alderman Davis met Angela at the hall.",
+            "angela",
+            "davis"
+        ));
+        assert!(!DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Angela whispered while Alderman Davis spoke.",
+            "angela",
+            "davis"
+        ));
+        assert!(!DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Senator Davis discussed the bill with Angela.",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::body_has_unrelated_titled_surname(
+            "Alderman Davis arrived.",
+            "davis"
+        ));
+        // R2.3 Mixed-case & possessive hardening
+        assert!(!DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Angela greeted Davis at noon.",
+            "angela",
+            "davis"
+        ));
+        assert!(!DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Angela thanked Davis.",
+            "angela",
+            "davis"
+        ));
+        assert!(!DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Angela's cousin Davis arrived.",
+            "angela",
+            "davis"
+        ));
+        assert!(!DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Angela's Davis Street office.",
+            "angela",
+            "davis"
+        ));
+        assert!(!DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "ANGELA'S COUSIN DAVIS.",
+            "angela",
+            "davis"
+        ));
+        // Retained positive cases (ALL-CAPS, filename case/underscores, Irish/hyphenated middle)
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "ANGELA YVONNE DAVIS",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "This biographical profile covers ANGELA YVONNE DAVIS in detail.",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency(
+            "Angela O'Connor Davis",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency_in_filename(
+            "Angela_Y_Davis_Sermon.docx",
+            "angela",
+            "davis"
+        ));
+        assert!(DeterministicOfflineSynthesisEngine::matches_strict_person_name_adjacency_in_filename(
+            "angela_marie_davis.docx",
+            "angela",
+            "davis"
+        ));
+
+        // Case-insensitive 2-word person query extraction
+        for q in ["Who is Angela Davis", "WhO is Angela Davis", "WHO IS ANGELA DAVIS", "whos Angela Davis"] {
+            let low = q.to_ascii_lowercase();
+            let extracted = DeterministicOfflineSynthesisEngine::extract_two_word_person_query_terms(
+                &low,
+                &[],
+            );
+            assert_eq!(
+                extracted,
+                Some(("angela".to_string(), "davis".to_string())),
+                "Failed for query `{q}`"
+            );
+        }
+
+        // End-to-end synthesize_with_history across mixed case queries rejects close-proximity Alderman Davis
+        let valid_sermon = ScoredChunk::new(
+            DocumentChunk::new(
+                "sermon:0",
+                "sermon",
+                "C:/Ministry/Visionary_Fire_Creation.docx",
+                1,
+                50,
+                0,
+                vec![0.1; 768],
+                "Unity sermon on spiritual renewal and divine presence. Signed at conclusion by Rev. Angela Davis.",
+                None,
+            )
+            .unwrap(),
+            0.92,
+            "local",
+            false,
+        );
+        let close_alderman = ScoredChunk::new(
+            DocumentChunk::new(
+                "mystery:0",
+                "mystery",
+                "C:/Mystery/Good_Times_Murder_Mystery.docx",
+                1,
+                30,
+                0,
+                vec![0.1; 768],
+                "Alderman Davis questioned Angela in the parlor about the missing ledger.",
+                None,
+            )
+            .unwrap(),
+            0.95,
+            "local",
+            false,
+        );
+        let greeted_or_possessive = ScoredChunk::new(
+            DocumentChunk::new(
+                "greet:0",
+                "greet",
+                "C:/Notes/Meeting_Notes.docx",
+                1,
+                30,
+                0,
+                vec![0.1; 768],
+                "Angela greeted Davis at noon near Angela's Davis Street office where Angela's cousin Davis arrived.",
+                None,
+            )
+            .unwrap(),
+            0.94,
+            "local",
+            false,
+        );
+        let all_caps_mid = ScoredChunk::new(
+            DocumentChunk::new(
+                "caps:0",
+                "caps",
+                "C:/Bio/Profile.docx",
+                1,
+                30,
+                0,
+                vec![0.1; 768],
+                "ANGELA YVONNE DAVIS published essays on social justice.",
+                None,
+            )
+            .unwrap(),
+            0.90,
+            "local",
+            false,
+        );
+        for q in ["Who is Angela Davis", "WhO is Angela Davis", "WHO IS ANGELA DAVIS"] {
+            let (ans, cits) = DeterministicOfflineSynthesisEngine::synthesize_with_history(
+                q,
+                q,
+                &[],
+                &[
+                    close_alderman.clone(),
+                    greeted_or_possessive.clone(),
+                    valid_sermon.clone(),
+                    all_caps_mid.clone(),
+                ],
+                "offline",
+                None,
+            );
+            assert!(!ans.contains("Alderman Davis"), "Leaked Alderman Davis for `{q}`:\n{ans}");
+            assert!(!ans.contains("Good_Times_Murder_Mystery"), "Leaked mystery doc for `{q}`:\n{ans}");
+            assert!(!ans.contains("Meeting_Notes.docx"), "Leaked possessive/greeted doc for `{q}`:\n{ans}");
+            assert_eq!(cits.len(), 2, "Only valid sermon + ALL-CAPS middle-name doc should survive for `{q}`");
+            assert!(ans.contains("Visionary_Fire_Creation.docx"), "Missing sermon for `{q}`");
+            assert!(ans.contains("Profile.docx"), "Missing ANGELA YVONNE DAVIS doc for `{q}`");
+        }
+    }
+
+    #[test]
+    fn test_r2_answer_focused_window_preserves_tail_signature() {
+        let filler = "Spiritual reflection on community stewardship and renewal in the sanctuary. ".repeat(140);
+        let sermon = format!(
+            "Opening invocation on Visionary Fire Creation.\n\n{}\n\nBenediction and closing prayer.\nRev. Angela Davis\nSenior Unity Minister",
+            filler
+        );
+        assert!(sermon.chars().count() > 9500);
+        let window_6000 = DeterministicOfflineSynthesisEngine::answer_focused_window(
+            "Who is Angela Davis",
+            &sermon,
+            6000,
+        );
+        assert!(
+            window_6000.chars().count() <= 6000,
+            "Window exceeded 6000 chars: {}",
+            window_6000.chars().count()
+        );
+        assert!(
+            window_6000.contains("Opening invocation"),
+            "Must retain document lead"
+        );
+        assert!(
+            window_6000.contains("Rev. Angela Davis"),
+            "Must preserve tail signature 'Rev. Angela Davis' inside 6000-char window, got tail: {}",
+            &window_6000[window_6000.len().saturating_sub(300)..]
+        );
+
+        // Multi-hit (>= 8 spaced post-lead hits) + < min_gap hit near tail + trailing "Rev. Angela Davis"
+        // at both 6000 and 3200 char budgets
+        let mut multi_hit_sermon = String::from(
+            "Opening invocation on Visionary Fire Creation.\n\n",
+        );
+        for i in 0..8 {
+            multi_hit_sermon.push_str(&format!(
+                "Section {i}: Angela Davis teaches spiritual stewardship and community renewal. "
+            ));
+            multi_hit_sermon.push_str(
+                &"Contemplative reflection on sanctuary leadership and divine presence. ".repeat(19),
+            );
+            multi_hit_sermon.push_str("\n\n");
+        }
+        multi_hit_sermon.push_str("Closing remarks mention Angela Davis briefly before benediction.\n");
+        multi_hit_sermon.push_str(&"Sanctuary blessing. ".repeat(12));
+        multi_hit_sermon.push_str("\nBenediction and closing prayer.\nRev. Angela Davis\nSenior Unity Minister");
+        assert!(multi_hit_sermon.chars().count() > 11_000);
+
+        for budget in [6000usize, 3200usize] {
+            let win = DeterministicOfflineSynthesisEngine::answer_focused_window(
+                "Who is Angela Davis",
+                &multi_hit_sermon,
+                budget,
+            );
+            assert!(
+                win.chars().count() <= budget,
+                "Window exceeded {budget} chars: {}",
+                win.chars().count()
+            );
+            assert!(
+                win.contains("Opening invocation"),
+                "Must retain document lead for budget={budget}"
+            );
+            assert!(
+                win.contains("Rev. Angela Davis"),
+                "Must preserve tail signature 'Rev. Angela Davis' for >=8 spaced hits at budget={budget}, got tail: {}",
+                &win[win.len().saturating_sub(300)..]
+            );
+        }
+    }
+
+    #[test]
+    fn test_r2_multipass_batching_and_completeness_gate() {
+        let mut docs = Vec::new();
+        for i in 0..8 {
+            docs.push(ScoredChunk::new(
+                DocumentChunk::new(
+                    format!("lease_{i}:0"),
+                    format!("lease_{i}"),
+                    format!("C:/Leases/Property_{i}_Lease.docx"),
+                    1,
+                    20,
+                    0,
+                    vec![0.1; 768],
+                    format!("SIMPLE LEASE AGREEMENT between Angela Davis (landlord) and Tenant {i} for monthly rent ${}00.", i + 5),
+                    None,
+                )
+                .unwrap(),
+                0.9,
+                "local",
+                false,
+            ));
+        }
+        for i in 0..3 {
+            docs.push(ScoredChunk::new(
+                DocumentChunk::new(
+                    format!("min_{i}:0"),
+                    format!("min_{i}"),
+                    format!("C:/Ministry/Sermon_{i}.docx"),
+                    1,
+                    20,
+                    0,
+                    vec![0.1; 768],
+                    format!("Unity sermon {i} by Reverend Angela Davis exploring New Thought ministry."),
+                    None,
+                )
+                .unwrap(),
+                0.88,
+                "local",
+                false,
+            ));
+        }
+        let refs: Vec<&ScoredChunk> = docs.iter().collect();
+        let batches = DeterministicOfflineSynthesisEngine::plan_multipass_cluster_batches(&refs, true);
+        // 8 lease docs -> 2 batches (6 + 2); 3 ministry docs -> 1 batch (3) => 3 batches total, each <= 6 docs
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|(_, b)| !b.is_empty() && b.len() <= 6));
+
+        // Completeness gate catches missing [k], < 150 words/doc, and shortcut refusals even on done_reason=stop
+        let short_with_missing = "Angela Davis is the landlord in [1] and [2]. This response will focus on key highlights.";
+        let (missing, shallow) =
+            DeterministicOfflineSynthesisEngine::find_missing_or_shallow_batch_docs(
+                short_with_missing,
+                &[1, 2, 3, 4],
+            );
+        assert_eq!(missing, vec![3, 4]);
+        assert!(shallow);
+
+        let deep_enough = format!("{} [1] [2]", "Detailed grounded clause analysis across the lease terms. ".repeat(45));
+        let (missing2, shallow2) =
+            DeterministicOfflineSynthesisEngine::find_missing_or_shallow_batch_docs(
+                &deep_enough,
+                &[1, 2],
+            );
+        assert!(missing2.is_empty());
+        assert!(!shallow2);
+
+        let overview = DeterministicOfflineSynthesisEngine::format_multipass_overview_banner(
+            "Who is Angela Davis",
+            &refs,
+            &[
+                "Residential Property Leasing & Real Estate Management",
+                "Religious Ministry, Spiritual Teaching & Organizational Stewardship",
+            ],
+        );
+        assert!(overview.contains("[11]"), "Overview must list all 11 attested citations: {overview}");
+    }
+
+    #[test]
+    fn test_r2_mesh_synthesis_relay_request_signing_and_origin_attribution() {
+        let seed = [0x42u8; 32];
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let requester_pid = quorum_network::derive_peer_id_from_pubkey(&pubkey)
+            .unwrap()
+            .to_string();
+        let third_peer_pid = "12D3KooWEcNhRemotePeer12345".to_string();
+
+        let local_sc = ScoredChunk::new(
+            DocumentChunk::new(
+                "loc:0",
+                "loc",
+                "C:/Local/Doc1.docx",
+                1,
+                10,
+                0,
+                vec![0.1; 768],
+                "Local requester evidence.",
+                None,
+            )
+            .unwrap(),
+            0.95,
+            "local",
+            false,
+        );
+        let remote_sc = ScoredChunk::new(
+            DocumentChunk::new(
+                "rem:0",
+                "rem",
+                "D:/Remote/Doc2.docx",
+                1,
+                10,
+                0,
+                vec![0.1; 768],
+                "Remote peer evidence.",
+                None,
+            )
+            .unwrap(),
+            0.92,
+            third_peer_pid.clone(),
+            true,
+        );
+
+        let req = DeterministicOfflineSynthesisEngine::build_mesh_synthesis_relay_request(
+            "Who is Angela Davis",
+            &[],
+            &[&local_sc, &remote_sc],
+            "qwen2.5:7b",
+            Some((requester_pid.clone(), seed)),
+        );
+        assert_eq!(req.sender_peer_id, requester_pid);
+        assert_eq!(req.sender_pubkey, pubkey);
+        assert!(
+            crate::crypto::verify_request(&req, quorum_types::AccessTier::Tier0Public, 60).is_ok(),
+            "Relay request must verify cleanly against real Ed25519 signing credentials"
+        );
+        let relay = req.synthesis_relay.expect("relay payload");
+        assert_eq!(relay.evidence_chunks[0].origin_peer_id.as_deref(), Some(requester_pid.as_str()));
+        assert_eq!(relay.evidence_chunks[1].origin_peer_id.as_deref(), Some(third_peer_pid.as_str()));
+
+        // Low-RAM delegation check (< 6.0 GB RAM and < 4500 MB VRAM)
+        let low_hw = crate::hardware::HardwareTelemetry {
+            free_ram_gb: 3.5,
+            total_ram_gb: 8.0,
+            free_vram_mb: 0,
+            total_vram_mb: 0,
+            cpu_cores: 4,
+            gpu_name: None,
+            gpu_count: 0,
+        };
+        assert!(DeterministicOfflineSynthesisEngine::should_prefer_mesh_relay_upfront(
+            &low_hw,
+            &["qwen2.5:1.5b".to_string()],
+        ));
+    }
+
+    #[test]
+    fn test_r2_preposition_cleanup_in_remap_and_compact_citations() {
+        let sc = ScoredChunk::new(
+            DocumentChunk::new(
+                "d1:0",
+                "d1",
+                "C:/Docs/Lease.docx",
+                1,
+                10,
+                0,
+                vec![0.1; 768],
+                "Angela Davis is the landlord.",
+                None,
+            )
+            .unwrap(),
+            0.95,
+            "local",
+            false,
+        );
+        let raw = "According to [99], and [100], the agreement states rent is $725 [1]. In documents such as [99] and [100], the tenant agreed [1]. Verified in [1], and [99].";
+        let (cleaned, kept) = DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
+            raw,
+            &[&sc],
+            true,
+        );
+        assert_eq!(kept.len(), 1);
+        assert!(!cleaned.contains("According to, and,"), "Dangling 'According to, and,' leaked: {cleaned}");
+        assert!(!cleaned.contains("According to,"), "Dangling 'According to,' leaked: {cleaned}");
+        assert!(!cleaned.contains("such as and,"), "Dangling 'such as and,' leaked: {cleaned}");
+        assert!(!cleaned.contains(", and ."), "Dangling ', and .' leaked: {cleaned}");
+        assert!(cleaned.contains("[1]"));
+
+        // Mixed valid+OOB, comma-less, sentence-end, and control assertions
+        let (mix_left, _) = DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
+            "According to [99] and [1], rent is $725 [1].",
+            &[&sc],
+            true,
+        );
+        assert_eq!(mix_left.trim(), "According to [1], rent is $725 [1].");
+
+        let (mix_right, _) = DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
+            "According to [1] and [99], rent is $725 [1].",
+            &[&sc],
+            true,
+        );
+        assert_eq!(mix_right.trim(), "According to [1], rent is $725 [1].");
+
+        let (commaless, _) = DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
+            "According to [99] and [100] the tenant agreed [1].",
+            &[&sc],
+            true,
+        );
+        assert_eq!(commaless.trim(), "The tenant agreed [1].");
+
+        let (sent_end, _) = DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
+            "She lived in New Orleans, according to [99] and [100]. Lease [1] confirms.",
+            &[&sc],
+            true,
+        );
+        assert_eq!(sent_end.trim(), "She lived in New Orleans. Lease [1] confirms.");
+
+        let (in_docs_left, _) = DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
+            "In documents such as [99] and [1], the tenant agreed [1].",
+            &[&sc],
+            true,
+        );
+        assert_eq!(in_docs_left.trim(), "In documents such as [1], the tenant agreed [1].");
+
+        let (in_docs_right, _) = DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
+            "In documents such as [1] and [99], the tenant agreed [1].",
+            &[&sc],
+            true,
+        );
+        assert_eq!(in_docs_right.trim(), "In documents such as [1], the tenant agreed [1].");
+
+        let sc2 = ScoredChunk::new(
+            DocumentChunk::new(
+                "d2:0",
+                "d2",
+                "C:/Docs/Addendum.docx",
+                1,
+                10,
+                0,
+                vec![0.1; 768],
+                "Addendum confirms $725.",
+                None,
+            )
+            .unwrap(),
+            0.90,
+            "local",
+            false,
+        );
+        let (ctrl1, _) = DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
+            "According to [1] and [2], the lease states $725 [1].",
+            &[&sc, &sc2],
+            true,
+        );
+        assert_eq!(ctrl1.trim(), "According to [1] and [2], the lease states $725 [1].");
+
+        let (ctrl2, _) = DeterministicOfflineSynthesisEngine::remap_and_compact_citations(
+            "According to the lease agreement, rent is $725 [1].",
+            &[&sc],
+            true,
+        );
+        assert_eq!(ctrl2.trim(), "According to the lease agreement, rent is $725 [1].");
+    }
+
+    #[test]
+    fn test_r2_family_counted_selection_preserves_all_48_families_with_multi_chunk_docs() {
+        // 48 unique document families x 2 chunks each = 96 raw chunks (> chunk_limit=64 and > max_excerpts=48).
+        // Family-counted selection must preserve all 48 canonical families into [1]..[48].
+        let mut chunks: Vec<ScoredChunk> = Vec::with_capacity(96);
+        for fam_idx in 0..48usize {
+            let suffix_0 = if fam_idx % 2 == 0 { "_v1.docx" } else { ".docx" };
+            let suffix_1 = if fam_idx % 2 == 0 { "_final.docx" } else { " (1).docx" };
+            let peer_1 = if fam_idx % 2 == 0 { "local" } else { "12D3KooWPeerB" };
+            let remote_1 = fam_idx % 2 != 0;
+            for part in 0..2usize {
+                let score = 0.99 - (fam_idx as f32) * 0.005 - (part as f32) * 0.0001;
+                let file_path = if part == 0 {
+                    format!("C:/Corpus/Angela_Davis_Record_{fam_idx:02}{suffix_0}")
+                } else {
+                    format!("D:/Corpus/Angela_Davis_Record_{fam_idx:02}{suffix_1}")
+                };
+                chunks.push(ScoredChunk::new(
+                    DocumentChunk::new(
+                        format!("fam_{fam_idx:02}:{part}"),
+                        format!("fam_{fam_idx:02}"),
+                        file_path,
+                        (part * 20 + 1) as u32,
+                        (part * 20 + 20) as u32,
+                        0,
+                        vec![0.1; 768],
+                        format!(
+                            "Record {fam_idx:02} section {part}: Angela Davis documented property stewardship clause {fam_idx:02} part {part} for monthly fee ${}.00.",
+                            500 + fam_idx
+                        ),
+                        None,
+                    )
+                    .unwrap(),
+                    score,
+                    if part == 0 { "local" } else { peer_1 },
+                    if part == 0 { false } else { remote_1 },
+                ));
+            }
+        }
+        assert_eq!(chunks.len(), 96);
+
+        let (ans, cits) = DeterministicOfflineSynthesisEngine::synthesize_with_history(
+            "Summarize all Angela Davis records",
+            "Summarize all Angela Davis records",
+            &[],
+            &chunks,
+            "offline",
+            None,
+        );
+        assert_eq!(
+            cits.len(),
+            48,
+            "All 48 unique canonical families must survive 96 raw multi-chunk inputs without evicting families 33..48; got {} citations",
+            cits.len()
+        );
+        assert!(
+            ans.contains("[48]"),
+            "Final synthesized output must cite [48]: tail=\n{}",
+            &ans[ans.len().saturating_sub(600)..]
+        );
+    }
+
+    #[test]
+    fn test_r2_multipass_live_mock_ollama_loop_and_completeness_gate() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let mut docs: Vec<ScoredChunk> = Vec::with_capacity(11);
+        for i in 0..8usize {
+            docs.push(ScoredChunk::new(
+                DocumentChunk::new(
+                    format!("mp_lease_{i}:0"),
+                    format!("mp_lease_{i}"),
+                    format!("C:/Leases/Property_{i}_Lease.docx"),
+                    1,
+                    25,
+                    0,
+                    vec![0.1; 768],
+                    format!(
+                        "SIMPLE LEASE AGREEMENT between Angela Davis (landlord) and Tenant{i} (tenant) at {i}00 Castiglione Street for monthly rent ${}00.00 with security deposit ${}50.00 and renewal notice required.",
+                        6 + i,
+                        6 + i
+                    ),
+                    None,
+                )
+                .unwrap(),
+                0.95 - (i as f32) * 0.005,
+                "local",
+                false,
+            ));
+        }
+        for i in 0..3usize {
+            docs.push(ScoredChunk::new(
+                DocumentChunk::new(
+                    format!("mp_min_{i}:0"),
+                    format!("mp_min_{i}"),
+                    format!("C:/Ministry/Sermon_{i}.docx"),
+                    1,
+                    25,
+                    0,
+                    vec![0.1; 768],
+                    format!(
+                        "Unity spiritual teaching sermon {i} by Reverend Angela Davis on New Thought ministry, sanctuary stewardship, and metaphysical prayer."
+                    ),
+                    None,
+                )
+                .unwrap(),
+                0.90 - (i as f32) * 0.005,
+                "local",
+                false,
+            ));
+        }
+        let doc_refs: Vec<&ScoredChunk> = docs.iter().collect();
+
+        #[derive(Clone, Debug)]
+        struct RecordedCall {
+            num_ctx: u64,
+            num_predict: u64,
+            excerpt_count: usize,
+            has_assistant_refusal: bool,
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock ollama");
+        let addr = listener.local_addr().expect("local addr");
+        let host_port = format!("127.0.0.1:{}", addr.port());
+        let recorded = Arc::new(Mutex::new(Vec::<RecordedCall>::new()));
+        let recorded_srv = Arc::clone(&recorded);
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop_flag);
+        listener.set_nonblocking(true).expect("set_nonblocking");
+
+        let server_handle = std::thread::spawn(move || {
+            let mut call_idx = 0usize;
+            while !stop_srv.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                        let mut req_line = String::new();
+                        if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                            continue;
+                        }
+                        let mut content_len = 0usize;
+                        let mut hline = String::new();
+                        loop {
+                            hline.clear();
+                            if reader.read_line(&mut hline).unwrap_or(0) == 0
+                                || hline == "\r\n"
+                                || hline == "\n"
+                            {
+                                break;
+                            }
+                            let low = hline.to_ascii_lowercase();
+                            if let Some(rest) = low.strip_prefix("content-length:") {
+                                content_len = rest.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                        let mut body_bytes = vec![0u8; content_len];
+                        if content_len > 0 && reader.read_exact(&mut body_bytes).is_err() {
+                            continue;
+                        }
+                        let req_json: serde_json::Value =
+                            serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+                        let num_ctx = req_json["options"]["num_ctx"].as_u64().unwrap_or(0);
+                        let num_predict = req_json["options"]["num_predict"].as_u64().unwrap_or(0);
+                        let msgs = req_json["messages"].as_array().cloned().unwrap_or_default();
+                        let has_assistant_refusal = msgs.iter().any(|m| {
+                            m["role"].as_str() == Some("assistant")
+                                && m["content"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .contains("This response will focus on")
+                        });
+                        let user_prompt = msgs
+                            .iter()
+                            .rev()
+                            .find(|m| m["role"].as_str() == Some("user"))
+                            .and_then(|m| m["content"].as_str())
+                            .unwrap_or("");
+
+                        let mut doc_nums: Vec<usize> = Vec::new();
+                        for line in user_prompt.lines() {
+                            if let Some(rest) = line.strip_prefix('[') {
+                                if let Some((num_s, after)) = rest.split_once(']') {
+                                    if after.starts_with(" Source File:") {
+                                        if let Ok(n) = num_s.parse::<usize>() {
+                                            doc_nums.push(n);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        recorded_srv.lock().unwrap().push(RecordedCall {
+                            num_ctx,
+                            num_predict,
+                            excerpt_count: doc_nums.len(),
+                            has_assistant_refusal,
+                        });
+                        call_idx += 1;
+
+                        let make_grounded_sentences = |n: usize, ministry: bool, count: usize| -> String {
+                            const LEASE_TEMPLATES: &[&str] = &[
+                                "Angela Davis is named as landlord in the lease agreement",
+                                "The Castiglione Street lease specifies monthly rent and security deposit obligations",
+                                "Renewal notice is required under the Castiglione Street lease with Angela Davis",
+                                "Monthly rent and security deposit terms bind the tenant and landlord Angela Davis",
+                                "The lease agreement documents landlord responsibilities for Angela Davis at Castiglione Street",
+                                "Security deposit rules and renewal notice terms appear in the Castiglione Street agreement",
+                                "Landlord Angela Davis executed the Castiglione Street lease specifying monthly rent",
+                                "Tenant and landlord obligations cover monthly rent, security deposit, and renewal notice",
+                                "The agreement confirms Angela Davis manages the Castiglione Street lease terms",
+                                "Provision details for monthly rent and renewal notice are recorded by Angela Davis",
+                                "Castiglione Street lease clauses establish the security deposit and monthly rent schedule",
+                                "Written renewal notice requirements apply to the Castiglione Street lease with Angela Davis",
+                            ];
+                            const MINISTRY_TEMPLATES: &[&str] = &[
+                                "Reverend Angela Davis led Unity spiritual teaching and New Thought ministry",
+                                "Sanctuary stewardship and metaphysical prayer are emphasized by Reverend Angela Davis",
+                                "The Unity sermon documents New Thought ministry work led by Reverend Angela Davis",
+                                "Spiritual teaching and sanctuary stewardship themes appear in the Unity sermon",
+                                "Metaphysical prayer guides New Thought ministry under Reverend Angela Davis",
+                                "Reverend Angela Davis directed sanctuary stewardship in the Unity spiritual teaching record",
+                                "New Thought ministry principles and metaphysical prayer anchor the Unity sermon",
+                                "Unity teaching by Reverend Angela Davis highlights sanctuary stewardship",
+                                "The sermon record affirms Reverend Angela Davis in Unity spiritual teaching",
+                                "Metaphysical prayer and spiritual teaching define the New Thought ministry work",
+                                "Sanctuary stewardship practices are detailed by Reverend Angela Davis",
+                                "Unity ministry records preserve metaphysical prayer and New Thought teaching",
+                            ];
+                            let templates = if ministry { MINISTRY_TEMPLATES } else { LEASE_TEMPLATES };
+                            let mut out = String::new();
+                            for idx in 0..count {
+                                let t = templates[idx % templates.len()];
+                                out.push_str(&format!("{t} [{n}]. "));
+                            }
+                            out
+                        };
+
+                        let is_ministry = user_prompt.contains("Religious Ministry");
+                        let reply_text = if call_idx == 1 {
+                            // Batch 1 initial: shortcut refusal with done_reason == "stop"
+                            format!(
+                                "This response will focus on [{}] due to space.",
+                                doc_nums.first().copied().unwrap_or(1)
+                            )
+                        } else if call_idx == 2 {
+                            // Batch 1 enrichment: replaces refusal, cites all docs in batch (~420 words)
+                            let mut s = String::new();
+                            for &n in &doc_nums {
+                                s.push_str(&make_grounded_sentences(n, is_ministry, 6));
+                            }
+                            s
+                        } else if call_idx == 3 {
+                            // Batch 2 initial: short (< 300 words) and omits doc_nums[1]
+                            let first_n = doc_nums.first().copied().unwrap_or(7);
+                            make_grounded_sentences(first_n, is_ministry, 1)
+                        } else if call_idx == 4 {
+                            // Batch 2 enrichment: still omits doc_nums[1] so inside-cluster repair triggers
+                            let first_n = doc_nums.first().copied().unwrap_or(7);
+                            make_grounded_sentences(first_n, is_ministry, 5)
+                        } else if call_idx == 5 {
+                            // Batch 3: >= 150 words/doc citing all docs in batch, keeping total corpus < 1500 words
+                            let mut s = String::new();
+                            for &n in &doc_nums {
+                                s.push_str(&make_grounded_sentences(n, is_ministry, 12));
+                            }
+                            s
+                        } else {
+                            // Corpus-level < 1500-word enrichment pass: > 950 grounded words
+                            let mut s = String::new();
+                            for &n in &doc_nums {
+                                s.push_str(&make_grounded_sentences(n, is_ministry, 15));
+                            }
+                            s
+                        };
+
+                        let chunk = serde_json::json!({
+                            "model": "qwen2.5:7b",
+                            "message": { "role": "assistant", "content": reply_text },
+                            "done": true,
+                            "done_reason": "stop",
+                            "eval_count": 128
+                        })
+                        .to_string();
+                        let http_resp = format!(
+                            "HTTP/1.0 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{}\n",
+                            chunk
+                        );
+                        let _ = stream.write_all(http_resp.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let hw = crate::hardware::HardwareTelemetry {
+            free_ram_gb: 64.0,
+            total_ram_gb: 64.0,
+            free_vram_mb: 8192,
+            total_vram_mb: 8192,
+            cpu_cores: 16,
+            gpu_name: Some("MockGPU".to_string()),
+            gpu_count: 1,
+        };
+        let ui = crate::dlp_mesh::ChatGptUiSettings::default();
+        let installed = vec!["qwen2.5:7b".to_string()];
+
+        let result = DeterministicOfflineSynthesisEngine::query_local_ollama_chat_at(
+            addr,
+            &host_port,
+            "Who is Angela Davis",
+            &[],
+            &doc_refs,
+            "qwen2.5:7b",
+            &hw,
+            &ui,
+            &installed,
+            None,
+        );
+
+        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = server_handle.join();
+
+        let (answer, citations) = result.expect("query_local_ollama_chat_at should succeed");
+        let calls = recorded.lock().unwrap().clone();
+        assert!(
+            calls.len() >= 6,
+            "Expected >= 6 /api/chat calls (3 batches + refusal enrichment + batch2 enrichment + <1500w corpus pass), got {}: {:?}",
+            calls.len(),
+            calls
+        );
+        for (idx, c) in calls.iter().enumerate() {
+            assert_eq!(c.num_ctx, 32768, "Call {idx} must use num_ctx=32768");
+            assert!(c.num_predict >= 4096, "Call {idx} must use num_predict>=4096, got {}", c.num_predict);
+            assert!(c.excerpt_count >= 1 && c.excerpt_count <= 6, "Call {idx} batch size must be 1..=6, got {}", c.excerpt_count);
+        }
+        assert!(
+            calls[1].has_assistant_refusal,
+            "Call 2 enrichment must pass prior assistant shortcut refusal in messages"
+        );
+
+        assert!(
+            !answer.contains("This response will focus on"),
+            "Shortcut refusal must be completely replaced:\n{answer}"
+        );
+        assert!(
+            !answer.contains("**Source Record "),
+            "Must never dump raw Source Record blocks:\n{answer}"
+        );
+        assert!(
+            answer.contains("### Identity & Domain Cluster Summary"),
+            "Must contain unified summary table:\n{answer}"
+        );
+        for k in 1..=11usize {
+            assert!(
+                answer.contains(&format!("[{k}]")),
+                "All 11 documents must be cited; missing [{k}] in:\n{answer}"
+            );
+            assert!(
+                answer.contains(&format!("**[{k}]**")),
+                "Summary table must include **[{k}]**:\n{answer}"
+            );
+        }
+        assert_eq!(
+            citations.len(),
+            11,
+            "Must return 1-to-1 Sources citations for all 11 attested docs"
         );
     }
 }

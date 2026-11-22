@@ -196,9 +196,11 @@ async fn serve_asset(Path(path): Path<String>) -> Response {
     }
 }
 
-/// GET /favicon.ico - Serves favicon.
+/// GET /favicon.ico - Serves custom QuorumRAG icon.
 async fn serve_favicon() -> Response {
-    if let Some((bytes, mime)) = quorum_ui::get_asset("favicon.svg") {
+    if let Some((bytes, _)) = quorum_ui::get_asset("favicon.ico") {
+        ([(header::CONTENT_TYPE, "image/x-icon")], bytes).into_response()
+    } else if let Some((bytes, mime)) = quorum_ui::get_asset("favicon.svg") {
         ([(header::CONTENT_TYPE, mime)], bytes).into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()

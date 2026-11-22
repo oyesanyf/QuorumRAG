@@ -108,6 +108,158 @@ pub fn consonant_skeleton(s: &str) -> String {
     out
 }
 
+/// Cleans dangling prepositions, conjunctions, and orphaned punctuation left behind when
+/// out-of-bounds citation markers (`[99]`, `[100]`) are stripped from synthesized prose.
+pub fn clean_dangling_citation_prepositions(text: &str) -> String {
+    use std::sync::OnceLock;
+    static RE_SPACE_PUNCT: OnceLock<Regex> = OnceLock::new();
+    static RE_EMPTY_PARENS: OnceLock<Regex> = OnceLock::new();
+    static RE_PAREN_LEAD_CONJ: OnceLock<Regex> = OnceLock::new();
+    static RE_PAREN_TRAIL_CONJ: OnceLock<Regex> = OnceLock::new();
+    static RE_INTRO_CONJ_BEFORE_CITE: OnceLock<Regex> = OnceLock::new();
+    static RE_INTRO_COMMA_BEFORE_CITE: OnceLock<Regex> = OnceLock::new();
+    static RE_INTRO_CITE_DANGLING_CONJ: OnceLock<Regex> = OnceLock::new();
+    static RE_ACCORDING_AND: OnceLock<Regex> = OnceLock::new();
+    static RE_ACCORDING_END: OnceLock<Regex> = OnceLock::new();
+    static RE_MID_CONJ_COMMA: OnceLock<Regex> = OnceLock::new();
+    static RE_DANGLING_CONJ_PUNCT: OnceLock<Regex> = OnceLock::new();
+    static RE_MULTI_COMMA: OnceLock<Regex> = OnceLock::new();
+    static RE_LEAD_COMMA: OnceLock<Regex> = OnceLock::new();
+
+    let re_space_punct = RE_SPACE_PUNCT.get_or_init(|| Regex::new(r"[ \t]+([.,;:])").unwrap());
+    let re_empty_parens =
+        RE_EMPTY_PARENS.get_or_init(|| Regex::new(r"[ \t]*\(\s*(?:[,;]|and|or)?\s*\)").unwrap());
+    let re_paren_lead_conj = RE_PAREN_LEAD_CONJ.get_or_init(|| {
+        Regex::new(r"(?i)\(\s*(?:[,;]|\b(?:and|or)\b)\s*(\[\d+(?:\s*,\s*\d+)*\])\s*\)").unwrap()
+    });
+    let re_paren_trail_conj = RE_PAREN_TRAIL_CONJ.get_or_init(|| {
+        Regex::new(r"(?i)\(\s*(\[\d+(?:\s*,\s*\d+)*\])\s*(?:[,;]|\b(?:and|or)\b)\s*\)").unwrap()
+    });
+    let re_intro_conj_before_cite = RE_INTRO_CONJ_BEFORE_CITE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(\b(?:according\s+to|based\s+on|per|as\s+(?:noted|stated|documented)\s+in|in\s+(?:documents?|sources?|records?)\s+such\s+as|verified\s+in|reported\s+in|confirmed\s+in|shown\s+in|from|in|see)(?:\s+(?:the\s+)?(?:sources?|documents?|records?))?)(?:\s*,\s*|\s+)\b(?:and|or)\b\s*(\[\d+\])",
+        )
+        .unwrap()
+    });
+    let re_intro_comma_before_cite = RE_INTRO_COMMA_BEFORE_CITE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(\b(?:according\s+to|based\s+on|per|as\s+(?:noted|stated|documented)\s+in|in\s+(?:documents?|sources?|records?)\s+such\s+as|verified\s+in|reported\s+in|confirmed\s+in|shown\s+in|from|in|see)(?:\s+(?:the\s+)?(?:sources?|documents?|records?))?)\s*,\s*(\[\d+\])",
+        )
+        .unwrap()
+    });
+    let re_intro_cite_dangling_conj = RE_INTRO_CITE_DANGLING_CONJ.get_or_init(|| {
+        Regex::new(
+            r"(?i)(\b(?:according\s+to|based\s+on|per|as\s+(?:noted|stated|documented)\s+in|in\s+(?:documents?|sources?|records?)\s+such\s+as|verified\s+in|reported\s+in|confirmed\s+in|shown\s+in|see)(?:\s+(?:the\s+)?(?:sources?|documents?|records?))?\s+\[\d+\](?:\s*,\s*\[\d+\])*)\s*(?:,\s*)?\b(?:and|or)\b\s*,",
+        )
+        .unwrap()
+    });
+    let re_according_and = RE_ACCORDING_AND.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:,\s*)?\b(?:according\s+to|based\s+on|per|as\s+(?:noted|stated|documented)\s+in|in\s+(?:documents?|sources?|records?)\s+such\s+as)(?:\s+(?:the\s+)?(?:sources?|documents?|records?))?(?:(?:\s*,\s*|\s+)\b(?:and|or)\b\s*,|\s*,|\s+\b(?:and|or)\b\s+)\s*",
+        )
+        .unwrap()
+    });
+    let re_according_end = RE_ACCORDING_END.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:,\s*)?\b(?:according\s+to|based\s+on|per|as\s+(?:noted|stated|documented)\s+in|in\s+(?:documents?|sources?|records?)\s+such\s+as)(?:\s+(?:the\s+)?(?:sources?|documents?|records?))?(?:\s*,?\s*\b(?:and|or)\b)?\s*\.",
+        )
+        .unwrap()
+    });
+    let re_mid_conj_comma =
+        RE_MID_CONJ_COMMA.get_or_init(|| Regex::new(r",\s*\b(?:and|or)\b\s*,").unwrap());
+    let re_dangling_conj_punct =
+        RE_DANGLING_CONJ_PUNCT.get_or_init(|| Regex::new(r",?\s*\b(?:and|or)\b\s*([.;:])").unwrap());
+    let re_multi_comma = RE_MULTI_COMMA.get_or_init(|| Regex::new(r"(?:,\s*){2,}").unwrap());
+    let re_lead_comma = RE_LEAD_COMMA.get_or_init(|| Regex::new(r"(?m)^[ \t]*[,;]+[ \t]*").unwrap());
+
+    let mut out = text.to_string();
+    out = re_empty_parens.replace_all(&out, "").to_string();
+    out = re_paren_lead_conj.replace_all(&out, "($1)").to_string();
+    out = re_paren_trail_conj.replace_all(&out, "($1)").to_string();
+    out = re_space_punct.replace_all(&out, "$1").to_string();
+    out = re_multi_comma.replace_all(&out, ", ").to_string();
+    out = re_intro_conj_before_cite.replace_all(&out, "$1 $2").to_string();
+    out = re_intro_comma_before_cite.replace_all(&out, "$1 $2").to_string();
+    out = re_intro_cite_dangling_conj.replace_all(&out, "$1,").to_string();
+    out = re_mid_conj_comma.replace_all(&out, ",").to_string();
+    out = re_multi_comma.replace_all(&out, ", ").to_string();
+    out = re_dangling_conj_punct.replace_all(&out, "$1").to_string();
+    out = re_space_punct.replace_all(&out, "$1").to_string();
+    out = re_according_and.replace_all(&out, " ").to_string();
+    out = re_according_end.replace_all(&out, ".").to_string();
+    out = re_multi_comma.replace_all(&out, ", ").to_string();
+    out = re_space_punct.replace_all(&out, "$1").to_string();
+    out = re_lead_comma.replace_all(&out, "").to_string();
+
+    // Collapse double horizontal spaces while preserving newlines/list-indentation and capitalize sentence starts.
+    let mut fixed_lines: Vec<String> = Vec::new();
+    for line in out.lines() {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with('#') || trimmed_start.starts_with('|') {
+            fixed_lines.push(line.to_string());
+            continue;
+        }
+        let is_indented_list = line.starts_with("  ")
+            && (trimmed_start.starts_with("- ")
+                || trimmed_start.starts_with("* ")
+                || trimmed_start.starts_with("• ")
+                || trimmed_start.starts_with(|c: char| c.is_ascii_digit()));
+        let collapsed = if is_indented_list {
+            line.to_string()
+        } else {
+            let mut s = String::with_capacity(line.len());
+            let mut prev_space = false;
+            for ch in line.chars() {
+                if ch == ' ' || ch == '\t' {
+                    if !prev_space && !s.is_empty() {
+                        s.push(' ');
+                    }
+                    prev_space = true;
+                } else {
+                    s.push(ch);
+                    prev_space = false;
+                }
+            }
+            s
+        };
+        let mut chars: Vec<char> = collapsed.chars().collect();
+        let mut at_sentence_start = true;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if at_sentence_start {
+                if c.is_whitespace() || c == '-' || c == '*' {
+                    i += 1;
+                    continue;
+                }
+                if c.is_ascii_lowercase() {
+                    chars[i] = c.to_ascii_uppercase();
+                }
+                at_sentence_start = false;
+            } else if matches!(c, '.' | '!' | '?')
+                && i + 1 < chars.len()
+                && chars[i + 1].is_whitespace()
+            {
+                at_sentence_start = true;
+            }
+            i += 1;
+        }
+        let line_str: String = chars.into_iter().collect();
+        let line_clean = line_str.trim_start_matches(". ").to_string();
+        fixed_lines.push(if line_str.trim() == "." {
+            String::new()
+        } else {
+            line_clean
+        });
+    }
+    let joined = fixed_lines.join("\n");
+    if text.ends_with('\n') && !joined.ends_with('\n') {
+        format!("{}\n", joined)
+    } else {
+        joined
+    }
+}
+
 /// The Response Formatter Watchdog supervisor.
 pub struct ResponseFormatterWatchdog;
 
@@ -256,6 +408,11 @@ impl ResponseFormatterWatchdog {
                     caps[0].to_string()
                 });
                 prose = replaced.to_string();
+                let cleaned_preps = clean_dangling_citation_prepositions(&prose);
+                if cleaned_preps != prose {
+                    prose = cleaned_preps;
+                    formatting_repaired = true;
+                }
             }
         }
 
@@ -846,5 +1003,156 @@ mod tests {
             report.cleaned_prose
         );
         assert!(!report.cleaned_prose.contains("()"));
+    }
+
+    #[test]
+    fn test_r2_watchdog_cleans_dangling_prepositions_after_oob_citation_strip() {
+        let c1 = DocumentChunk::new(
+            "l1:0",
+            "l1",
+            "C:/Docs/Lease.docx",
+            1,
+            10,
+            0,
+            vec![0.0; 768],
+            "Angela Davis is the landlord at 2913 Castiglione St. Monthly rent is $725.00.",
+            None,
+        )
+        .unwrap();
+        let sc = ScoredChunk::new(c1, 0.95, "local", false);
+        let refs = vec![&sc];
+
+        let noisy = "According to [99], and [100], Angela Davis is the landlord at 2913 Castiglione St [1]. Monthly rent is $725.00 [1].";
+        let report = ResponseFormatterWatchdog::inspect_and_repair("Who is Angela Davis?", noisy, &refs);
+        assert!(
+            !report.cleaned_prose.contains("According to, and,"),
+            "Watchdog must clean dangling 'According to, and,' artifact: {}",
+            report.cleaned_prose
+        );
+        assert!(
+            !report.cleaned_prose.contains("[99]") && !report.cleaned_prose.contains("[100]"),
+            "OOB citations must be stripped: {}",
+            report.cleaned_prose
+        );
+        assert!(report.cleaned_prose.contains("Angela Davis is the landlord"));
+
+        // Mixed valid+OOB, comma-less, sentence-end, and control assertions on clean_dangling_citation_prepositions
+        // (matching Watchdog's post-OOB-strip input) as well as end-to-end inspect_and_repair.
+        assert_eq!(
+            clean_dangling_citation_prepositions("According to  and [1], monthly rent is $725.00 [1].").trim(),
+            "According to [1], monthly rent is $725.00 [1]."
+        );
+        assert_eq!(
+            clean_dangling_citation_prepositions("According to [1] and , monthly rent is $725.00 [1].").trim(),
+            "According to [1], monthly rent is $725.00 [1]."
+        );
+        assert_eq!(
+            clean_dangling_citation_prepositions("According to  and  the tenant agreed [1].").trim(),
+            "The tenant agreed [1]."
+        );
+        assert_eq!(
+            clean_dangling_citation_prepositions("She lived in New Orleans, according to  and . Lease [1] confirms.").trim(),
+            "She lived in New Orleans. Lease [1] confirms."
+        );
+        assert_eq!(
+            clean_dangling_citation_prepositions("In documents such as  and [1], the tenant agreed [1].").trim(),
+            "In documents such as [1], the tenant agreed [1]."
+        );
+        assert_eq!(
+            clean_dangling_citation_prepositions("In documents such as [1] and , the tenant agreed [1].").trim(),
+            "In documents such as [1], the tenant agreed [1]."
+        );
+
+        let r_mix_left = ResponseFormatterWatchdog::inspect_and_repair(
+            "Who is Angela Davis?",
+            "Angela Davis is the landlord [1]. According to [99] and [1], monthly rent is $725.00 [1].",
+            &refs,
+        );
+        assert!(
+            r_mix_left.cleaned_prose.contains("According to [1], monthly rent is $725.00 [1]."),
+            "Watchdog must normalize mixed OOB+valid: {}",
+            r_mix_left.cleaned_prose
+        );
+
+        let r_mix_right = ResponseFormatterWatchdog::inspect_and_repair(
+            "Who is Angela Davis?",
+            "Angela Davis is the landlord [1]. According to [1] and [99], monthly rent is $725.00 [1].",
+            &refs,
+        );
+        assert!(
+            r_mix_right.cleaned_prose.contains("According to [1], monthly rent is $725.00 [1]."),
+            "Watchdog must normalize mixed valid+OOB: {}",
+            r_mix_right.cleaned_prose
+        );
+
+        let r_commaless = ResponseFormatterWatchdog::inspect_and_repair(
+            "Who is Angela Davis?",
+            "Angela Davis is the landlord [1]. According to [99] and [100] the tenant agreed [1].",
+            &refs,
+        );
+        assert!(
+            r_commaless.cleaned_prose.contains("The tenant agreed [1]."),
+            "Watchdog must capitalize after stripping comma-less all-OOB introducer: {}",
+            r_commaless.cleaned_prose
+        );
+
+        let r_sent_end = ResponseFormatterWatchdog::inspect_and_repair(
+            "Who is Angela Davis?",
+            "Angela Davis lived in New Orleans, according to [99] and [100]. Lease [1] confirms.",
+            &refs,
+        );
+        assert!(
+            r_sent_end.cleaned_prose.contains("Angela Davis lived in New Orleans."),
+            "Trailing ', according to [99] and [100].' must clean cleanly: {}",
+            r_sent_end.cleaned_prose
+        );
+        assert!(!r_sent_end.cleaned_prose.contains("according to."));
+
+        let r_in_docs = ResponseFormatterWatchdog::inspect_and_repair(
+            "Who is Angela Davis?",
+            "Angela Davis is the landlord [1]. In documents such as [99] and [1], and in documents such as [1] and [99], the tenant agreed [1].",
+            &refs,
+        );
+        assert!(
+            r_in_docs.cleaned_prose.contains("In documents such as [1], and in documents such as [1], the tenant agreed [1]."),
+            "Watchdog must clean both mixed 'in documents such as' variants: {}",
+            r_in_docs.cleaned_prose
+        );
+
+        // Control strings must remain intact
+        let c2 = DocumentChunk::new(
+            "l2:0",
+            "l2",
+            "C:/Docs/Lease2.docx",
+            1,
+            10,
+            0,
+            vec![0.0; 768],
+            "Lease addendum specifies $725.00 rent.",
+            None,
+        )
+        .unwrap();
+        let sc2 = ScoredChunk::new(c2, 0.90, "local", false);
+        let refs2 = vec![&sc, &sc2];
+        let ctrl1 = ResponseFormatterWatchdog::inspect_and_repair(
+            "Who is Angela Davis?",
+            "Angela Davis is the landlord [1]. According to [1] and [2], the lease states $725.00 [1].",
+            &refs2,
+        );
+        assert!(
+            ctrl1.cleaned_prose.contains("According to [1] and [2], the lease states $725.00 [1]."),
+            "Valid two-citation introducer must remain intact: {}",
+            ctrl1.cleaned_prose
+        );
+        let ctrl2 = ResponseFormatterWatchdog::inspect_and_repair(
+            "Who is Angela Davis?",
+            "Angela Davis is the landlord [1]. According to the lease agreement, rent is $725.00 [1].",
+            &refs,
+        );
+        assert!(
+            ctrl2.cleaned_prose.contains("According to the lease agreement, rent is $725.00 [1]."),
+            "Valid noun-phrase introducer must remain intact: {}",
+            ctrl2.cleaned_prose
+        );
     }
 }

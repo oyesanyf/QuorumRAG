@@ -234,6 +234,17 @@ pub trait MeshQueryDispatcher: Send + Sync {
     }
 
     fn peer_count(&self) -> usize;
+
+    /// Returns `(local_peer_id, secret_seed)` when backed by a real Ed25519 swarm identity.
+    fn signing_credentials(&self) -> Option<(String, [u8; 32])> {
+        None
+    }
+
+    /// Returns clean dialable multiaddrs (`/ip4/.../tcp/.../p2p/<PeerId>`) of connected peers
+    /// for transitive full-mesh discovery, excluding port 4001 noise.
+    fn connected_peer_multiaddrs(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Simulated remote peer node with network latency and authorized access tier for testing.
@@ -437,6 +448,7 @@ impl MeshQueryDispatcher for MockMeshDispatcher {
                         chunks,
                         synthesis_response: synthesis_resp,
                         warm_llm_available: is_warm,
+                        peer_multiaddrs: Vec::new(),
                     });
                     if responses.len() >= max_peer_responses || pending_ids.is_empty() {
                         break;
@@ -568,17 +580,171 @@ pub fn collect_trusted_bootstrap_multiaddrs(
     out
 }
 
+/// Formats a connected peer's `(peer_id, Multiaddr)` into a clean dialable multiaddr with `/p2p/<PeerId>`,
+/// filtering out port 4001 IPFS swarm noise and avoiding duplicate `/p2p/<PeerId>` suffixes.
+pub fn format_clean_peer_multiaddr(peer_id: &str, addr: &quorum_network::Multiaddr) -> Option<String> {
+    if peer_id.trim().is_empty() {
+        return None;
+    }
+    let raw = addr.to_string();
+    if raw.contains("/tcp/4001")
+        || raw.contains("/udp/4001")
+        || raw.ends_with(":4001")
+        || raw.ends_with("/4001")
+        || raw.contains("/4001/")
+    {
+        return None;
+    }
+    let base = raw.split("/p2p/").next().unwrap_or(&raw).trim_end_matches('/');
+    if base.is_empty() || (!base.contains("/tcp/") && !base.contains("/udp/")) {
+        return None;
+    }
+    Some(format!("{}/p2p/{}", base, peer_id.trim()))
+}
+
+/// Filters newly learned `peer_multiaddrs` down to valid, unconnected, non-self, non-4001 dial targets.
+pub fn filter_newly_learned_dial_targets(
+    candidates: &[String],
+    local_peer_id: &str,
+    connected_addrs: &HashMap<quorum_network::libp2p::PeerId, quorum_network::Multiaddr>,
+    self_listen_addrs: &[quorum_network::Multiaddr],
+) -> Vec<quorum_network::Multiaddr> {
+    use quorum_network::libp2p::multiaddr::Protocol;
+
+    let connected_peer_ids: HashSet<String> =
+        connected_addrs.keys().map(|p| p.to_string()).collect();
+    let connected_bases: HashSet<String> = connected_addrs
+        .values()
+        .map(|a| {
+            let s = a.to_string();
+            s.split("/p2p/")
+                .next()
+                .unwrap_or(&s)
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .collect();
+    let self_listen_bases: HashSet<String> = self_listen_addrs
+        .iter()
+        .map(|a| {
+            let s = a.to_string();
+            s.split("/p2p/")
+                .next()
+                .unwrap_or(&s)
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .collect();
+
+    let mut self_non_loopback_ips: HashSet<std::net::IpAddr> = HashSet::new();
+    let mut self_listen_ports: HashSet<u16> = HashSet::new();
+    for la in self_listen_addrs {
+        for proto in la.iter() {
+            match proto {
+                Protocol::Ip4(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+                    self_non_loopback_ips.insert(std::net::IpAddr::V4(ip));
+                }
+                Protocol::Ip6(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+                    self_non_loopback_ips.insert(std::net::IpAddr::V6(ip));
+                }
+                Protocol::Tcp(port) | Protocol::Udp(port) if port > 0 => {
+                    self_listen_ports.insert(port);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut seen_bases = HashSet::new();
+    let mut targets = Vec::new();
+    for raw in candidates {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.contains("/tcp/4001")
+            || trimmed.contains("/udp/4001")
+            || trimmed.ends_with(":4001")
+            || trimmed.ends_with("/4001")
+            || trimmed.contains("/4001/")
+        {
+            continue;
+        }
+        let Ok(ma) = trimmed.parse::<quorum_network::Multiaddr>() else {
+            continue;
+        };
+        if !quorum_network::is_allowed_trusted_bootstrap_address(&ma) {
+            continue;
+        }
+
+        let mut embedded_peer_id: Option<String> = None;
+        let mut cand_ip: Option<std::net::IpAddr> = None;
+        let mut cand_port: Option<u16> = None;
+        for proto in ma.iter() {
+            match proto {
+                Protocol::P2p(pid) => embedded_peer_id = Some(pid.to_string()),
+                Protocol::Ip4(ip) => cand_ip = Some(std::net::IpAddr::V4(ip)),
+                Protocol::Ip6(ip) => cand_ip = Some(std::net::IpAddr::V6(ip)),
+                Protocol::Tcp(port) | Protocol::Udp(port) => cand_port = Some(port),
+                _ => {}
+            }
+        }
+
+        if let Some(ref pid_str) = embedded_peer_id {
+            if !local_peer_id.is_empty() && pid_str == local_peer_id {
+                continue;
+            }
+            if connected_peer_ids.contains(pid_str) {
+                continue;
+            }
+        }
+
+        let base_str = trimmed
+            .split("/p2p/")
+            .next()
+            .unwrap_or(trimmed)
+            .trim_end_matches('/')
+            .to_string();
+        if base_str.is_empty()
+            || connected_bases.contains(&base_str)
+            || self_listen_bases.contains(&base_str)
+        {
+            continue;
+        }
+
+        if let Some(ip) = cand_ip {
+            if self_non_loopback_ips.contains(&ip)
+                && (embedded_peer_id.is_none()
+                    || cand_port.map_or(true, |p| self_listen_ports.contains(&p)))
+            {
+                continue;
+            }
+        }
+
+        if seen_bases.insert(base_str) {
+            targets.push(ma);
+        }
+    }
+    targets
+}
+
 /// Production mesh dispatcher bridging to the `NetworkSwarmHandle`.
 #[derive(Clone)]
 pub struct SwarmMeshDispatcher {
     pub handle: NetworkSwarmHandle,
+    pub local_peer_id: String,
+    pub secret_seed: [u8; 32],
     pub last_bootstrap_dial_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SwarmMeshDispatcher {
-    pub fn new(handle: NetworkSwarmHandle) -> Self {
+    pub fn new(
+        handle: NetworkSwarmHandle,
+        local_peer_id: impl Into<String>,
+        secret_seed: [u8; 32],
+    ) -> Self {
         Self {
             handle,
+            local_peer_id: local_peer_id.into(),
+            secret_seed,
             last_bootstrap_dial_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -847,6 +1013,7 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
         let primary_deadline = tokio::time::Instant::now() + timeout;
         let mut active_deadline = primary_deadline;
         let mut responses = Vec::new();
+        let mut seen_learned_addrs: HashSet<String> = HashSet::new();
 
         loop {
             if futures.is_empty() {
@@ -881,6 +1048,46 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
                         chunks = chunks_len,
                         "Received federated P2P mesh response"
                     );
+                    if !resp.peer_multiaddrs.is_empty() {
+                        let new_candidates: Vec<String> = resp
+                            .peer_multiaddrs
+                            .iter()
+                            .filter(|ma| seen_learned_addrs.insert((*ma).clone()))
+                            .cloned()
+                            .collect();
+                        if !new_candidates.is_empty() {
+                            let handle_clone = self.handle.clone();
+                            let self_pid = if self.local_peer_id.is_empty() {
+                                self.handle.local_peer_id().to_string()
+                            } else {
+                                self.local_peer_id.clone()
+                            };
+                            tokio::spawn(async move {
+                                let connected_now = handle_clone.connected_peer_addresses();
+                                let self_listen =
+                                    handle_clone.listen_addresses().await.unwrap_or_default();
+                                let targets = filter_newly_learned_dial_targets(
+                                    &new_candidates,
+                                    &self_pid,
+                                    &connected_now,
+                                    &self_listen,
+                                );
+                                for ma in targets {
+                                    tracing::info!(
+                                        addr = %ma,
+                                        "Transitive mesh discovery auto-dialing newly learned peer"
+                                    );
+                                    if let Err(err) = handle_clone.dial_trusted(ma.clone()).await {
+                                        tracing::debug!(
+                                            addr = %ma,
+                                            error = %err,
+                                            "Transitive mesh auto-dial attempt failed"
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
                     responses.push(resp);
 
                     // EARLY RESOLUTION LAW:
@@ -1015,6 +1222,37 @@ impl MeshQueryDispatcher for SwarmMeshDispatcher {
     fn peer_count(&self) -> usize {
         self.handle.connected_peer_addresses().len()
     }
+
+    fn signing_credentials(&self) -> Option<(String, [u8; 32])> {
+        if self.local_peer_id.is_empty() {
+            None
+        } else {
+            Some((self.local_peer_id.clone(), self.secret_seed))
+        }
+    }
+
+    fn connected_peer_multiaddrs(&self) -> Vec<String> {
+        let self_pid = if self.local_peer_id.is_empty() {
+            self.handle.local_peer_id().to_string()
+        } else {
+            self.local_peer_id.clone()
+        };
+        let mut out: Vec<String> = self
+            .handle
+            .connected_peer_addresses()
+            .into_iter()
+            .filter_map(|(peer_id, addr)| {
+                let pid_str = peer_id.to_string();
+                if pid_str == self_pid {
+                    return None;
+                }
+                format_clean_peer_multiaddr(&pid_str, &addr)
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 /// Dispatches only to local storage without any remote peers.
@@ -1049,6 +1287,12 @@ pub struct OsoosiMeshInboundHandler {
     pub local_peer_id: String,
     pub embedder: Option<Arc<dyn quorum_contract::EmbeddingGenerator>>,
     pub dispatcher: Arc<std::sync::RwLock<Option<Arc<dyn MeshQueryDispatcher>>>>,
+    pub ollama_override: Option<(
+        std::net::SocketAddr,
+        String,
+        crate::hardware::HardwareTelemetry,
+        Vec<String>,
+    )>,
 }
 
 impl OsoosiMeshInboundHandler {
@@ -1061,6 +1305,7 @@ impl OsoosiMeshInboundHandler {
             local_peer_id: local_peer_id.into(),
             embedder: None,
             dispatcher: Arc::new(std::sync::RwLock::new(None)),
+            ollama_override: None,
         }
     }
 
@@ -1069,6 +1314,17 @@ impl OsoosiMeshInboundHandler {
         embedder: Arc<dyn quorum_contract::EmbeddingGenerator>,
     ) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    pub fn with_ollama_override(
+        mut self,
+        addr: std::net::SocketAddr,
+        host_port: impl Into<String>,
+        hw: crate::hardware::HardwareTelemetry,
+        installed_models: Vec<String>,
+    ) -> Self {
+        self.ollama_override = Some((addr, host_port.into(), hw, installed_models));
         self
     }
 
@@ -1094,8 +1350,78 @@ impl OsoosiMeshInboundHandler {
             local_peer_id: local_peer_id.into(),
             embedder: Some(embedder),
             dispatcher: Arc::new(std::sync::RwLock::new(None)),
+            ollama_override: None,
         }
     }
+
+    fn advertised_peer_multiaddrs_for(&self, requester_peer_id: &str) -> Vec<String> {
+        let disp_opt = self
+            .dispatcher
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(disp) = disp_opt else {
+            return Vec::new();
+        };
+        disp.connected_peer_multiaddrs()
+            .into_iter()
+            .filter(|ma| {
+                let p2p_id = ma.rsplit("/p2p/").next().unwrap_or("");
+                let is_requester = !requester_peer_id.is_empty() && p2p_id == requester_peer_id;
+                let is_self = !self.local_peer_id.is_empty() && p2p_id == self.local_peer_id;
+                !is_requester && !is_self
+            })
+            .collect()
+    }
+}
+
+/// Converts delegated `CandidateChunkDto`s into `ScoredChunk`s for `synthesis_relay`,
+/// preferring non-empty `expanded_window` over `content` and preserving each chunk's original
+/// `origin_peer_id` / `source_peer` with accurate `is_remote` relative to `local_peer_id` / `"local"`.
+pub fn build_relay_scored_chunks(
+    evidence_chunks: &[CandidateChunkDto],
+    local_peer_id: &str,
+) -> Vec<quorum_types::ScoredChunk> {
+    evidence_chunks
+        .iter()
+        .map(|dto| {
+            let text_content = dto
+                .expanded_window
+                .as_ref()
+                .filter(|w| !w.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| dto.content.clone());
+            let doc_chunk = quorum_types::DocumentChunk {
+                chunk_id: dto.chunk_id.clone(),
+                document_id: dto
+                    .chunk_id
+                    .rsplit_once(':')
+                    .map(|(d, _)| d.to_string())
+                    .unwrap_or_else(|| dto.file_path.clone()),
+                file_path: dto.file_path.clone(),
+                line_start: dto.line_start,
+                line_end: dto.line_end,
+                blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(&text_content),
+                access_tier: dto.access_tier,
+                vector: vec![0.0; 768],
+                text_content,
+                metadata_json: "{}".to_string(),
+            };
+            let origin = dto
+                .origin_peer_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+            let is_remote = origin.map_or(false, |p| {
+                p != local_peer_id && !p.eq_ignore_ascii_case("local")
+            });
+            let source_peer = origin
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| local_peer_id.to_string());
+            let score = if dto.score > 0.0 { dto.score } else { 1.0 };
+            quorum_types::ScoredChunk::new(doc_chunk, score, source_peer, is_remote)
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -1119,6 +1445,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     chunks: Vec::new(),
                     synthesis_response: None,
                     warm_llm_available: false,
+                    peer_multiaddrs: Vec::new(),
                 };
             }
             cache.insert(cache_key, now);
@@ -1136,6 +1463,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 chunks: Vec::new(),
                 synthesis_response: None,
                 warm_llm_available: false,
+                peer_multiaddrs: Vec::new(),
             };
         }
 
@@ -1155,6 +1483,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 chunks: Vec::new(),
                 synthesis_response: None,
                 warm_llm_available: false,
+                peer_multiaddrs: Vec::new(),
             };
         }
 
@@ -1170,6 +1499,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 chunks: Vec::new(),
                 synthesis_response: None,
                 warm_llm_available: false,
+                peer_multiaddrs: Vec::new(),
             };
         }
 
@@ -1188,6 +1518,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                         chunks: Vec::new(),
                         synthesis_response: None,
                         warm_llm_available: false,
+                        peer_multiaddrs: Vec::new(),
                     };
                 }
             }
@@ -1203,6 +1534,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     chunks: Vec::new(),
                     synthesis_response: None,
                     warm_llm_available: false,
+                    peer_multiaddrs: Vec::new(),
                 };
             }
         }
@@ -1229,6 +1561,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 chunks: Vec::new(),
                 synthesis_response: None,
                 warm_llm_available: false,
+                peer_multiaddrs: Vec::new(),
             };
         }
 
@@ -1256,6 +1589,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     chunks: Vec::new(),
                     synthesis_response: None,
                     warm_llm_available: false,
+                    peer_multiaddrs: Vec::new(),
                 };
             }
         };
@@ -1269,6 +1603,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 chunks: Vec::new(),
                 synthesis_response: None,
                 warm_llm_available: false,
+                peer_multiaddrs: self.advertised_peer_multiaddrs_for(&req.sender_peer_id),
             };
         }
 
@@ -1283,34 +1618,39 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                     chunks: Vec::new(),
                     synthesis_response: None,
                     warm_llm_available: false,
+                    peer_multiaddrs: Vec::new(),
                 };
             }
 
-            let scored_chunks: Vec<quorum_types::ScoredChunk> = relay.evidence_chunks.iter().map(|dto| {
-                let doc_chunk = quorum_types::DocumentChunk {
-                    chunk_id: dto.chunk_id.clone(),
-                    document_id: dto.chunk_id.rsplit_once(':').map(|(d, _)| d.to_string()).unwrap_or_else(|| dto.file_path.clone()),
-                    file_path: dto.file_path.clone(),
-                    line_start: dto.line_start,
-                    line_end: dto.line_end,
-                    blake3_hash: quorum_types::DocumentChunk::compute_blake3_hash(&dto.content),
-                    access_tier: dto.access_tier,
-                    vector: vec![0.0; 768],
-                    text_content: dto.content.clone(),
-                    metadata_json: "{}".to_string(),
-                };
-                quorum_types::ScoredChunk::new(doc_chunk, 1.0, self.local_peer_id.clone(), false)
-            }).collect();
+            let scored_chunks = build_relay_scored_chunks(&relay.evidence_chunks, &self.local_peer_id);
             let scored_refs: Vec<&quorum_types::ScoredChunk> = scored_chunks.iter().collect();
 
             let model = relay.model_tag.as_deref().unwrap_or("qwen2.5:7b");
-            let synthesis_opt = crate::offline_engine::DeterministicOfflineSynthesisEngine::query_local_ollama_chat(
-                &relay.prompt,
-                &relay.history,
-                &scored_refs,
-                model,
-                None,
-            );
+            let synthesis_opt = if let Some((addr, ref host_port, ref hw, ref installed_models)) =
+                self.ollama_override
+            {
+                let ui = crate::dlp_mesh::ChatGptUiSettings::default();
+                crate::offline_engine::DeterministicOfflineSynthesisEngine::query_local_ollama_chat_at(
+                    addr,
+                    host_port,
+                    &relay.prompt,
+                    &relay.history,
+                    &scored_refs,
+                    model,
+                    hw,
+                    &ui,
+                    installed_models,
+                    None,
+                )
+            } else {
+                crate::offline_engine::DeterministicOfflineSynthesisEngine::query_local_ollama_chat(
+                    &relay.prompt,
+                    &relay.history,
+                    &scored_refs,
+                    model,
+                    None,
+                )
+            };
 
             if let Some((synthesized_text, citations)) = synthesis_opt {
                 return FederatedQueryResponse {
@@ -1324,6 +1664,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                         responder_peer_id: self.local_peer_id.clone(),
                     }),
                     warm_llm_available: true,
+                    peer_multiaddrs: self.advertised_peer_multiaddrs_for(&req.sender_peer_id),
                 };
             }
         }
@@ -1380,7 +1721,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 && !stripped_entity_q.eq_ignore_ascii_case(&req.query_text)
             {
                 self.local_storage
-                    .search_text(&stripped_entity_q, effective_tier, 24)
+                    .search_text(&stripped_entity_q, effective_tier, 96)
                     .await
             } else {
                 Vec::new()
@@ -1395,7 +1736,7 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
                 req.top_k.clamp(16, 128),
             ),
             self.local_storage
-                .search_text(&req.query_text, effective_tier, 24),
+                .search_text(&req.query_text, effective_tier, 96),
             stripped_fut,
         );
 
@@ -1546,18 +1887,41 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
 
         scored.retain(|c| !crate::artemis_airgap::is_airgap_restricted_chunk(&c.chunk));
 
-        // Cap per-document-family candidates and bound total candidates to 48 before parent-window expansion,
-        // and expand 10KB parent windows only on the top 20 candidates so million-chunk peers respond in <600ms.
+        // Cap per-document-family candidates (max 3 per family) and bound total candidates to 128 before parent-window expansion,
+        // and expand 10KB parent windows on the top 32 unique-family candidates.
         let mut scored =
-            crate::agentic::retrieve::RetrieveMeshNode::cap_document_families_federated(scored, 2);
-        scored.truncate(48);
+            crate::agentic::retrieve::RetrieveMeshNode::cap_document_families_federated(scored, 3);
+        scored.truncate(128);
 
         // RLM parent-document expansion up to 10,000 bytes BEFORE outbound DLP inspection
+        let mut expanded_families: HashSet<String> = HashSet::with_capacity(32);
         let mut candidate_dtos = Vec::with_capacity(scored.len());
-        for (idx, c) in scored.into_iter().enumerate() {
+        for c in scored.into_iter() {
             let mut dto = CandidateChunkDto::from_scored_chunk(&c);
             dto.origin_peer_id = Some(self.local_peer_id.clone());
-            if idx < 20 {
+            let fam_key = if c.chunk.file_path.to_ascii_lowercase().starts_with("artemis://") {
+                c.chunk.file_path.to_ascii_lowercase()
+            } else {
+                let dk = crate::offline_engine::DeterministicOfflineSynthesisEngine::derive_document_family_key(
+                    &c.chunk.file_path,
+                );
+                if dk.is_empty() {
+                    crate::offline_engine::DeterministicOfflineSynthesisEngine::normalize_file_stem(
+                        &c.chunk.file_path,
+                    )
+                } else {
+                    dk
+                }
+            };
+            let should_expand = if expanded_families.contains(&fam_key) {
+                false
+            } else if expanded_families.len() < 32 {
+                expanded_families.insert(fam_key);
+                true
+            } else {
+                false
+            };
+            if should_expand {
                 if let Some((_start, _end, expanded_text, _, _)) =
                     self.local_storage.expand_parent_window(
                         &c.chunk.document_id,
@@ -1614,6 +1978,122 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             chunks: safe_chunks,
             synthesis_response: None,
             warm_llm_available: warm_llm,
+            peer_multiaddrs: self.advertised_peer_multiaddrs_for(&req.sender_peer_id),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quorum_network::libp2p::{Multiaddr, PeerId};
+
+    #[test]
+    fn test_format_clean_peer_multiaddr_filters_4001_and_deduplicates_p2p() {
+        let pid = PeerId::random().to_string();
+        let addr_4001: Multiaddr = "/ip4/10.0.0.165/tcp/4001".parse().unwrap();
+        assert!(format_clean_peer_multiaddr(&pid, &addr_4001).is_none());
+
+        let addr_udp_4001: Multiaddr = "/ip4/10.0.0.165/udp/4001/quic-v1".parse().unwrap();
+        assert!(format_clean_peer_multiaddr(&pid, &addr_udp_4001).is_none());
+
+        let addr_with_p2p: Multiaddr = format!("/ip4/10.0.0.165/tcp/3032/p2p/{}", pid)
+            .parse()
+            .unwrap();
+        let formatted = format_clean_peer_multiaddr(&pid, &addr_with_p2p).unwrap();
+        assert_eq!(formatted, format!("/ip4/10.0.0.165/tcp/3032/p2p/{}", pid));
+        assert_eq!(formatted.matches("/p2p/").count(), 1);
+    }
+
+    #[test]
+    fn test_filter_newly_learned_dial_targets_blocks_self_4001_and_connected() {
+        let local_pid = PeerId::random();
+        let connected_pid = PeerId::random();
+        let new_pid = PeerId::random();
+
+        let mut connected_addrs = HashMap::new();
+        connected_addrs.insert(
+            connected_pid,
+            "/ip4/127.0.0.1/tcp/41001".parse::<Multiaddr>().unwrap(),
+        );
+        let self_listen = vec![
+            "/ip4/127.0.0.1/tcp/41000".parse::<Multiaddr>().unwrap(),
+            "/ip4/10.0.0.10/tcp/3032".parse::<Multiaddr>().unwrap(),
+        ];
+
+        let candidates = vec![
+            format!("/ip4/127.0.0.1/tcp/41000/p2p/{}", local_pid),
+            format!("/ip4/10.0.0.10/tcp/3032/p2p/{}", new_pid),
+            format!("/ip4/127.0.0.1/tcp/41001/p2p/{}", connected_pid),
+            format!("/ip4/127.0.0.1/tcp/4001/p2p/{}", new_pid),
+            format!("/ip4/127.0.0.1/tcp/41002/p2p/{}", new_pid),
+            format!("/ip4/127.0.0.1/tcp/41002/p2p/{}", new_pid),
+        ];
+
+        let filtered = filter_newly_learned_dial_targets(
+            &candidates,
+            &local_pid.to_string(),
+            &connected_addrs,
+            &self_listen,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].to_string(),
+            format!("/ip4/127.0.0.1/tcp/41002/p2p/{}", new_pid)
+        );
+    }
+
+    #[test]
+    fn test_build_relay_scored_chunks_preserves_provenance_and_prefers_expanded_window() {
+        let local_pid = "12D3KooWLocalHostPeer";
+        let remote_pid = "12D3KooWRemoteHostPeer";
+        let dtos = vec![
+            CandidateChunkDto {
+                chunk_id: "doc_r:0".to_string(),
+                file_path: "D:/Remote/Lease.docx".to_string(),
+                line_start: 1,
+                line_end: 10,
+                content: "Short snippet".to_string(),
+                score: 0.92,
+                access_tier: 0,
+                origin_peer_id: Some(remote_pid.to_string()),
+                expanded_window: Some("Expanded 10KB lease agreement text".to_string()),
+            },
+            CandidateChunkDto {
+                chunk_id: "doc_l:0".to_string(),
+                file_path: "C:/Local/Notes.docx".to_string(),
+                line_start: 1,
+                line_end: 5,
+                content: "Local notes content".to_string(),
+                score: 0.88,
+                access_tier: 0,
+                origin_peer_id: Some(local_pid.to_string()),
+                expanded_window: Some("   ".to_string()),
+            },
+            CandidateChunkDto {
+                chunk_id: "doc_loc_kw:0".to_string(),
+                file_path: "C:/Local/LocalKw.docx".to_string(),
+                line_start: 1,
+                line_end: 5,
+                content: "Local keyword content".to_string(),
+                score: 0.75,
+                access_tier: 0,
+                origin_peer_id: Some("local".to_string()),
+                expanded_window: None,
+            },
+        ];
+
+        let scored = build_relay_scored_chunks(&dtos, local_pid);
+        assert_eq!(scored.len(), 3);
+        assert!(scored[0].is_remote);
+        assert_eq!(scored[0].source_peer, remote_pid);
+        assert_eq!(scored[0].chunk.text_content, "Expanded 10KB lease agreement text");
+
+        assert!(!scored[1].is_remote);
+        assert_eq!(scored[1].source_peer, local_pid);
+        assert_eq!(scored[1].chunk.text_content, "Local notes content");
+
+        assert!(!scored[2].is_remote);
+        assert_eq!(scored[2].source_peer, "local");
     }
 }

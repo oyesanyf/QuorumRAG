@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g. 0.6.17)'
+        description: 'Release version (e.g. 0.6.18)'
         required: false
-        default: '0.6.17'
+        default: '0.6.18'
 
 permissions: read-all
 
@@ -71,7 +71,7 @@ jobs:
           WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
         run: |
           $env:PATH = "$env:USERPROFILE\.dotnet\tools;C:\ProgramData\chocolatey\bin;$env:PATH"
-          $ver = if ($env:REF_NAME -like "quorumrag-v*") { $env:REF_NAME.Substring(11) } elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "0.6.17" }
+          $ver = if ($env:REF_NAME -like "quorumrag-v*") { $env:REF_NAME.Substring(11) } elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "0.6.18" }
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1 -Version $ver -SkipDefenderScan
           $msi = "deploy\windows\QuorumRAG-$ver-x86_64.msi"
           $zip = "deploy\windows\QuorumRAG-$ver-windows-x86_64.zip"
@@ -154,7 +154,7 @@ jobs:
           workspaces: .
           key: quorumrag-linux-x64
 
-      - name: Verify Workspace Compilation & v0.6.17 Regression Suites
+      - name: Verify Workspace Compilation & v0.6.18 Regression Suites
         run: |
           cargo check --workspace --all-targets
           cargo test -p quorum-types --lib
@@ -170,7 +170,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.17}"
+          VERSION="${INPUT_VERSION:-0.6.18}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop
           ./target/release/quorumrag --version
@@ -251,7 +251,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.17}"
+          VERSION="${INPUT_VERSION:-0.6.18}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop
           ./target/release/quorumrag --version
@@ -314,7 +314,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.17}"
+          VERSION="${INPUT_VERSION:-0.6.18}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target aarch64-apple-darwin
           cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target x86_64-apple-darwin
@@ -394,7 +394,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.17}"
+          VERSION="${INPUT_VERSION:-0.6.18}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target aarch64-apple-darwin
           cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target x86_64-apple-darwin
@@ -471,7 +471,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.17}"
+          VERSION="${INPUT_VERSION:-0.6.18}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           cargo build --release -p quorum-daemon --bin quorumrag --bin quorum-desktop --target aarch64-apple-darwin
           cargo build --release -p quorum-daemon --bin quorum-desktop --bin quorumrag --target x86_64-apple-darwin
@@ -513,6 +513,7 @@ jobs:
       id-token: write
       attestations: write
       contents: write
+      actions: write
     steps:
       - name: Checkout commit
         shell: bash
@@ -535,7 +536,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.17}"
+          VERSION="${INPUT_VERSION:-0.6.18}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           mkdir -p release_assets
           find dist/ -type f \( -name "*.msi" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg" -o -name "*.dmg" -o -name "*.tar.gz" \) -exec cp -f {} release_assets/ \;
@@ -578,7 +579,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${INPUT_VERSION:-0.6.17}"
+          VERSION="${INPUT_VERSION:-0.6.18}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then VERSION="${REF_NAME#quorumrag-v}"; fi
           TAG_NAME="quorumrag-v${VERSION}"
           if [[ "${REF_NAME}" == quorumrag-v* ]]; then TAG_NAME="${REF_NAME}"; fi
@@ -603,7 +604,7 @@ jobs:
           prerelease: false
           make_latest: true
 
-      - name: Prune Superseded Releases (Keep Only Most Recent Multi-OS Release)
+      - name: Prune Superseded Releases & Actions Build Artifacts (Keep Only Most Recent Build Set)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -615,3 +616,41 @@ jobs:
             echo "Removing superseded release & tag: ${old_tag}"
             gh release delete "${old_tag}" --repo "${REPO}" --cleanup-tag --yes || true
           done
+          # Prune superseded GitHub Actions build artifacts so strictly one build set remains per artifact name
+          python3 - <<'PYEOF'
+          import json, os, subprocess
+          repo = os.environ["REPO"]
+          raw = subprocess.check_output(
+              ["gh", "api", "--paginate", f"/repos/{repo}/actions/artifacts?per_page=100"],
+              text=True,
+              encoding="utf-8",
+          )
+          # gh api --paginate may emit concatenated JSON objects across pages
+          decoder = json.JSONDecoder()
+          idx, artifacts = 0, []
+          while idx < len(raw):
+              while idx < len(raw) and raw[idx].isspace():
+                  idx += 1
+              if idx >= len(raw):
+                  break
+              obj, idx = decoder.raw_decode(raw, idx)
+              artifacts.extend(obj.get("artifacts", []))
+          artifacts = [a for a in artifacts if not a.get("expired")]
+          artifacts.sort(key=lambda a: (a.get("created_at", ""), a.get("id", 0)), reverse=True)
+          seen = set()
+          deleted = 0
+          for art in artifacts:
+              name = art.get("name", "")
+              aid = art.get("id")
+              if name in seen and aid:
+                  subprocess.run(
+                      ["gh", "api", "-X", "DELETE", f"/repos/{repo}/actions/artifacts/{aid}"],
+                      check=False,
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                  )
+                  deleted += 1
+              else:
+                  seen.add(name)
+          print(f"[+] Pruned {deleted} superseded Actions build artifact(s); retained latest set: {sorted(seen)}")
+          PYEOF
