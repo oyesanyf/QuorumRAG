@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/quorum-types",
+    "crates/quorum-atlaskv",
     "crates/quorum-classifier",
     "crates/quorum-contract",
     "crates/quorum-storage",
@@ -14,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.18"
+version = "0.7.0"
 edition = "2021"
 authors = ["QuorumRAG Team"]
 license = "MIT OR Apache-2.0"
@@ -23,6 +24,7 @@ repository = "https://github.com/oyesanyf/QuorumRAG"
 [workspace.dependencies]
 # Internal workspace crates
 quorum-types = { path = "crates/quorum-types" }
+quorum-atlaskv = { path = "crates/quorum-atlaskv" }
 quorum-classifier = { path = "crates/quorum-classifier" }
 quorum-contract = { path = "crates/quorum-contract" }
 quorum-storage = { path = "crates/quorum-storage" }

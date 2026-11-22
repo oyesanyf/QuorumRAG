@@ -1540,6 +1540,28 @@ impl DeterministicOfflineSynthesisEngine {
         model_tag: &str,
         telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
     ) -> (String, Vec<Citation>) {
+        Self::synthesize_with_history_and_kg(
+            prompt,
+            expanded_query,
+            history,
+            chunks,
+            "",
+            model_tag,
+            telemetry_tx,
+        )
+    }
+
+    /// Generates a grounded RAG synthesis response enriched with optional Layer-1 AtlasKV
+    /// Knowledge Graph triples (`kg_context`) alongside retrieved vector/BM25 chunks.
+    pub fn synthesize_with_history_and_kg(
+        prompt: &str,
+        expanded_query: &str,
+        history: &[ChatTurnMessage],
+        chunks: &[ScoredChunk],
+        kg_context: &str,
+        model_tag: &str,
+        telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
+    ) -> (String, Vec<Citation>) {
         if telemetry_tx.map(|tx| tx.is_closed()).unwrap_or(false) {
             let citations: Vec<Citation> = chunks.iter().map(|c| c.to_citation()).collect();
             return ("Request cancelled by client.".to_string(), citations);
@@ -2655,13 +2677,16 @@ impl DeterministicOfflineSynthesisEngine {
                     }
                 }
 
-                if let Some((llm_orchestrated, llm_citations)) = Self::query_local_ollama_chat(
-                    &effective_question,
-                    history,
-                    &matched_chunk_refs,
-                    model_tag,
-                    telemetry_tx,
-                ) {
+                if let Some((llm_orchestrated, llm_citations)) =
+                    Self::query_local_ollama_chat_with_kg(
+                        &effective_question,
+                        history,
+                        &matched_chunk_refs,
+                        kg_context,
+                        model_tag,
+                        telemetry_tx,
+                    )
+                {
                     return (
                         maybe_append_forensics_disabled_notice(llm_orchestrated, true),
                         llm_citations,
@@ -2690,9 +2715,14 @@ impl DeterministicOfflineSynthesisEngine {
                         .take(1)
                         {
                             tracing::warn!(failed = %failed_model, retry = %fast, "Primary synthesis failed; retrying with faster local model");
-                            if let Some((text, cits)) =
-                                Self::query_local_ollama_chat(&effective_question, history, top_refs, &fast, telemetry_tx)
-                            {
+                            if let Some((text, cits)) = Self::query_local_ollama_chat_with_kg(
+                                &effective_question,
+                                history,
+                                top_refs,
+                                kg_context,
+                                &fast,
+                                telemetry_tx,
+                            ) {
                                 return (
                                     maybe_append_forensics_disabled_notice(text, true),
                                     cits,
@@ -8856,6 +8886,26 @@ impl DeterministicOfflineSynthesisEngine {
         requested_model_tag: &str,
         telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
     ) -> Option<(String, Vec<Citation>)> {
+        Self::query_local_ollama_chat_with_kg(
+            prompt,
+            history,
+            matched_chunks,
+            "",
+            requested_model_tag,
+            telemetry_tx,
+        )
+    }
+
+    /// Multi-turn real-time streaming orchestration via local Ollama `POST /api/chat` enriched
+    /// with optional grounded Layer-1 AtlasKV Knowledge Graph triples (`kg_context`).
+    pub fn query_local_ollama_chat_with_kg(
+        prompt: &str,
+        history: &[ChatTurnMessage],
+        matched_chunks: &[&ScoredChunk],
+        kg_context: &str,
+        requested_model_tag: &str,
+        telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
+    ) -> Option<(String, Vec<Citation>)> {
         use std::net::{SocketAddr, ToSocketAddrs};
 
         if matched_chunks.is_empty() {
@@ -8958,12 +9008,13 @@ impl DeterministicOfflineSynthesisEngine {
         }
         let resolved_model_owned =
             Self::resolve_ollama_model_tag(requested_model_tag, &hw, &installed_models);
-        let res = Self::query_local_ollama_chat_at(
+        let res = Self::query_local_ollama_chat_at_with_kg(
             addr,
             host_port,
             prompt,
             history,
             matched_chunks,
+            kg_context,
             &resolved_model_owned,
             &hw,
             &ui,
@@ -8988,6 +9039,37 @@ impl DeterministicOfflineSynthesisEngine {
         prompt: &str,
         history: &[ChatTurnMessage],
         matched_chunks: &[&ScoredChunk],
+        requested_model_tag: &str,
+        hw: &crate::hardware::HardwareTelemetry,
+        ui: &crate::dlp_mesh::ChatGptUiSettings,
+        installed_models: &[String],
+        telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
+    ) -> Option<(String, Vec<Citation>)> {
+        Self::query_local_ollama_chat_at_with_kg(
+            addr,
+            host_port,
+            prompt,
+            history,
+            matched_chunks,
+            "",
+            requested_model_tag,
+            hw,
+            ui,
+            installed_models,
+            telemetry_tx,
+        )
+    }
+
+    /// Zero-global-state local Ollama orchestration helper with optional Layer-1 AtlasKV
+    /// Knowledge Graph triple grounding block (`kg_context`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_local_ollama_chat_at_with_kg(
+        addr: std::net::SocketAddr,
+        host_port: &str,
+        prompt: &str,
+        history: &[ChatTurnMessage],
+        matched_chunks: &[&ScoredChunk],
+        kg_context: &str,
         requested_model_tag: &str,
         hw: &crate::hardware::HardwareTelemetry,
         ui: &crate::dlp_mesh::ChatGptUiSettings,
@@ -9518,11 +9600,17 @@ impl DeterministicOfflineSynthesisEngine {
             " Some excerpts include 'Visual Content' written by a local vision model that looked at the actual image file: use it to describe what each image shows (subjects, appearance, setting), cite that image's number, and never claim the documents lack a description when Visual Content is present."
         };
         let continuation_guard_note = format!("{}{}", continuation_guard_note, vision_directive);
+        let kg_block_suffix = if kg_context.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", kg_context.trim())
+        };
         let user_content = format!(
-            "Reference Excerpts (numbered [1] through [{}], for your use only; never repeat this label):\n{}\n\nUser Question: {}\n\n\
+            "Reference Excerpts (numbered [1] through [{}], for your use only; never repeat this label):\n{}{}\n\nUser Question: {}\n\n\
             INSTRUCTION: Synthesize a complete, exhaustive, multi-paragraph analysis across the relevant source documents above to answer ONLY the User Question. {} and cite source documents inline using ONLY valid bracketed numbers `[1]` through `[{}]`. Write flowing prose paragraphs (not a bullet list of file names), start with a full sentence rather than a heading, and never repeat any sentence or paragraph.{}{}",
             max_doc_num,
             context_blocks,
+            kg_block_suffix,
             prompt,
             opening_directive,
             max_doc_num,
@@ -9596,11 +9684,14 @@ impl DeterministicOfflineSynthesisEngine {
                     }
 
                     let batch_doc_nums: Vec<usize> = batch_docs.iter().map(|(n, _)| *n).collect();
-                    let batch_blocks = batch_docs
+                    let mut batch_blocks = batch_docs
                         .iter()
                         .map(|&(doc_num, sc)| format_doc_excerpt(doc_num, sc, batch_excerpt_chars))
                         .collect::<Vec<_>>()
                         .join("\n\n");
+                    if !kg_block_suffix.is_empty() {
+                        batch_blocks.push_str(&kg_block_suffix);
+                    }
                     let batch_prompt = Self::build_multipass_batch_prompt(
                         clean_prompt_for_prefix,
                         cluster_label,

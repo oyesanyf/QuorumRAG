@@ -395,15 +395,66 @@ impl AgenticStateGraphRunner {
                 AgenticStateName::RetrieveMesh => {
                     let start = std::time::Instant::now();
                     let effective_vec = rewritten_vector.as_deref().unwrap_or(vector);
-                    RetrieveMeshNode::execute(
-                        &mut graph_state,
-                        engine,
-                        effective_vec,
-                        access_tier,
-                        top_k,
-                    )
-                    .await;
+
+                    // Launch AtlasKV 3-level HiKVP pruning concurrently off the async runtime thread
+                    let atlaskv_cfg = crate::dlp_mesh::global_mesh_dlp_controller()
+                        .settings
+                        .read()
+                        .map(|s| s.atlaskv.clone())
+                        .unwrap_or_default();
+                    let forensics_on = crate::artemis_airgap::is_forensics_enabled();
+                    let atlaskv_fut = {
+                        let store_opt = engine.local_storage.atlaskv();
+                        let qvec = effective_vec.to_vec();
+                        let leaf_k = atlaskv_cfg.leaf_top_k_kb.max(1);
+                        let enabled = atlaskv_cfg.enabled;
+                        async move {
+                            let store = if enabled { store_opt? } else { return None };
+                            tokio::task::spawn_blocking(move || {
+                                store.hikvp_search(&qvec, access_tier, leaf_k, None).ok()
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }
+                    };
+
+                    let (_, atlaskv_res) = tokio::join!(
+                        RetrieveMeshNode::execute(
+                            &mut graph_state,
+                            engine,
+                            effective_vec,
+                            access_tier,
+                            top_k,
+                        ),
+                        atlaskv_fut
+                    );
                     let latency = start.elapsed().as_millis() as u64;
+
+                    if let Some((mut kg_triples, kg_trace)) = atlaskv_res {
+                        if !forensics_on {
+                            kg_triples.retain(|t| {
+                                !crate::artemis_airgap::is_artemis_uri(&t.triple.file_path)
+                            });
+                        }
+                        let formatted_kg = quorum_atlaskv::format_grounded_kg_context(&kg_triples);
+                        let injected = kg_triples.len();
+                        graph_state.atlaskv_triples = kg_triples;
+                        graph_state.atlaskv_context = formatted_kg;
+
+                        if let Some(ref tx) = telemetry_tx {
+                            let _ = tx
+                                .send(AgenticTelemetryEvent::AtlasKvPruned {
+                                    root_scanned: kg_trace.root_selected,
+                                    inter_scanned: kg_trace.inter_scanned,
+                                    leaf_selected: kg_trace.leaf_selected,
+                                    triples_injected: injected,
+                                    used_hierarchy: kg_trace.used_hierarchy,
+                                    elapsed_ms: kg_trace.elapsed_us / 1000,
+                                })
+                                .await;
+                        }
+                    }
 
                     if let Some(ref tx) = telemetry_tx {
                         let local_count = graph_state.retrieved_chunks.iter().filter(|c| !c.is_remote).count();

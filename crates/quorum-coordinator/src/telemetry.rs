@@ -118,6 +118,16 @@ pub enum AgenticTelemetryEvent {
         misses: u64,
         hit_rate: f32,
     },
+    /// AtlasKV 3-level HiKVP knowledge graph pruning telemetry
+    #[serde(rename = "atlas_kv_pruned")]
+    AtlasKvPruned {
+        root_scanned: usize,
+        inter_scanned: usize,
+        leaf_selected: usize,
+        triples_injected: usize,
+        used_hierarchy: bool,
+        elapsed_ms: u64,
+    },
 }
 
 impl AgenticTelemetryEvent {

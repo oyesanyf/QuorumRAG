@@ -1,0 +1,23 @@
+[package]
+name = "quorum-atlaskv"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pure-Rust AtlasKV KG2KV extractor, 3-level hierarchical centroid index (Root -> Inter1 -> Leaf), sublinear HiKVP pruner, and native .npy/c2id interop for QuorumRAG"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+half = "2.7"
+memmap2 = "0.9"
+rayon = "1.12"
+parking_lot = "0.12"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

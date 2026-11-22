@@ -537,6 +537,8 @@ pub struct PersistedDaemonSettings {
     pub dlp: MeshDlpPolicy,
     #[serde(default)]
     pub artemis: crate::artemis_airgap::ArtemisDfirSettings,
+    #[serde(default)]
+    pub atlaskv: quorum_atlaskv::AtlasKvSettings,
 }
 
 /// Live runtime telemetry for the DLP & Mesh Governance controller.

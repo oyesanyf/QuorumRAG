@@ -101,6 +101,10 @@ pub trait StorageSearcher: Send + Sync {
     ) -> Option<(usize, usize, String, Option<String>, Option<String>)> {
         None
     }
+
+    fn atlaskv(&self) -> Option<Arc<quorum_atlaskv::AtlasKvStore>> {
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -231,6 +235,10 @@ impl StorageSearcher for quorum_storage::StorageEngine {
         .ok()
         .flatten()
     }
+
+    fn atlaskv(&self) -> Option<Arc<quorum_atlaskv::AtlasKvStore>> {
+        Some(quorum_storage::StorageEngine::atlaskv(self))
+    }
 }
 
 #[async_trait::async_trait]
@@ -326,6 +334,10 @@ impl<T: StorageSearcher + ?Sized> StorageSearcher for Arc<T> {
         max_tier: u8,
     ) -> Option<(usize, usize, String, Option<String>, Option<String>)> {
         (**self).expand_parent_window(doc_id_or_path, anchor_text, window_bytes, max_tier)
+    }
+
+    fn atlaskv(&self) -> Option<Arc<quorum_atlaskv::AtlasKvStore>> {
+        (**self).atlaskv()
     }
 }
 

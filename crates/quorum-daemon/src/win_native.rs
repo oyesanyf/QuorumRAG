@@ -40,7 +40,10 @@ use windows::Win32::System::Services::{
 use windows::Win32::System::Threading::{
     OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    SHChangeNotify, ShellExecuteW, SHCNE_ASSOCCHANGED, SHCNE_UPDATEDIR, SHCNF_FLUSH, SHCNF_IDLIST,
+    SHCNF_PATHW,
+};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 /// Standard `DELETE` access right (`0x00010000`) for `OpenServiceW` -> `DeleteService`.
@@ -619,5 +622,32 @@ pub fn shell_open_url(url: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("ShellExecuteW returned status code {code}"))
+    }
+}
+
+/// Flushes the Windows Explorer shell icon cache so newly installed/upgraded Desktop and
+/// Start Menu shortcuts immediately display the custom QuorumRAG icon without a reboot.
+pub fn refresh_shell_icon_cache() {
+    // SAFETY: `SHChangeNotify` with `SHCNE_ASSOCCHANGED | SHCNF_IDLIST` accepts null item pointers.
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH, None, None);
+    }
+
+    for env_key in ["PUBLIC", "USERPROFILE"] {
+        if let Some(root) = std::env::var_os(env_key) {
+            let desktop = std::path::PathBuf::from(root).join("Desktop");
+            if desktop.is_dir() {
+                let path_w = wide_nul(&desktop.to_string_lossy());
+                // SAFETY: `path_w` is a NUL-terminated UTF-16 path string matching `SHCNF_PATHW`.
+                unsafe {
+                    SHChangeNotify(
+                        SHCNE_UPDATEDIR,
+                        SHCNF_PATHW | SHCNF_FLUSH,
+                        Some(path_w.as_ptr().cast()),
+                        None,
+                    );
+                }
+            }
+        }
     }
 }

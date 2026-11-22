@@ -151,6 +151,34 @@ impl QueryCoordinator {
 
         let mut synthesis_prompt =
             DeterministicOfflineSynthesisEngine::build_synthesis_prompt(prompt, &chunks);
+        let atlaskv_settings = crate::dlp_mesh::global_mesh_dlp_controller()
+            .settings
+            .read()
+            .map(|s| s.atlaskv.clone())
+            .unwrap_or_default();
+        if atlaskv_settings.enabled {
+            if let Some(store) = self.engine.local_storage.atlaskv() {
+                let qv = vector.clone();
+                let max_tier = access_tier;
+                let leaf_k = atlaskv_settings.leaf_top_k_kb.max(1);
+                if let Ok(Ok((mut triples, _trace))) = tokio::task::spawn_blocking(move || {
+                    store.hikvp_search(&qv, max_tier, leaf_k, None)
+                })
+                .await
+                {
+                    if !forensics_enabled {
+                        triples.retain(|t| !crate::artemis_airgap::is_artemis_uri(&t.triple.file_path));
+                    }
+                    if !triples.is_empty() {
+                        let kg_ctx = quorum_atlaskv::format_grounded_kg_context(&triples);
+                        if !kg_ctx.trim().is_empty() {
+                            synthesis_prompt.push_str("\n\n");
+                            synthesis_prompt.push_str(&kg_ctx);
+                        }
+                    }
+                }
+            }
+        }
         if !forensics_enabled && query_targets_forensics {
             synthesis_prompt.push_str("\n\n> **Notice**: The forensics subsystem is currently disabled. Forensic sources and `artemis://` telemetry were skipped during retrieval.");
         }
