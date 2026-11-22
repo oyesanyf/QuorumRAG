@@ -590,6 +590,10 @@ pub fn extract_grounded_facts(subject: Option<&str>, texts: &[(String, String, S
             candidates.push(("Dates", m.as_str().to_string()));
         }
         for m in r.money.find_iter(text) {
+            // Skip truncated partial dollar fragments right at the end of a chunk (e.g. "$1" from "$195.00")
+            if m.end() == text.len() && m.as_str().len() <= 3 {
+                continue;
+            }
             let label = money_label(text, m.start());
             let v = if label.is_empty() { m.as_str().to_string() } else { format!("{} {}", label, m.as_str()) };
             candidates.push(("Amounts", v));
@@ -957,10 +961,17 @@ pub fn synthesize_grounded_document_analysis(
         })
         .collect();
     let joined = clean_lines.join("\n");
-    let window = crate::offline_engine::DeterministicOfflineSynthesisEngine::answer_focused_window(
+    let stripped_chatter = crate::structured_output::strip_chatgpt_export_chatter(
+        &crate::structured_output::strip_extraction_field_artifacts(joined.trim()),
+    );
+    let healed_joined = crate::structured_output::heal_leading_fragment(&stripped_chatter);
+    let window_raw = crate::offline_engine::DeterministicOfflineSynthesisEngine::answer_focused_window(
         prompt,
-        joined.trim(),
+        healed_joined.trim(),
         3200,
+    );
+    let window = crate::structured_output::balance_markdown_emphasis(
+        &crate::structured_output::heal_leading_fragment(window_raw.trim()),
     );
     if window.trim().is_empty() {
         return String::new();
@@ -1129,40 +1140,8 @@ pub fn render_disambiguated_multi_cluster_report(
             md.push('\n');
         }
 
-        if items.len() >= 2 {
-            md.push_str("| Ref | Source Document | Origin Node | Grounded Context Summary |\n");
-            md.push_str("|---|---|---|---|\n");
-            for it in items.iter() {
-                let doc_name = it
-                    .scored
-                    .chunk
-                    .file_path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(&it.scored.chunk.file_path)
-                    .replace('|', "\\|");
-                let origin = if it.scored.is_remote
-                    && !it.scored.source_peer.is_empty()
-                    && !it.scored.source_peer.eq_ignore_ascii_case("local")
-                {
-                    let short_peer: String = it.scored.source_peer.chars().take(12).collect();
-                    format!("Mesh Peer (`{}`)", short_peer)
-                } else {
-                    "Local Host".to_string()
-                };
-                let brief = crate::offline_engine::DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(
-                    &it.cleaned_text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "),
-                    180,
-                )
-                .replace('|', "\\|");
-                md.push_str(&format!(
-                    "| **[{}]** | `{}` | {} | {} |\n",
-                    it.global_cite, doc_name, origin, brief
-                ));
-            }
-            md.push('\n');
-        }
-
+        // Single canonical cross-cluster GFM table is emitted once at the bottom (`Identity & Domain Cluster Summary`)
+        // to avoid repeating the exact same 17 rows twice back-to-back while preserving 100% of document analysis.
         for it in items.iter() {
             let doc_name = it
                 .scored
@@ -1254,17 +1233,30 @@ pub fn render_homonym_cluster_summary_table(chunks: &[&ScoredChunk]) -> String {
         } else {
             "Local Host".to_string()
         };
-        let stripped = strip_leading_title(
-            &cleaned
+        let non_contact_joined = cleaned
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !is_contact_bar_or_header(l))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fallback_joined = if non_contact_joined.trim().is_empty() {
+            cleaned
                 .lines()
                 .map(str::trim)
-                .filter(|l| !l.is_empty() && !is_contact_bar_or_header(l))
+                .filter(|l| !l.is_empty())
                 .collect::<Vec<_>>()
-                .join(" "),
+                .join(" ")
+        } else {
+            non_contact_joined
+        };
+        let stripped = crate::structured_output::balance_markdown_emphasis(
+            &crate::structured_output::heal_leading_fragment(&strip_leading_title(
+                &crate::structured_output::strip_extraction_field_artifacts(&fallback_joined),
+            )),
         );
         let brief = crate::offline_engine::DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(
             stripped.trim(),
-            160,
+            180,
         )
         .replace('|', "\\|");
         rows.push(format!(
@@ -1369,9 +1361,40 @@ pub fn enforce_multi_cluster_homonym_sections(
 
     // 2. Prepend upfront homonym disambiguation banner if absent
     if !out.contains("multiple distinct individuals") && !out.contains("distinct contexts") {
+        let clean_fallback = |raw: &str| -> String {
+            let stripped = raw
+                .trim()
+                .trim_end_matches(|c: char| matches!(c, '?' | '!' | '.'))
+                .trim();
+            let low = stripped.to_ascii_lowercase();
+            let after_q = [
+                "who is ", "who was ", "who are ", "who were ",
+                "what is ", "what was ", "tell me about ",
+            ]
+            .iter()
+            .find_map(|p| low.strip_prefix(p).map(|_| stripped[p.len()..].trim()))
+            .unwrap_or(stripped);
+            let after_low = after_q.to_ascii_lowercase();
+            let mut cut = after_q.len();
+            for sep in [
+                "?", ",", ";", " and what ", " what is ", " what are ", " what was ",
+                " where is ", " when did ", " how did ", " why did ",
+            ] {
+                if let Some(pos) = after_low.find(sep) {
+                    if pos >= 2 && pos < cut {
+                        cut = pos;
+                    }
+                }
+            }
+            after_q[..cut].trim().to_string()
+        };
         let subj_label = subject
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| prompt.trim());
+            .map(clean_fallback)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                let c = clean_fallback(prompt);
+                if c.is_empty() { prompt.trim().to_string() } else { c }
+            });
         let cluster_summary = specific_clusters.join("; ");
         let all_cites = (1..=chunks.len())
             .map(|n| format!("[{n}]"))

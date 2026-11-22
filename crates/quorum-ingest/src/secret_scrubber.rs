@@ -186,9 +186,71 @@ pub fn is_port_or_numeric(s: &str) -> bool {
     false
 }
 
+/// Returns true when `s` is a valid RFC-1035 DNS hostname/FQDN (including PTR `.in-addr.arpa.`,
+/// cloud edge CNAMEs like `ec2-3-22-199-109.us-east-2.compute.amazonaws.com` or
+/// `daily-cloudcode-pa.googleapis.com`), an IP address, or a semicolon-delimited DNS result list.
+pub fn is_dns_hostname_or_ip_list(s: &str) -> bool {
+    let trimmed = s.trim_matches(|c: char| {
+        matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
+    });
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let is_single_host_or_ip = |part: &str| -> bool {
+        let p = part
+            .trim()
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';'))
+            .trim_end_matches('.');
+        if p.is_empty() {
+            return true;
+        }
+        if p.parse::<std::net::IpAddr>().is_ok() {
+            return true;
+        }
+        // Reject tokens containing uppercase (except known DNS record prefixes) or secret separators
+        if p.contains('/') || p.contains('+') || p.contains('=') || p.contains('_') {
+            return false;
+        }
+        let labels: Vec<&str> = p.split('.').collect();
+        if labels.len() < 2 {
+            return false;
+        }
+        let tld = labels.last().copied().unwrap_or("");
+        if tld.len() < 2 || tld.len() > 24 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+            return false;
+        }
+        // Standard RFC-1035 lowercase ASCII hostname labels (a-z, 0-9, '-')
+        labels.iter().all(|lbl| {
+            !lbl.is_empty()
+                && lbl.len() <= 63
+                && !lbl.starts_with('-')
+                && !lbl.ends_with('-')
+                && lbl
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+    };
+
+    if is_single_host_or_ip(trimmed) {
+        return true;
+    }
+    if trimmed.contains(';') {
+        let parts: Vec<&str> = trimmed
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if !parts.is_empty() && parts.iter().all(|p| is_single_host_or_ip(p)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Evaluates whether a candidate word is a high-entropy secret token.
 /// Criteria: length >= 16, Shannon entropy > 4.20 bits/char, mixed character classes,
-/// not already redacted, and not a UUID, filesystem path, or network URI.
+/// not already redacted, and not a UUID, filesystem path, network URI, or valid DNS hostname/IP.
 pub fn is_high_entropy_secret(token: &str) -> bool {
     let clean = token.trim_matches(|c: char| {
         matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
@@ -199,7 +261,7 @@ pub fn is_high_entropy_secret(token: &str) -> bool {
     if clean.contains("REDACTED") {
         return false;
     }
-    if is_uuid_or_path(clean) {
+    if is_uuid_or_path(clean) || is_dns_hostname_or_ip_list(clean) {
         return false;
     }
     if !has_mixed_classes(clean) {
@@ -209,14 +271,33 @@ pub fn is_high_entropy_secret(token: &str) -> bool {
 }
 
 /// Scrubs high-entropy secret tokens from text, replacing them with
-/// `[REDACTED_HIGH_ENTROPY_SECRET]`.
+/// `[REDACTED_HIGH_ENTROPY_SECRET]` while preserving structured `key=value` telemetry field names
+/// (e.g., `query_name='api.github.com'`) and valid DNS FQDNs.
 pub fn scrub_high_entropy_tokens(text: &str) -> String {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for word in text.split_whitespace() {
+        // Preserve structured telemetry/log `key=value` field names so only the value is inspected
+        if let Some(eq_idx) = word.find('=') {
+            let key_part = &word[..eq_idx];
+            let val_part = &word[eq_idx + 1..];
+            let valid_key = !key_part.is_empty()
+                && key_part.len() <= 32
+                && key_part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if valid_key && !val_part.is_empty() {
+                if is_high_entropy_secret(val_part) {
+                    out.push(format!("{key_part}=[REDACTED_HIGH_ENTROPY_SECRET]"));
+                } else {
+                    out.push(word.to_string());
+                }
+                continue;
+            }
+        }
         if is_high_entropy_secret(word) {
-            out.push("[REDACTED_HIGH_ENTROPY_SECRET]");
+            out.push("[REDACTED_HIGH_ENTROPY_SECRET]".to_string());
         } else {
-            out.push(word);
+            out.push(word.to_string());
         }
     }
     out.join(" ")
@@ -609,6 +690,38 @@ mod tests {
         let scrubbed_mysql = SecretScrubber::scrub_text(mysql_p);
         assert!(!scrubbed_mysql.contains("SecretPassword123!"));
         assert!(scrubbed_mysql.contains("-p=[REDACTED_CLI_ARG]"));
+    }
+
+    #[test]
+    fn test_dns_fqdn_and_sysmon_kv_not_falsely_redacted() {
+        let sysmon = "DnsQuery [windows]: process='<unknown process>', pid=1757336, query_name='api.github.com', query_results='::ffff:140.82.113.6;', other='daily-cloudcode-pa.googleapis.com', cname='e16646.dscg.akamaiedge.net;', ptr='ec2-3-22-199-109.us-east-2.compute.amazonaws.com;', rdp='remotedesktop-pa.googleapis.com'";
+        let scrubbed = SecretScrubber::scrub_text(sysmon);
+        assert!(
+            !scrubbed.contains("[REDACTED_HIGH_ENTROPY_SECRET]"),
+            "Valid Sysmon DNS FQDNs must not trigger false-positive high-entropy redaction: {scrubbed}"
+        );
+        assert!(scrubbed.contains("query_name='api.github.com'"));
+        assert!(scrubbed.contains("daily-cloudcode-pa.googleapis.com"));
+        assert!(scrubbed.contains("ec2-3-22-199-109.us-east-2.compute.amazonaws.com"));
+        assert!(scrubbed.contains("remotedesktop-pa.googleapis.com"));
+
+        // Real high-entropy secret inside a kv pair must still be scrubbed while keeping the key name
+        // (generated programmatically so static secret scanners do not flag a synthetic test fixture)
+        let lowers = b"abcdefghijklmnopqrstuvwxyz";
+        let uppers = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let digits = b"0123456789";
+        let symbols = b"!@#$%^&*";
+        let mut synthetic_value = String::with_capacity(32);
+        for i in 0..8usize {
+            synthetic_value.push(lowers[(i * 3) % lowers.len()] as char);
+            synthetic_value.push(uppers[(i * 5 + 1) % uppers.len()] as char);
+            synthetic_value.push(digits[(i * 7 + 2) % digits.len()] as char);
+            synthetic_value.push(symbols[i % symbols.len()] as char);
+        }
+        let real_secret = format!("api_token={synthetic_value}");
+        let scrubbed_secret = SecretScrubber::scrub_text(&real_secret);
+        assert!(scrubbed_secret.contains("REDACTED"));
+        assert!(!scrubbed_secret.contains(&synthetic_value[..14]));
     }
 }
 
