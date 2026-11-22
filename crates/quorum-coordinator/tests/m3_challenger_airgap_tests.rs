@@ -448,11 +448,13 @@ async fn test_adversarial_outbound_scatter_gather_suppression() {
     );
 
     // 2. SwarmMeshDispatcher suppression check
-    let config = NetworkConfig::new_localhost();
-    let (_jh, handle) = start_network_node(config, None).await.unwrap();
-    let dispatcher = SwarmMeshDispatcher::new(handle);
     let temp = tempfile::tempdir().unwrap();
     let seed = load_or_generate_node_seed(temp.path()).unwrap();
+    let mut config = NetworkConfig::new_localhost();
+    config.ed25519_seed = Some(seed);
+    let (_jh, handle) = start_network_node(config, None).await.unwrap();
+    let local_peer_id = handle.local_peer_id().to_string();
+    let dispatcher = SwarmMeshDispatcher::new(handle, local_peer_id, seed);
     let req = make_signed_request(&seed, "Search artemis://windows/registry", AccessTier::Tier0Public);
 
     let (responses, diagnostics) = dispatcher

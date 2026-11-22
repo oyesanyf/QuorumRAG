@@ -5,7 +5,7 @@ set -euo pipefail
 # Generates Debian (.deb), RedHat (.rpm), and portable (.tar.gz) packages for Linux deployments.
 
 BINARY_PATH="${1:-target/release/quorumrag}"
-VERSION="${2:-0.6.17}"
+VERSION="${2:-0.6.18}"
 INPUT_ARCH="${3:-amd64}"
 DIST_DIR="${4:-deploy/linux}"
 PACKAGE_NAME="${5:-quorumrag}"
@@ -75,6 +75,16 @@ cp -f "${CTL_FILE}" "${TAR_STAGING}/quorumrag-ctl"
 chmod 755 "${TAR_STAGING}/quorumrag-ctl"
 cp -f "${DESKTOP_FILE}" "${TAR_STAGING}/quorumrag.desktop"
 chmod 644 "${TAR_STAGING}/quorumrag.desktop"
+ICONS_DIR="${ROOT_DIR}/assets/icons"
+if [ -d "${ICONS_DIR}" ]; then
+    mkdir -p "${TAR_STAGING}/icons"
+    for sz in 64 128 256 512; do
+        if [ -f "${ICONS_DIR}/quorumrag-${sz}.png" ]; then
+            cp -f "${ICONS_DIR}/quorumrag-${sz}.png" "${TAR_STAGING}/icons/quorumrag-${sz}.png"
+            chmod 644 "${TAR_STAGING}/icons/quorumrag-${sz}.png"
+        fi
+    done
+fi
 
 cat <<'EOF' > "${TAR_STAGING}/install.sh"
 #!/usr/bin/env bash
@@ -98,6 +108,13 @@ fi
 install -m 644 "${SCRIPT_DIR}/quorumrag.service" /lib/systemd/system/quorumrag.service
 install -m 755 "${SCRIPT_DIR}/quorumrag-ctl" /usr/lib/quorumrag/quorumrag-ctl
 install -m 644 "${SCRIPT_DIR}/quorumrag.desktop" /usr/share/applications/quorumrag.desktop
+for sz in 64 128 256 512; do
+    if [ -f "${SCRIPT_DIR}/icons/quorumrag-${sz}.png" ]; then
+        mkdir -p "/usr/share/icons/hicolor/${sz}x${sz}/apps"
+        install -m 644 "${SCRIPT_DIR}/icons/quorumrag-${sz}.png" "/usr/share/icons/hicolor/${sz}x${sz}/apps/quorumrag.png"
+    fi
+done
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
 /usr/lib/quorumrag/quorumrag-ctl post-install
 echo "[+] Installed /usr/bin/quorumrag and quorumrag.service (Zero-Touch PATH)."
 echo "    Uninstall completely: sudo ./uninstall.sh [--purge]"
@@ -214,6 +231,13 @@ cp -f "${CTL_FILE}" "${DEB_STAGING}/usr/lib/quorumrag/quorumrag-ctl"
 chmod 755 "${DEB_STAGING}/usr/lib/quorumrag/quorumrag-ctl"
 cp -f "${DESKTOP_FILE}" "${DEB_STAGING}/usr/share/applications/quorumrag.desktop"
 chmod 644 "${DEB_STAGING}/usr/share/applications/quorumrag.desktop"
+for sz in 64 128 256 512; do
+    if [ -f "${ROOT_DIR}/assets/icons/quorumrag-${sz}.png" ]; then
+        mkdir -p "${DEB_STAGING}/usr/share/icons/hicolor/${sz}x${sz}/apps"
+        cp -f "${ROOT_DIR}/assets/icons/quorumrag-${sz}.png" "${DEB_STAGING}/usr/share/icons/hicolor/${sz}x${sz}/apps/quorumrag.png"
+        chmod 644 "${DEB_STAGING}/usr/share/icons/hicolor/${sz}x${sz}/apps/quorumrag.png"
+    fi
+done
 
 DEB_OUT="${DIST_DIR}/${PACKAGE_NAME}_${VERSION}_${DEB_ARCH}.deb"
 if command -v dpkg-deb >/dev/null 2>&1; then
@@ -308,6 +332,12 @@ install -m 755 "${BINARY_PATH}" %{buildroot}/usr/bin/quorumrag
 install -m 644 "${SERVICE_FILE}" %{buildroot}/usr/lib/systemd/system/quorumrag.service
 install -m 755 "${CTL_FILE}" %{buildroot}/usr/lib/quorumrag/quorumrag-ctl
 install -m 644 "${DESKTOP_FILE}" %{buildroot}/usr/share/applications/quorumrag.desktop
+for sz in 64 128 256 512; do
+    if [ -f "${ROOT_DIR}/assets/icons/quorumrag-\${sz}.png" ]; then
+        mkdir -p "%{buildroot}/usr/share/icons/hicolor/\${sz}x\${sz}/apps"
+        install -m 644 "${ROOT_DIR}/assets/icons/quorumrag-\${sz}.png" "%{buildroot}/usr/share/icons/hicolor/\${sz}x\${sz}/apps/quorumrag.png"
+    fi
+done
 ${DESKTOP_RPM_INSTALL}
 
 %pre
@@ -348,6 +378,10 @@ fi
 /usr/lib/quorumrag/quorumrag-ctl
 ${DESKTOP_RPM_FILE}
 /usr/share/applications/quorumrag.desktop
+/usr/share/icons/hicolor/64x64/apps/quorumrag.png
+/usr/share/icons/hicolor/128x128/apps/quorumrag.png
+/usr/share/icons/hicolor/256x256/apps/quorumrag.png
+/usr/share/icons/hicolor/512x512/apps/quorumrag.png
 %dir /var/lib/quorumrag
 %dir /var/lib/quorumrag/data
 %dir /var/lib/quorumrag/docs

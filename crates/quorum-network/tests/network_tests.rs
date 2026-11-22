@@ -30,6 +30,7 @@ impl InboundQueryHandler for TestQueryHandler {
             }],
             synthesis_response: None,
             warm_llm_available: false,
+            peer_multiaddrs: Vec::new(),
         }
     }
 }

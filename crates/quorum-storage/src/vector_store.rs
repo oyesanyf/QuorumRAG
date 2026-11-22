@@ -7,13 +7,50 @@ use std::fs::create_dir_all;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use lancedb::index::vector::IvfPqIndexBuilder;
+use lancedb::index::vector::{IvfHnswSqIndexBuilder, IvfPqIndexBuilder};
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::OptimizeAction;
 use lancedb::{Connection, DistanceType, Table};
 use quorum_types::{DocumentChunk, ScoredChunk};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::RwLock;
+
+/// Minimum runtime available RAM (16 GiB) required to prefer `IVF_HNSW_SQ` over `IVF_PQ`.
+pub(crate) const IVF_HNSW_SQ_MIN_AVAILABLE_RAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Adaptive LanceDB vector ANN index strategy chosen strictly from runtime available RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorIndexStrategy {
+    /// Higher-recall HNSW + Scalar Quantization for hosts with >= 16 GiB free RAM.
+    IvfHnswSq,
+    /// Low-RAM Product Quantization for laptops and constrained nodes (< 16 GiB free RAM).
+    IvfPq,
+}
+
+/// Selects `IVF_HNSW_SQ` when runtime available RAM >= 16 GiB, otherwise `IVF_PQ`.
+#[inline]
+pub(crate) fn select_adaptive_vector_index_strategy(
+    available_ram_bytes: u64,
+) -> VectorIndexStrategy {
+    if available_ram_bytes >= IVF_HNSW_SQ_MIN_AVAILABLE_RAM_BYTES {
+        VectorIndexStrategy::IvfHnswSq
+    } else {
+        VectorIndexStrategy::IvfPq
+    }
+}
+
+fn current_available_ram_bytes() -> u64 {
+    let sys = System::new_with_specifics(
+        RefreshKind::new().with_memory(MemoryRefreshKind::everything()),
+    );
+    let avail = sys.available_memory();
+    if avail > 0 {
+        avail
+    } else {
+        sys.free_memory()
+    }
+}
 
 use crate::arrow_interop::{chunks_to_record_batch, extract_scored_chunks};
 use crate::config::StorageConfig;
@@ -199,11 +236,20 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Creates scalar pre-filter indices and dynamic IVF_PQ vector index using Cosine distance.
+    /// Creates scalar pre-filter indices (including `blake3_hash` BTree for O(log N) dedup)
+    /// and an adaptive vector ANN index (`IVF_HNSW_SQ` on >= 16 GiB free RAM, `IVF_PQ` below).
     pub(crate) async fn create_ivf_pq_index(&self) -> Result<(), StorageError> {
+        self.create_adaptive_indices_for_ram(current_available_ram_bytes())
+            .await
+    }
+
+    pub(crate) async fn create_adaptive_indices_for_ram(
+        &self,
+        available_ram_bytes: u64,
+    ) -> Result<(), StorageError> {
         let table = self.table.read().await;
 
-        // 1. Create scalar pre-filter indices if supported
+        // 1. Create scalar pre-filter indices (Bitmap on access_tier; BTree on file_path, chunk_id, blake3_hash)
         let _ = table
             .create_index(&["access_tier"], Index::Bitmap(Default::default()))
             .execute()
@@ -216,24 +262,74 @@ impl VectorStore {
             .create_index(&["chunk_id"], Index::BTree(Default::default()))
             .execute()
             .await;
+        let _ = table
+            .create_index(&["blake3_hash"], Index::BTree(Default::default()))
+            .execute()
+            .await;
 
         let num_rows = table.count_rows(None).await.unwrap_or(0);
         if num_rows < 256 {
-            // IVF_PQ requires adequate training rows
+            // Vector ANN index requires adequate training rows
             return Ok(());
         }
 
-        // Dynamic IVF_PQ partition sizing based on square root of row count
+        // 2. Dynamic partition sizing based on square root of row count
         let num_partitions = ((num_rows as f64).sqrt().round() as u32).clamp(16, 1024);
-        let builder = IvfPqIndexBuilder::default()
-            .distance_type(DistanceType::Cosine)
-            .num_partitions(num_partitions);
+        let strategy = select_adaptive_vector_index_strategy(available_ram_bytes);
 
-        table
-            .create_index(&["vector"], Index::IvfPq(builder))
-            .execute()
-            .await
-            .map_err(|e| StorageError::Lance(format!("Create IVF_PQ index error: {}", e)))?;
+        match strategy {
+            VectorIndexStrategy::IvfHnswSq => {
+                let hnsw_builder = IvfHnswSqIndexBuilder::default()
+                    .distance_type(DistanceType::Cosine)
+                    .num_partitions(num_partitions);
+                match table
+                    .create_index(&["vector"], Index::IvfHnswSq(hnsw_builder))
+                    .execute()
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            num_rows,
+                            num_partitions,
+                            available_ram_gb = available_ram_bytes / (1024 * 1024 * 1024),
+                            "Created adaptive LanceDB IVF_HNSW_SQ vector index + blake3_hash BTree index"
+                        );
+                    }
+                    Err(hnsw_err) => {
+                        tracing::warn!(
+                            error = %hnsw_err,
+                            "IVF_HNSW_SQ index creation failed; falling back cleanly to IVF_PQ"
+                        );
+                        let pq_builder = IvfPqIndexBuilder::default()
+                            .distance_type(DistanceType::Cosine)
+                            .num_partitions(num_partitions);
+                        table
+                            .create_index(&["vector"], Index::IvfPq(pq_builder))
+                            .execute()
+                            .await
+                            .map_err(|e| {
+                                StorageError::Lance(format!("Create IVF_PQ fallback index error: {}", e))
+                            })?;
+                    }
+                }
+            }
+            VectorIndexStrategy::IvfPq => {
+                let pq_builder = IvfPqIndexBuilder::default()
+                    .distance_type(DistanceType::Cosine)
+                    .num_partitions(num_partitions);
+                table
+                    .create_index(&["vector"], Index::IvfPq(pq_builder))
+                    .execute()
+                    .await
+                    .map_err(|e| StorageError::Lance(format!("Create IVF_PQ index error: {}", e)))?;
+                tracing::info!(
+                    num_rows,
+                    num_partitions,
+                    available_ram_gb = available_ram_bytes / (1024 * 1024 * 1024),
+                    "Created low-RAM LanceDB IVF_PQ vector index + blake3_hash BTree index"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -343,6 +439,95 @@ impl VectorStore {
             .await
             .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
         Ok(before_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn adaptive_vector_index_strategy_selects_hnsw_sq_above_16gb_and_pq_below() {
+        let gib = 1024u64 * 1024 * 1024;
+        assert_eq!(
+            select_adaptive_vector_index_strategy(2 * gib),
+            VectorIndexStrategy::IvfPq
+        );
+        assert_eq!(
+            select_adaptive_vector_index_strategy(16 * gib - 1),
+            VectorIndexStrategy::IvfPq
+        );
+        assert_eq!(
+            select_adaptive_vector_index_strategy(16 * gib),
+            VectorIndexStrategy::IvfHnswSq
+        );
+        assert_eq!(
+            select_adaptive_vector_index_strategy(186 * gib),
+            VectorIndexStrategy::IvfHnswSq
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_index_builds_blake3_btree_and_vector_indices_for_both_ram_tiers() {
+        for (label, sim_ram) in [
+            ("low_ram_ivf_pq", 4u64 * 1024 * 1024 * 1024),
+            ("high_ram_ivf_hnsw_sq", 64u64 * 1024 * 1024 * 1024),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let cfg = StorageConfig::new(tmp.path())
+                .with_vector_dimension(16)
+                .with_auto_index_threshold(10_000);
+            let store = VectorStore::open(&cfg).await.unwrap();
+
+            let mut chunks = Vec::with_capacity(300);
+            for i in 0..300usize {
+                let mut vec = vec![0.05f32; 16];
+                vec[i % 16] = 1.0;
+                let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                for x in &mut vec {
+                    *x /= norm;
+                }
+                chunks.push(
+                    DocumentChunk::new(
+                        format!("doc:{i}"),
+                        format!("doc_{}", i % 10),
+                        format!("folder/file_{}.txt", i % 10),
+                        1,
+                        5,
+                        0,
+                        vec,
+                        format!("Adaptive index test payload {label} row {i}"),
+                        None,
+                    )
+                    .unwrap(),
+                );
+            }
+            store.insert_chunks(&chunks).await.unwrap();
+            store
+                .create_adaptive_indices_for_ram(sim_ram)
+                .await
+                .expect("create adaptive indices");
+
+            let indices = store.table.read().await.list_indices().await.unwrap();
+            assert!(
+                indices
+                    .iter()
+                    .any(|idx| idx.columns.iter().any(|c| c == "blake3_hash")),
+                "{label}: expected BTree index on blake3_hash, got {:?}",
+                indices
+            );
+            assert!(
+                indices
+                    .iter()
+                    .any(|idx| idx.columns.iter().any(|c| c == "vector")),
+                "{label}: expected vector ANN index on vector, got {:?}",
+                indices
+            );
+            assert!(store.has_chunk_hash(&chunks[42].blake3_hash).await.unwrap());
+            let hits = store.search_vector(&chunks[42].vector, 0, 5).await.unwrap();
+            assert!(!hits.is_empty());
+        }
     }
 }
 

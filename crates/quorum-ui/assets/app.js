@@ -4952,11 +4952,19 @@ function secureRandomIndex(n) {
       toast.style.cssText = 'position:fixed; bottom:24px; right:24px; z-index:250000; pointer-events:none; background:var(--accent, #10a37f); color:#fff; padding:10px 18px; border-radius:999px; font-size:13px; font-weight:600; box-shadow:0 6px 20px rgba(0,0,0,0.45); transition:opacity 0.2s ease;';
       document.body.appendChild(toast);
     }
+    clearTimeout(window._quorumToastTimer);
+    clearTimeout(window._quorumToastClearTimer);
+    toast.style.display = 'block';
     toast.textContent = msg;
     toast.style.opacity = '1';
-    clearTimeout(window._quorumToastTimer);
     window._quorumToastTimer = setTimeout(() => {
       if (toast) toast.style.opacity = '0';
+      window._quorumToastClearTimer = setTimeout(() => {
+        if (toast && toast.style.opacity === '0') {
+          toast.textContent = '';
+          toast.style.display = 'none';
+        }
+      }, 240);
     }, 2600);
   }
 

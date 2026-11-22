@@ -407,6 +407,7 @@ async fn test_adv_remote_chunk_access_tier_clamping_to_requested() {
         ],
         synthesis_response: None,
         warm_llm_available: false,
+        peer_multiaddrs: Vec::new(),
     };
 
     let dispatcher = Arc::new(DirectResponseDispatcher {
@@ -505,6 +506,7 @@ async fn test_adv_remote_chunk_inverted_lines_rejected() {
         ],
         synthesis_response: None,
         warm_llm_available: false,
+        peer_multiaddrs: Vec::new(),
     };
 
     let dispatcher = Arc::new(DirectResponseDispatcher {

@@ -33,6 +33,7 @@ impl InboundQueryHandler for EchoQueryHandler {
             }],
             synthesis_response: None,
             warm_llm_available: false,
+            peer_multiaddrs: Vec::new(),
         }
     }
 }

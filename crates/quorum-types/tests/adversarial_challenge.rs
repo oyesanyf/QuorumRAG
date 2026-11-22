@@ -539,6 +539,7 @@ fn test_federated_query_roundtrip_serialization() {
         ],
         synthesis_response: None,
         warm_llm_available: false,
+        peer_multiaddrs: Vec::new(),
     };
 
     let resp_json = serde_json::to_string(&resp).expect("Serialize FederatedQueryResponse");

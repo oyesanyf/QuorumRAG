@@ -24,6 +24,7 @@ chrono = { workspace = true }
 parking_lot = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 regex = "1"
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

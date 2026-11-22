@@ -506,6 +506,71 @@ pub async fn discover_reachable_lan_p2p_ips(
     probe_open_p2p_hosts(candidates.into_iter().collect(), p2p_port).await
 }
 
+/// Filters multiaddrs learned from `P2P_WATCHER_CANARY_QUERY` responses down to dialable
+/// LAN/WAN multiaddrs that do not point to self, port 4001, or already-connected peers.
+/// Returns deduplicated `(full_multiaddr_to_dial, clean_base_multiaddr, optional_peer_id)` tuples.
+pub fn filter_canary_learned_peer_multiaddrs(
+    learned: &[String],
+    local_peer_id: &str,
+    self_ips: &[Ipv4Addr],
+    connected_peer_ids: &BTreeSet<String>,
+    connected_bases: &BTreeSet<String>,
+    self_listen_bases: &BTreeSet<String>,
+) -> Vec<(String, String, Option<String>)> {
+    let mut seen_bases = BTreeSet::new();
+    let mut out = Vec::new();
+
+    for raw in learned {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.contains("/tcp/4001")
+            || trimmed.contains("/udp/4001")
+            || trimmed.ends_with(":4001")
+            || trimmed.ends_with("/4001")
+            || trimmed.contains("/4001/")
+        {
+            continue;
+        }
+
+        let embedded_pid = trimmed
+            .split_once("/p2p/")
+            .map(|(_, pid)| pid.split('/').next().unwrap_or(pid).trim().to_string())
+            .filter(|p| !p.is_empty());
+
+        if let Some(ref pid) = embedded_pid {
+            if (!local_peer_id.is_empty() && pid == local_peer_id)
+                || connected_peer_ids.contains(pid)
+            {
+                continue;
+            }
+        }
+
+        let base = strip_p2p_suffix(trimmed).trim_end_matches('/').to_string();
+        if !is_dialable_lan_or_wan_multiaddr(&base) {
+            continue;
+        }
+        if connected_bases.contains(&base) || self_listen_bases.contains(&base) {
+            continue;
+        }
+
+        if let Some(rest) = base.strip_prefix("/ip4/") {
+            if let Some(ip_str) = rest.split('/').next() {
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    if self_ips.contains(&ip) {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if seen_bases.insert(base.clone()) {
+            out.push((trimmed.to_string(), base, embedded_pid));
+        }
+    }
+
+    out
+}
+
 /// Executes a real Ed25519-signed libp2p canary query against every currently connected peer,
 /// measuring live RTT and detecting half-open or wedged Yamux streams.
 pub async fn run_in_daemon_canary_probe(state: &Arc<DaemonState>) -> Vec<PeerCanaryProbeResult> {
@@ -576,12 +641,16 @@ pub async fn run_in_daemon_canary_probe(state: &Arc<DaemonState>) -> Vec<PeerCan
 
     let registry = global_peer_health_registry();
     let mut results = Vec::new();
+    let mut learned_multiaddrs = BTreeSet::new();
     while let Some(joined) = join_set.join_next().await {
         if let Ok((peer, ma_str, outcome, rtt_ms)) = joined {
             let peer_id_str = peer.to_string();
             match outcome {
-                Ok(Ok(_resp)) => {
+                Ok(Ok(resp)) => {
                     registry.record_canary_probe(&peer_id_str, rtt_ms);
+                    for ma in resp.peer_multiaddrs {
+                        learned_multiaddrs.insert(ma);
+                    }
                     results.push(PeerCanaryProbeResult {
                         peer_id: peer_id_str,
                         multiaddr: ma_str,
@@ -634,6 +703,80 @@ pub async fn run_in_daemon_canary_probe(state: &Arc<DaemonState>) -> Vec<PeerCan
     if let Ok(mut guard) = watcher.last_probe_results.write() {
         *guard = results.clone();
     }
+
+    if !learned_multiaddrs.is_empty() {
+        let learned_vec: Vec<String> = learned_multiaddrs.into_iter().collect();
+        let latest_addr_map = handle.connected_peer_addresses();
+        let connected_peer_ids: BTreeSet<String> =
+            latest_addr_map.keys().map(|p| p.to_string()).collect();
+        let connected_bases: BTreeSet<String> = latest_addr_map
+            .values()
+            .map(|m| strip_p2p_suffix(&m.to_string()))
+            .collect();
+        let self_listen_bases: BTreeSet<String> = handle
+            .listen_addresses()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| strip_p2p_suffix(&m.to_string()))
+            .collect();
+        let self_ips = discover_local_private_ipv4_addresses();
+        let targets = filter_canary_learned_peer_multiaddrs(
+            &learned_vec,
+            &watcher.local_peer_id,
+            &self_ips,
+            &connected_peer_ids,
+            &connected_bases,
+            &self_listen_bases,
+        );
+
+        if !targets.is_empty() {
+            let mut dialed_any = 0usize;
+            let mut cache = watcher.load_known_peers();
+            let mut cache_set: BTreeSet<String> = cache.multiaddrs.into_iter().collect();
+            let mut cache_dirty = false;
+
+            for (dial_str, base, opt_pid) in targets {
+                if cache_set.insert(base.clone()) {
+                    cache_dirty = true;
+                }
+                if let Some(pid) = opt_pid {
+                    if cache.peer_map.get(&pid) != Some(&base) {
+                        cache.peer_map.insert(pid, base.clone());
+                        cache_dirty = true;
+                    }
+                }
+                if let Ok(ma) = dial_str
+                    .parse::<Multiaddr>()
+                    .or_else(|_| base.parse::<Multiaddr>())
+                {
+                    if handle.dial_trusted(ma).await.is_ok() {
+                        dialed_any += 1;
+                        watcher.peers_redialed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            if cache_dirty {
+                cache.multiaddrs = cache_set.into_iter().collect();
+                cache.updated_at = Utc::now().to_rfc3339();
+                if let Ok(json) = serde_json::to_string_pretty(&cache) {
+                    let _ = std::fs::write(watcher.known_peers_path(), json);
+                }
+            }
+
+            if dialed_any > 0 {
+                info!(
+                    dialed_peers = dialed_any,
+                    "P2P Watcher canary discovered and auto-dialed transitive mesh peers"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let refreshed = handle.connected_peer_addresses();
+                watcher.save_known_peers_snapshot(&refreshed);
+            }
+        }
+    }
+
     results
 }
 
@@ -1265,5 +1408,40 @@ mod tests {
         assert!(!is_dialable_lan_or_wan_multiaddr("/dns4/ipfs.io/tcp/4001"));
         assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/127.0.0.1/tcp/3032"));
         assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/10.0.0.255/tcp/3032"));
+    }
+
+    #[test]
+    fn test_filter_canary_learned_peer_multiaddrs_filters_self_4001_loopback_and_connected() {
+        let local_pid = "12D3KooWDRDLdpC9DeyiHMfpTMUVrDz73vgYXKjQPJKWgtiaqtrL";
+        let connected_pid = "12D3KooWKHc3HiYDTmS9jymRJxHjuBEQ6Z3veB21KmzuH52iRFYu";
+        let new_pid = "12D3KooWEcNhbaJtvJCF6QqvWwzxWTXBMfMqvxrRbxKbAZ2ZvKR5";
+
+        let self_ips = vec![Ipv4Addr::new(10, 0, 0, 10)];
+        let mut connected_pids = BTreeSet::new();
+        connected_pids.insert(connected_pid.to_string());
+        let mut connected_bases = BTreeSet::new();
+        connected_bases.insert("/ip4/10.0.0.165/tcp/3032".to_string());
+        let self_listen_bases = BTreeSet::new();
+
+        let learned = vec![
+            format!("/ip4/10.0.0.10/tcp/3032/p2p/{}", local_pid),
+            format!("/ip4/10.0.0.10/tcp/3032/p2p/{}", new_pid),
+            format!("/ip4/127.0.0.1/tcp/3032/p2p/{}", new_pid),
+            format!("/ip4/10.0.0.20/tcp/4001/p2p/{}", new_pid),
+            format!("/ip4/10.0.0.165/tcp/3032/p2p/{}", connected_pid),
+            format!("/ip4/10.0.0.25/tcp/3032/p2p/{}", new_pid),
+        ];
+
+        let filtered = filter_canary_learned_peer_multiaddrs(
+            &learned,
+            local_pid,
+            &self_ips,
+            &connected_pids,
+            &connected_bases,
+            &self_listen_bases,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, "/ip4/10.0.0.25/tcp/3032");
+        assert_eq!(filtered[0].2.as_deref(), Some(new_pid));
     }
 }

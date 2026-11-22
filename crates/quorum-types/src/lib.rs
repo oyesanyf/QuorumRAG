@@ -662,6 +662,10 @@ pub struct FederatedQueryResponse {
     /// Indicates whether this peer currently has a warm local LLM available for synthesis.
     #[serde(default)]
     pub warm_llm_available: bool,
+
+    /// Dialable multiaddrs of connected mesh peers (`/ip4/.../tcp/.../p2p/<PeerId>`) for transitive discovery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_multiaddrs: Vec<String>,
 }
 
 /// Volatile memory wrapper for remote chunks received from untrusted peers.

@@ -402,6 +402,57 @@ def prune_superseded_local_and_remote_releases(root: Path, version: str, prune_r
             except urllib.error.HTTPError as exc:
                 print(f"[!] Could not prune old release {old_tag}: HTTP {exc.code}")
 
+    # Also prune superseded GitHub Actions build artifacts so strictly one build set remains per artifact name
+    try:
+        all_artifacts = []
+        page = 1
+        while True:
+            page_data = json.loads(
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"https://api.github.com/repos/{EXPECTED_REPO_SLUG}/actions/artifacts?per_page=100&page={page}",
+                        headers=headers,
+                    ),
+                    timeout=20,
+                )
+                .read()
+                .decode("utf-8")
+            )
+            batch = page_data.get("artifacts", [])
+            if not batch:
+                break
+            all_artifacts.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+
+        active = [a for a in all_artifacts if not a.get("expired")]
+        active.sort(key=lambda a: (a.get("created_at", ""), a.get("id", 0)), reverse=True)
+        seen_names: set[str] = set()
+        pruned_artifacts = 0
+        for art in active:
+            aname = art.get("name", "")
+            aid = art.get("id")
+            if aname in seen_names and aid:
+                try:
+                    urllib.request.urlopen(
+                        urllib.request.Request(
+                            f"https://api.github.com/repos/{EXPECTED_REPO_SLUG}/actions/artifacts/{aid}",
+                            method="DELETE",
+                            headers=headers,
+                        ),
+                        timeout=20,
+                    )
+                    pruned_artifacts += 1
+                except Exception:
+                    pass
+            else:
+                seen_names.add(aname)
+        if pruned_artifacts:
+            print(f"[+] Pruned {pruned_artifacts} superseded GitHub Actions build artifact(s); retained latest set.")
+    except Exception as exc:
+        print(f"[!] Skipped remote Actions artifact pruning: {exc}")
+
 
 def collect_canonical_artifacts(root: Path, version: str) -> list[Path]:
     v_clean = version.lstrip("v")

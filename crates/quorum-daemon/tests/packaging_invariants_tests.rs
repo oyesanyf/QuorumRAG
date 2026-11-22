@@ -221,3 +221,61 @@ fn cross_os_packaging_versions_match_workspace_cargo_toml() {
         "packaging/macos/build_packages.sh default VERSION does not match Cargo.toml ({ver})"
     );
 }
+
+#[test]
+fn custom_app_icon_is_wired_across_windows_linux_macos_and_webui() {
+    let root = repo_root();
+    for rel in [
+        "assets/icons/quorumrag.ico",
+        "assets/icons/quorumrag.icns",
+        "assets/icons/quorumrag.rc",
+        "assets/icons/quorumrag-64.png",
+        "assets/icons/quorumrag-128.png",
+        "assets/icons/quorumrag-256.png",
+        "assets/icons/quorumrag-512.png",
+        "crates/quorum-ui/assets/favicon.ico",
+        "crates/quorum-ui/assets/quorumrag-icon.png",
+    ] {
+        let p = root.join(rel);
+        assert!(p.is_file(), "Missing custom icon asset: {}", p.display());
+    }
+
+    let wxs = fs::read_to_string(root.join("wix/QuorumRAG.wxs")).expect("read QuorumRAG.wxs");
+    assert!(
+        wxs.contains(r#"<Icon Id="QuorumRAGIcon.ico" SourceFile="assets\icons\quorumrag.ico" />"#),
+        "wix/QuorumRAG.wxs must declare QuorumRAGIcon.ico"
+    );
+    assert!(
+        wxs.contains(r#"<Property Id="ARPPRODUCTICON" Value="QuorumRAGIcon.ico" />"#),
+        "wix/QuorumRAG.wxs must set ARPPRODUCTICON"
+    );
+    assert_eq!(
+        wxs.matches(r#"Icon="QuorumRAGIcon.ico""#).count(),
+        2,
+        "Both StartMenuLaunchShortcut and DesktopLaunchShortcut must specify Icon=\"QuorumRAGIcon.ico\""
+    );
+
+    let build_rs = fs::read_to_string(root.join("crates/quorum-daemon/build.rs"))
+        .expect("read crates/quorum-daemon/build.rs");
+    assert!(build_rs.contains("quorumrag.rc"));
+    for forbidden_net in ["TcpStream::connect", "reqwest::", "curl http", "169.254.169.254"] {
+        assert!(
+            !build_rs.contains(forbidden_net),
+            "build.rs must remain 100% hermetic without network calls"
+        );
+    }
+
+    let desktop = fs::read_to_string(root.join("packaging/linux/quorumrag.desktop"))
+        .expect("read quorumrag.desktop");
+    assert!(desktop.contains("Icon=quorumrag"));
+    assert!(!desktop.contains("Icon=applications-internet"));
+
+    let linux_sh = fs::read_to_string(root.join("packaging/linux/build_packages.sh"))
+        .expect("read packaging/linux/build_packages.sh");
+    assert!(linux_sh.contains("/usr/share/icons/hicolor/"));
+
+    let macos_sh = fs::read_to_string(root.join("packaging/macos/build_packages.sh"))
+        .expect("read packaging/macos/build_packages.sh");
+    assert!(macos_sh.contains("QuorumRAG.icns"));
+    assert!(macos_sh.contains("<key>CFBundleIconFile</key>"));
+}

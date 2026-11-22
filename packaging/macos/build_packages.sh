@@ -5,7 +5,7 @@ set -euo pipefail
 # Generates macOS native installer (.pkg), disk image (.dmg), and portable (.tar.gz) packages.
 
 BINARY_PATH="${1:-target/release/quorumrag}"
-VERSION="${2:-0.6.17}"
+VERSION="${2:-0.6.18}"
 INPUT_ARCH="${3:-universal}"
 DIST_DIR="${4:-deploy/macos}"
 PACKAGE_NAME="${5:-quorumrag}"
@@ -42,7 +42,9 @@ mkdir -p "${DIST_DIR}"
 DIST_DIR="$(cd "${DIST_DIR}" && pwd)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PLIST_FILE="${SCRIPT_DIR}/dev.quorumrag.daemon.plist"
+ICON_ICNS="${ROOT_DIR}/assets/icons/quorumrag.icns"
 INSTALL_SH="${SCRIPT_DIR}/install.sh"
 UNINSTALL_SH="${SCRIPT_DIR}/uninstall.sh"
 
@@ -85,6 +87,10 @@ mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
 
 cp -f "${BINARY_PATH}" "${APP_BUNDLE}/Contents/MacOS/quorumrag-bin"
 chmod 755 "${APP_BUNDLE}/Contents/MacOS/quorumrag-bin"
+if [ -f "${ICON_ICNS}" ]; then
+    cp -f "${ICON_ICNS}" "${APP_BUNDLE}/Contents/Resources/QuorumRAG.icns"
+    chmod 644 "${APP_BUNDLE}/Contents/Resources/QuorumRAG.icns"
+fi
 
 if [ -f "${DESKTOP_PATH}" ]; then
     cp -f "${DESKTOP_PATH}" "${APP_BUNDLE}/Contents/MacOS/QuorumRAG"
@@ -123,6 +129,8 @@ cat <<EOF > "${APP_BUNDLE}/Contents/Info.plist"
     <key>CFBundleDisplayName</key>
     <string>QuorumRAG</string>
     <key>CFBundleExecutable</key>
+    <string>QuorumRAG</string>
+    <key>CFBundleIconFile</key>
     <string>QuorumRAG</string>
     <key>CFBundleIdentifier</key>
     <string>dev.quorumrag.app</string>

@@ -78,6 +78,7 @@ impl InboundQueryHandler for DefaultInboundQueryHandler {
             chunks: Vec::new(),
             synthesis_response: None,
             warm_llm_available: false,
+            peer_multiaddrs: Vec::new(),
         }
     }
 }

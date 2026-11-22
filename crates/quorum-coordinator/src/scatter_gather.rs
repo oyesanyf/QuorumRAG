@@ -542,7 +542,7 @@ impl ScatterGatherEngine {
                         sender_pubkey: [0u8; 32],
                         query_text: sanitized_query,
                         embedding: query_vec.to_vec(),
-                        top_k: (top_k * self.config.candidate_multiplier).clamp(16, 64),
+                        top_k: (top_k * self.config.candidate_multiplier).clamp(16, 128),
                         timestamp: Utc::now().timestamp(),
                         signature: [0u8; 64],
                         origin_peer_id: None,
@@ -817,7 +817,7 @@ impl ScatterGatherEngine {
             local_results,
             remote_lists,
             self.config.rrf_k,
-            top_k,
+            top_k.max(256),
         );
         // Promote chunks (including remote peer chunks) that contain exact rare query tokens (e.g. "16017" in "CVE-2020-16017")
         // when partial matches lack the specific identifier token.
@@ -979,7 +979,7 @@ impl ScatterGatherEngine {
                             sender_pubkey: [0u8; 32],
                             query_text: sanitized_query,
                             embedding: query_vec,
-                            top_k: (top_k * self.config.candidate_multiplier).clamp(16, 64),
+                            top_k: (top_k * self.config.candidate_multiplier).clamp(16, 128),
                             timestamp: Utc::now().timestamp(),
                             signature: [0u8; 64],
                             origin_peer_id: None,

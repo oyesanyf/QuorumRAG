@@ -494,18 +494,18 @@ impl RetrieveMeshNode {
             }
 
             if should_run_supplemental {
-                let max_supp = if peer_count > 0 { 4 } else { 96 };
+                let max_supp = 96;
                 let supp_denom = if peer_count > 0 { 120.0 } else { 60.0 };
                 for (idx, mut hit) in entity_hits.into_iter().take(max_supp).enumerate() {
                     // Harmonized supplemental score scale prevents local text from skewing
-                    // candidate ranks over remote peers when connected to mesh.
+                    // candidate ranks over remote peers when connected to mesh, without dropping local entity hits.
                     hit.score = 1.0 / (supp_denom + idx as f32);
                     if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                         chunks.push(hit);
                     }
                 }
 
-                let max_prompt = if peer_count > 0 { 4 } else { 64 };
+                let max_prompt = 64;
                 for (idx, mut hit) in prompt_hits.into_iter().take(max_prompt).enumerate() {
                     hit.score = 1.0 / (supp_denom + idx as f32);
                     if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
@@ -513,7 +513,7 @@ impl RetrieveMeshNode {
                     }
                 }
 
-                let max_cue = if peer_count > 0 { 4 } else { 48 };
+                let max_cue = 48;
                 for (idx, mut hit) in cue_hits.into_iter().take(max_cue).enumerate() {
                     hit.score = 1.0 / (supp_denom + idx as f32);
                     if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
@@ -1294,7 +1294,9 @@ impl RetrieveMeshNode {
                 .map(|c| c.chunk.chunk_id.clone())
                 .collect();
             let mut top_local_docs: Vec<(String, f32)> = Vec::new();
-            let max_scan = if peer_count > 0 { 8 } else { chunks.len() };
+            // Scan all retrieved chunks (still capped at 4 distinct local docs) so remote hits ranked ahead
+            // by the harmonized supplemental denominator never starve local multi-chunk sibling expansion.
+            let max_scan = chunks.len();
             for item in chunks.iter().take(max_scan).filter(|c| c.source_peer == "local") {
                 let doc_prefix = if !item.chunk.document_id.is_empty() {
                     item.chunk.document_id.clone()

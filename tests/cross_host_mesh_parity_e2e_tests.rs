@@ -813,7 +813,11 @@ async fn test_swarm_mesh_dispatcher_3_peer_parity_with_1_8s_million_chunk_peer()
     let coord_wdrdl = QueryCoordinator::new(
         Arc::new(ScatterGatherEngine::new(
             Arc::clone(&storage_wdrdl) as Arc<dyn quorum_coordinator::StorageSearcher>,
-            Arc::new(SwarmMeshDispatcher::new(handle_wdrdl.clone())),
+            Arc::new(SwarmMeshDispatcher::new(
+                handle_wdrdl.clone(),
+                pid_wdrdl.clone(),
+                seed_wdrdl,
+            )),
             Arc::new(tokio::sync::RwLock::new(PeerAclManager::default())),
             default_cfg.clone(),
             seed_wdrdl,
@@ -825,7 +829,11 @@ async fn test_swarm_mesh_dispatcher_3_peer_parity_with_1_8s_million_chunk_peer()
     let coord_wecnh = QueryCoordinator::new(
         Arc::new(ScatterGatherEngine::new(
             Arc::clone(&storage_wecnh) as Arc<dyn quorum_coordinator::StorageSearcher>,
-            Arc::new(SwarmMeshDispatcher::new(handle_wecnh.clone())),
+            Arc::new(SwarmMeshDispatcher::new(
+                handle_wecnh.clone(),
+                pid_wecnh.clone(),
+                seed_wecnh,
+            )),
             Arc::new(tokio::sync::RwLock::new(PeerAclManager::default())),
             default_cfg.clone(),
             seed_wecnh,
@@ -903,7 +911,7 @@ async fn test_swarm_mesh_dispatcher_3_peer_parity_with_1_8s_million_chunk_peer()
         &mut direct_req,
         quorum_types::AccessTier::Tier0Public,
     );
-    let disp_wdrdl = SwarmMeshDispatcher::new(handle_wdrdl);
+    let disp_wdrdl = SwarmMeshDispatcher::new(handle_wdrdl, pid_wdrdl.clone(), seed_wdrdl);
     let t0 = std::time::Instant::now();
     let (unhealthy_resps, _) = disp_wdrdl
         .query_peers_with_diagnostics(&direct_req, Duration::from_millis(8000))
@@ -917,4 +925,766 @@ async fn test_swarm_mesh_dispatcher_3_peer_parity_with_1_8s_million_chunk_peer()
     );
     assert_eq!(unhealthy_resps.len(), 1, "Fast peer WKHc3 still returned immediately");
     registry.clear_peer_failures(&pid_wecnh);
+}
+
+#[tokio::test]
+async fn test_transitive_3_node_discovery_auto_dial_and_signing_credentials() {
+    use quorum_coordinator::{
+        global_mesh_dlp_controller, global_peer_health_registry, OsoosiMeshInboundHandler,
+        SwarmMeshDispatcher, P2P_WATCHER_CANARY_QUERY,
+    };
+    use quorum_network::{start_network_node, NetworkConfig};
+    use quorum_storage::{StorageConfig, StorageEngine};
+
+    {
+        let ctrl = global_mesh_dlp_controller();
+        let mut g = ctrl.settings.write().unwrap();
+        g.mesh.p2p_enabled = true;
+        g.mesh.require_explicit_folder_share = false;
+        g.mesh.shared_folders.clear();
+    }
+
+    let dir_a = tempfile::tempdir().expect("dir_a");
+    let dir_b = tempfile::tempdir().expect("dir_b");
+    let dir_c = tempfile::tempdir().expect("dir_c");
+
+    let storage_a = Arc::new(
+        StorageEngine::open(StorageConfig::new(dir_a.path().to_path_buf()))
+            .await
+            .expect("storage_a"),
+    );
+    let storage_b = Arc::new(
+        StorageEngine::open(StorageConfig::new(dir_b.path().to_path_buf()))
+            .await
+            .expect("storage_b"),
+    );
+    let storage_c = Arc::new(
+        StorageEngine::open(StorageConfig::new(dir_c.path().to_path_buf()))
+            .await
+            .expect("storage_c"),
+    );
+
+    let derive_pid = |seed: [u8; 32]| -> String {
+        let sk = quorum_network::libp2p::identity::ed25519::SecretKey::try_from_bytes(seed).unwrap();
+        let kp = quorum_network::libp2p::identity::ed25519::Keypair::from(sk);
+        quorum_network::libp2p::identity::Keypair::from(kp)
+            .public()
+            .to_peer_id()
+            .to_string()
+    };
+
+    let seed_a = [0x71u8; 32];
+    let seed_b = [0x72u8; 32];
+    let seed_c = [0x73u8; 32];
+    let pid_a = derive_pid(seed_a);
+    let pid_b = derive_pid(seed_b);
+    let pid_c = derive_pid(seed_c);
+
+    let registry = global_peer_health_registry();
+    registry.clear_peer_failures(&pid_a);
+    registry.clear_peer_failures(&pid_b);
+    registry.clear_peer_failures(&pid_c);
+
+    let handler_a = Arc::new(OsoosiMeshInboundHandler::new(
+        Arc::clone(&storage_a) as Arc<dyn quorum_coordinator::StorageSearcher>,
+        pid_a.clone(),
+    ));
+    let handler_b = Arc::new(OsoosiMeshInboundHandler::new(
+        Arc::clone(&storage_b) as Arc<dyn quorum_coordinator::StorageSearcher>,
+        pid_b.clone(),
+    ));
+    let handler_c = Arc::new(OsoosiMeshInboundHandler::new(
+        Arc::clone(&storage_c) as Arc<dyn quorum_coordinator::StorageSearcher>,
+        pid_c.clone(),
+    ));
+
+    let mut cfg_a = NetworkConfig::new_localhost();
+    cfg_a.ed25519_seed = Some(seed_a);
+    let (_jh_a, handle_a) = start_network_node(cfg_a, Some(handler_a.clone()))
+        .await
+        .expect("start A");
+
+    let mut cfg_b = NetworkConfig::new_localhost();
+    cfg_b.ed25519_seed = Some(seed_b);
+    let (_jh_b, handle_b) = start_network_node(cfg_b, Some(handler_b.clone()))
+        .await
+        .expect("start B");
+
+    let mut cfg_c = NetworkConfig::new_localhost();
+    cfg_c.ed25519_seed = Some(seed_c);
+    let (_jh_c, handle_c) = start_network_node(cfg_c, Some(handler_c.clone()))
+        .await
+        .expect("start C");
+
+    let disp_a = Arc::new(SwarmMeshDispatcher::new(
+        handle_a.clone(),
+        pid_a.clone(),
+        seed_a,
+    ));
+    let disp_b = Arc::new(SwarmMeshDispatcher::new(
+        handle_b.clone(),
+        pid_b.clone(),
+        seed_b,
+    ));
+    let disp_c = Arc::new(SwarmMeshDispatcher::new(
+        handle_c.clone(),
+        pid_c.clone(),
+        seed_c,
+    ));
+    handler_a.set_dispatcher(disp_a.clone());
+    handler_b.set_dispatcher(disp_b.clone());
+    handler_c.set_dispatcher(disp_c.clone());
+
+    // Verify signing_credentials returns real Ed25519 identity
+    assert_eq!(
+        disp_a.signing_credentials(),
+        Some((pid_a.clone(), seed_a)),
+        "SwarmMeshDispatcher::signing_credentials must return configured Ed25519 identity"
+    );
+
+    let tcp_b = handle_b
+        .listen_addresses()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.to_string().contains("/tcp/"))
+        .unwrap();
+    let tcp_c = handle_c
+        .listen_addresses()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.to_string().contains("/tcp/"))
+        .unwrap();
+
+    // Linear topology ONLY: A <-> B and B <-> C (A is NOT initially connected to C)
+    handle_a.dial(tcp_b).await.expect("A dials B");
+    handle_b.dial(tcp_c).await.expect("B dials C");
+    tokio::time::sleep(Duration::from_millis(450)).await;
+
+    assert_eq!(handle_a.connected_peers().await.unwrap().len(), 1);
+    assert_eq!(handle_b.connected_peers().await.unwrap().len(), 2);
+    assert_eq!(handle_c.connected_peers().await.unwrap().len(), 1);
+
+    let b_addrs = disp_b.connected_peer_multiaddrs();
+    assert!(
+        b_addrs.iter().any(|ma| ma.ends_with(&format!("/p2p/{}", pid_c))),
+        "B must report C's dialable multiaddr in connected_peer_multiaddrs: {:?}",
+        b_addrs
+    );
+    assert!(
+        b_addrs.iter().all(|ma| !ma.contains("/tcp/4001") && !ma.contains("/udp/4001")),
+        "connected_peer_multiaddrs must filter port 4001 noise: {:?}",
+        b_addrs
+    );
+
+    // Send a signed canary query from A -> B; B responds with peer_multiaddrs containing C (excluding A and B),
+    // and A's SwarmMeshDispatcher::query_peers_with_diagnostics auto-dials C into a full 3-way mesh!
+    let mut canary_req = FederatedQueryRequest {
+        query_id: uuid::Uuid::new_v4(),
+        sender_peer_id: pid_a.clone(),
+        sender_pubkey: [0u8; 32],
+        query_text: P2P_WATCHER_CANARY_QUERY.to_string(),
+        embedding: vec![0.0f32; 768],
+        top_k: 0,
+        timestamp: chrono::Utc::now().timestamp(),
+        signature: [0u8; 64],
+        origin_peer_id: None,
+        relay_hops: 0,
+        visited_peers: Vec::new(),
+        synthesis_relay: None,
+    };
+    quorum_coordinator::crypto::sign_request(
+        &seed_a,
+        &mut canary_req,
+        quorum_types::AccessTier::Tier0Public,
+    );
+
+    let (resps, _) = disp_a
+        .query_peers_with_diagnostics(&canary_req, Duration::from_secs(4))
+        .await
+        .expect("canary query A->B");
+    assert_eq!(resps.len(), 1);
+    assert!(
+        resps[0]
+            .peer_multiaddrs
+            .iter()
+            .any(|ma| ma.ends_with(&format!("/p2p/{}", pid_c))),
+        "B's response must advertise C in peer_multiaddrs: {:?}",
+        resps[0].peer_multiaddrs
+    );
+    assert!(
+        resps[0]
+            .peer_multiaddrs
+            .iter()
+            .all(|ma| !ma.ends_with(&format!("/p2p/{}", pid_a))
+                && !ma.ends_with(&format!("/p2p/{}", pid_b))),
+        "B must exclude requester A and self B from advertised peer_multiaddrs: {:?}",
+        resps[0].peer_multiaddrs
+    );
+
+    // Wait up to 2.5s for A's async auto-dial to converge into a full 3-way mesh
+    let mut converged = false;
+    for _ in 0..50 {
+        let a_peers = handle_a.connected_peers().await.unwrap();
+        let c_peers = handle_c.connected_peers().await.unwrap();
+        if a_peers.len() == 2 && c_peers.len() == 2 {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        converged,
+        "A and C must converge into full 3-way mesh (A={:?}, C={:?})",
+        handle_a.connected_peers().await.unwrap(),
+        handle_c.connected_peers().await.unwrap()
+    );
+
+    // Also verify port 4001 and self-dial filtering directly
+    let bad_and_self = vec![
+        format!("/ip4/127.0.0.1/tcp/4001/p2p/{}", pid_c),
+        format!("/ip4/127.0.0.1/tcp/3032/p2p/{}", pid_a),
+    ];
+    let filtered = quorum_coordinator::mesh::filter_newly_learned_dial_targets(
+        &bad_and_self,
+        &pid_a,
+        &handle_a.connected_peer_addresses(),
+        &handle_a.listen_addresses().await.unwrap(),
+    );
+    assert!(
+        filtered.is_empty(),
+        "Port 4001 and self-dials must be filtered out: {:?}",
+        filtered
+    );
+}
+
+#[test]
+fn test_synthesis_relay_preserves_provenance_and_prefers_expanded_window() {
+    let responder_pid = "12D3KooWKHc3ResponderNode";
+    let remote_origin_pid = "12D3KooWEcNhOriginNode";
+    let dtos = vec![
+        CandidateChunkDto {
+            chunk_id: "c_remote:0".to_string(),
+            file_path: "D:/Docs/Unity_Ministry_Steward.docx".to_string(),
+            line_start: 1,
+            line_end: 30,
+            content: "Short chunk snippet".to_string(),
+            score: 0.91,
+            access_tier: 0,
+            origin_peer_id: Some(remote_origin_pid.to_string()),
+            expanded_window: Some("Full 10KB expanded ministry stewardship text with Rev. Angela Davis signature.".to_string()),
+        },
+        CandidateChunkDto {
+            chunk_id: "c_responder_local:0".to_string(),
+            file_path: "C:/Docs/Susan_Lease.doc".to_string(),
+            line_start: 1,
+            line_end: 20,
+            content: "Lease between Angela Davis and Casey Ringgold".to_string(),
+            score: 0.85,
+            access_tier: 0,
+            origin_peer_id: Some(responder_pid.to_string()),
+            expanded_window: None,
+        },
+        CandidateChunkDto {
+            chunk_id: "c_local_kw:0".to_string(),
+            file_path: "C:/Docs/Local_Note.txt".to_string(),
+            line_start: 1,
+            line_end: 5,
+            content: "Local note".to_string(),
+            score: 0.70,
+            access_tier: 0,
+            origin_peer_id: Some("local".to_string()),
+            expanded_window: None,
+        },
+    ];
+
+    let scored = quorum_coordinator::mesh::build_relay_scored_chunks(&dtos, responder_pid);
+    assert_eq!(scored.len(), 3);
+
+    assert!(scored[0].is_remote);
+    assert_eq!(scored[0].source_peer, remote_origin_pid);
+    assert!(scored[0].chunk.text_content.contains("Full 10KB expanded ministry stewardship text"));
+    let cit_0 = scored[0].to_citation();
+    assert!(cit_0.is_external_node);
+    assert_eq!(cit_0.node_id.as_deref(), Some(remote_origin_pid));
+
+    assert!(!scored[1].is_remote);
+    assert_eq!(scored[1].source_peer, responder_pid);
+    assert_eq!(scored[1].chunk.text_content, "Lease between Angela Davis and Casey Ringgold");
+
+    assert!(!scored[2].is_remote);
+    assert_eq!(scored[2].source_peer, "local");
+}
+
+#[test]
+fn test_r2_cross_host_deterministic_canonical_citation_and_table_parity() {
+    let emb = vec![0.03f32; 768];
+    let make_chunk = |id: &str, path: &str, text: &str, score: f32, peer: &str, remote: bool| {
+        ScoredChunk::new(
+            DocumentChunk::new(id, id, path, 1, 20, 0, emb.clone(), text, None).unwrap(),
+            score,
+            peer,
+            remote,
+        )
+    };
+
+    // Host A sees local Academic + remote Lease + remote Ministry
+    let host_a_inputs = vec![
+        make_chunk(
+            "a_acad:0",
+            "C:/HostA/Women_Race_Class_Summary.docx",
+            "Women, Race & Class is a landmark critical theory work by Angela Davis, published in 1981.",
+            0.96,
+            "local",
+            false,
+        ),
+        make_chunk(
+            "a_lease:0",
+            "D:/HostB/Susan_Lease.doc",
+            "SIMPLE LEASE AGREEMENT between Angela Davis (landlord) and Casey Ringgold (tenant) at 2913 Castiglione St. Monthly rent $614.00.",
+            0.90,
+            "12D3KooWHostB",
+            true,
+        ),
+        make_chunk(
+            "a_min:0",
+            "E:/HostC/Visionary_Fire_Creation.docx",
+            "Unity ministry sermon on spiritual teaching and divine presence signed by Rev. Angela Davis.",
+            0.88,
+            "12D3KooWHostC",
+            true,
+        ),
+    ];
+
+    // Host B receives the EXACT same 3 documents in REVERSED arrival order and inverted local/remote origin & scores
+    let host_b_inputs = vec![
+        make_chunk(
+            "b_min:0",
+            "E:/HostC/Visionary_Fire_Creation.docx",
+            "Unity ministry sermon on spiritual teaching and divine presence signed by Rev. Angela Davis.",
+            0.97,
+            "12D3KooWHostC",
+            true,
+        ),
+        make_chunk(
+            "b_lease:0",
+            "D:/HostB/Susan_Lease.doc",
+            "SIMPLE LEASE AGREEMENT between Angela Davis (landlord) and Casey Ringgold (tenant) at 2913 Castiglione St. Monthly rent $614.00.",
+            0.95,
+            "local",
+            false,
+        ),
+        make_chunk(
+            "b_acad:0",
+            "C:/HostA/Women_Race_Class_Summary.docx",
+            "Women, Race & Class is a landmark critical theory work by Angela Davis, published in 1981.",
+            0.85,
+            "12D3KooWHostA",
+            true,
+        ),
+    ];
+
+    let (ans_a, cits_a) = DeterministicOfflineSynthesisEngine::synthesize_with_history(
+        "Who is Angela Davis",
+        "Who is Angela Davis",
+        &[],
+        &host_a_inputs,
+        "offline",
+        None,
+    );
+    let (ans_b, cits_b) = DeterministicOfflineSynthesisEngine::synthesize_with_history(
+        "Who is Angela Davis",
+        "Who is Angela Davis",
+        &[],
+        &host_b_inputs,
+        "offline",
+        None,
+    );
+
+    let keys_a: Vec<String> = cits_a
+        .iter()
+        .map(|c| DeterministicOfflineSynthesisEngine::derive_document_family_key(&c.file_path))
+        .collect();
+    let keys_b: Vec<String> = cits_b
+        .iter()
+        .map(|c| DeterministicOfflineSynthesisEngine::derive_document_family_key(&c.file_path))
+        .collect();
+    assert_eq!(keys_a, keys_b, "Cross-host [1]..[N] canonical order must be identical");
+    assert_eq!(
+        keys_a,
+        vec![
+            "women_race_class_summary".to_string(),
+            "susan_lease".to_string(),
+            "visionary_fire_creation".to_string(),
+        ]
+    );
+
+    let table_rows = |ans: &str| -> Vec<String> {
+        ans.lines()
+            .filter(|l| l.starts_with("| **["))
+            .map(|l| {
+                let cols: Vec<&str> = l.split('|').collect();
+                format!("{}|{}", cols.get(1).unwrap_or(&"").trim(), cols.get(2).unwrap_or(&"").trim())
+            })
+            .collect()
+    };
+    assert_eq!(
+        table_rows(&ans_a),
+        table_rows(&ans_b),
+        "Identity & Domain Cluster Summary row order must match 100% across hosts:\nA:\n{ans_a}\nB:\n{ans_b}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_r2_2node_libp2p_synthesis_relay_round_trip_with_mock_ollama() {
+    use quorum_coordinator::{
+        global_peer_health_registry, OsoosiMeshInboundHandler, SwarmMeshDispatcher,
+    };
+    use quorum_network::{start_network_node, NetworkConfig};
+    use quorum_storage::{StorageConfig, StorageEngine};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock ollama");
+    let addr = listener.local_addr().expect("mock ollama addr");
+    let host_port = format!("127.0.0.1:{}", addr.port());
+    let seen_prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen_prompts_srv = Arc::clone(&seen_prompts);
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_srv = Arc::clone(&stop_flag);
+    listener.set_nonblocking(true).expect("set_nonblocking");
+
+    let server_handle = std::thread::spawn(move || {
+        while !stop_srv.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let mut content_len = 0usize;
+                    let mut hline = String::new();
+                    loop {
+                        hline.clear();
+                        if reader.read_line(&mut hline).unwrap_or(0) == 0
+                            || hline == "\r\n"
+                            || hline == "\n"
+                        {
+                            break;
+                        }
+                        let low = hline.to_ascii_lowercase();
+                        if let Some(rest) = low.strip_prefix("content-length:") {
+                            content_len = rest.trim().parse::<usize>().unwrap_or(0);
+                        }
+                    }
+                    let mut body_bytes = vec![0u8; content_len];
+                    if content_len > 0 && reader.read_exact(&mut body_bytes).is_err() {
+                        continue;
+                    }
+                    let req_json: serde_json::Value =
+                        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+                    let user_prompt = req_json["messages"]
+                        .as_array()
+                        .and_then(|arr| arr.last())
+                        .and_then(|m| m["content"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    seen_prompts_srv.lock().unwrap().push(user_prompt.clone());
+
+                    let mut doc_nums: Vec<usize> = Vec::new();
+                    for line in user_prompt.lines() {
+                        if let Some(rest) = line.strip_prefix('[') {
+                            if let Some((num_s, after)) = rest.split_once(']') {
+                                if after.starts_with(" Source File:") {
+                                    if let Ok(n) = num_s.parse::<usize>() {
+                                        doc_nums.push(n);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    const LEASE_SENTS: &[&str] = &[
+                        "Angela Davis serves as landlord at 2913 Castiglione St. with $725.00 monthly rent",
+                        "The 2913 Castiglione St. lease names Angela Davis as landlord for $725.00 monthly rent",
+                        "Monthly rent of $725.00 is specified for Castiglione Street under landlord Angela Davis",
+                        "Angela Davis manages the Castiglione Street lease at 2913 Castiglione St. for $725.00",
+                        "Under the Castiglione Street lease, Angela Davis is the landlord collecting $725.00 monthly rent",
+                        "The lease record at 2913 Castiglione St. confirms Angela Davis as landlord at $725.00 monthly rent",
+                        "Castiglione Street landlord Angela Davis documented the $725.00 monthly rent arrangement",
+                        "Verified terms at 2913 Castiglione St. establish $725.00 monthly rent with Angela Davis",
+                        "Angela Davis oversees the 2913 Castiglione St. lease with $725.00 monthly rent",
+                        "The Castiglione Street lease sets $725.00 monthly rent payable to landlord Angela Davis",
+                        "Landlord Angela Davis signed the Castiglione Street lease at 2913 Castiglione St. for $725.00",
+                        "Rent of $725.00 monthly is documented at 2913 Castiglione St. under Angela Davis",
+                    ];
+                    const MINISTRY_SENTS: &[&str] = &[
+                        "Rev. Angela Davis serves on the Unity ministry board",
+                        "On the Unity ministry board, Rev. Angela Davis contributes spiritual leadership",
+                        "The Unity ministry board record names Rev. Angela Davis as a serving member",
+                        "Rev. Angela Davis participates in Unity ministry board stewardship",
+                        "Unity ministry board documentation confirms service by Rev. Angela Davis",
+                        "Ministry records show Rev. Angela Davis serving on the Unity ministry board",
+                        "Spiritual governance on the Unity ministry board includes Rev. Angela Davis",
+                        "Rev. Angela Davis is documented on the Unity ministry board",
+                        "The Unity ministry board roster includes Rev. Angela Davis",
+                        "Board stewardship at Unity ministry involves Rev. Angela Davis",
+                        "Rev. Angela Davis holds a role on the Unity ministry board",
+                        "Unity ministry records identify Rev. Angela Davis on the ministry board",
+                    ];
+                    let is_ministry = user_prompt.contains("Religious Ministry");
+                    let sents = if is_ministry { MINISTRY_SENTS } else { LEASE_SENTS };
+                    let mut reply_text = String::new();
+                    for &n in &doc_nums {
+                        for idx in 0..12 {
+                            reply_text.push_str(&format!("{} [{n}]. ", sents[idx]));
+                        }
+                    }
+                    if reply_text.is_empty() {
+                        reply_text = "Angela Davis serves as landlord at 2913 Castiglione St. with $725.00 monthly rent [1].".to_string();
+                    }
+                    let chunk = serde_json::json!({
+                        "model": "qwen2.5:7b",
+                        "message": { "role": "assistant", "content": reply_text },
+                        "done": true,
+                        "done_reason": "stop",
+                        "eval_count": 48
+                    })
+                    .to_string();
+                    let http_resp = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{}\n",
+                        chunk
+                    );
+                    let _ = stream.write_all(http_resp.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let dir_a = tempfile::tempdir().expect("dir_a");
+    let dir_b = tempfile::tempdir().expect("dir_b");
+    let storage_a = Arc::new(
+        StorageEngine::open(StorageConfig::new(dir_a.path().to_path_buf()))
+            .await
+            .expect("storage_a"),
+    );
+    let storage_b = Arc::new(
+        StorageEngine::open(StorageConfig::new(dir_b.path().to_path_buf()))
+            .await
+            .expect("storage_b"),
+    );
+
+    let derive_pid = |seed: [u8; 32]| -> String {
+        let sk = quorum_network::libp2p::identity::ed25519::SecretKey::try_from_bytes(seed).unwrap();
+        let kp = quorum_network::libp2p::identity::ed25519::Keypair::from(sk);
+        quorum_network::libp2p::identity::Keypair::from(kp)
+            .public()
+            .to_peer_id()
+            .to_string()
+    };
+
+    let seed_a = [0x71u8; 32];
+    let seed_b = [0x72u8; 32];
+    let seed_c = [0x73u8; 32];
+    let pid_a = derive_pid(seed_a);
+    let pid_b = derive_pid(seed_b);
+    let pid_c = derive_pid(seed_c);
+
+    let registry = global_peer_health_registry();
+    registry.clear_peer_failures(&pid_a);
+    registry.clear_peer_failures(&pid_b);
+
+    let hw_b = HardwareTelemetry {
+        free_ram_gb: 32.0,
+        total_ram_gb: 32.0,
+        free_vram_mb: 16384,
+        total_vram_mb: 16384,
+        cpu_cores: 16,
+        gpu_name: Some("MockGPU".to_string()),
+        gpu_count: 1,
+    };
+
+    let handler_a = Arc::new(OsoosiMeshInboundHandler::new(
+        Arc::clone(&storage_a) as Arc<dyn quorum_coordinator::StorageSearcher>,
+        pid_a.clone(),
+    ));
+    let handler_b = Arc::new(
+        OsoosiMeshInboundHandler::new(
+            Arc::clone(&storage_b) as Arc<dyn quorum_coordinator::StorageSearcher>,
+            pid_b.clone(),
+        )
+        .with_ollama_override(addr, host_port, hw_b, vec!["qwen2.5:7b".to_string()]),
+    );
+
+    let mut cfg_a = NetworkConfig::new_localhost();
+    cfg_a.ed25519_seed = Some(seed_a);
+    cfg_a.request_timeout = Duration::from_secs(120);
+    let (_jh_a, handle_a) = start_network_node(cfg_a, Some(handler_a))
+        .await
+        .expect("start node A");
+
+    let mut cfg_b = NetworkConfig::new_localhost();
+    cfg_b.ed25519_seed = Some(seed_b);
+    cfg_b.request_timeout = Duration::from_secs(120);
+    let (_jh_b, handle_b) = start_network_node(cfg_b, Some(handler_b))
+        .await
+        .expect("start node B");
+
+    let tcp_addr_b = handle_b
+        .listen_addresses()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.to_string().contains("/tcp/"))
+        .unwrap();
+    handle_a.dial(tcp_addr_b).await.unwrap();
+    for _ in 0..20 {
+        if handle_a.connected_peers().await.unwrap().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(handle_a.connected_peers().await.unwrap().len(), 1);
+
+    let disp_a = SwarmMeshDispatcher::new(handle_a.clone(), pid_a.clone(), seed_a);
+
+    let local_sc = ScoredChunk::new(
+        DocumentChunk::new(
+            "relay_loc:0",
+            "relay_loc",
+            "C:/HostA/Castiglione_Lease.docx",
+            1,
+            20,
+            0,
+            vec![0.1; 768],
+            "Short snippet only.",
+            None,
+        )
+        .unwrap(),
+        0.95,
+        "local",
+        false,
+    );
+    let third_peer_sc = ScoredChunk::new(
+        DocumentChunk::new(
+            "relay_c:0",
+            "relay_c",
+            "D:/HostC/Unity_Ministry_Steward.docx",
+            1,
+            20,
+            0,
+            vec![0.1; 768],
+            "Rev. Angela Davis serves on the Unity ministry board.",
+            None,
+        )
+        .unwrap(),
+        0.92,
+        pid_c.clone(),
+        true,
+    );
+
+    // 1. Direct signed MeshSynthesisRelayPayload over 2-node libp2p testing expanded_window preference
+    let mut relay_req = DeterministicOfflineSynthesisEngine::build_mesh_synthesis_relay_request(
+        "Who is Angela Davis",
+        &[],
+        &[&local_sc, &third_peer_sc],
+        "qwen2.5:7b",
+        disp_a.signing_credentials(),
+    );
+    if let Some(ref mut payload) = relay_req.synthesis_relay {
+        assert_eq!(
+            payload.evidence_chunks[0].origin_peer_id.as_deref(),
+            Some(pid_a.as_str())
+        );
+        assert_eq!(
+            payload.evidence_chunks[1].origin_peer_id.as_deref(),
+            Some(pid_c.as_str())
+        );
+        payload.evidence_chunks[0].expanded_window = Some(
+            "Expanded 10KB Castiglione Street lease at 2913 Castiglione St. naming Angela Davis as landlord with $725.00 monthly rent."
+                .to_string(),
+        );
+    }
+    quorum_coordinator::crypto::sign_request(
+        &seed_a,
+        &mut relay_req,
+        quorum_types::AccessTier::Tier0Public,
+    );
+
+    let responses = disp_a
+        .query_peers(&relay_req, Duration::from_millis(90_000))
+        .await
+        .expect("libp2p synthesis_relay query_peers should succeed");
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].responder_peer_id, pid_b);
+    let synth = responses[0]
+        .synthesis_response
+        .as_ref()
+        .expect("Node B must return synthesis_response");
+    assert_eq!(synth.responder_peer_id, pid_b);
+    assert!(synth.synthesized_text.contains("2913 Castiglione St."));
+    assert_eq!(synth.citations.len(), 2);
+    assert!(synth.citations.iter().all(|c| c.is_external_node));
+    let cited_nodes: Vec<Option<&str>> = synth
+        .citations
+        .iter()
+        .map(|c| c.node_id.as_deref())
+        .collect();
+    assert!(cited_nodes.contains(&Some(pid_a.as_str())));
+    assert!(cited_nodes.contains(&Some(pid_c.as_str())));
+
+    {
+        let prompts = seen_prompts.lock().unwrap();
+        assert!(
+            !prompts.is_empty()
+                && prompts
+                    .iter()
+                    .any(|p| p.contains("Expanded 10KB Castiglione Street lease")),
+            "Node B must prefer expanded_window over short content; prompts={:?}",
+            *prompts
+        );
+    }
+
+    // 2. Verify try_mesh_synthesis_relay_with_dispatcher end-to-end without mutating global dispatcher
+    let rich_local_sc = ScoredChunk::new(
+        DocumentChunk::new(
+            "relay_loc2:0",
+            "relay_loc2",
+            "C:/HostA/Castiglione_Lease.docx",
+            1,
+            20,
+            0,
+            vec![0.1; 768],
+            "Angela Davis serves as landlord at 2913 Castiglione St. with $725.00 monthly rent.",
+            None,
+        )
+        .unwrap(),
+        0.95,
+        "local",
+        false,
+    );
+    let relayed_via_helper = DeterministicOfflineSynthesisEngine::try_mesh_synthesis_relay_with_dispatcher(
+        &disp_a,
+        "Who is Angela Davis",
+        &[],
+        &[&rich_local_sc, &third_peer_sc],
+        "qwen2.5:7b",
+        None,
+    );
+
+    stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    let (helper_text, helper_cits) =
+        relayed_via_helper.expect("try_mesh_synthesis_relay_with_dispatcher must succeed over libp2p");
+    assert!(helper_text.contains("2913 Castiglione St."));
+    assert_eq!(helper_cits.len(), 2);
 }
