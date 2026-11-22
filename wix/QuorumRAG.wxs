@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?ifndef ProductVersion ?>
-<?define ProductVersion = "0.7.0" ?>
+<?define ProductVersion = "0.7.1" ?>
 <?endif ?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
     <Package Name="QuorumRAG P2P Agentic RAG"
@@ -11,6 +11,10 @@
 
         <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallExecute" />
         <MediaTemplate EmbedCab="yes" />
+
+        <!-- Fast, predictable installs/upgrades: skip slow VSS System Restore point creation
+             and redundant FileCosting progress stalls (Microsoft documented MSIFASTINSTALL=7). -->
+        <Property Id="MSIFASTINSTALL" Value="7" />
 
         <!-- Custom QuorumRAG Superellipse Icon (Add/Remove Programs + Start Menu + Desktop) -->
         <Icon Id="QuorumRAGIcon.ico" SourceFile="assets\icons\quorumrag.ico" />
@@ -132,7 +136,7 @@
         </Feature>
 
         <!-- Scoped Private-LAN Firewall Rules for QuorumRAG P2P Mesh & libp2p mDNS/UDP/TCP
-             Opt out during silent install via: msiexec /i QuorumRAG-0.7.0-x86_64.msi FIREWALLRULE=0 -->
+             Opt out during silent install via: msiexec /i QuorumRAG-0.7.1-x86_64.msi FIREWALLRULE=0 -->
         <Property Id="FIREWALLRULE" Value="1" Secure="yes" />
         <CustomAction Id="AddQuorumFirewallRules"
                       BinaryRef="QuorumDesktopHelper"
@@ -164,7 +168,7 @@
                       Return="asyncNoWait"
                       ExeCommand="--open-ui" />
 
-        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.7.0-x86_64.msi REMOVEDATA=1
+        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.7.1-x86_64.msi REMOVEDATA=1
              deletes the index and logs in %ProgramData%\QuorumRAG (kept by default). -->
         <Property Id="REMOVEDATA" Value="0" Secure="yes" />
         <CustomAction Id="RemoveQuorumData"
@@ -195,6 +199,16 @@
                       Impersonate="no"
                       Return="ignore"
                       ExeCommand="--msi-stop-cleanup --delete-service" />
+        <!-- State-aware pre-StopServices reconciliation for fresh installs, repairs, reinstalls,
+             and upgrades: explicitly inspects SCM for any service state (Stopped, Running, Paused,
+             StartPending, StopPending, ContinuePending, PausePending, or leftover registration)
+             and transitions cleanly to SERVICE_STOPPED before MSI StopServices / InstallFiles. -->
+        <CustomAction Id="EnsureQuorumServiceStopped"
+                      BinaryRef="QuorumDesktopHelper"
+                      Execute="deferred"
+                      Impersonate="no"
+                      Return="ignore"
+                      ExeCommand="--msi-stop-cleanup" />
         <!-- Fresh-install lock guarantee: terminate any leftover portable/console quorumrag.exe
              before file installation (native Win32 Toolhelp32 process snapshot, zero taskkill console popup). -->
         <CustomAction Id="KillQuorumOrphans"
@@ -207,6 +221,9 @@
         <InstallExecuteSequence>
             <Custom Action="StopDeleteQuorumServiceUpgrade" After="InstallInitialize" Condition="WIX_UPGRADE_DETECTED AND NOT REINSTALL" />
             <InstallExecute After="StopDeleteQuorumServiceUpgrade" />
+            <!-- Inspect and cleanly reconcile any pre-existing QuorumRAGDaemon SCM state
+                 (Running, Stopped, Paused, StartPending, StopPending, etc.) before MSI StopServices. -->
+            <Custom Action="EnsureQuorumServiceStopped" Before="StopServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
             <!-- Uninstall path: RemoveExistingProducts is never scheduled, so anchor before
                  StopServices/DeleteServices/RemoveFiles. Idempotent no-ops when nothing is left over. -->
             <Custom Action="StopDeleteQuorumServiceUninstall" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT REINSTALL" />

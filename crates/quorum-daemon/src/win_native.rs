@@ -33,9 +33,11 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::Services::{
     CloseServiceHandle, ControlService, DeleteService, OpenSCManagerW, OpenServiceW,
-    QueryServiceStatus, StartServiceW, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP,
-    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STOP, SERVICE_STOPPED,
+    QueryServiceStatus, QueryServiceStatusEx, StartServiceW, SC_HANDLE, SC_MANAGER_CONNECT,
+    SC_STATUS_PROCESS_INFO, SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_STOP, SERVICE_PAUSED,
+    SERVICE_PAUSE_PENDING, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_PROCESS,
+    SERVICE_STOP, SERVICE_STOPPED, SERVICE_STOP_PENDING,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
@@ -354,17 +356,55 @@ pub fn remove_quorum_firewall_rules() -> Result<usize, String> {
     Ok(removed)
 }
 
-/// Summary of a Windows Service state queried natively via Win32 SCM.
+/// Summary of all 7 Win32 Service Control Manager states queried natively via SCM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceStateSummary {
     NotInstalled,
-    Running,
-    StartPending,
     Stopped,
+    StartPending,
+    StopPending,
+    Running,
+    ContinuePending,
+    PausePending,
+    Paused,
     Other(u32),
 }
 
-/// Queries the current status of a Windows service via `OpenSCManagerW` + `QueryServiceStatus`
+impl ServiceStateSummary {
+    pub fn from_win32_state(state: SERVICE_STATUS_CURRENT_STATE) -> Self {
+        match state {
+            SERVICE_STOPPED => Self::Stopped,
+            SERVICE_START_PENDING => Self::StartPending,
+            SERVICE_STOP_PENDING => Self::StopPending,
+            SERVICE_RUNNING => Self::Running,
+            SERVICE_CONTINUE_PENDING => Self::ContinuePending,
+            SERVICE_PAUSE_PENDING => Self::PausePending,
+            SERVICE_PAUSED => Self::Paused,
+            other => Self::Other(other.0),
+        }
+    }
+}
+
+/// Queries `SERVICE_STATUS_PROCESS` (`dwCurrentState` + `dwProcessId`) via `QueryServiceStatusEx`.
+fn query_service_status_process(svc: SC_HANDLE) -> Option<SERVICE_STATUS_PROCESS> {
+    let mut ssp = SERVICE_STATUS_PROCESS::default();
+    let mut bytes_needed = 0u32;
+    let buf_len = std::mem::size_of::<SERVICE_STATUS_PROCESS>();
+    // SAFETY: `ssp` is stack-allocated, properly aligned, and valid for `buf_len` writable bytes.
+    let buf = unsafe { std::slice::from_raw_parts_mut((&mut ssp as *mut SERVICE_STATUS_PROCESS).cast::<u8>(), buf_len) };
+    if unsafe { QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, Some(buf), &mut bytes_needed) }.is_ok() {
+        return Some(ssp);
+    }
+    // Fallback to `QueryServiceStatus` if `QueryServiceStatusEx` is unavailable.
+    let mut status = SERVICE_STATUS::default();
+    if unsafe { QueryServiceStatus(svc, &mut status) }.is_ok() {
+        ssp.dwCurrentState = status.dwCurrentState;
+        return Some(ssp);
+    }
+    None
+}
+
+/// Queries the current status of a Windows service via `OpenSCManagerW` + `QueryServiceStatusEx`
 /// without spawning `sc.exe`.
 pub fn query_windows_service_status(service_name: &str) -> ServiceStateSummary {
     // SAFETY: Read-only connection to the local Service Control Manager.
@@ -380,17 +420,9 @@ pub fn query_windows_service_status(service_name: &str) -> ServiceStateSummary {
         Err(_) => return ServiceStateSummary::NotInstalled,
     };
 
-    let mut status = SERVICE_STATUS::default();
-    // SAFETY: `svc.0` has `SERVICE_QUERY_STATUS` access and `status` is valid writable memory.
-    if unsafe { QueryServiceStatus(svc.0, &mut status) }.is_err() {
-        return ServiceStateSummary::NotInstalled;
-    }
-
-    match status.dwCurrentState {
-        SERVICE_RUNNING => ServiceStateSummary::Running,
-        SERVICE_START_PENDING => ServiceStateSummary::StartPending,
-        SERVICE_STOPPED => ServiceStateSummary::Stopped,
-        other => ServiceStateSummary::Other(other.0),
+    match query_service_status_process(svc.0) {
+        Some(ssp) => ServiceStateSummary::from_win32_state(ssp.dwCurrentState),
+        None => ServiceStateSummary::NotInstalled,
     }
 }
 
@@ -429,14 +461,65 @@ pub fn start_windows_service(service_name: &str) -> Result<bool, String> {
         .map_err(|e| format!("StartServiceW('{service_name}') failed: {e}"))
 }
 
-/// Stops a Windows service via Win32 `ControlService(SERVICE_CONTROL_STOP)`, terminates any
-/// lingering `quorumrag.exe` child/orphan processes via Toolhelp32, and optionally deletes
-/// the service registration (`DeleteService`) — completely replacing `cmd.exe /c sc.exe & taskkill.exe`.
+/// Terminates a single PID safely (excluding system PIDs 0/4 and `skip_pid`).
+fn terminate_pid_safe(pid: u32, skip_pid: u32) -> bool {
+    if pid == 0 || pid == 4 || pid == skip_pid {
+        return false;
+    }
+    // SAFETY: Opens target PID with minimal `PROCESS_TERMINATE | PROCESS_SYNCHRONIZE` rights.
+    if let Ok(proc_handle) =
+        unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) }
+    {
+        let killed = unsafe {
+            let ok = TerminateProcess(proc_handle, 0).is_ok();
+            if ok {
+                let _ = WaitForSingleObject(proc_handle, 3_000);
+            }
+            let _ = CloseHandle(proc_handle);
+            ok
+        };
+        return killed;
+    }
+    false
+}
+
+/// Polls SCM until the service reaches `SERVICE_STOPPED` or `timeout` elapses.
+fn wait_until_service_stopped(svc: SC_HANDLE, timeout: Duration) -> (bool, u32) {
+    let deadline = Instant::now() + timeout;
+    let mut last_pid = 0u32;
+    loop {
+        if let Some(ssp) = query_service_status_process(svc) {
+            if ssp.dwProcessId != 0 {
+                last_pid = ssp.dwProcessId;
+            }
+            if ssp.dwCurrentState == SERVICE_STOPPED {
+                return (true, last_pid);
+            }
+        } else {
+            return (true, last_pid);
+        }
+        if Instant::now() >= deadline {
+            return (false, last_pid);
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+}
+
+/// Explicitly inspects the live Win32 SCM state of `service_name` and reconciles EVERY possible
+/// state (`Stopped`, `Running`, `Paused`, `StartPending`, `StopPending`, `ContinuePending`,
+/// `PausePending`, `NotInstalled`, or `MarkedForDelete`) cleanly before MSI file replacement,
+/// repair, upgrade, or uninstall.
+///
+/// Escalates to terminating the service's exact SCM `dwProcessId` plus any orphaned `quorumrag.exe`
+/// (`watch-p2p`) processes if an older binary refuses to stop within `stop_timeout`, waits until
+/// SCM confirms `SERVICE_STOPPED`, and (when `delete_service` is true) deletes the service and
+/// waits for SCM to finish clearing the `MARKED_FOR_DELETE` tombstone.
 pub fn stop_and_cleanup_windows_service(
     service_name: &str,
     delete_service: bool,
     stop_timeout: Duration,
 ) -> Result<(), String> {
+    let self_pid = std::process::id();
     if let Ok(scm) = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) } {
         let _scm_guard = ScHandleGuard(scm);
         let svc_w = wide_nul(service_name);
@@ -446,43 +529,128 @@ pub fn stop_and_cleanup_windows_service(
 
         // SAFETY: `svc_w` is NUL-terminated UTF-16.
         if let Ok(svc) = unsafe { OpenServiceW(scm, PCWSTR(svc_w.as_ptr()), desired) } {
-            let _svc_guard = ScHandleGuard(svc);
-            let mut status = SERVICE_STATUS::default();
+            let mut service_pid = 0u32;
+            let mut stopped = false;
 
-            // SAFETY: Queries and sends `SERVICE_CONTROL_STOP` when not already stopped.
-            let already_stopped = unsafe { QueryServiceStatus(svc, &mut status) }.is_ok()
-                && status.dwCurrentState == SERVICE_STOPPED;
-
-            if !already_stopped {
-                unsafe {
-                    let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut status);
-                }
-                let deadline = Instant::now() + stop_timeout;
-                while Instant::now() < deadline {
-                    if unsafe { QueryServiceStatus(svc, &mut status) }.is_ok()
-                        && status.dwCurrentState == SERVICE_STOPPED
-                    {
-                        break;
+            {
+                let _svc_guard = ScHandleGuard(svc);
+                if let Some(ssp) = query_service_status_process(svc) {
+                    service_pid = ssp.dwProcessId;
+                    let state = ServiceStateSummary::from_win32_state(ssp.dwCurrentState);
+                    match state {
+                        ServiceStateSummary::Stopped => {
+                            stopped = true;
+                        }
+                        ServiceStateSummary::StopPending => {
+                            // Service is already stopping; wait for it to finish cleanly without
+                            // issuing a duplicate ControlService (which fails with ERROR_SERVICE_CANNOT_ACCEPT_CTRL).
+                            let (ok, pid) = wait_until_service_stopped(svc, stop_timeout);
+                            stopped = ok;
+                            if pid != 0 {
+                                service_pid = pid;
+                            }
+                        }
+                        ServiceStateSummary::StartPending
+                        | ServiceStateSummary::ContinuePending
+                        | ServiceStateSummary::PausePending => {
+                            // Pending transition cannot accept STOP immediately; wait briefly for
+                            // transition to settle, then issue STOP if not already stopped.
+                            let settle_deadline = Instant::now() + Duration::from_secs(3);
+                            while Instant::now() < settle_deadline {
+                                if let Some(cur) = query_service_status_process(svc) {
+                                    if cur.dwProcessId != 0 {
+                                        service_pid = cur.dwProcessId;
+                                    }
+                                    match ServiceStateSummary::from_win32_state(cur.dwCurrentState) {
+                                        ServiceStateSummary::Stopped => {
+                                            stopped = true;
+                                            break;
+                                        }
+                                        ServiceStateSummary::Running | ServiceStateSummary::Paused => {
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                } else {
+                                    stopped = true;
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(120));
+                            }
+                            if !stopped {
+                                let mut ctl_status = SERVICE_STATUS::default();
+                                unsafe {
+                                    let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut ctl_status);
+                                }
+                                let (ok, pid) = wait_until_service_stopped(svc, stop_timeout);
+                                stopped = ok;
+                                if pid != 0 {
+                                    service_pid = pid;
+                                }
+                            }
+                        }
+                        ServiceStateSummary::Running
+                        | ServiceStateSummary::Paused
+                        | ServiceStateSummary::Other(_) => {
+                            let mut ctl_status = SERVICE_STATUS::default();
+                            // SAFETY: `svc` was opened with `SERVICE_STOP`.
+                            unsafe {
+                                let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut ctl_status);
+                            }
+                            let (ok, pid) = wait_until_service_stopped(svc, stop_timeout);
+                            stopped = ok;
+                            if pid != 0 {
+                                service_pid = pid;
+                            }
+                        }
+                        ServiceStateSummary::NotInstalled => {
+                            stopped = true;
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(150));
+                }
+
+                // If service failed to stop cleanly within `stop_timeout` (e.g., upgrading from an
+                // older binary whose shutdown hangs), terminate its exact SCM PID + all `quorumrag.exe`
+                // children and wait until SCM observes `SERVICE_STOPPED`.
+                if !stopped {
+                    if service_pid != 0 {
+                        let _ = terminate_pid_safe(service_pid, self_pid);
+                    }
+                    let _ = terminate_processes_by_name("quorumrag.exe", self_pid);
+                    let _ = wait_until_service_stopped(svc, Duration::from_secs(5));
+                } else {
+                    // Service is stopped; still reap any detached `quorumrag.exe` (`watch-p2p` or portable).
+                    let _ = terminate_processes_by_name("quorumrag.exe", self_pid);
+                }
+
+                if delete_service {
+                    // SAFETY: `svc` was opened with `ACCESS_DELETE`.
+                    unsafe {
+                        let _ = DeleteService(svc);
+                    }
                 }
             }
-
-            // Ensure no orphaned `quorumrag.exe` (such as detached `watch-p2p` or hung child) holds file locks.
-            let _ = terminate_processes_by_name("quorumrag.exe", std::process::id());
-
+            // `_svc_guard` is now dropped (handle closed), allowing SCM to finalize deletion.
             if delete_service {
-                // SAFETY: `svc` was opened with `ACCESS_DELETE`.
-                unsafe {
-                    let _ = DeleteService(svc);
+                let del_deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < del_deadline {
+                    match unsafe { OpenServiceW(scm, PCWSTR(svc_w.as_ptr()), SERVICE_QUERY_STATUS) } {
+                        Ok(h) => {
+                            unsafe {
+                                let _ = CloseServiceHandle(h);
+                            }
+                            std::thread::sleep(Duration::from_millis(120));
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
             return Ok(());
         }
     }
 
-    // Even if the service was not registered, clean up any orphan `quorumrag.exe` holding locks.
-    let _ = terminate_processes_by_name("quorumrag.exe", std::process::id());
+    // Service is not registered (or SCM unavailable); still clean up any portable/orphan `quorumrag.exe`.
+    let _ = terminate_processes_by_name("quorumrag.exe", self_pid);
     Ok(())
 }
 
