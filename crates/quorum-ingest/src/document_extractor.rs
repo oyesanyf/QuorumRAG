@@ -1919,6 +1919,10 @@ impl DocumentExtractor {
         let pcd_start = cp_array_len;
 
         let mut extracted_text = String::new();
+        // Track binary Word field nesting: 0x13 (Begin instruction) .. 0x14 (Display separator) .. 0x15 (End).
+        // Instruction text (e.g., `HYPERLINK "mailto:..."`) between 0x13 and 0x14 is skipped while visible
+        // display text between 0x14 and 0x15 is preserved cleanly.
+        let mut field_instr_stack: Vec<bool> = Vec::new();
 
         for i in 0..n_pieces {
             let cp_curr = u32::from_le_bytes(pcd_data[i * 4..i * 4 + 4].try_into().ok()?) as usize;
@@ -1940,12 +1944,21 @@ impl DocumentExtractor {
                 if actual_offset + char_count <= word_bytes.len() {
                     let slice = &word_bytes[actual_offset..actual_offset + char_count];
                     for &b in slice {
-                        if b == 0x0D || b == 0x07 || b == 0x0B {
-                            extracted_text.push('\n');
-                        } else if b == 0x09 {
-                            extracted_text.push('\t');
-                        } else if (0x20..=0x7E).contains(&b) || b >= 0xA0 {
-                            extracted_text.push(b as char);
+                        match b {
+                            0x13 => field_instr_stack.push(true),
+                            0x14 => {
+                                if let Some(top) = field_instr_stack.last_mut() {
+                                    *top = false;
+                                }
+                            }
+                            0x15 => {
+                                field_instr_stack.pop();
+                            }
+                            _ if field_instr_stack.iter().any(|&in_instr| in_instr) => {}
+                            0x0D | 0x07 | 0x0B => extracted_text.push('\n'),
+                            0x09 => extracted_text.push('\t'),
+                            0x20..=0x7E | 0xA0..=0xFF => extracted_text.push(b as char),
+                            _ => {}
                         }
                     }
                 }
@@ -1960,10 +1973,21 @@ impl DocumentExtractor {
                         .collect();
                     for ch in char::decode_utf16(u16_chars) {
                         if let Ok(c) = ch {
-                            if c == '\r' || c == '\x07' || c == '\x0b' {
-                                extracted_text.push('\n');
-                            } else if c == '\t' || !c.is_control() {
-                                extracted_text.push(c);
+                            match c {
+                                '\u{0013}' => field_instr_stack.push(true),
+                                '\u{0014}' => {
+                                    if let Some(top) = field_instr_stack.last_mut() {
+                                        *top = false;
+                                    }
+                                }
+                                '\u{0015}' => {
+                                    field_instr_stack.pop();
+                                }
+                                _ if field_instr_stack.iter().any(|&in_instr| in_instr) => {}
+                                '\r' | '\x07' | '\x0b' => extracted_text.push('\n'),
+                                '\t' => extracted_text.push('\t'),
+                                _ if !c.is_control() => extracted_text.push(c),
+                                _ => {}
                             }
                         }
                     }
@@ -1971,11 +1995,38 @@ impl DocumentExtractor {
             }
         }
 
-        if extracted_text.trim().is_empty() {
+        let cleaned = Self::strip_word_field_codes(&extracted_text);
+        if cleaned.trim().is_empty() {
             None
         } else {
-            Some(extracted_text)
+            Some(cleaned)
         }
+    }
+
+    /// Strips residual Word/ODT field instruction codes (`HYPERLINK "mailto:..."`, `MERGEFORMAT`,
+    /// `PAGEREF`, `TOC`) and decorative blank signature rules (`________`) while keeping display text.
+    pub fn strip_word_field_codes(raw: &str) -> String {
+        static HYPERLINK_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static FIELD_INSTR_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static UNDERSCORE_RULE_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+        let hyperlink_re = HYPERLINK_RE.get_or_init(|| {
+            regex::Regex::new(r#"(?i)\bHYPERLINK\s+"[^"]*"(?:\s+\\[a-z]\s+"[^"]*")*\s*"#)
+                .expect("valid hyperlink regex")
+        });
+        let field_instr_re = FIELD_INSTR_RE.get_or_init(|| {
+            regex::Regex::new(
+                r#"(?i)\b(?:MERGEFORMAT|PAGEREF\s+\S+|REF\s+_Ref\S+|TOC\s+\\o\s+"[^"]*")\b"#,
+            )
+            .expect("valid field instr regex")
+        });
+        let underscore_re = UNDERSCORE_RULE_RE
+            .get_or_init(|| regex::Regex::new(r"_{4,}").expect("valid underscore regex"));
+
+        let s1 = hyperlink_re.replace_all(raw, "");
+        let s2 = field_instr_re.replace_all(&s1, "");
+        let s3 = underscore_re.replace_all(&s2, " ");
+        s3.into_owned()
     }
 
     /// Scans the entire WordDocument stream for UTF-16LE and CP1252 text runs without any 256KB cap.
@@ -2016,7 +2067,7 @@ impl DocumentExtractor {
         }
 
         if !u16_runs.is_empty() {
-            out.push_str(&u16_runs.join("\n"));
+            out.push_str(&Self::strip_word_field_codes(&u16_runs.join("\n")));
             return out;
         }
 
@@ -2026,14 +2077,14 @@ impl DocumentExtractor {
                 run.push(b as char);
             } else {
                 if run.trim().len() >= 4 {
-                    out.push_str(run.trim());
+                    out.push_str(&Self::strip_word_field_codes(run.trim()));
                     out.push('\n');
                 }
                 run.clear();
             }
         }
         if run.trim().len() >= 4 {
-            out.push_str(run.trim());
+            out.push_str(&Self::strip_word_field_codes(run.trim()));
         }
         out
     }

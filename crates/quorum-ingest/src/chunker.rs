@@ -274,16 +274,24 @@ impl TextChunker {
         }
 
         // 4. Fallback: snap to nearest whitespace / word boundary.
-        // If cand_start falls inside an alphanumeric word, advance forward to the start of the next word.
+        // If cand_start falls inside any non-whitespace token (including words, numbers like `$20,000`,
+        // or hyphenated/punctuated terms), advance forward to the start of the next whitespace-delimited token
+        // so chunks never start mid-word (`Gela`, `Ant`, `bject`) or mid-number (`,000.`).
         let mut cand = cand_start;
         while !content.is_char_boundary(cand) && cand < safe_max {
             cand += 1;
         }
 
         let is_inside_word = if cand > 0 && cand < total_len {
-            let prev_alpha = content[..cand].chars().next_back().map_or(false, |c| c.is_alphanumeric());
-            let next_alpha = content[cand..].chars().next().map_or(false, |c| c.is_alphanumeric());
-            prev_alpha && next_alpha
+            let prev_non_ws = content[..cand]
+                .chars()
+                .next_back()
+                .map_or(false, |c| !c.is_whitespace());
+            let next_non_ws = content[cand..]
+                .chars()
+                .next()
+                .map_or(false, |c| !c.is_whitespace());
+            prev_non_ws && next_non_ws
         } else {
             false
         };

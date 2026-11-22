@@ -1607,6 +1607,10 @@ function secureRandomIndex(n) {
       handleExtractCommand(codeToExtract);
       promptInput.value = '';
       promptInput.style.height = 'auto';
+      lastSpellcheckedText = '';
+      if (spellcheckStatus) {
+        spellcheckStatus.textContent = '✨ Dynamic LLM Spellcheck Active';
+      }
       return;
     }
 
@@ -1623,6 +1627,10 @@ function secureRandomIndex(n) {
     appendMessage('user', text);
     promptInput.value = '';
     promptInput.style.height = 'auto';
+    lastSpellcheckedText = '';
+    if (spellcheckStatus) {
+      spellcheckStatus.textContent = '✨ Dynamic LLM Spellcheck Active';
+    }
 
     // Create Assistant Message with animated cycling thinking indicator + response action toolbar
     const { bodyEl, citationsEl, headerEl, actionsEl } = createAssistantMessage();
@@ -1932,11 +1940,61 @@ function secureRandomIndex(n) {
   }
 
   function renderInlineMarkdown(escaped) {
-    return escaped
-      .replace(/`([^`]+)`/g, '<code style="background:rgba(128,128,128,0.16);padding:1px 5px;border-radius:4px;font-family:monospace;font-size:0.88em;">$1</code>')
-      .replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/\/)[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:var(--accent);text-decoration:underline;">$1</a>')
+    // Protect inline `code` spans before bold/italic/link replacements so code markers stay intact.
+    const codeSpans = [];
+    let out = String(escaped || '').replace(/`([^`]+)`/g, (_m, inner) => {
+      const idx = codeSpans.length;
+      codeSpans.push(`<code class="qr-md-inline-code">${inner}</code>`);
+      return `\u0000QRCODE${idx}\u0000`;
+    });
+    out = out
+      .replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/\/)[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" class="qr-md-link">$1</a>')
       .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
       .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    return out.replace(/\u0000QRCODE(\d+)\u0000/g, (_m, idx) => codeSpans[Number(idx)] || '');
+  }
+
+  function parseGfmTableRow(line) {
+    const trimmed = String(line || '').trim();
+    const cells = [];
+    let current = '';
+    for (let i = 0; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (ch === '\\' && i + 1 < trimmed.length && trimmed[i + 1] === '|') {
+        current += '|';
+        i++;
+      } else if (ch === '|') {
+        cells.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    cells.push(current.trim());
+    if (trimmed.startsWith('|') && cells.length > 0 && cells[0] === '') {
+      cells.shift();
+    }
+    if (trimmed.endsWith('|') && !trimmed.endsWith('\\|') && cells.length > 0 && cells[cells.length - 1] === '') {
+      cells.pop();
+    }
+    return cells;
+  }
+
+  function parseGfmSeparatorAlignments(line) {
+    const trimmed = String(line || '').trim();
+    if (!trimmed.includes('|') || !/^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$/.test(trimmed)) {
+      return null;
+    }
+    const cells = parseGfmTableRow(trimmed);
+    if (cells.length === 0) return null;
+    const aligns = [];
+    for (const c of cells) {
+      if (!/^:?-{3,}:?$/.test(c)) return null;
+      if (c.startsWith(':') && c.endsWith(':')) aligns.push('center');
+      else if (c.endsWith(':')) aligns.push('right');
+      else aligns.push('left');
+    }
+    return aligns;
   }
 
   function renderMarkdownHtml(raw) {
@@ -1953,49 +2011,205 @@ function secureRandomIndex(n) {
     cleanedRaw = cleanedRaw.replace(/^###?\s*📄.*$/gm, '');
     const lines = cleanedRaw.split(/\r?\n/);
     let html = '';
-    let inList = false;
+    let listTag = null;
+    let inQuote = false;
+    let inFence = false;
+    let fenceLang = '';
+    let fenceLines = [];
+    let detailsStack = [];
+
+    const closeList = () => {
+      if (listTag) {
+        html += `</${listTag}>`;
+        listTag = null;
+      }
+    };
+    const closeQuote = () => {
+      if (inQuote) {
+        html += '</blockquote>';
+        inQuote = false;
+      }
+    };
+    const closeBlocks = () => {
+      closeList();
+      closeQuote();
+    };
 
     for (let i = 0; i < lines.length; i++) {
-      const trimmed = lines[i].trim();
-      if (!trimmed) {
-        if (inList) {
-          html += '</ul>';
-          inList = false;
+      const rawLine = lines[i];
+      const trimmed = rawLine.trim();
+
+      // 1. Fenced code blocks (``` or ~~~)
+      const fenceMatch = /^(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)\s*$/.exec(trimmed);
+      if (fenceMatch) {
+        if (!inFence) {
+          closeBlocks();
+          inFence = true;
+          fenceLang = fenceMatch[2] || '';
+          fenceLines = [];
+        } else {
+          const langAttr = fenceLang ? ` data-lang="${escapeHtml(fenceLang)}"` : '';
+          html += `<pre class="qr-md-pre"><code${langAttr}>${escapeHtml(fenceLines.join('\n'))}</code></pre>`;
+          inFence = false;
+          fenceLang = '';
+          fenceLines = [];
         }
         continue;
       }
+      if (inFence) {
+        fenceLines.push(rawLine);
+        continue;
+      }
 
+      if (!trimmed) {
+        closeBlocks();
+        continue;
+      }
+
+      // 2. Allowlisted collapsible <details> / <summary> drawers (all other raw HTML stays escaped)
+      const openDetailsMatch = /^<details(\s+open)?>\s*$/i.exec(trimmed);
+      if (openDetailsMatch) {
+        closeBlocks();
+        const openAttr = openDetailsMatch[1] ? ' open' : '';
+        html += `<details class="qr-md-details"${openAttr}>`;
+        detailsStack.push({ bodyOpened: false });
+        continue;
+      }
+      const summaryMatch = /^<summary>([\s\S]*?)<\/summary>\s*$/i.exec(trimmed);
+      if (summaryMatch && detailsStack.length > 0) {
+        closeBlocks();
+        const top = detailsStack[detailsStack.length - 1];
+        const summaryLabel = renderInlineMarkdown(escapeHtml(summaryMatch[1].trim()));
+        html += `<summary class="qr-md-summary">${summaryLabel}</summary>`;
+        if (!top.bodyOpened) {
+          html += '<div class="qr-md-details-body">';
+          top.bodyOpened = true;
+        }
+        continue;
+      }
+      if (/^<\/details>\s*$/i.test(trimmed) && detailsStack.length > 0) {
+        closeBlocks();
+        const top = detailsStack.pop();
+        if (top && top.bodyOpened) {
+          html += '</div>';
+        }
+        html += '</details>';
+        continue;
+      }
+
+      // 3. GitHub Flavored Markdown (GFM) Tables
+      if (trimmed.includes('|') && i + 1 < lines.length) {
+        const alignments = parseGfmSeparatorAlignments(lines[i + 1]);
+        if (alignments) {
+          closeBlocks();
+          const headerCells = parseGfmTableRow(trimmed);
+          const colCount = Math.max(headerCells.length, alignments.length);
+          let tableHtml = '<div tabindex="0" role="region" aria-label="Grounded evidence summary table" class="qr-md-table-wrap"><table class="qr-md-table"><thead><tr>';
+          for (let c = 0; c < colCount; c++) {
+            const align = alignments[c] || 'left';
+            const cellText = renderInlineMarkdown(escapeHtml(headerCells[c] || ''));
+            tableHtml += `<th scope="col" style="text-align:${align};">${cellText}</th>`;
+          }
+          tableHtml += '</tr></thead><tbody>';
+          i += 2;
+          while (i < lines.length) {
+            const rowTrimmed = lines[i].trim();
+            if (!rowTrimmed || !rowTrimmed.includes('|')) {
+              i--;
+              break;
+            }
+            if (/^<details/i.test(rowTrimmed) || /^<\/details>/i.test(rowTrimmed) || /^#{1,6}\s/.test(rowTrimmed)) {
+              i--;
+              break;
+            }
+            const rowCells = parseGfmTableRow(rowTrimmed);
+            tableHtml += '<tr>';
+            for (let c = 0; c < colCount; c++) {
+              const align = alignments[c] || 'left';
+              const cellText = renderInlineMarkdown(escapeHtml(rowCells[c] || ''));
+              tableHtml += `<td style="text-align:${align};">${cellText}</td>`;
+            }
+            tableHtml += '</tr>';
+            i++;
+          }
+          tableHtml += '</tbody></table></div>';
+          html += tableHtml;
+          continue;
+        }
+      }
+
+      // 4. Horizontal rule
       if (trimmed === '---' || trimmed === '***') {
-        if (inList) { html += '</ul>'; inList = false; }
+        closeBlocks();
         html += '<hr style="border:none;border-top:1px solid var(--border-color,rgba(128,128,128,0.25));margin:12px 0;">';
-      } else if (trimmed.startsWith('#### ')) {
-        if (inList) { html += '</ul>'; inList = false; }
+        continue;
+      }
+
+      // 5. Blockquotes (> ...)
+      if (trimmed.startsWith('> ') || trimmed === '>') {
+        closeList();
+        if (!inQuote) {
+          html += '<blockquote class="qr-md-quote">';
+          inQuote = true;
+        }
+        const quoteContent = trimmed === '>' ? '' : trimmed.slice(2);
+        if (quoteContent) {
+          html += `<p style="margin:0 0 6px 0;line-height:1.6;">${renderInlineMarkdown(escapeHtml(quoteContent))}</p>`;
+        }
+        continue;
+      } else {
+        closeQuote();
+      }
+
+      // 6. Headings
+      if (trimmed.startsWith('#### ')) {
+        closeList();
         const heading = renderInlineMarkdown(escapeHtml(trimmed.slice(5)));
         html += `<h5 style="margin:10px 0 4px 0;font-size:0.92rem;font-weight:600;">${heading}</h5>`;
       } else if (trimmed.startsWith('### ')) {
-        if (inList) { html += '</ul>'; inList = false; }
+        closeList();
         const heading = renderInlineMarkdown(escapeHtml(trimmed.slice(4)));
         html += `<h4 style="margin:12px 0 6px 0;font-size:0.98rem;font-weight:600;">${heading}</h4>`;
       } else if (trimmed.startsWith('## ') || trimmed.startsWith('# ')) {
-        if (inList) { html += '</ul>'; inList = false; }
+        closeList();
         const sliceLen = trimmed.startsWith('## ') ? 3 : 2;
         const heading = renderInlineMarkdown(escapeHtml(trimmed.slice(sliceLen)));
         html += `<h3 style="margin:14px 0 6px 0;font-size:1.05rem;font-weight:600;">${heading}</h3>`;
-      } else if (trimmed.startsWith('- ') || trimmed.startsWith('* ') || /^\d+\.\s+/.test(trimmed)) {
-        if (!inList) {
-          html += '<ul style="margin:8px 0 12px 20px;padding:0;line-height:1.65;">';
-          inList = true;
+      } else if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+        if (listTag !== 'ul') {
+          closeList();
+          html += '<ul class="qr-md-ul" style="margin:8px 0 12px 20px;padding:0;line-height:1.65;">';
+          listTag = 'ul';
         }
-        const itemText = trimmed.replace(/^([-*]|\d+\.)\s+/, '');
-        const item = renderInlineMarkdown(escapeHtml(itemText));
-        html += `<li style="margin-bottom:6px;">${item}</li>`;
+        const itemText = trimmed.slice(2);
+        html += `<li style="margin-bottom:6px;">${renderInlineMarkdown(escapeHtml(itemText))}</li>`;
+      } else if (/^\d+\.\s+/.test(trimmed)) {
+        if (listTag !== 'ol') {
+          closeList();
+          html += '<ol class="qr-md-ol" style="margin:8px 0 12px 20px;padding:0;line-height:1.65;">';
+          listTag = 'ol';
+        }
+        const itemText = trimmed.replace(/^\d+\.\s+/, '');
+        html += `<li style="margin-bottom:6px;">${renderInlineMarkdown(escapeHtml(itemText))}</li>`;
       } else {
-        if (inList) { html += '</ul>'; inList = false; }
+        closeList();
         const para = renderInlineMarkdown(escapeHtml(trimmed));
         html += `<p style="margin:0 0 10px 0;line-height:1.65;">${para}</p>`;
       }
     }
-    if (inList) html += '</ul>';
+
+    if (inFence) {
+      const langAttr = fenceLang ? ` data-lang="${escapeHtml(fenceLang)}"` : '';
+      html += `<pre class="qr-md-pre"><code${langAttr}>${escapeHtml(fenceLines.join('\n'))}</code></pre>`;
+    }
+    closeBlocks();
+    while (detailsStack.length > 0) {
+      const top = detailsStack.pop();
+      if (top && top.bodyOpened) {
+        html += '</div>';
+      }
+      html += '</details>';
+    }
     return html;
   }
 
@@ -2313,7 +2527,7 @@ function secureRandomIndex(n) {
       if (/\[\d+\]/.test(walker.currentNode.nodeValue)) nodes.push(walker.currentNode);
     }
     for (const node of nodes) {
-      if (node.parentElement && node.parentElement.closest('code, .inline-cite-badge')) continue;
+      if (node.parentElement && node.parentElement.closest('code, pre, summary, .inline-cite-badge')) continue;
       const frag = document.createDocumentFragment();
       const parts = node.nodeValue.split(/(\[\d+\])/);
       for (const part of parts) {

@@ -6754,7 +6754,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-atlaskv"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "half",
@@ -6772,7 +6772,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-classifier"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "magika",
  "serde",
@@ -6784,7 +6784,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-cli"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -6804,7 +6804,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-contract"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -6826,7 +6826,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-coordinator"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -6848,6 +6848,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rhai",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6866,7 +6867,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-daemon"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6908,7 +6909,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-ingest"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "cfb",
@@ -6940,7 +6941,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-network"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6963,7 +6964,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-storage"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -6989,7 +6990,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-types"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -7003,7 +7004,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-ui"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "axum",
  "mime_guess",
@@ -7671,6 +7672,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9cb23c424d8ee841bb4d813677ca237e2a610067d594fec130f87d6093495ab5"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "schemars"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
+dependencies = [
+ "dyn-clone",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -2741,3 +2741,168 @@ audio.qr-lightbox-media { width: min(640px, 100%); }
   font-size: 13px;
 }
 .save-file-option:hover, .save-file-option:focus-visible { background: rgba(128, 128, 128, 0.18); }
+
+/* ---------------------------------------------------------------------------
+   GFM Markdown Rendering: Responsive Tables, Blockquotes, Code Fences,
+   and Accessible Collapsible Evidence Drawers (<details>/<summary>)
+   --------------------------------------------------------------------------- */
+.qr-md-inline-code {
+  background: rgba(128, 128, 128, 0.16);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+}
+.qr-md-link {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.qr-md-table-wrap {
+  overflow: auto;
+  max-inline-size: 100%;
+  max-block-size: min(520px, 75vh);
+  container-type: inline-size;
+  margin: 12px 0 14px 0;
+  border-radius: 10px;
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.28));
+  background: rgba(128, 128, 128, 0.04);
+}
+.qr-md-table-wrap:focus-visible {
+  outline: 2px solid var(--accent, #10a37f);
+  outline-offset: 2px;
+}
+.qr-md-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+.qr-md-table thead {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+}
+.qr-md-table th {
+  background: var(--bg-surface, #1f2229);
+  color: var(--text-primary, #f4f4f5);
+  font-weight: 600;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border-color, rgba(128, 128, 128, 0.3));
+  white-space: nowrap;
+}
+.qr-md-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.16);
+  vertical-align: top;
+  word-break: break-word;
+}
+.qr-md-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.qr-md-table tbody tr:nth-child(even) td {
+  background: rgba(128, 128, 128, 0.04);
+}
+.qr-md-table tbody tr:hover td {
+  background: rgba(128, 128, 128, 0.1);
+}
+body.theme-white .qr-md-table th {
+  background: #f3f4f6;
+  color: #111827;
+}
+body.theme-white .qr-md-table tbody tr:nth-child(even) td {
+  background: rgba(15, 23, 42, 0.025);
+}
+
+.qr-md-quote {
+  margin: 10px 0 12px 0;
+  padding: 8px 14px;
+  border-inline-start: 3px solid var(--accent, #10a37f);
+  background: rgba(128, 128, 128, 0.08);
+  border-radius: 0 8px 8px 0;
+  color: var(--text-primary);
+}
+.qr-md-quote p:last-child {
+  margin-bottom: 0 !important;
+}
+
+.qr-md-pre {
+  margin: 10px 0 12px 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  overflow-x: auto;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.28));
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+body.theme-white .qr-md-pre {
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+.qr-md-details {
+  margin: 12px 0 14px 0;
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.28));
+  border-radius: 10px;
+  background: rgba(128, 128, 128, 0.05);
+  overflow: hidden;
+}
+.qr-md-summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.55ch;
+  padding: 9px 13px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-primary);
+}
+.qr-md-summary::-webkit-details-marker {
+  display: none;
+}
+.qr-md-summary::before {
+  content: "\25BE";
+  display: inline-block;
+  font-size: 0.9em;
+  line-height: 1;
+  flex-shrink: 0;
+  rotate: -90deg;
+}
+.qr-md-details[open] > .qr-md-summary::before {
+  rotate: 0deg;
+}
+.qr-md-summary:hover {
+  background: rgba(128, 128, 128, 0.1);
+}
+.qr-md-summary:focus-visible {
+  outline: 2px solid var(--accent, #10a37f);
+  outline-offset: -2px;
+}
+.qr-md-details-body {
+  padding: 10px 14px 12px 14px;
+  border-top: 1px solid rgba(128, 128, 128, 0.18);
+  font-size: 0.89rem;
+}
+.qr-md-details::details-content {
+  interpolate-size: allow-keywords;
+  overflow: clip;
+  contain: layout;
+}
+.qr-md-details:not([open])::details-content {
+  block-size: 0;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .qr-md-summary::before {
+    transition: rotate 0.18s ease;
+  }
+  .qr-md-details::details-content {
+    transition: block-size, content-visibility, display;
+    transition-duration: 0.22s;
+    transition-timing-function: ease-in-out;
+    transition-behavior: allow-discrete;
+  }
+}

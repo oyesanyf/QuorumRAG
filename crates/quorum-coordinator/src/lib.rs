@@ -22,6 +22,7 @@ pub mod relevance_attestor;
 pub mod response_formatter_watchdog;
 pub mod rlm_orchestrator;
 pub mod scatter_gather;
+pub mod structured_output;
 pub mod telemetry;
 pub mod tpm;
 pub mod types;

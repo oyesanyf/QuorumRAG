@@ -500,7 +500,7 @@ impl DeterministicOfflineSynthesisEngine {
     /// `entity["book","Women, Race & Class","Angela Davis 1981"]` -> `Women, Race & Class`
     /// and strips `**:::`, `:::`, and `:contentReference[...]` markers.
     pub fn normalize_inline_markup_artifacts(input: &str) -> String {
-        let mut s = input
+        let mut s = crate::structured_output::strip_extraction_field_artifacts(input)
             .replace("**:::", "")
             .replace(":::**", "")
             .replace(":::", "");
@@ -3051,7 +3051,9 @@ impl DeterministicOfflineSynthesisEngine {
                 &sanitized_prose,
                 &contributing_chunks,
             );
-            let final_answer = Self::strip_orphan_citation_stubs(&watchdog_report.cleaned_prose);
+            let final_answer = crate::structured_output::balance_markdown_emphasis(
+                &Self::strip_orphan_citation_stubs(&watchdog_report.cleaned_prose),
+            );
             let mut synthesized_rag = format!("{}{}", final_answer, sources_block);
 
             let query_targets_forensics = forensic_intent.is_some()
@@ -3972,64 +3974,100 @@ impl DeterministicOfflineSynthesisEngine {
             }
         };
 
+        let strip_compound_tail = |raw: &str| -> String {
+            // Trim trailing secondary question clauses (e.g. "angela davis what is her research" -> "angela davis")
+            let mut cut = raw.len();
+            let raw_low = raw.to_ascii_lowercase();
+            for sep in [
+                "?",
+                ",",
+                ";",
+                " and what ",
+                " and where ",
+                " and when ",
+                " and how ",
+                " and why ",
+                " what is ",
+                " what are ",
+                " what was ",
+                " what were ",
+                " what does ",
+                " what did ",
+                " where is ",
+                " where did ",
+                " when did ",
+                " how did ",
+                " how does ",
+                " why did ",
+                " tell me ",
+            ] {
+                if let Some(pos) = raw_low.find(sep) {
+                    if pos >= 2 && pos < cut {
+                        cut = pos;
+                    }
+                }
+            }
+            raw[..cut].trim().to_string()
+        };
+
         // 1. "who is / who was / who are / who were"
         if lower.starts_with("who is ") {
-            let raw = clean_prompt["who is ".len()..].trim();
-            if is_clause_or_malformed_tail(raw) {
+            let raw = strip_compound_tail(clean_prompt["who is ".len()..].trim());
+            if is_clause_or_malformed_tail(&raw) {
                 return String::new();
             }
-            return format!("{} is ", snap_or_cap(raw));
+            return format!("{} is ", snap_or_cap(&raw));
         }
         if lower.starts_with("who was ") {
-            let raw = clean_prompt["who was ".len()..].trim();
-            if is_clause_or_malformed_tail(raw) {
+            let raw = strip_compound_tail(clean_prompt["who was ".len()..].trim());
+            if is_clause_or_malformed_tail(&raw) {
                 return String::new();
             }
-            return format!("{} was ", snap_or_cap(raw));
+            return format!("{} was ", snap_or_cap(&raw));
         }
         if lower.starts_with("who are ") {
-            let raw = clean_prompt["who are ".len()..].trim();
-            if is_clause_or_malformed_tail(raw) {
+            let raw = strip_compound_tail(clean_prompt["who are ".len()..].trim());
+            if is_clause_or_malformed_tail(&raw) {
                 return String::new();
             }
-            return format!("{} are ", snap_or_cap(raw));
+            return format!("{} are ", snap_or_cap(&raw));
         }
         if lower.starts_with("who were ") {
-            let raw = clean_prompt["who were ".len()..].trim();
-            if is_clause_or_malformed_tail(raw) {
+            let raw = strip_compound_tail(clean_prompt["who were ".len()..].trim());
+            if is_clause_or_malformed_tail(&raw) {
                 return String::new();
             }
-            return format!("{} were ", snap_or_cap(raw));
+            return format!("{} were ", snap_or_cap(&raw));
         }
 
         // 2. "what is / what was / what are / what were"
         if lower.starts_with("what is ") {
-            let raw = clean_prompt["what is ".len()..].trim();
-            if is_clause_or_malformed_tail(raw) {
+            let raw = strip_compound_tail(clean_prompt["what is ".len()..].trim());
+            if is_clause_or_malformed_tail(&raw) {
                 return String::new();
             }
-            return format!("{} is ", snap_or_cap(raw));
+            return format!("{} is ", snap_or_cap(&raw));
         }
         if lower.starts_with("what was ") {
-            let raw = clean_prompt["what was ".len()..].trim();
-            if is_clause_or_malformed_tail(raw) {
+            let raw = strip_compound_tail(clean_prompt["what was ".len()..].trim());
+            if is_clause_or_malformed_tail(&raw) {
                 return String::new();
             }
-            return format!("{} was ", snap_or_cap(raw));
+            return format!("{} was ", snap_or_cap(&raw));
         }
         if lower.starts_with("what are ") {
-            let raw = clean_prompt["what are ".len()..].trim();
-            if is_clause_or_malformed_tail(raw) {
+            let raw = strip_compound_tail(clean_prompt["what are ".len()..].trim());
+            if is_clause_or_malformed_tail(&raw) {
                 return String::new();
             }
-            return format!("{} are ", snap_or_cap(raw));
+            return format!("{} are ", snap_or_cap(&raw));
         }
         if lower.starts_with("what were ") {
-            let raw = clean_prompt["what were ".len()..].trim();
-            if is_clause_or_malformed_tail(raw) {
+            let raw = strip_compound_tail(clean_prompt["what were ".len()..].trim());
+            if is_clause_or_malformed_tail(&raw) {
                 return String::new();
             }
-            return format!("{} were ", snap_or_cap(raw));
+            return format!("{} were ", snap_or_cap(&raw));
         }
 
         // 3. "what the <topic>" (e.g. "what the cigna policy")
@@ -4274,7 +4312,8 @@ impl DeterministicOfflineSynthesisEngine {
                 let v = rest[..end]
                     .trim()
                     .trim_end_matches('.')
-                    .trim_end_matches(']');
+                    .trim_end_matches(']')
+                    .trim_end_matches(')');
                 if !v.is_empty() {
                     return Some(v.to_string());
                 }
@@ -4308,62 +4347,173 @@ impl DeterministicOfflineSynthesisEngine {
         let top_text = Self::clean_chunk_text(&top.chunk.text_content);
         let top_path = top.chunk.file_path.as_str();
 
+        struct ParsedDnsRow {
+            timestamp: String,
+            proc_name: String,
+            pid: String,
+            proto: String,
+            port: String,
+            domain: String,
+            results: String,
+            source_uri: String,
+            cite_num: usize,
+        }
+
+        let extract_sysmon_field = |seg: &str, key: &str| -> Option<String> {
+            let pat = format!("{}=", key);
+            if let Some(pos) = seg.find(&pat) {
+                let rest = &seg[pos + pat.len()..];
+                let end = rest
+                    .find(|c: char| c == ',' || c == '|' || c == '\n' || c == '\r')
+                    .unwrap_or(rest.len());
+                let v = rest[..end]
+                    .trim()
+                    .trim_matches('\'')
+                    .trim_end_matches(')')
+                    .trim();
+                if !v.is_empty() && !v.contains("[REDACTED_HIGH_ENTROPY_SECRET]") {
+                    return Some(v.to_string());
+                }
+            }
+            None
+        };
+
+        // Pre-parse individual Sysmon/DNS events cleanly BEFORE constructing the lead sentence AND table,
+        // splitting on `DnsQuery [` boundaries so `process`, `pid`, `query_name`, `query_results`, and `date`
+        // ALWAYS come from the exact same event and are sorted strictly newest-first chronologically.
+        let mut parsed_dns_rows: Vec<ParsedDnsRow> = Vec::new();
+        if intent == ForensicQueryIntent::DnsTraffic {
+            let mut seen_event_keys = std::collections::HashSet::new();
+            for (idx, c) in matched_chunks.iter().take(12).enumerate() {
+                let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
+                let segments: Vec<String> = if cleaned.contains("DnsQuery [") {
+                    cleaned
+                        .split("DnsQuery [")
+                        .skip(1)
+                        .map(|seg| format!("DnsQuery [{}", seg.trim()))
+                        .collect()
+                } else {
+                    vec![cleaned]
+                };
+
+                for seg in segments {
+                    let proc_raw = seg
+                        .find("process '")
+                        .and_then(|pos| {
+                            let rest = &seg[pos + "process '".len()..];
+                            rest.find('\'').map(|end| rest[..end].trim().to_string())
+                        })
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| extract_sysmon_field(&seg, "Image"))
+                        .or_else(|| extract_sysmon_field(&seg, "image"))
+                        .or_else(|| Self::extract_forensic_kv(&seg, "process"))
+                        .or_else(|| Self::extract_forensic_kv(&seg, "process_name"))
+                        .or_else(|| Self::extract_forensic_kv(&seg, "service"))
+                        .unwrap_or_else(|| {
+                            if seg.contains("svchost.exe (Dnscache)")
+                                || c.chunk.file_path.contains("dnscache")
+                            {
+                                "svchost.exe (Dnscache)".to_string()
+                            } else {
+                                "System DNS Resolver".to_string()
+                            }
+                        });
+                    let proc_name = if proc_raw.eq_ignore_ascii_case("<unknown process>") {
+                        "unknown process".to_string()
+                    } else {
+                        proc_raw
+                    };
+                    let pid = Self::extract_forensic_kv(&seg, "pid")
+                        .or_else(|| Self::extract_forensic_kv(&seg, "ProcessId"))
+                        .or_else(|| Self::extract_forensic_kv(&seg, "PID"))
+                        .map(|p| p.trim_end_matches(')').to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let port = Self::extract_forensic_kv(&seg, "port")
+                        .or_else(|| Self::extract_forensic_kv(&seg, "dns_port"))
+                        .unwrap_or_else(|| "53".to_string());
+                    let proto = Self::extract_forensic_kv(&seg, "protocol")
+                        .unwrap_or_else(|| "UDP".to_string());
+                    // Fallback to prose phrase `for domain '<name>'` if legacy chunk had redacted `query_name=`
+                    let domain = extract_sysmon_field(&seg, "QueryName")
+                        .or_else(|| extract_sysmon_field(&seg, "query_name"))
+                        .or_else(|| Self::extract_forensic_kv(&seg, "RecordName"))
+                        .or_else(|| {
+                            seg.find("for domain '").and_then(|pos| {
+                                let rest = &seg[pos + "for domain '".len()..];
+                                rest.find('\'').map(|end| rest[..end].trim().to_string())
+                            })
+                        })
+                        .or_else(|| Self::extract_forensic_kv(&seg, "domain"))
+                        .or_else(|| Self::extract_forensic_kv(&seg, "remote"))
+                        .unwrap_or_else(|| "-".to_string());
+                    let results = extract_sysmon_field(&seg, "QueryResults")
+                        .or_else(|| extract_sysmon_field(&seg, "query_results"))
+                        .or_else(|| {
+                            seg.find("' -> '").and_then(|pos| {
+                                let rest = &seg[pos + "' -> '".len()..];
+                                rest.find('\'').map(|end| rest[..end].trim().to_string())
+                            })
+                        })
+                        .or_else(|| Self::extract_forensic_kv(&seg, "Data"))
+                        .or_else(|| Self::extract_forensic_kv(&seg, "state"))
+                        .unwrap_or_else(|| "Success".to_string());
+                    let timestamp = extract_sysmon_field(&seg, "date")
+                        .or_else(|| extract_sysmon_field(&seg, "UtcTime"))
+                        .or_else(|| {
+                            seg.strip_prefix("DnsQuery [")
+                                .and_then(|rest| rest.find(']').map(|end| rest[..end].trim().to_string()))
+                        })
+                        .unwrap_or_default();
+
+                    let dedup_key = format!("{}|{}|{}|{}", timestamp, pid, domain, results);
+                    if !seen_event_keys.insert(dedup_key) {
+                        continue;
+                    }
+                    parsed_dns_rows.push(ParsedDnsRow {
+                        timestamp,
+                        proc_name,
+                        pid,
+                        proto,
+                        port,
+                        domain,
+                        results,
+                        source_uri: c.chunk.file_path.clone(),
+                        cite_num: idx + 1,
+                    });
+                }
+            }
+            // Sort strictly newest-first by full ISO timestamp
+            parsed_dns_rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(a.cite_num.cmp(&b.cite_num)));
+        }
+
         let lead = match intent {
             ForensicQueryIntent::DnsTraffic => {
-                let proc_name = Self::extract_forensic_kv(&top_text, "process")
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "process_name"))
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "Image"))
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "image"))
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "service"));
-                let pid = Self::extract_forensic_kv(&top_text, "pid")
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "ProcessId"))
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "PID"));
-                let query_name = Self::extract_forensic_kv(&top_text, "QueryName")
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "query_name"))
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "RecordName"))
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "domain"));
-                let query_results = Self::extract_forensic_kv(&top_text, "QueryResults")
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "query_results"))
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "Data"));
-                let port = Self::extract_forensic_kv(&top_text, "port")
-                    .or_else(|| Self::extract_forensic_kv(&top_text, "dns_port"))
-                    .unwrap_or_else(|| "53".to_string());
-                let proto = Self::extract_forensic_kv(&top_text, "protocol")
-                    .unwrap_or_else(|| "UDP".to_string());
-
-                let p_label = proc_name
-                    .clone()
-                    .unwrap_or_else(|| {
-                        if top_text.contains("svchost.exe (Dnscache)") || top_path.contains("dnscache") {
-                            "svchost.exe (Dnscache)".to_string()
-                        } else if let Some(p) = &pid {
-                            format!("PID {}", p)
+                if let Some(top_row) = parsed_dns_rows.first() {
+                    let pid_part = if !top_row.pid.is_empty() && top_row.pid != "-" && top_row.pid != "0" {
+                        format!(" (PID `{}`)", top_row.pid)
+                    } else {
+                        String::new()
+                    };
+                    let query_part = if !top_row.domain.is_empty() && top_row.domain != "-" {
+                        let res_part = if !top_row.results.is_empty() && top_row.results != "-" {
+                            format!(" -> `{}`", top_row.results)
                         } else {
-                            "system DNS resolver".to_string()
-                        }
-                    });
-                let pid_part = pid
-                    .as_deref()
-                    .filter(|p| *p != "0")
-                    .map(|p| format!(" (PID `{}`)", p))
-                    .unwrap_or_default();
-                let query_part = query_name
-                    .as_deref()
-                    .filter(|q| !q.is_empty())
-                    .map(|q| {
-                        let res_part = query_results
-                            .as_deref()
-                            .filter(|r| !r.is_empty())
-                            .map(|r| format!(" -> `{}`", r))
-                            .unwrap_or_default();
-                        format!(" for domain **`{}`**{}", q, res_part)
-                    })
-                    .unwrap_or_default();
-
-                format!(
-                    "According to **Artemis DFIR** host DNS telemetry (`{}`), the process observed utilizing DNS traffic (port `{}/{}`) on this asset is **`{}`**{}{}. **[1]**",
-                    top_path, port, proto, p_label, pid_part, query_part
-                )
+                            String::new()
+                        };
+                        format!(" for domain **`{}`**{}", top_row.domain, res_part)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "According to **Artemis DFIR** host DNS telemetry (`{}`), the most recent process observed utilizing DNS traffic (port `{}/{}`) on this asset is **`{}`**{}{}. **[{}]**",
+                        top_row.source_uri, top_row.port, top_row.proto, top_row.proc_name, pid_part, query_part, top_row.cite_num
+                    )
+                } else {
+                    format!(
+                        "According to **Artemis DFIR** host DNS telemetry (`{}`), DNS resolver activity was recorded on this asset. **[1]**",
+                        top_path
+                    )
+                }
             }
             ForensicQueryIntent::NetworkInternet => {
                 let proc_name = Self::extract_forensic_kv(&top_text, "process");
@@ -4499,60 +4649,59 @@ impl DeterministicOfflineSynthesisEngine {
         out.push_str(&lead);
 
         if intent == ForensicQueryIntent::DnsTraffic {
+            // If we have a chronological latest forward (non-PTR) domain distinct from the top reverse PTR row,
+            // surface both clearly in the lead so "what is the last dns query, what domain did it go to" is crystal clear.
+            if let Some(newest_ext) = parsed_dns_rows.iter().find(|r| {
+                !r.domain.is_empty()
+                    && r.domain != "-"
+                    && !r.domain.ends_with(".in-addr.arpa.")
+                    && !r.domain.ends_with(".in-addr.arpa")
+                    && !r.domain.ends_with(".ip6.arpa.")
+            }) {
+                if let Some(first_row) = parsed_dns_rows.first() {
+                    if first_row.domain.ends_with(".in-addr.arpa.")
+                        || first_row.domain.ends_with(".in-addr.arpa")
+                    {
+                        out.push_str(&format!(
+                            "\n\nThe most recent external forward domain lookup recorded was **`{}`** by **`{}`** (PID `{}`{}) -> `{}` **[{}]**. ",
+                            newest_ext.domain,
+                            newest_ext.proc_name,
+                            newest_ext.pid,
+                            if newest_ext.timestamp.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" at `{}`", newest_ext.timestamp)
+                            },
+                            newest_ext.results,
+                            newest_ext.cite_num
+                        ));
+                    }
+                }
+            }
+
             out.push_str("\n\n### Forensic DNS Resolution Summary\n\n");
             out.push_str("| # | Process | PID | Protocol / Port | Target Domain / Remote Socket | Query Status / Results | Telemetry Source |\n");
             out.push_str("|---|---|---|---|---|---|---|\n");
-            for (idx, c) in matched_chunks.iter().take(8).enumerate() {
-                let text = Self::clean_chunk_text(&c.chunk.text_content);
-                let proc_name = Self::extract_forensic_kv(&text, "process")
-                    .or_else(|| Self::extract_forensic_kv(&text, "process_name"))
-                    .or_else(|| Self::extract_forensic_kv(&text, "Image"))
-                    .or_else(|| Self::extract_forensic_kv(&text, "image"))
-                    .or_else(|| Self::extract_forensic_kv(&text, "service"))
-                    .unwrap_or_else(|| {
-                        if text.contains("svchost.exe (Dnscache)") || c.chunk.file_path.contains("dnscache") {
-                            "svchost.exe (Dnscache)".to_string()
-                        } else {
-                            "System DNS Resolver".to_string()
-                        }
-                    });
-                let pid = Self::extract_forensic_kv(&text, "pid")
-                    .or_else(|| Self::extract_forensic_kv(&text, "ProcessId"))
-                    .or_else(|| Self::extract_forensic_kv(&text, "PID"))
-                    .unwrap_or_else(|| "-".to_string());
-                let port = Self::extract_forensic_kv(&text, "port")
-                    .or_else(|| Self::extract_forensic_kv(&text, "dns_port"))
-                    .unwrap_or_else(|| "53".to_string());
-                let proto = Self::extract_forensic_kv(&text, "protocol")
-                    .unwrap_or_else(|| "UDP".to_string());
-                let domain = Self::extract_forensic_kv(&text, "QueryName")
-                    .or_else(|| Self::extract_forensic_kv(&text, "query_name"))
-                    .or_else(|| Self::extract_forensic_kv(&text, "RecordName"))
-                    .or_else(|| Self::extract_forensic_kv(&text, "remote"))
-                    .unwrap_or_else(|| "-".to_string());
-                let results = Self::extract_forensic_kv(&text, "QueryResults")
-                    .or_else(|| Self::extract_forensic_kv(&text, "query_results"))
-                    .or_else(|| Self::extract_forensic_kv(&text, "Data"))
-                    .or_else(|| Self::extract_forensic_kv(&text, "state"))
-                    .unwrap_or_else(|| "Success".to_string());
+            for (row_idx, r) in parsed_dns_rows.iter().take(12).enumerate() {
                 out.push_str(&format!(
                     "| {} | `{}` | `{}` | `{} / {}` | `{}` | `{}` | `{}` |\n",
-                    idx + 1,
-                    proc_name.replace('|', "\\|"),
-                    pid.replace('|', "\\|"),
-                    proto.replace('|', "\\|"),
-                    port.replace('|', "\\|"),
-                    domain.replace('|', "\\|"),
-                    results.replace('|', "\\|"),
-                    c.chunk.file_path.replace('|', "\\|")
+                    row_idx + 1,
+                    r.proc_name.replace('|', "\\|"),
+                    r.pid.replace('|', "\\|"),
+                    r.proto.replace('|', "\\|"),
+                    r.port.replace('|', "\\|"),
+                    r.domain.replace('|', "\\|"),
+                    r.results.replace('|', "\\|"),
+                    r.source_uri.replace('|', "\\|")
                 ));
             }
         }
 
-        out.push_str("\n\n### Artemis DFIR Host Telemetry Evidence\n\n");
         let mut seen_evidence = std::collections::HashSet::new();
-        for (idx, c) in matched_chunks.iter().take(6).enumerate() {
-            let cleaned = Self::clean_chunk_text(&c.chunk.text_content);
+        let mut raw_evidence_items: Vec<String> = Vec::new();
+        for (idx, c) in matched_chunks.iter().take(8).enumerate() {
+            let cleaned = Self::clean_chunk_text(&c.chunk.text_content)
+                .replace("<unknown process>", "unknown process");
             let compact_lines: Vec<&str> = cleaned
                 .lines()
                 .map(str::trim)
@@ -4565,12 +4714,22 @@ impl DeterministicOfflineSynthesisEngine {
             if !seen_evidence.insert(line_joined.clone()) {
                 continue;
             }
-            out.push_str(&format!(
+            raw_evidence_items.push(format!(
                 "- **[{}]** (`{}`): {}\n",
                 idx + 1,
                 c.chunk.file_path,
                 line_joined
             ));
+        }
+        if !raw_evidence_items.is_empty() {
+            out.push_str(&format!(
+                "\n\n<details>\n<summary>Artemis DFIR Host Telemetry Evidence ({} records)</summary>\n\n",
+                raw_evidence_items.len()
+            ));
+            for item in raw_evidence_items {
+                out.push_str(&item);
+            }
+            out.push_str("\n</details>");
         }
         out.trim_end().to_string()
     }
@@ -8654,6 +8813,80 @@ impl DeterministicOfflineSynthesisEngine {
         )
     }
 
+    /// Executes a schema-constrained local Ollama `/api/chat` call passing `schemars`-generated
+    /// JSON Schema in Ollama's native `"format"` field (GBNF grammar decoding) and deserializes
+    /// into `StructuredSynthesisResponse`. Returns `None` cleanly if the local Ollama version does
+    /// not support JSON Schema `format` or times out so the caller seamlessly falls back to streaming.
+    #[allow(clippy::too_many_arguments)]
+    fn query_ollama_structured_json(
+        addr: &std::net::SocketAddr,
+        host_port: &str,
+        target_model: &str,
+        initial_messages: &[serde_json::Value],
+        temp: f32,
+        num_predict: usize,
+        num_ctx: usize,
+    ) -> Option<crate::structured_output::StructuredSynthesisResponse> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let mut stream = TcpStream::connect_timeout(addr, Duration::from_millis(800)).ok()?;
+        let read_timeout = Self::socket_read_timeout_for_model(target_model);
+        let _ = stream.set_read_timeout(Some(read_timeout));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+
+        let mut messages_with_schema_note = initial_messages.to_vec();
+        if let Some(last) = messages_with_schema_note.last_mut() {
+            if let Some(content) = last.get("content").and_then(|v| v.as_str()) {
+                let enriched = format!(
+                    "{}\n\nSTRICT STRUCTURED JSON OUTPUT REQUIREMENT: Populate EVERY field of the JSON schema thoroughly with ZERO content reduction. Write exhaustive multi-paragraph `narrative_paragraphs` covering every single document [1]..[N], rich `key_facts`, and complete `document_table` summaries. Never emit raw document header dumps or echo the raw query in `section_title`.",
+                    content
+                );
+                if let Some(obj) = last.as_object_mut() {
+                    obj.insert("content".to_string(), serde_json::Value::String(enriched));
+                }
+            }
+        }
+
+        let mut payload_val = serde_json::json!({
+            "model": target_model,
+            "messages": messages_with_schema_note,
+            "stream": false,
+            "keep_alive": "24h",
+            "format": crate::structured_output::ollama_response_json_schema(),
+            "options": Self::build_ollama_chat_options(temp, num_predict, num_ctx)
+        });
+        if Self::model_uses_thinking_flag(target_model) {
+            if let Some(obj) = payload_val.as_object_mut() {
+                obj.insert("think".to_string(), serde_json::Value::Bool(false));
+            }
+        }
+        let payload = payload_val.to_string();
+        let request = format!(
+            "POST /api/chat HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            host_port,
+            payload.len(),
+            payload
+        );
+        stream.write_all(request.as_bytes()).ok()?;
+
+        let mut resp_bytes = Vec::new();
+        stream.read_to_end(&mut resp_bytes).ok()?;
+        let resp_str = String::from_utf8_lossy(&resp_bytes);
+        let body = resp_str
+            .split_once("\r\n\r\n")
+            .or_else(|| resp_str.split_once("\n\n"))
+            .map(|(_, b)| b)
+            .unwrap_or("");
+        let json_body: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+        let content = json_body
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())?;
+        crate::structured_output::parse_structured_response(content)
+    }
+
     /// Executes a single streaming `/api/chat` conversation (including `done_reason == "length"`
     /// continuation hops and repetition detection) and returns the raw generated text.
     fn stream_ollama_chat_messages(
@@ -9927,23 +10160,56 @@ impl DeterministicOfflineSynthesisEngine {
                 }
                 assembled
             } else {
-                let mut raw = Self::stream_ollama_chat_messages(
-                    &addr,
-                    host_port,
-                    target_model,
-                    &messages,
-                    temp,
-                    per_hop_predict,
-                    num_ctx,
-                    max_hops,
-                    max_output_tokens,
-                    &prior_answer_text,
-                    telemetry_tx,
-                )?;
-                let (deduped, _) = Self::deduplicate_repeated_paragraphs(&raw);
-                raw = deduped;
-                raw = Self::drop_ungrounded_sentences(&raw, &source_corpus);
-                raw
+                // Attempt Ollama native JSON-Schema structured synthesis first (GBNF grammar constrained via schemars)
+                // when not in continuation mode; falls back seamlessly to unconstrained streaming if unsupported.
+                let structured_opt = if prior_answer_text.is_empty() {
+                    Self::query_ollama_structured_json(
+                        &addr,
+                        host_port,
+                        target_model,
+                        &messages,
+                        temp,
+                        per_hop_predict.max(3072),
+                        num_ctx,
+                    )
+                } else {
+                    None
+                };
+
+                if let Some(structured) = structured_opt {
+                    let rendered = crate::structured_output::render_structured_response_markdown(
+                        &structured,
+                        &unique_file_chunks,
+                        true,
+                    );
+                    if let Some(tx) = telemetry_tx {
+                        let _ = Self::send_telemetry(
+                            tx,
+                            AgenticTelemetryEvent::TokenDelta {
+                                delta: rendered.clone(),
+                            },
+                        );
+                    }
+                    rendered
+                } else {
+                    let mut raw = Self::stream_ollama_chat_messages(
+                        &addr,
+                        host_port,
+                        target_model,
+                        &messages,
+                        temp,
+                        per_hop_predict,
+                        num_ctx,
+                        max_hops,
+                        max_output_tokens,
+                        &prior_answer_text,
+                        telemetry_tx,
+                    )?;
+                    let (deduped, _) = Self::deduplicate_repeated_paragraphs(&raw);
+                    raw = deduped;
+                    raw = Self::drop_ungrounded_sentences(&raw, &source_corpus);
+                    raw
+                }
             };
 
             if !prior_answer_text.is_empty() {
@@ -9962,7 +10228,8 @@ impl DeterministicOfflineSynthesisEngine {
             let prose_only = Self::strip_sources_footer(full_text.trim());
             let pass1 = Self::strip_question_echo_and_meta_with_corpus(prose_only, prompt, &source_corpus);
             let pass2 = Self::strip_stub_heading_and_label_echo(&pass1);
-            let mut cleaned_final = Self::strip_question_echo_and_meta_with_corpus(&pass2, prompt, &source_corpus);
+            let pass3 = Self::strip_question_echo_and_meta_with_corpus(&pass2, prompt, &source_corpus);
+            let mut cleaned_final = crate::structured_output::balance_markdown_emphasis(&pass3);
             if !prior_answer_text.is_empty() {
                 cleaned_final = Self::drop_sentences_repeating_prior(&cleaned_final, &prior_answer_text);
             }
@@ -10061,7 +10328,8 @@ impl DeterministicOfflineSynthesisEngine {
                     &sanitized_prose,
                     &compacted_chunks,
                 );
-                let compacted_prose = watchdog_report.cleaned_prose;
+                let compacted_prose =
+                    crate::structured_output::balance_markdown_emphasis(&watchdog_report.cleaned_prose);
                 let sources_block = Self::format_sources_block(&compacted_chunks);
                 let final_with_sources = format!("{}{}", compacted_prose.trim(), sources_block);
                 let mut turn_citations = Self::build_deduplicated_citations(&compacted_chunks);
@@ -12950,6 +13218,104 @@ Angela Davis is documented as the lessor in New Orleans [2].";
             citations.len(),
             11,
             "Must return 1-to-1 Sources citations for all 11 attested docs"
+        );
+    }
+
+    fn make_v080_test_chunk(path: &str, text: &str, score: f32) -> ScoredChunk {
+        ScoredChunk {
+            chunk: quorum_types::DocumentChunk::new(
+                "v080-id",
+                "v080-doc",
+                path,
+                1,
+                10,
+                0,
+                vec![0.0; 8],
+                text,
+                Some("{}".to_string()),
+            )
+            .expect("test chunk"),
+            score,
+            source_peer: "local".to_string(),
+            is_remote: false,
+        }
+    }
+
+    #[test]
+    fn test_compound_query_subject_extraction_strips_secondary_question() {
+        let chunk = make_v080_test_chunk(
+            "docs/Women Race Class Summary.docx",
+            "Women, Race & Class is a landmark work by Angela Davis published in 1981.",
+            0.95,
+        );
+        let refs = vec![&chunk];
+        let prefix = DeterministicOfflineSynthesisEngine::format_question_restated_prefix_with_chunks(
+            "who is angela davis what is her research",
+            &refs,
+        );
+        assert_eq!(
+            prefix, "Angela Davis is ",
+            "Compound query must extract clean subject 'Angela Davis', never echoing 'What Is Her Research'"
+        );
+
+        let prefix2 = DeterministicOfflineSynthesisEngine::format_question_restated_prefix_with_chunks(
+            "who is angela davis and what is her research?",
+            &refs,
+        );
+        assert_eq!(prefix2, "Angela Davis is ");
+    }
+
+    #[test]
+    fn test_forensic_dns_splits_multi_event_sysmon_chunks_and_sorts_newest_first() {
+        // Two concatenated Sysmon Event 22 records in a single chunk:
+        // Event 1: earlier timestamp, GitHub IP 140.82.113.6, legacy-redacted query_name= with clean `for domain 'api.github.com'`
+        // Event 2: newer timestamp, Nike domain store.nike.com -> 23.194.151.90
+        let multi_event_chunk = make_v080_test_chunk(
+            "artemis://windows/eventlog/Microsoft-Windows-Sysmon/Operational",
+            "DnsQuery [2026-11-22 10:15:00] Sysmon Event 22: process 'C:\\Program Files\\Git\\usr\\bin\\git.exe' (pid=4012) resolved DNS query for domain 'api.github.com' -> '::ffff:140.82.113.6;' | date=2026-11-22 10:15:00.100, pid=4012, image=C:\\Program Files\\Git\\usr\\bin\\git.exe, [REDACTED_HIGH_ENTROPY_SECRET], query_results=::ffff:140.82.113.6;\n\
+             DnsQuery [2026-11-22 11:05:30] Sysmon Event 22: process 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' (pid=9812) resolved DNS query for domain 'store.nike.com' -> 'type: 5 e1234.dscx.akamaiedge.net;23.194.151.90;' | date=2026-11-22 11:05:30.250, pid=9812, image=C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe, query_name=store.nike.com, query_results=type: 5 e1234.dscx.akamaiedge.net;23.194.151.90;",
+            0.98,
+        );
+        let refs = vec![&multi_event_chunk];
+        let report = DeterministicOfflineSynthesisEngine::synthesize_artemis_forensic_answer(
+            ForensicQueryIntent::DnsTraffic,
+            "what was the last domain my computer visited?",
+            &refs,
+        );
+        assert!(!report.is_empty(), "Must synthesize forensic DNS report");
+
+        // 1. Both distinct domains must be present with their OWN IPs in the lead + summary table
+        //    (never pairing GitHub IP 140.82.113.6 with store.nike.com; the raw chunk stays verbatim in <details>)
+        let summary_part = report.split("<details>").next().unwrap_or(&report);
+        assert!(
+            summary_part.contains("`store.nike.com`") && summary_part.contains("`api.github.com`"),
+            "Must extract both store.nike.com and fallback api.github.com:\n{summary_part}"
+        );
+        for line in summary_part.lines() {
+            if line.contains("140.82.113.6") {
+                assert!(
+                    line.contains("api.github.com") && !line.contains("store.nike.com"),
+                    "GitHub IP 140.82.113.6 must only be paired with api.github.com, never store.nike.com: {line}"
+                );
+            }
+            if line.contains("23.194.151.90") {
+                assert!(
+                    line.contains("store.nike.com"),
+                    "Nike IP 23.194.151.90 must be paired with store.nike.com: {line}"
+                );
+            }
+        }
+        // 2. Newest timestamp (11:05:30 store.nike.com) must appear BEFORE older (10:15:00 api.github.com)
+        let pos_nike = report.find("| 1 |").and_then(|start| report[start..].find("store.nike.com").map(|o| start + o));
+        let pos_gh = report.find("| 2 |").and_then(|start| report[start..].find("api.github.com").map(|o| start + o));
+        assert!(
+            pos_nike.is_some() && pos_gh.is_some() && pos_nike < pos_gh,
+            "Rows must be sorted chronologically newest-first (Row 1 = store.nike.com, Row 2 = api.github.com):\n{report}"
+        );
+        // 3. Raw telemetry evidence must be tucked inside a collapsible <details> drawer (zero content reduction)
+        assert!(
+            report.contains("<details>\n<summary>Artemis DFIR Host Telemetry Evidence"),
+            "Raw telemetry records must be preserved inside a collapsible <details> drawer:\n{report}"
         );
     }
 }
