@@ -6753,8 +6753,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "quorum-atlaskv"
+version = "0.7.0"
+dependencies = [
+ "blake3",
+ "half",
+ "memmap2",
+ "parking_lot",
+ "rayon",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "quorum-classifier"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "magika",
  "serde",
@@ -6766,7 +6784,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-cli"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -6786,7 +6804,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-contract"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -6808,7 +6826,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-coordinator"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -6819,6 +6837,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
+ "quorum-atlaskv",
  "quorum-classifier",
  "quorum-contract",
  "quorum-ingest",
@@ -6847,7 +6866,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-daemon"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6859,6 +6878,7 @@ dependencies = [
  "futures-util",
  "mime_guess",
  "open",
+ "quorum-atlaskv",
  "quorum-classifier",
  "quorum-contract",
  "quorum-coordinator",
@@ -6888,7 +6908,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-ingest"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "blake3",
  "cfb",
@@ -6920,7 +6940,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-network"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6943,7 +6963,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-storage"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -6953,6 +6973,7 @@ dependencies = [
  "futures",
  "lancedb",
  "parking_lot",
+ "quorum-atlaskv",
  "quorum-types",
  "regex",
  "rusqlite",
@@ -6968,7 +6989,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-types"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -6982,7 +7003,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-ui"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "axum",
  "mime_guess",

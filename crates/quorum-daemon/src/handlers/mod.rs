@@ -1,4 +1,5 @@
 pub mod artemis;
+pub mod atlaskv;
 pub mod cache;
 pub mod chat;
 pub mod drift;

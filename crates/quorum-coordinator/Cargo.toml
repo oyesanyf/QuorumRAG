@@ -8,6 +8,7 @@ description = "Scatter-gather query coordinator, 400ms timeout guard, Ed25519 AC
 
 [dependencies]
 quorum-types = { workspace = true }
+quorum-atlaskv = { workspace = true }
 quorum-contract = { workspace = true }
 quorum-storage = { workspace = true }
 quorum-network = { workspace = true }

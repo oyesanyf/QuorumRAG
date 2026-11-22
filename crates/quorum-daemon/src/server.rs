@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::handlers::{artemis, cache, chat, drift, export, health, history, langextract, marketplace, media, mesh, reindex, settings};
+use crate::handlers::{artemis, atlaskv, cache, chat, drift, export, health, history, langextract, marketplace, media, mesh, reindex, settings};
 use crate::state::DaemonState;
 
 /// Constructs the complete Axum 0.7 web server Router.
@@ -99,6 +99,18 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         // Google LangExtract Endpoints
         .route("/api/langextract", post(langextract::extract_handler))
         .route("/api/langextract/visualize", post(langextract::visualize_handler))
+
+        // AtlasKV Pure-Rust Knowledge Graph & HiKVP Endpoints
+        .route("/api/v1/atlaskv/status", get(atlaskv::atlaskv_status_handler))
+        .route(
+            "/api/v1/atlaskv/config",
+            get(atlaskv::atlaskv_get_config_handler).post(atlaskv::atlaskv_update_config_handler),
+        )
+        .route("/api/v1/atlaskv/build", post(atlaskv::atlaskv_build_handler))
+        .route("/api/v1/atlaskv/query", post(atlaskv::atlaskv_query_handler))
+        .route("/api/v1/atlaskv/export", post(atlaskv::atlaskv_export_handler))
+        .route("/api/v1/atlaskv/import", post(atlaskv::atlaskv_import_handler))
+        .route("/api/v1/atlaskv/import-json", post(atlaskv::atlaskv_import_json_handler))
 
         // Opt-In Sovereign AI Training Data Marketplace Endpoints (Disabled by Default)
         .route("/api/v1/marketplace/status", get(marketplace::marketplace_status_handler))

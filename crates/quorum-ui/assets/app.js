@@ -1800,6 +1800,12 @@ function secureRandomIndex(n) {
       if (telemetryModelInfo) {
         telemetryModelInfo.textContent = `Model: ${data.model_name || ''} | Mode: ${data.search_mode || ''}`;
       }
+    } else if (type === 'AtlasKvPruned' || type === 'atlas_kv_pruned') {
+      if (telemetryModelInfo && Number(data.triples_injected || 0) > 0) {
+        const badge = ` | 🪐 AtlasKV: ${data.triples_injected} KG triples (${data.root_scanned || 0}→${data.inter_scanned || 0}→${data.leaf_selected || 0}) in ${data.elapsed_ms || 0}ms`;
+        const cur = telemetryModelInfo.textContent || '';
+        telemetryModelInfo.textContent = cur.includes('AtlasKV:') ? cur.replace(/\s*\|\s*🪐 AtlasKV:.*$/, badge) : (cur + badge);
+      }
     } else if (type === 'RetrievalCompleted' || type === 'retrieval_completed') {
       setCompletedStep('step-classify');
       setActiveStep('step-retrieve');
@@ -3407,6 +3413,9 @@ function secureRandomIndex(n) {
 
   let activeSettingsTab = 'general';
   let cachedSettingsData = null;
+  let cachedAtlasKvStatus = null;
+  let cachedAtlasKvQueryResult = null;
+  let atlasKvBuilding = false;
   let currentBrowsePath = '';
   let currentBrowseParentPath = '';
   let cachedBrowseDirs = [];
@@ -3520,6 +3529,19 @@ function secureRandomIndex(n) {
     }
   }
 
+  async function fetchAtlasKvData() {
+    try {
+      const resp = await fetch('/api/v1/atlaskv/status');
+      if (resp.ok) {
+        cachedAtlasKvStatus = await resp.json();
+      }
+      return cachedAtlasKvStatus;
+    } catch (e) {
+      console.error('Error fetching AtlasKV status:', e);
+      return null;
+    }
+  }
+
   async function openSettingsView(tab = 'general') {
     activeSettingsTab = tab;
     const mktModal = document.getElementById('modal-marketplace');
@@ -3534,6 +3556,9 @@ function secureRandomIndex(n) {
     ]);
     if (cachedSettingsData && (cachedSettingsData.forensics_enabled || (cachedSettingsData.artemis && cachedSettingsData.artemis.enabled))) {
       await fetchArtemisData();
+    }
+    if (tab === 'atlaskv') {
+      await fetchAtlasKvData();
     }
     if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace' || tab === 'dlp' || tab === 'artemis-dfir') {
       await fetchMeshData();
@@ -3616,6 +3641,9 @@ function secureRandomIndex(n) {
           await fetchArtemisData();
         }
       }
+      if (tab === 'atlaskv') {
+        await fetchAtlasKvData();
+      }
       if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace' || tab === 'general' || tab === 'dlp' || tab === 'artemis-dfir') {
         await fetchBrowseFolders(currentBrowsePath);
       }
@@ -3635,6 +3663,7 @@ function secureRandomIndex(n) {
         const match = !q || label.includes(q) || tab.includes(q)
           || (q.includes('phi') && tab === 'dlp')
           || (q.includes('redact') && tab === 'dlp')
+          || ((q.includes('atlas') || q.includes('hikvp') || q.includes('graph') || q.includes('triple') || q.includes('kg') || q.includes('kblam')) && tab === 'atlaskv')
           || ((q.includes('opt') || q.includes('sell') || q.includes('consent') || q.includes('personal') || q.includes('market')) && (tab === 'marketplace' || tab === 'marketplace-ledger'))
           || ((q.includes('ledger') || q.includes('bounty') || q.includes('revenue')) && tab === 'marketplace-ledger')
           || ((q.includes('stream') || q.includes('reindex') || q.includes('drift') || q.includes('diag')) && tab === 'diagnostics')
@@ -3643,7 +3672,10 @@ function secureRandomIndex(n) {
           || (q.includes('share') && tab === 'mesh');
         btn.style.display = match ? 'flex' : 'none';
       });
-      if (q.includes('opt') || q.includes('sell') || q.includes('consent') || q.includes('personal') || q.includes('market')) {
+      if (q.includes('atlas') || q.includes('hikvp') || q.includes('triple') || q.includes('kblam')) {
+        activeSettingsTab = 'atlaskv';
+        highlightSettingsNav('atlaskv');
+      } else if (q.includes('opt') || q.includes('sell') || q.includes('consent') || q.includes('personal') || q.includes('market')) {
         activeSettingsTab = 'marketplace';
         highlightSettingsNav('marketplace');
       } else if (q.includes('ledger') || q.includes('bounty') || q.includes('revenue')) {
@@ -5894,6 +5926,101 @@ function secureRandomIndex(n) {
           showSettingsToast('✓ Microsoft Presidio + GLiNER (urchade/gliner_multi_pii-v1) verified & provisioned');
           break;
 
+        case 'atlaskv-refresh':
+          e.preventDefault();
+          await fetchAtlasKvData();
+          renderSettingsTabContent('atlaskv', '');
+          showSettingsToast('✓ AtlasKV Knowledge Graph metrics refreshed');
+          break;
+
+        case 'atlaskv-build':
+          e.preventDefault();
+          if (atlasKvBuilding) break;
+          atlasKvBuilding = true;
+          renderSettingsTabContent('atlaskv', '');
+          showSettingsToast('🪐 Extracting KG2KV triples & rebuilding 3-level Spherical K-Means++ hierarchy...');
+          try {
+            const resp = await fetch('/api/v1/atlaskv/build', { method: 'POST' });
+            const body = await resp.json();
+            if (resp.ok) {
+              await fetchAtlasKvData();
+              showSettingsToast(`✓ AtlasKV built: ${body.inserted_triples || 0} triples indexed (${(body.stats && body.stats.active_triples) || 0} active)`);
+            } else {
+              showSettingsToast('AtlasKV build failed: ' + (body.error || resp.statusText));
+            }
+          } catch (err) {
+            showSettingsToast('AtlasKV build error: ' + err.message);
+          } finally {
+            atlasKvBuilding = false;
+            renderSettingsTabContent('atlaskv', '');
+          }
+          break;
+
+        case 'atlaskv-query': {
+          e.preventDefault();
+          const qEl = document.getElementById('atlaskv-query-input');
+          const tierEl = document.getElementById('atlaskv-query-tier');
+          const qText = (qEl && qEl.value ? qEl.value : '').trim();
+          if (!qText) {
+            showSettingsToast('Enter a query to inspect HiKVP triple retrieval.');
+            break;
+          }
+          try {
+            const resp = await fetch('/api/v1/atlaskv/query', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                query: qText,
+                max_tier: Number((tierEl && tierEl.value) || 0),
+                top_k: 24
+              })
+            });
+            const body = await resp.json();
+            if (resp.ok) {
+              cachedAtlasKvQueryResult = body;
+              renderSettingsTabContent('atlaskv', '');
+              const t = body.trace || {};
+              const ms = (Number(t.elapsed_us || 0) / 1000).toFixed(2);
+              showSettingsToast(`✓ HiKVP matched ${(body.triples || []).length} triples (${t.root_selected || 0}→${t.inter_scanned || 0}→${t.leaf_selected || 0}) in ${ms}ms`);
+            } else {
+              showSettingsToast('AtlasKV query failed: ' + (body.error || resp.statusText));
+            }
+          } catch (err) {
+            showSettingsToast('AtlasKV query error: ' + err.message);
+          }
+          break;
+        }
+
+        case 'atlaskv-export': {
+          e.preventDefault();
+          const prefEl = document.getElementById('atlaskv-export-prefix');
+          const prefix = (prefEl && prefEl.value ? prefEl.value : 'quorumrag_kg').trim() || 'quorumrag_kg';
+          try {
+            const resp = await fetch('/api/v1/atlaskv/export', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ dataset_prefix: prefix, max_tier: 0 })
+            });
+            const body = await resp.json();
+            if (resp.ok) {
+              const exportedCount = (body.manifest && body.manifest.exported_triples) || body.exported_triples || 0;
+              showSettingsToast(`✓ Exported ${exportedCount} triples to AtlasKV .npy / c2id / qkv.json (${prefix})`);
+            } else {
+              showSettingsToast('AtlasKV export failed: ' + (body.error || resp.statusText));
+            }
+          } catch (err) {
+            showSettingsToast('AtlasKV export error: ' + err.message);
+          }
+          break;
+        }
+
+        case 'atlaskv-trigger-upload': {
+          e.preventDefault();
+          const upEl = document.getElementById('atlaskv-json-upload');
+          if (upEl) upEl.click();
+          break;
+        }
+
         case 'refresh-tpm':
           e.preventDefault();
           await window.quorumRefreshTpmStatus();
@@ -6628,6 +6755,76 @@ function secureRandomIndex(n) {
           } catch (err) {
             showSettingsToast('Error updating retention policy: ' + err.message);
           }
+          break;
+        }
+
+        case 'atlaskv-config': {
+          const cur = (cachedAtlasKvStatus && cachedAtlasKvStatus.settings) || (cachedSettingsData && cachedSettingsData.atlaskv) || {
+            enabled: true,
+            auto_extract_on_ingest: true,
+            root_top_k_kb: 8,
+            inter_top_k_kb: 24,
+            leaf_top_k_kb: 24,
+            mesh_centroid_routing: true,
+            max_triples_per_chunk: 8,
+            cluster_rebuild_delta_pct: 10
+          };
+          const key = changeEl.dataset.configKey;
+          const next = Object.assign({}, cur);
+          if (changeEl.type === 'checkbox') {
+            next[key] = !!changeEl.checked;
+          } else {
+            next[key] = Math.max(1, Number(changeEl.value || cur[key] || 8));
+          }
+          try {
+            const resp = await fetch('/api/v1/atlaskv/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(next)
+            });
+            if (resp.ok) {
+              await fetchAtlasKvData();
+              renderSettingsTabContent('atlaskv', '');
+              showSettingsToast('✓ AtlasKV configuration saved');
+            }
+          } catch (err) {
+            showSettingsToast('Error saving AtlasKV config: ' + err.message);
+          }
+          break;
+        }
+
+        case 'atlaskv-upload-json': {
+          const file = changeEl.files && changeEl.files[0];
+          if (!file) break;
+          try {
+            const raw = await file.text();
+            const parsed = JSON.parse(raw);
+            const items = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.items) ? parsed.items : []);
+            if (!items.length) {
+              showSettingsToast('Selected JSON file contains 0 AtlasKV QKV items.');
+              break;
+            }
+            const resp = await fetch('/api/v1/atlaskv/import-json', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                dataset_name: file.name,
+                access_tier: 0,
+                items
+              })
+            });
+            const body = await resp.json();
+            if (resp.ok) {
+              await fetchAtlasKvData();
+              renderSettingsTabContent('atlaskv', '');
+              showSettingsToast(`✓ Imported ${body.imported_triples || 0} AtlasKV triples from ${file.name}`);
+            } else {
+              showSettingsToast('AtlasKV JSON import failed: ' + (body.error || resp.statusText));
+            }
+          } catch (err) {
+            showSettingsToast('Failed to parse AtlasKV JSON: ' + err.message);
+          }
+          changeEl.value = '';
           break;
         }
       }
@@ -8383,6 +8580,166 @@ function secureRandomIndex(n) {
             </tbody>
           </table>
         </div>
+        </div>
+      `;
+    } else if (tab === 'atlaskv') {
+      const akvResp = cachedAtlasKvStatus || {};
+      const st = akvResp.stats || {};
+      const cfg = akvResp.settings || (data && data.atlaskv) || {
+        enabled: true,
+        auto_extract_on_ingest: true,
+        root_top_k_kb: 8,
+        inter_top_k_kb: 24,
+        leaf_top_k_kb: 24,
+        mesh_centroid_routing: true,
+        max_triples_per_chunk: 8,
+        cluster_rebuild_delta_pct: 10
+      };
+      const ramMb = ((Number(st.estimated_resident_ram_bytes || 0)) / (1024 * 1024)).toFixed(2);
+      const diskMb = ((Number(st.disk_bytes_shards || 0)) / (1024 * 1024)).toFixed(2);
+      const qRes = cachedAtlasKvQueryResult;
+      const qTrace = (qRes && qRes.trace) || null;
+      const qTriplesHtml = qRes && Array.isArray(qRes.triples) && qRes.triples.length
+        ? qRes.triples.slice(0, 20).map(item => {
+            const t = item.triple || {};
+            const score = Number(item.score || 0).toFixed(3);
+            return `
+              <tr style="border-bottom:1px solid var(--border-color); font-size:12px;">
+                <td style="padding:6px;"><strong>${escapeHtml(t.entity || '')}</strong></td>
+                <td style="padding:6px;"><code>${escapeHtml(t.relation || '')}</code></td>
+                <td style="padding:6px;">${escapeHtml(t.value || '')}</td>
+                <td style="padding:6px;">${escapeHtml(t.work_cluster_id || 'General')}</td>
+                <td style="padding:6px;">Tier ${Number(t.access_tier || 0)} • <code>${score}</code></td>
+              </tr>
+            `;
+          }).join('')
+        : '<tr><td colspan="5" style="padding:10px; color:var(--text-muted); font-size:12px;">Run a HiKVP query above to inspect 3-level centroid pruning and grounded KG triples.</td></tr>';
+
+      settingsContent.innerHTML = `
+        <div class="settings-centered-container">
+          <h2 class="settings-page-title">🪐 AtlasKV Knowledge Graph (Native Layer-1)</h2>
+          <p class="settings-page-subtitle">
+            Sublinear 3-level Hierarchical Key-Value Pruning (<code>Root → Inter1 → Leaf</code>) backed by memory-mapped <code>f16</code> shards and Spherical K-Means++ clustering—zero Python/CUDA footprint, full Ollama compatibility, and native <code>HKUST-KnowComp/AtlasKV</code> <code>.npy</code> / <code>qkv.json</code> interop.
+          </p>
+
+          <div class="settings-card">
+            <div class="settings-card-title">
+              <span>📊 Live Knowledge Graph &amp; HiKVP Hierarchy Footprint</span>
+              <span class="dlp-badge-allow">${cfg.enabled !== false ? '✓ Active' : 'Paused'}</span>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(155px, 1fr)); gap:10px; margin-bottom:14px;">
+              <div class="stat-row" style="padding:10px; border:1px solid var(--border-color); border-radius:8px; display:flex; flex-direction:column; gap:4px;">
+                <span style="font-size:11px; color:var(--text-muted);">Active KG Triples</span>
+                <strong style="font-size:18px;">${Number(st.active_triples || 0).toLocaleString()}</strong>
+              </div>
+              <div class="stat-row" style="padding:10px; border:1px solid var(--border-color); border-radius:8px; display:flex; flex-direction:column; gap:4px;">
+                <span style="font-size:11px; color:var(--text-muted);">3-Level Hierarchy (L0 / L1 / L2)</span>
+                <strong style="font-size:16px;">${Number(st.root_clusters || 0)} / ${Number(st.inter_clusters || 0)} / ${Number(st.active_triples || 0)}</strong>
+              </div>
+              <div class="stat-row" style="padding:10px; border:1px solid var(--border-color); border-radius:8px; display:flex; flex-direction:column; gap:4px;">
+                <span style="font-size:11px; color:var(--text-muted);">Resident Centroid RAM</span>
+                <strong style="font-size:18px;">${ramMb} MB</strong>
+              </div>
+              <div class="stat-row" style="padding:10px; border:1px solid var(--border-color); border-radius:8px; display:flex; flex-direction:column; gap:4px;">
+                <span style="font-size:11px; color:var(--text-muted);">Mmap f16 Shard Disk</span>
+                <strong style="font-size:18px;">${diskMb} MB</strong>
+              </div>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button type="button" class="btn-primary" data-action="atlaskv-build" ${atlasKvBuilding ? 'disabled' : ''}>
+                ${atlasKvBuilding ? '⏳ Building AtlasKV Hierarchy...' : '⚡ Build / Refresh Knowledge Graph'}
+              </button>
+              <button type="button" class="btn-secondary" data-action="atlaskv-refresh">🔄 Refresh Metrics</button>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <div class="settings-card-title"><span>⚙️ Retrieval, Extraction &amp; Mesh Routing Policy</span></div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label for="sw-atlaskv-enabled" class="settings-row-label">Enable AtlasKV Layer-1 Knowledge Graph Grounding</label>
+                <div class="settings-row-desc">Runs concurrent 3-level HiKVP triple retrieval alongside LanceDB/Tantivy hybrid search and injects homonym-separated KG facts into Ollama synthesis prompts.</div>
+              </div>
+              <input id="sw-atlaskv-enabled" type="checkbox" class="quorum-switch" ${cfg.enabled !== false ? 'checked' : ''} data-change-action="atlaskv-config" data-config-key="enabled">
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label for="sw-atlaskv-auto" class="settings-row-label">Auto-Extract KG2KV Triples During Document Ingestion</label>
+                <div class="settings-row-desc">Automatically mines structured (Subject, Property, Value) triples on every ingested chunk and purges them atomically on file deletion.</div>
+              </div>
+              <input id="sw-atlaskv-auto" type="checkbox" class="quorum-switch" ${cfg.auto_extract_on_ingest !== false ? 'checked' : ''} data-change-action="atlaskv-config" data-config-key="auto_extract_on_ingest">
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label for="sw-atlaskv-mesh" class="settings-row-label">P2P Mesh Root-Centroid Routing (Zero Tier-3 Leakage)</label>
+                <div class="settings-row-desc">Publishes compact Tier-0/1 root centroids (&lt;200 KB) so federated queries skip irrelevant peers before full scatter-gather.</div>
+              </div>
+              <input id="sw-atlaskv-mesh" type="checkbox" class="quorum-switch" ${cfg.mesh_centroid_routing !== false ? 'checked' : ''} data-change-action="atlaskv-config" data-config-key="mesh_centroid_routing">
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">HiKVP Pruning Budget (<code>k_root</code> / <code>k_inter</code> / <code>k_leaf</code>)</span>
+                <div class="settings-row-desc">Controls how many L0 root clusters, L1 intermediate clusters, and L2 grounded leaf triples are scored per query.</div>
+              </div>
+              <div class="settings-row-controls" style="gap:6px;">
+                <input type="number" class="settings-input" style="width:68px;" min="1" max="512" value="${Number(cfg.root_top_k_kb || 8)}" title="Root Top-K" data-change-action="atlaskv-config" data-config-key="root_top_k_kb">
+                <input type="number" class="settings-input" style="width:68px;" min="1" max="1024" value="${Number(cfg.inter_top_k_kb || 24)}" title="Inter Top-K" data-change-action="atlaskv-config" data-config-key="inter_top_k_kb">
+                <input type="number" class="settings-input" style="width:68px;" min="1" max="512" value="${Number(cfg.leaf_top_k_kb || 24)}" title="Leaf Top-K" data-change-action="atlaskv-config" data-config-key="leaf_top_k_kb">
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <div class="settings-card-title"><span>🔍 Live HiKVP Triple Inspector</span></div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+              <input type="text" id="atlaskv-query-input" class="settings-input" style="flex:1; min-width:220px;" placeholder="Ask a grounded entity question (e.g. Who is Angela Davis?)">
+              <select id="atlaskv-query-tier" class="settings-select" style="width:120px;">
+                <option value="0">Max Tier 0</option>
+                <option value="1">Max Tier 1</option>
+                <option value="2">Max Tier 2</option>
+              </select>
+              <button type="button" class="btn-primary" data-action="atlaskv-query">Run HiKVP Query</button>
+            </div>
+            ${qTrace ? `<div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">Trace: <strong>${qTrace.root_selected || 0}</strong> roots → <strong>${qTrace.inter_scanned || 0}</strong> inter → <strong>${qTrace.leaf_selected || 0}</strong> leaves (${qTrace.used_hierarchy ? '3-level hierarchy' : 'flat scan'}) in <strong>${(Number(qTrace.elapsed_us || 0) / 1000).toFixed(2)}ms</strong></div>` : ''}
+            <div style="overflow-x:auto;">
+              <table class="report-table" style="width:100%;">
+                <thead>
+                  <tr style="border-bottom:1px solid var(--border-color); font-size:11.5px; text-align:left;">
+                    <th style="padding:6px;">Subject</th>
+                    <th style="padding:6px;">Property</th>
+                    <th style="padding:6px;">Value</th>
+                    <th style="padding:6px;">Domain Cluster</th>
+                    <th style="padding:6px;">Tier / Score</th>
+                  </tr>
+                </thead>
+                <tbody>${qTriplesHtml}</tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <div class="settings-card-title"><span>📦 Native HKUST-KnowComp/AtlasKV Dataset Interop</span></div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">Export Native <code>.npy</code> / <code>c2id</code> / <code>qkv.json</code> Bundle</span>
+                <div class="settings-row-desc">Writes standard AtlasKV NumPy key/value shards and cluster maps under <code>&lt;storage&gt;/.atlaskv/interop/</code> (strictly path-contained).</div>
+              </div>
+              <div class="settings-row-controls" style="gap:6px;">
+                <input type="text" id="atlaskv-export-prefix" class="settings-input" style="width:150px;" value="quorumrag_kg" placeholder="dataset_prefix">
+                <button type="button" class="btn-secondary" data-action="atlaskv-export">⬇ Export AtlasKV</button>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">Import AtlasKV QKV JSON Dataset</span>
+                <div class="settings-row-desc">Select a local <code>*_qkv.json</code> file via the native OS file picker to ingest grounded KG triples directly into QuorumRAG.</div>
+              </div>
+              <div class="settings-row-controls">
+                <input type="file" id="atlaskv-json-upload" accept=".json" style="display:none;" data-change-action="atlaskv-upload-json">
+                <button type="button" class="btn-secondary" data-action="atlaskv-trigger-upload">📂 Upload QKV JSON...</button>
+              </div>
+            </div>
+          </div>
         </div>
       `;
     } else if (tab === 'artemis-dfir') {

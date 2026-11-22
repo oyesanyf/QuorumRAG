@@ -391,11 +391,22 @@ fn main() {
             std::process::exit(if ok { 0 } else { 1 });
         }
         "--open-ui" => {
+            #[cfg(windows)]
+            {
+                win_native::refresh_shell_icon_cache();
+            }
             let port = parse_u16_flag(&args, "--port", default_http_port());
             let timeout_secs = parse_u64_flag(&args, "--timeout-secs", 90);
             let url = format!("http://127.0.0.1:{port}/");
             let _ = wait_for_daemon_health(port, timeout_secs);
             open_browser_native(&url);
+            std::process::exit(0);
+        }
+        "--msi-refresh-icons" => {
+            #[cfg(windows)]
+            {
+                win_native::refresh_shell_icon_cache();
+            }
             std::process::exit(0);
         }
         "--msi-kill-orphans" => {

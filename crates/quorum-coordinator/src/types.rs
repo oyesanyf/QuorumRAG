@@ -88,6 +88,8 @@ pub struct AgenticGraphState {
     pub extracted_entities: Vec<crate::langextract::Extraction>,
     pub seen_chunk_ids: std::collections::HashSet<String>,
     pub peer_diagnostics: Option<quorum_types::FederatedPeerDiagnostics>,
+    pub atlaskv_triples: Vec<quorum_atlaskv::ScoredKgTriple>,
+    pub atlaskv_context: String,
 }
 
 impl AgenticGraphState {
@@ -119,6 +121,8 @@ impl AgenticGraphState {
             extracted_entities: Vec::new(),
             seen_chunk_ids: std::collections::HashSet::new(),
             peer_diagnostics: None,
+            atlaskv_triples: Vec::new(),
+            atlaskv_context: String::new(),
         }
     }
 

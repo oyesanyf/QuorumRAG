@@ -10,11 +10,12 @@ impl SynthesizeWithCitationsNode {
         state: &mut AgenticGraphState,
         telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
     ) {
-        let (resp, citations) = DeterministicOfflineSynthesisEngine::synthesize_with_history(
+        let (resp, citations) = DeterministicOfflineSynthesisEngine::synthesize_with_history_and_kg(
             &state.original_prompt,
             &state.current_query,
             &state.conversation_history,
             &state.retrieved_chunks,
+            &state.atlaskv_context,
             &state.selected_model_tag,
             telemetry_tx,
         );

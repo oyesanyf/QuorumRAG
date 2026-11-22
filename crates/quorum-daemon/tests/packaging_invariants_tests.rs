@@ -126,6 +126,7 @@ fn wix_manifest_enforces_ice63_error_2613_prevention_and_zero_touch_path() {
         ("AddQuorumFirewallRules", "--msi-firewall-add"),
         ("RemoveQuorumFirewallRules", "--msi-firewall-remove"),
         ("RemoveQuorumData", "--msi-remove-data"),
+        ("RefreshShellIcons", "--msi-refresh-icons"),
         ("LaunchQuorumWebUi", "--open-ui"),
     ] {
         let marker = format!(r#"<CustomAction Id="{ca_id}""#);

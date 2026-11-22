@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?ifndef ProductVersion ?>
-<?define ProductVersion = "0.6.18" ?>
+<?define ProductVersion = "0.7.0" ?>
 <?endif ?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
     <Package Name="QuorumRAG P2P Agentic RAG"
@@ -132,7 +132,7 @@
         </Feature>
 
         <!-- Scoped Private-LAN Firewall Rules for QuorumRAG P2P Mesh & libp2p mDNS/UDP/TCP
-             Opt out during silent install via: msiexec /i QuorumRAG-0.6.18-x86_64.msi FIREWALLRULE=0 -->
+             Opt out during silent install via: msiexec /i QuorumRAG-0.7.0-x86_64.msi FIREWALLRULE=0 -->
         <Property Id="FIREWALLRULE" Value="1" Secure="yes" />
         <CustomAction Id="AddQuorumFirewallRules"
                       BinaryRef="QuorumDesktopHelper"
@@ -151,6 +151,12 @@
              The native GUI helper performs an in-process TCP health probe against 127.0.0.1:3031
              and opens the default browser via ShellExecuteW (zero console window). Disable with LAUNCHBROWSER=0. -->
         <Property Id="LAUNCHBROWSER" Value="1" Secure="yes" />
+        <CustomAction Id="RefreshShellIcons"
+                      BinaryRef="QuorumDesktopHelper"
+                      Execute="immediate"
+                      Impersonate="yes"
+                      Return="ignore"
+                      ExeCommand="--msi-refresh-icons" />
         <CustomAction Id="LaunchQuorumWebUi"
                       BinaryRef="QuorumDesktopHelper"
                       Execute="immediate"
@@ -158,7 +164,7 @@
                       Return="asyncNoWait"
                       ExeCommand="--open-ui" />
 
-        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.6.18-x86_64.msi REMOVEDATA=1
+        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.7.0-x86_64.msi REMOVEDATA=1
              deletes the index and logs in %ProgramData%\QuorumRAG (kept by default). -->
         <Property Id="REMOVEDATA" Value="0" Secure="yes" />
         <CustomAction Id="RemoveQuorumData"
@@ -208,7 +214,8 @@
             <Custom Action="AddQuorumFirewallRules" After="InstallFiles" Condition="FIREWALLRULE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
             <Custom Action="RemoveQuorumFirewallRules" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
             <Custom Action="RemoveQuorumData" After="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND REMOVEDATA=&quot;1&quot; AND NOT UPGRADINGPRODUCTCODE" />
-            <Custom Action="LaunchQuorumWebUi" After="InstallFinalize" Condition="LAUNCHBROWSER=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="RefreshShellIcons" After="InstallFinalize" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+            <Custom Action="LaunchQuorumWebUi" After="RefreshShellIcons" Condition="LAUNCHBROWSER=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
         </InstallExecuteSequence>
     </Package>
 </Wix>

@@ -19,6 +19,7 @@ pub struct UpdateSettingsPayload {
     pub mesh: Option<OsoosiMeshSettings>,
     pub dlp: Option<MeshDlpPolicy>,
     pub artemis: Option<quorum_coordinator::artemis_airgap::ArtemisDfirSettings>,
+    pub atlaskv: Option<quorum_atlaskv::AtlasKvSettings>,
     pub forensics_enabled: Option<bool>,
 }
 
@@ -140,6 +141,7 @@ pub async fn get_settings_handler(State(state): State<Arc<DaemonState>>) -> impl
         "dlp": settings.dlp,
         "dlp_stats": dlp_stats,
         "artemis": settings.artemis,
+        "atlaskv": settings.atlaskv,
         "forensics_enabled": settings.artemis.enabled,
         "runtime": {
             "local_peer_id": local_peer_id,
@@ -186,6 +188,9 @@ pub async fn update_settings_handler(
         if let Some(artemis) = payload.artemis {
             guard.artemis = artemis;
         }
+        if let Some(atlaskv) = payload.atlaskv {
+            guard.atlaskv = atlaskv;
+        }
         if let Some(forensics_enabled) = payload.forensics_enabled {
             guard.artemis.enabled = forensics_enabled;
         }
@@ -211,6 +216,7 @@ pub async fn update_settings_handler(
         "mesh": updated.mesh,
         "dlp": updated.dlp,
         "artemis": updated.artemis,
+        "atlaskv": updated.atlaskv,
         "forensics_enabled": updated.artemis.enabled
     }))
 }

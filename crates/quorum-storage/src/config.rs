@@ -75,6 +75,11 @@ impl StorageConfig {
     pub fn document_catalog_path(&self) -> PathBuf {
         self.storage_path.join("document_catalog.db")
     }
+
+    /// Path to embedded AtlasKV Knowledge Graph & HiKVP hierarchical index directory (`.atlaskv`).
+    pub fn atlaskv_path(&self) -> PathBuf {
+        self.storage_path.join(".atlaskv")
+    }
 }
 
 impl<P: AsRef<Path>> From<P> for StorageConfig {

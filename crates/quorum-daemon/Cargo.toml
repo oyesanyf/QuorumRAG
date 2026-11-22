@@ -17,6 +17,7 @@ path = "src/desktop_main.rs"
 [dependencies]
 # Workspace crates
 quorum-types = { workspace = true }
+quorum-atlaskv = { workspace = true }
 quorum-classifier = { workspace = true }
 quorum-contract = { workspace = true }
 quorum-storage = { workspace = true }

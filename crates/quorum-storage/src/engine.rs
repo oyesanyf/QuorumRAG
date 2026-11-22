@@ -135,18 +135,29 @@ pub struct StorageEngine {
     vector_store: Arc<VectorStore>,
     fts_index: Arc<TantivyFtsIndex>,
     catalog: Arc<DocumentCatalog>,
+    atlaskv: Arc<quorum_atlaskv::AtlasKvStore>,
     index_epoch: Arc<AtomicU64>,
     metadata_lock: Arc<Mutex<StorageMetadata>>,
     is_neural: Arc<AtomicBool>,
 }
 
 impl StorageEngine {
-    /// Opens or creates the embedded LanceDB vector table, co-located Tantivy FTS index, and SQLite document catalog.
+    /// Opens or creates the embedded LanceDB vector table, co-located Tantivy FTS index,
+    /// SQLite document catalog, and pure-Rust AtlasKV KG2KV/HiKVP store.
     pub async fn open(config: impl Into<StorageConfig>) -> Result<Self, StorageError> {
         let cfg = config.into();
         let vector_store = Arc::new(VectorStore::open(&cfg).await?);
         let fts_index = Arc::new(TantivyFtsIndex::open(&cfg.tantivy_path())?);
         let catalog = Arc::new(DocumentCatalog::open(&cfg.document_catalog_path())?);
+        let atlaskv_cfg = quorum_atlaskv::AtlasKvTreeConfig {
+            embedding_dim: cfg.vector_dimension,
+            ..Default::default()
+        };
+        let atlaskv = Arc::new(
+            quorum_atlaskv::AtlasKvStore::open(cfg.atlaskv_path(), atlaskv_cfg).map_err(|e| {
+                StorageError::Lance(format!("Failed to open AtlasKV store: {e}"))
+            })?,
+        );
 
         // Load or initialize metadata
         let meta_path = cfg.metadata_path();
@@ -173,10 +184,16 @@ impl StorageEngine {
             vector_store,
             fts_index,
             catalog,
+            atlaskv,
             index_epoch,
             metadata_lock,
             is_neural,
         })
+    }
+
+    /// Returns a handle to the co-located pure-Rust AtlasKV Knowledge Graph & HiKVP store.
+    pub fn atlaskv(&self) -> Arc<quorum_atlaskv::AtlasKvStore> {
+        Arc::clone(&self.atlaskv)
     }
 
     /// Returns the active index epoch for deterministic query cache key derivation.
@@ -291,6 +308,45 @@ impl StorageEngine {
 
         // Automatically hydrate document catalog for ingested files
         let _ = self.catalog.hydrate_from_chunks(&unique_chunks);
+
+        // Extract grounded KG2KV triples off the async runtime thread and align vectors to chunk embedding space
+        let atlaskv_for_write = Arc::clone(&self.atlaskv);
+        let dim = self.config.vector_dimension;
+        let chunks_for_kg = unique_chunks;
+        let _ = tokio::task::spawn_blocking(move || {
+            let extractor = quorum_atlaskv::Kg2KvExtractor::new(
+                quorum_atlaskv::Kg2KvExtractorConfig::default(),
+            );
+            let mut triples = Vec::new();
+            let mut kvecs = Vec::new();
+            let mut vvecs = Vec::new();
+            for ch in &chunks_for_kg {
+                if ch.vector.len() != dim {
+                    continue;
+                }
+                let src = quorum_atlaskv::KgSourceChunk {
+                    chunk_id: ch.chunk_id.clone(),
+                    document_id: ch.document_id.clone(),
+                    file_path: ch.file_path.clone(),
+                    line_start: ch.line_start,
+                    line_end: ch.line_end,
+                    access_tier: ch.access_tier,
+                    text_content: ch.text_content.clone(),
+                    metadata_json: ch.metadata_json.clone(),
+                };
+                if let Ok(extracted) = extractor.extract_from_chunk(&src) {
+                    for rec in extracted {
+                        triples.push(rec);
+                        kvecs.push(ch.vector.clone());
+                        vvecs.push(ch.vector.clone());
+                    }
+                }
+            }
+            if !triples.is_empty() {
+                let _ = atlaskv_for_write.insert_triples(&triples, &kvecs, &vvecs);
+            }
+        })
+        .await;
 
         Ok(count)
     }
@@ -562,6 +618,7 @@ impl StorageEngine {
         let lance_deleted = self.vector_store.delete_by_file_path(file_path).await?;
         let tantivy_deleted = self.fts_index.delete_by_file_path(file_path)?;
         let _ = self.catalog.delete_by_file_path(file_path);
+        let _ = self.atlaskv.delete_by_file_path(file_path);
         Ok(lance_deleted.max(tantivy_deleted))
     }
 
@@ -583,6 +640,7 @@ impl StorageEngine {
         for p in &existing_paths {
             let _ = self.fts_index.delete_by_file_path(p);
             let _ = self.catalog.delete_by_file_path(p);
+            let _ = self.atlaskv.delete_by_file_path(p);
         }
         Ok(())
     }
