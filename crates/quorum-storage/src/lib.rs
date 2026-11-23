@@ -91,7 +91,7 @@ pub(crate) fn file_path_compare_key(raw: &str) -> String {
         let mut out = String::with_capacity(effective.len());
         let mut prev_sep = false;
         for ch in effective.chars() {
-            if ch == '/' {
+            if ch == '/' || ch == '\\' {
                 if !prev_sep {
                     out.push('/');
                 }
