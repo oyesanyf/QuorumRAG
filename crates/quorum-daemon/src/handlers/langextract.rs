@@ -7,9 +7,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::state::DaemonState;
-use quorum_coordinator::langextract::{
-    ExampleData, Extraction, LlmFusionConsensus,
-};
+use quorum_coordinator::langextract::{ExampleData, Extraction, LlmFusionConsensus};
 
 /// Request payload for `/api/langextract` and `/api/langextract/visualize`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,7 +90,10 @@ fn resolve_text_source(
         let p = Path::new(file_path);
         for comp in p.components() {
             if matches!(comp, std::path::Component::ParentDir) {
-                return Err((StatusCode::FORBIDDEN, "Directory traversal (..) strictly blocked"));
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Directory traversal (..) strictly blocked",
+                ));
             }
         }
 
@@ -101,7 +102,10 @@ fn resolve_text_source(
             Err(_) => Err((StatusCode::NOT_FOUND, "Failed to read requested file path")),
         }
     } else {
-        Err((StatusCode::BAD_REQUEST, "Must provide either 'text' or 'file_path'"))
+        Err((
+            StatusCode::BAD_REQUEST,
+            "Must provide either 'text' or 'file_path'",
+        ))
     }
 }
 
@@ -141,8 +145,8 @@ fn generate_candidate_extractions(text: &str, file_path: Option<&str>) -> Vec<Ex
                     .unwrap_or("")
                     .trim();
                 if !ident.is_empty() && text.contains(ident) && seen.insert(ident.to_string()) {
-                    let mut ext = Extraction::new("struct_symbol", ident)
-                        .with_attribute("kind", "struct");
+                    let mut ext =
+                        Extraction::new("struct_symbol", ident).with_attribute("kind", "struct");
                     if let Some(fp) = file_path {
                         ext = ext.with_source("chunk_local", fp);
                     }
@@ -155,7 +159,10 @@ fn generate_candidate_extractions(text: &str, file_path: Option<&str>) -> Vec<Ex
     // Security advisory markers
     for word in text.split_whitespace() {
         let cleaned = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
-        if (cleaned.starts_with("CVE-") || cleaned.starts_with("RFC-")) && text.contains(cleaned) && seen.insert(cleaned.to_string()) {
+        if (cleaned.starts_with("CVE-") || cleaned.starts_with("RFC-"))
+            && text.contains(cleaned)
+            && seen.insert(cleaned.to_string())
+        {
             extractions.push(Extraction::new("security_advisory", cleaned));
         }
     }
@@ -164,7 +171,15 @@ fn generate_candidate_extractions(text: &str, file_path: Option<&str>) -> Vec<Ex
     if extractions.is_empty() {
         for word in text.split_whitespace() {
             let cleaned = word.trim_matches(|c: char| !c.is_alphanumeric());
-            if cleaned.len() >= 4 && cleaned.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) && text.contains(cleaned) && seen.insert(cleaned.to_string()) {
+            if cleaned.len() >= 4
+                && cleaned
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                && text.contains(cleaned)
+                && seen.insert(cleaned.to_string())
+            {
                 extractions.push(Extraction::new("named_entity", cleaned));
                 if extractions.len() >= 5 {
                     break;

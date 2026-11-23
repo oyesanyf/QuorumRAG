@@ -2001,12 +2001,17 @@ function secureRandomIndex(n) {
     if (!raw) return '';
     // Consolidate to a single unified Sources footer (`citationsEl`) so the body never duplicates the file list
     let cleanedRaw = stripSourcesFooterMarkdown(raw);
-    // Strip ChatGPT export artifacts and file citation tokens
-    cleanedRaw = cleanedRaw.replace(/fileciteturn\d+file\d+/gi, '').replace(/sandbox:\/mnt\/data\/\S*/gi, '');
+    // Strip ChatGPT export artifacts, legacy Word HYPERLINK field codes, and file citation tokens
+    cleanedRaw = cleanedRaw
+      .replace(/fileciteturn\d+file\d+/gi, '')
+      .replace(/sandbox:\/mnt\/data\/\S*/gi, '')
+      .replace(/\bHYPERLINK\s+"[^"]*"(?:\s+\\[a-z]\s+"[^"]*")*\s*/gi, '');
     // Strip line number references e.g. (Lines 35–39), (Lines 1-10), (Line 42), :35-39 from prose body
     cleanedRaw = cleanedRaw
       .replace(/\(Lines?\s*\d+(\s*[–—\-]\s*\d+)?\)/gi, '')
       .replace(/:(\d+)\s*[–—\-]\s*(\d+)/g, '');
+    // Normalize stray spaces before punctuation AFTER stripping inline line/source tokens (`[1] .` -> `[1].`)
+    cleanedRaw = cleanedRaw.replace(/(\*{0,2}\[\d+\]\*{0,2}) +([.,;:])/g, '$1$2');
     // Strip raw markdown file headers e.g. ### 📄 filename
     cleanedRaw = cleanedRaw.replace(/^###?\s*📄.*$/gm, '');
     const lines = cleanedRaw.split(/\r?\n/);
@@ -2530,7 +2535,8 @@ function secureRandomIndex(n) {
       if (node.parentElement && node.parentElement.closest('code, pre, summary, .inline-cite-badge')) continue;
       const frag = document.createDocumentFragment();
       const parts = node.nodeValue.split(/(\[\d+\])/);
-      for (const part of parts) {
+      for (let pi = 0; pi < parts.length; pi++) {
+        let part = parts[pi];
         const m = /^\[(\d+)\]$/.exec(part);
         const n = m ? parseInt(m[1], 10) : 0;
         if (m && n >= 1 && n <= max) {
@@ -2543,11 +2549,26 @@ function secureRandomIndex(n) {
           b.title = rec ? `${rec.fileName}\n${rec.filePath}` : '';
           b.addEventListener('click', () => focusCitation(citationsEl, n));
           frag.appendChild(b);
+          // Prevent visual `[1] .` gap when a trailing text segment starts with whitespace before punctuation
+          if (pi + 1 < parts.length && /^\s+[.,;:]/.test(parts[pi + 1])) {
+            parts[pi + 1] = parts[pi + 1].replace(/^\s+([.,;:])/, '$1');
+          }
         } else if (part) {
           frag.appendChild(document.createTextNode(part));
         }
       }
-      node.parentNode.replaceChild(frag, node);
+      const parent = node.parentNode;
+      parent.replaceChild(frag, node);
+      // Also trim leading whitespace before punctuation on the next sibling text node
+      // (covers `<strong>[1]</strong> .` where the period sits outside `<strong>`).
+      const anchor = (parent && (parent.tagName === 'STRONG' || parent.tagName === 'EM') && !parent.nextSibling)
+        ? null
+        : (parent && (parent.tagName === 'STRONG' || parent.tagName === 'EM') ? parent : null);
+      if (anchor && anchor.nextSibling && anchor.nextSibling.nodeType === Node.TEXT_NODE) {
+        if (/^\s+[.,;:]/.test(anchor.nextSibling.nodeValue)) {
+          anchor.nextSibling.nodeValue = anchor.nextSibling.nodeValue.replace(/^\s+([.,;:])/, '$1');
+        }
+      }
     }
   }
 
@@ -2802,6 +2823,14 @@ function secureRandomIndex(n) {
         el.classList.add('completed');
       }
     });
+    if (telemetryModelInfo) {
+      const cur = String(telemetryModelInfo.textContent || '').trim();
+      if (/^Synthesizing with /i.test(cur)) {
+        telemetryModelInfo.textContent = cur.replace(/^Synthesizing with /i, '✓ Complete — ').replace(/\.{3}\s*$/, '');
+      } else if (!cur || cur.endsWith('...')) {
+        telemetryModelInfo.textContent = '✓ Synthesis Complete';
+      }
+    }
   }
 
   function appendMessage(role, text) {
@@ -3756,6 +3785,182 @@ function secureRandomIndex(n) {
     }
   }
 
+  const DEFAULT_CLOUD_DRIVES_POLICY = {
+    placeholder_mode: 'locally_synced_only',
+    hydration_max_file_size_mb: 25,
+    default_enabled: false,
+    default_access_tier: 3,
+  };
+
+  const CLOUD_DRIVE_PROVIDER_META = {
+    google_drive: { label: 'Google Drive', icon: '🟢', enabled: false },
+    onedrive_personal: { label: 'OneDrive (Personal)', icon: '☁️', enabled: false },
+    onedrive_business: { label: 'OneDrive (Business)', icon: '🏢', enabled: false },
+    onedrive: { label: 'OneDrive', icon: '☁️', enabled: false },
+    dropbox: { label: 'Dropbox', icon: '📦', enabled: false },
+    icloud_drive: { label: 'iCloud Drive', icon: '🍏', enabled: false },
+    box: { label: 'Box', icon: '🟦', enabled: false },
+    nextcloud: { label: 'Nextcloud', icon: '🔵', enabled: false },
+    proton_drive: { label: 'Proton Drive', icon: '🟣', enabled: false },
+    pcloud: { label: 'pCloud', icon: '🩵', enabled: false },
+  };
+
+  let cachedCloudDrivesData = null;
+  let cloudDrivesLoading = false;
+  let cloudDrivesError = null;
+  let cloudDrivesBusyIds = new Set();
+  let pendingCloudDrivePickerId = '';
+  let cloudDrivesFetchSeq = 0;
+
+  function setCloudDriveCardBusyState(driveId, busy) {
+    const cleanId = String(driveId || '').trim();
+    if (!cleanId) return;
+    const root = document.getElementById('settings-content-container') || document;
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+    root.querySelectorAll('[data-drive-id]').forEach((el) => {
+      if (el && el.dataset && el.dataset.driveId === cleanId) {
+        el.disabled = Boolean(busy);
+      }
+    });
+  }
+
+  async function fetchCloudDrivesData(forceRefresh = false) {
+    if (cloudDrivesLoading && !forceRefresh) return cachedCloudDrivesData;
+    const seq = ++cloudDrivesFetchSeq;
+    cloudDrivesLoading = true;
+    cloudDrivesError = null;
+    try {
+      const resp = await fetch('/api/cloud-drives');
+      if (seq !== cloudDrivesFetchSeq) return cachedCloudDrivesData;
+      if (!resp.ok) {
+        const errBody = await resp.json().catch(() => ({}));
+        if (seq !== cloudDrivesFetchSeq) return cachedCloudDrivesData;
+        cloudDrivesError = errBody.error || `HTTP ${resp.status} ${resp.statusText}`;
+        return cachedCloudDrivesData;
+      }
+      const payload = await resp.json();
+      if (seq !== cloudDrivesFetchSeq) return cachedCloudDrivesData;
+      if (payload && Array.isArray(payload.drives)) {
+        cachedCloudDrivesData = payload;
+        cloudDrivesError = null;
+      } else {
+        cloudDrivesError = 'Invalid /api/cloud-drives response payload';
+      }
+      return cachedCloudDrivesData;
+    } catch (err) {
+      if (seq !== cloudDrivesFetchSeq) return cachedCloudDrivesData;
+      cloudDrivesError = (err && err.message) ? err.message : 'Unable to reach QuorumRAG daemon';
+      return cachedCloudDrivesData;
+    } finally {
+      if (seq === cloudDrivesFetchSeq) {
+        cloudDrivesLoading = false;
+      }
+    }
+  }
+
+  async function postCloudDrivesConfig(payload) {
+    try {
+      const resp = await fetch('/api/cloud-drives/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {})
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        return {
+          ok: false,
+          error: body.error || `HTTP ${resp.status} ${resp.statusText}`
+        };
+      }
+      if (body && Array.isArray(body.drives)) {
+        ++cloudDrivesFetchSeq;
+        cloudDrivesLoading = false;
+        cachedCloudDrivesData = body;
+        cloudDrivesError = null;
+      } else {
+        await fetchCloudDrivesData(true);
+      }
+      return { ok: true, data: body };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err && err.message) ? err.message : 'Network error updating cloud drives configuration'
+      };
+    }
+  }
+
+  window.quorumCloudDriveAddFolder = async function(driveId, folderPath) {
+    const cleanId = String(driveId || '').trim();
+    const cleanPath = String(folderPath || '').trim();
+    if (!cleanId || !cleanPath) return false;
+    if (cloudDrivesBusyIds.has(cleanId)) {
+      showSettingsToast('⏳ Cloud drive update already in progress...');
+      return false;
+    }
+    cloudDrivesBusyIds.add(cleanId);
+    setCloudDriveCardBusyState(cleanId, true);
+    try {
+      const res = await postCloudDrivesConfig({
+        action: 'add_folder',
+        id: cleanId,
+        path: cleanPath
+      });
+      if (!res.ok) {
+        showSettingsToast('⚠ ' + (res.error || 'Failed to add custom cloud folder'));
+        return false;
+      }
+      const hiddenInp = document.getElementById('cloud-drives-selected-folder-input');
+      if (hiddenInp) hiddenInp.value = cleanPath;
+      showSettingsToast(`✓ Added custom folder to ${cleanId}: ${cleanPath}`);
+      return true;
+    } finally {
+      cloudDrivesBusyIds.delete(cleanId);
+      setCloudDriveCardBusyState(cleanId, false);
+      if (activeSettingsTab === 'cloud-drives') {
+        renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+      }
+    }
+  };
+
+  window.quorumCloudDriveReindex = async function(driveId, btnEl) {
+    const cleanId = String(driveId || '').trim();
+    if (!cleanId || cloudDrivesBusyIds.has(cleanId)) {
+      if (cleanId) showSettingsToast('⏳ Cloud drive update already in progress...');
+      return false;
+    }
+    cloudDrivesBusyIds.add(cleanId);
+    setCloudDriveCardBusyState(cleanId, true);
+    if (btnEl) btnEl.disabled = true;
+    try {
+      const resp = await fetch('/api/cloud-drives/reindex', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: cleanId })
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showSettingsToast('⚠ ' + (body.error || `HTTP ${resp.status} ${resp.statusText}`));
+        return false;
+      }
+      if (typeof checkReindexStatus === 'function') checkReindexStatus();
+      await fetchCloudDrivesData(true);
+      const count = Array.isArray(body.triggered_paths) ? body.triggered_paths.length : 0;
+      showSettingsToast(count > 0
+        ? `✓ Reindexing started for ${count} path(s) in ${cleanId}`
+        : `✓ Reindex queued for ${cleanId}`);
+      return true;
+    } catch (err) {
+      showSettingsToast('⚠ ' + ((err && err.message) ? err.message : 'Failed to trigger cloud drive reindex'));
+      return false;
+    } finally {
+      cloudDrivesBusyIds.delete(cleanId);
+      setCloudDriveCardBusyState(cleanId, false);
+      if (activeSettingsTab === 'cloud-drives') {
+        renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+      }
+    }
+  };
+
   async function openSettingsView(tab = 'general') {
     activeSettingsTab = tab;
     const mktModal = document.getElementById('modal-marketplace');
@@ -3774,10 +3979,15 @@ function secureRandomIndex(n) {
     if (tab === 'atlaskv') {
       await fetchAtlasKvData();
     }
+    if (tab === 'cloud-drives') {
+      await fetchCloudDrivesData(true);
+    }
     if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace' || tab === 'dlp' || tab === 'artemis-dfir') {
       await fetchMeshData();
     }
-    renderSettingsTabContent(activeSettingsTab, settingsSearchInput ? settingsSearchInput.value : '');
+    if (activeSettingsTab === tab) {
+      renderSettingsTabContent(activeSettingsTab, settingsSearchInput ? settingsSearchInput.value : '');
+    }
   }
   window._jumpSettingsTab = openSettingsView;
 
@@ -3858,13 +4068,18 @@ function secureRandomIndex(n) {
       if (tab === 'atlaskv') {
         await fetchAtlasKvData();
       }
+      if (tab === 'cloud-drives') {
+        await fetchCloudDrivesData(true);
+      }
       if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace' || tab === 'general' || tab === 'dlp' || tab === 'artemis-dfir') {
         await fetchBrowseFolders(currentBrowsePath);
       }
       if (tab === 'mesh' || tab === 'storage' || tab === 'marketplace') {
         await fetchMeshData();
       }
-      renderSettingsTabContent(tab, '');
+      if (activeSettingsTab === tab) {
+        renderSettingsTabContent(tab, '');
+      }
     });
   });
 
@@ -3881,8 +4096,9 @@ function secureRandomIndex(n) {
           || ((q.includes('opt') || q.includes('sell') || q.includes('consent') || q.includes('personal') || q.includes('market')) && (tab === 'marketplace' || tab === 'marketplace-ledger'))
           || ((q.includes('ledger') || q.includes('bounty') || q.includes('revenue')) && tab === 'marketplace-ledger')
           || ((q.includes('stream') || q.includes('reindex') || q.includes('drift') || q.includes('diag')) && tab === 'diagnostics')
-          || (q.includes('folder') && (tab === 'marketplace' || tab === 'mesh' || tab === 'storage' || tab === 'artemis-dfir'))
+          || (q.includes('folder') && (tab === 'marketplace' || tab === 'mesh' || tab === 'storage' || tab === 'artemis-dfir' || tab === 'cloud-drives'))
           || ((q.includes('artemis') || q.includes('dfir') || q.includes('forensic') || q.includes('telemetry') || q.includes('evtx')) && tab === 'artemis-dfir')
+          || ((q.includes('cloud') || q.includes('gdrive') || q.includes('google drive') || q.includes('onedrive') || q.includes('dropbox') || q.includes('icloud') || /\bbox\b/.test(q) || q.includes('nextcloud') || q.includes('proton') || q.includes('pcloud') || q.includes('hydrate') || q.includes('placeholder')) && tab === 'cloud-drives')
           || (q.includes('share') && tab === 'mesh');
         btn.style.display = match ? 'flex' : 'none';
       });
@@ -3904,6 +4120,16 @@ function secureRandomIndex(n) {
       } else if (q.includes('artemis') || q.includes('dfir') || q.includes('forensic') || q.includes('telemetry') || q.includes('evtx')) {
         activeSettingsTab = 'artemis-dfir';
         highlightSettingsNav('artemis-dfir');
+      } else if (q.includes('cloud') || q.includes('gdrive') || q.includes('google drive') || q.includes('onedrive') || q.includes('dropbox') || q.includes('icloud') || /\bbox\b/.test(q) || q.includes('nextcloud') || q.includes('proton') || q.includes('pcloud') || q.includes('hydrate') || q.includes('placeholder')) {
+        activeSettingsTab = 'cloud-drives';
+        highlightSettingsNav('cloud-drives');
+        if (!cachedCloudDrivesData && !cloudDrivesLoading && !cloudDrivesError) {
+          fetchCloudDrivesData().then(() => {
+            if (activeSettingsTab === 'cloud-drives') {
+              renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+            }
+          });
+        }
       } else if (q.includes('mesh') || q.includes('share') || q.includes('peer')) {
         activeSettingsTab = 'mesh';
         highlightSettingsNav('mesh');
@@ -4352,6 +4578,7 @@ function secureRandomIndex(n) {
     dlp: 'HIPAA PHI/PII DLP Simulation Folder',
     reindex: 'Target Reindex Folder',
     artemis: 'Artemis DFIR .jsonl / Forensic Folder',
+    'cloud-drives': 'Cloud Drive Custom Sync Folder',
   };
 
   function formatDlpSimulationFilePath(folderOrFilePath) {
@@ -4365,6 +4592,7 @@ function secureRandomIndex(n) {
   function closePureRustPickerModal() {
     const modal = document.getElementById('modal-pure-rust-folder-picker');
     if (modal) modal.classList.add('hidden');
+    pendingCloudDrivePickerId = '';
     if (pureRustPickerInvokerEl && typeof pureRustPickerInvokerEl.focus === 'function') {
       try {
         pureRustPickerInvokerEl.focus();
@@ -4422,6 +4650,19 @@ function secureRandomIndex(n) {
       }
       renderSettingsTabContent('artemis-dfir', '');
       showSettingsToast('✓ Selected Artemis DFIR folder: ' + chosen);
+    } else if (ctx === 'cloud-drives') {
+      const hiddenInp = document.getElementById('cloud-drives-selected-folder-input');
+      if (hiddenInp) hiddenInp.value = chosen;
+      const targetDriveId = pendingCloudDrivePickerId || '';
+      if (!targetDriveId) {
+        showSettingsToast('⚠ No cloud drive selected for custom folder.');
+        return false;
+      }
+      const ok = await window.quorumCloudDriveAddFolder(targetDriveId, chosen);
+      if (ok) {
+        pendingCloudDrivePickerId = '';
+      }
+      return ok;
     } else {
       renderSettingsTabContent(activeSettingsTab, '');
       showSettingsToast('✓ Selected folder: ' + chosen);
@@ -5416,6 +5657,14 @@ function secureRandomIndex(n) {
           e.preventDefault();
           e.stopPropagation();
           const ctx = actionEl.dataset.context || 'general';
+          if (ctx === 'cloud-drives') {
+            const driveId = actionEl.dataset.driveId || '';
+            if (driveId && cloudDrivesBusyIds.has(driveId)) {
+              showSettingsToast('⏳ Cloud drive update already in progress...');
+              return;
+            }
+            pendingCloudDrivePickerId = driveId;
+          }
           await window.openPureRustFolderPicker(ctx, '', actionEl);
           break;
         }
@@ -6734,6 +6983,54 @@ function secureRandomIndex(n) {
           showSettingsToast(`✓ Added & indexed: ${pathVal}`);
           break;
         }
+
+        case 'cloud-drive-reindex': {
+          e.preventDefault();
+          const driveId = actionEl.dataset.driveId || '';
+          await window.quorumCloudDriveReindex(driveId, actionEl);
+          break;
+        }
+
+        case 'cloud-drive-remove-folder': {
+          e.preventDefault();
+          const driveId = actionEl.dataset.driveId || '';
+          const targetPath = actionEl.dataset.folderPath || '';
+          if (!driveId || !targetPath) break;
+          if (cloudDrivesBusyIds.has(driveId)) {
+            showSettingsToast('⏳ Cloud drive update already in progress...');
+            break;
+          }
+          cloudDrivesBusyIds.add(driveId);
+          setCloudDriveCardBusyState(driveId, true);
+          try {
+            const res = await postCloudDrivesConfig({
+              action: 'remove_folder',
+              id: driveId,
+              path: targetPath
+            });
+            if (!res.ok) {
+              showSettingsToast('⚠ ' + (res.error || 'Failed to remove custom cloud folder'));
+              break;
+            }
+            showSettingsToast(`✓ Removed custom folder from ${driveId}: ${targetPath}`);
+          } finally {
+            cloudDrivesBusyIds.delete(driveId);
+            setCloudDriveCardBusyState(driveId, false);
+            if (activeSettingsTab === 'cloud-drives') {
+              renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+            }
+          }
+          break;
+        }
+
+        case 'cloud-drive-refresh': {
+          e.preventDefault();
+          await fetchCloudDrivesData(true);
+          if (activeSettingsTab === 'cloud-drives') {
+            renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+          }
+          break;
+        }
       }
     });
 
@@ -7039,6 +7336,157 @@ function secureRandomIndex(n) {
             showSettingsToast('Failed to parse AtlasKV JSON: ' + err.message);
           }
           changeEl.value = '';
+          break;
+        }
+
+        case 'cloud-drive-toggle': {
+          const driveId = changeEl.dataset.driveId || '';
+          if (!driveId || cloudDrivesBusyIds.has(driveId)) {
+            changeEl.checked = !changeEl.checked;
+            if (driveId) showSettingsToast('⏳ Cloud drive update already in progress...');
+            break;
+          }
+          const nextEnabled = !!changeEl.checked;
+          const prevDrives = (cachedCloudDrivesData && Array.isArray(cachedCloudDrivesData.drives)) ? cachedCloudDrivesData.drives : [];
+          const drv = prevDrives.find(d => d && d.id === driveId) || {};
+          cloudDrivesBusyIds.add(driveId);
+          setCloudDriveCardBusyState(driveId, true);
+          changeEl.disabled = true;
+          try {
+            const res = await postCloudDrivesConfig({
+              action: 'toggle_drive',
+              id: driveId,
+              enabled: nextEnabled,
+              access_tier: Number(drv.access_tier ?? DEFAULT_CLOUD_DRIVES_POLICY.default_access_tier),
+              root_path: drv.root_path || null
+            });
+            if (!res.ok) {
+              changeEl.checked = !nextEnabled;
+              changeEl.disabled = false;
+              showSettingsToast('⚠ ' + (res.error || 'Failed to update cloud drive state'));
+              break;
+            }
+            if (typeof checkReindexStatus === 'function' && nextEnabled) checkReindexStatus();
+            if (nextEnabled) {
+              showSettingsToast(`✓ Enabled ${drv.label || driveId} indexing`);
+            } else {
+              const pf = Number((res.data && res.data.purged_files) || 0);
+              const pc = Number((res.data && res.data.purged_chunks) || 0);
+              showSettingsToast(pf > 0 || pc > 0
+                ? `✓ Disabled ${drv.label || driveId} and purged ${pf} file(s) / ${pc} chunk(s)`
+                : `✓ Disabled ${drv.label || driveId} and purged indexed data`);
+            }
+          } finally {
+            cloudDrivesBusyIds.delete(driveId);
+            setCloudDriveCardBusyState(driveId, false);
+            if (activeSettingsTab === 'cloud-drives') {
+              renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+            }
+          }
+          break;
+        }
+
+        case 'cloud-drive-set-tier': {
+          const driveId = changeEl.dataset.driveId || '';
+          const prevDrives = (cachedCloudDrivesData && Array.isArray(cachedCloudDrivesData.drives)) ? cachedCloudDrivesData.drives : [];
+          const drv = prevDrives.find(d => d && d.id === driveId) || {};
+          const prevTier = Number(drv.access_tier ?? DEFAULT_CLOUD_DRIVES_POLICY.default_access_tier);
+          if (!driveId || cloudDrivesBusyIds.has(driveId)) {
+            changeEl.value = String(prevTier);
+            if (driveId) showSettingsToast('⏳ Cloud drive update already in progress...');
+            break;
+          }
+          const nextTier = Number(changeEl.value);
+          cloudDrivesBusyIds.add(driveId);
+          setCloudDriveCardBusyState(driveId, true);
+          try {
+            const res = await postCloudDrivesConfig({
+              action: 'toggle_drive',
+              id: driveId,
+              enabled: Boolean(drv.enabled),
+              access_tier: nextTier,
+              root_path: drv.root_path || null
+            });
+            if (!res.ok) {
+              changeEl.value = String(prevTier);
+              showSettingsToast('⚠ ' + (res.error || 'Failed to update cloud drive access tier'));
+              break;
+            }
+            showSettingsToast(`✓ Updated Access Tier for ${drv.label || driveId} to Tier ${nextTier}`);
+          } finally {
+            cloudDrivesBusyIds.delete(driveId);
+            setCloudDriveCardBusyState(driveId, false);
+            if (activeSettingsTab === 'cloud-drives') {
+              renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+            }
+          }
+          break;
+        }
+
+        case 'cloud-drive-select-root': {
+          const driveId = changeEl.dataset.driveId || '';
+          const prevDrives = (cachedCloudDrivesData && Array.isArray(cachedCloudDrivesData.drives)) ? cachedCloudDrivesData.drives : [];
+          const drv = prevDrives.find(d => d && d.id === driveId) || {};
+          const prevRoot = drv.root_path || '';
+          if (!driveId || cloudDrivesBusyIds.has(driveId)) {
+            changeEl.value = prevRoot;
+            if (driveId) showSettingsToast('⏳ Cloud drive update already in progress...');
+            break;
+          }
+          const nextRoot = changeEl.value || '';
+          cloudDrivesBusyIds.add(driveId);
+          setCloudDriveCardBusyState(driveId, true);
+          try {
+            const res = await postCloudDrivesConfig({
+              action: 'toggle_drive',
+              id: driveId,
+              enabled: Boolean(drv.enabled),
+              access_tier: Number(drv.access_tier ?? DEFAULT_CLOUD_DRIVES_POLICY.default_access_tier),
+              root_path: nextRoot || null
+            });
+            if (!res.ok) {
+              changeEl.value = prevRoot;
+              showSettingsToast('⚠ ' + (res.error || 'Failed to select cloud drive sync root'));
+              break;
+            }
+            showSettingsToast(`✓ Updated sync root for ${drv.label || driveId}`);
+          } finally {
+            cloudDrivesBusyIds.delete(driveId);
+            setCloudDriveCardBusyState(driveId, false);
+            if (activeSettingsTab === 'cloud-drives') {
+              renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+            }
+          }
+          break;
+        }
+
+        case 'cloud-drives-set-hydration': {
+          const chkHydrate = document.getElementById('chk-cloud-hydrate-on-demand');
+          const inpMaxMb = document.getElementById('cloud-hydration-max-mb');
+          const prevMode = (cachedCloudDrivesData && cachedCloudDrivesData.placeholder_mode) || DEFAULT_CLOUD_DRIVES_POLICY.placeholder_mode;
+          const prevMb = Number((cachedCloudDrivesData && cachedCloudDrivesData.hydration_max_file_size_mb) || DEFAULT_CLOUD_DRIVES_POLICY.hydration_max_file_size_mb);
+          const nextMode = (chkHydrate && chkHydrate.checked) ? 'hydrate_on_demand' : 'locally_synced_only';
+          const rawMax = inpMaxMb ? String(inpMaxMb.value || '').trim() : String(prevMb);
+          const parsedMb = rawMax === '' ? NaN : Number(rawMax);
+          const nextMb = Number.isFinite(parsedMb) ? Math.max(1, Math.min(2048, Math.round(parsedMb))) : 25;
+          if (inpMaxMb) inpMaxMb.value = String(nextMb);
+          const res = await postCloudDrivesConfig({
+            action: 'set_hydration',
+            placeholder_mode: nextMode,
+            hydration_max_file_size_mb: nextMb
+          });
+          if (!res.ok) {
+            if (chkHydrate) chkHydrate.checked = (prevMode === 'hydrate_on_demand');
+            if (inpMaxMb) inpMaxMb.value = String(prevMb);
+            showSettingsToast('⚠ ' + (res.error || 'Failed to save placeholder hydration policy'));
+            break;
+          }
+          if (activeSettingsTab === 'cloud-drives') {
+            renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+          }
+          showSettingsToast(nextMode === 'hydrate_on_demand'
+            ? `✓ On-demand hydration enabled (max ${nextMb} MB per file)`
+            : '✓ Placeholder protection set to Locally synced files only');
           break;
         }
       }
@@ -9808,7 +10256,258 @@ function secureRandomIndex(n) {
               <button class="pill-btn" data-action="open-modal" data-modal-id="modal-recache">⚡ Compact &amp; Re-Cache Embeddings</button>
             </div>
           </div>` : ''}
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Cloud Drives (Opt-In Sync Roots)</span>
+              <div class="settings-row-desc">Enable or disable Google Drive, OneDrive, Dropbox, iCloud Drive, Box, Nextcloud, Proton Drive, and pCloud with placeholder protection and local-only access tiers.</div>
+            </div>
+            <button type="button" class="pill-btn" data-action="jump-tab" data-tab="cloud-drives">☁️ Manage Cloud Drives →</button>
+          </div>
         </div>
+        </div>
+      `;
+    } else if (tab === 'cloud-drives') {
+      const cd = cachedCloudDrivesData;
+      const placeholderMode = (cd && cd.placeholder_mode) || DEFAULT_CLOUD_DRIVES_POLICY.placeholder_mode;
+      const isHydrateOnDemand = placeholderMode === 'hydrate_on_demand';
+      const rawMaxMb = Number(cd && cd.hydration_max_file_size_mb);
+      const maxMb = (Number.isFinite(rawMaxMb) && rawMaxMb >= 1)
+        ? Math.min(2048, Math.round(rawMaxMb))
+        : DEFAULT_CLOUD_DRIVES_POLICY.hydration_max_file_size_mb;
+      const drives = (cd && Array.isArray(cd.drives)) ? cd.drives : [];
+
+      let bannerHtml = '';
+      if (cd && (cd.running_as_local_system || cd.virtual_drive_guidance)) {
+        const bannerTitle = cd.running_as_local_system ? 'Windows Service (LocalSystem)' : 'Virtual Drive Notice';
+        const bannerText = cd.virtual_drive_guidance || 'Running under Windows LocalSystem service context. Folder-backed syncs remain readable; per-user virtual stream drives require an active user session or custom folder selection.';
+        bannerHtml = `
+          <div class="cloud-drive-banner warn">
+            <div>
+              <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+                <span class="dlp-badge-redact">${bannerTitle}</span>
+                <strong>Service Context &amp; Virtual Drives</strong>
+              </div>
+              <div>${escapeHtml(bannerText)}</div>
+            </div>
+            <button type="button" class="pill-btn" data-action="cloud-drive-refresh">🔄 Refresh Status</button>
+          </div>
+        `;
+      }
+
+      let errorBannerHtml = '';
+      if (cd && cloudDrivesError) {
+        errorBannerHtml = `
+          <div class="cloud-drive-banner error">
+            <div>
+              <span class="dlp-badge-block">Sync Refresh Error</span>
+              <span style="margin-left:8px;">${escapeHtml(cloudDrivesError)}</span>
+            </div>
+            <button type="button" class="pill-btn" data-action="cloud-drive-refresh">🔄 Retry</button>
+          </div>
+        `;
+      }
+
+      const hydrationCardHtml = `
+        <div class="settings-card cloud-drive-hydration-card">
+          <div class="settings-card-title">
+            <span>🛡️ Placeholder Protection &amp; Files-On-Demand</span>
+            <span class="${isHydrateOnDemand ? 'dlp-badge-redact' : 'dlp-badge-allow'}">${isHydrateOnDemand ? 'Hydrate on Demand' : 'Locally Synced Only (Default)'}</span>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <label for="chk-cloud-hydrate-on-demand" class="settings-row-label">Hydrate cloud-only files on demand</label>
+              <div class="settings-row-desc">Default is <strong>Locally synced files only</strong> (OFF). Cloud-only stubs marked with <code>FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS</code>, <code>FILE_ATTRIBUTE_OFFLINE</code>, or <code>SF_DATALESS</code> are skipped before opening so offline machines never trigger multi-GB downloads.</div>
+            </div>
+            <div class="settings-row-controls">
+              <input id="chk-cloud-hydrate-on-demand" type="checkbox" class="quorum-switch" ${isHydrateOnDemand ? 'checked' : ''} data-change-action="cloud-drives-set-hydration">
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <label for="cloud-hydration-max-mb" class="settings-row-label">On-demand hydration per-file size cap (MB)</label>
+              <div class="settings-row-desc">Maximum file size (default 25 MB) allowed when on-demand placeholder hydration is enabled. Files larger than this cap remain skipped.</div>
+            </div>
+            <div class="settings-row-controls">
+              <input id="cloud-hydration-max-mb" type="number" class="settings-input cloud-drive-size-input" min="1" max="2048" value="${escapeHtml(String(maxMb))}" data-change-action="cloud-drives-set-hydration">
+              <span style="font-size:12.5px; color:var(--text-muted);">MB</span>
+            </div>
+          </div>
+        </div>
+      `;
+
+      let drivesSectionHtml = '';
+      if (cloudDrivesLoading && !cd) {
+        drivesSectionHtml = `
+          <div class="settings-card">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">Loading cloud drive discovery status...</span>
+                <div class="settings-row-desc">Querying QuorumRAG daemon for local sync roots, placeholder policy, and index counts.</div>
+              </div>
+            </div>
+          </div>
+        `;
+      } else if (!cd && cloudDrivesError) {
+        drivesSectionHtml = `
+          <div class="settings-card">
+            <div class="settings-card-title">
+              <span>Cloud Drive Discovery Unavailable</span>
+              <span class="dlp-badge-block">Backend Offline / Unavailable</span>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">Unable to load cloud drives from daemon</span>
+                <div class="settings-row-desc">${escapeHtml(cloudDrivesError)}</div>
+              </div>
+              <div class="settings-row-controls">
+                <button type="button" class="pill-btn" data-action="cloud-drive-refresh">🔄 Retry</button>
+              </div>
+            </div>
+          </div>
+        `;
+      } else if (!cd) {
+        drivesSectionHtml = `
+          <div class="settings-card">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">Cloud drive status not loaded</span>
+                <div class="settings-row-desc">Click Refresh to query live cloud drive discovery from the QuorumRAG daemon.</div>
+              </div>
+              <div class="settings-row-controls">
+                <button type="button" class="pill-btn" data-action="cloud-drive-refresh">🔄 Refresh</button>
+              </div>
+            </div>
+          </div>
+        `;
+      } else if (drives.length === 0) {
+        drivesSectionHtml = `
+          <div class="settings-card">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">No cloud sync providers returned by daemon.</span>
+                <div class="settings-row-desc">All cloud drive providers are opt-in and disabled by default.</div>
+              </div>
+              <div class="settings-row-controls">
+                <button type="button" class="pill-btn" data-action="cloud-drive-refresh">🔄 Refresh</button>
+              </div>
+            </div>
+          </div>
+        `;
+      } else {
+        const cards = drives.map((drv) => {
+          const drvId = String(drv.id || '');
+          const providerKey = String(drv.provider || drvId);
+          const meta = CLOUD_DRIVE_PROVIDER_META[drvId] || CLOUD_DRIVE_PROVIDER_META[providerKey] || { label: drvId, icon: '☁️' };
+          const drvLabel = drv.label || meta.label || drvId;
+          const isBusy = cloudDrivesBusyIds.has(drvId);
+          const isEnabled = Boolean(drv.enabled);
+          const status = String(drv.status || (drv.mounted ? 'mounted' : 'not_detected'));
+          const indexedFiles = Number(drv.indexed_files || 0);
+          const accessTier = Number(drv.access_tier ?? DEFAULT_CLOUD_DRIVES_POLICY.default_access_tier);
+          const detectedRoots = Array.isArray(drv.detected_roots) ? drv.detected_roots : [];
+          const customPaths = Array.isArray(drv.custom_paths) ? drv.custom_paths : [];
+          const canReindex = Boolean(isEnabled && ((drv.mounted && drv.root_path) || customPaths.length > 0));
+
+          let statusBadgeHtml = '<span class="status-pill idle cloud-drive-badge">Not Detected</span>';
+          if (status === 'mounted' || (drv.mounted && status !== 'session_only' && status !== 'error')) {
+            statusBadgeHtml = '<span class="dlp-badge-allow cloud-drive-badge">Mounted</span>';
+          } else if (status === 'session_only') {
+            statusBadgeHtml = '<span class="dlp-badge-redact cloud-drive-badge">Session Only</span>';
+          } else if (status === 'error') {
+            statusBadgeHtml = '<span class="dlp-badge-block cloud-drive-badge">Error</span>';
+          }
+
+          const indexedBadgeHtml = `<span class="status-pill ${indexedFiles > 0 ? 'healthy' : 'idle'} cloud-drive-badge">Indexed files: ${escapeHtml(indexedFiles.toLocaleString())}</span>`;
+          const meshBadgeHtml = `<span class="${drv.shared_with_mesh ? 'dlp-badge-allow' : 'status-pill idle'} cloud-drive-badge">${drv.shared_with_mesh ? 'Shared with Mesh' : 'Local-Only (Mesh Excluded)'}</span>`;
+
+          let rootHtml = '';
+          if (detectedRoots.length > 1) {
+            const rootOptions = detectedRoots.map((r) => {
+              const selectedAttr = (drv.root_path && drv.root_path === r) ? 'selected' : '';
+              return `<option value="${escapeHtml(r)}" ${selectedAttr}>${escapeHtml(r)}</option>`;
+            }).join('');
+            rootHtml = `
+              <div class="cloud-drive-path-line">
+                <span>Sync Root: </span>
+                <select class="settings-select" ${isBusy ? 'disabled' : ''} data-change-action="cloud-drive-select-root" data-drive-id="${escapeHtml(drvId)}">${rootOptions}</select>
+              </div>
+            `;
+          } else {
+            rootHtml = `<div class="cloud-drive-path-line">Sync Root: <code>${escapeHtml(drv.root_path || 'Not detected automatically')}</code></div>`;
+          }
+
+          let sessionNoticeHtml = '';
+          if (drv.session_only || drv.session_guidance) {
+            const guidanceText = drv.session_guidance || 'Virtual drive is mounted only inside an interactive user session and is not directly visible to LocalSystem.';
+            sessionNoticeHtml = `<div class="cloud-drive-banner warn" style="margin:0; padding:8px 12px;">${escapeHtml(guidanceText)}</div>`;
+          }
+
+          let customFoldersHtml = '';
+          if (customPaths.length > 0) {
+            const pills = customPaths.map((cp) => `
+              <span class="folder-pill-item">
+                <span>📁 ${escapeHtml(cp)}</span>
+                <button type="button" class="pill-btn-danger" style="padding:2px 8px; font-size:11px;" data-action="cloud-drive-remove-folder" data-drive-id="${escapeHtml(drvId)}" data-folder-path="${escapeHtml(cp)}" ${isBusy ? 'disabled' : ''}>✕</button>
+              </span>
+            `).join('');
+            customFoldersHtml = `<div class="cloud-drive-custom-folders">${pills}</div>`;
+          }
+
+          const tierOptions = [
+            { v: 3, t: 'Tier 3: Local-Only (Default)' },
+            { v: 2, t: 'Tier 2: Confidential' },
+            { v: 1, t: 'Tier 1: Internal Team' },
+            { v: 0, t: 'Tier 0: Public Mesh' },
+          ].map(opt => `<option value="${opt.v}" ${accessTier === opt.v ? 'selected' : ''}>${opt.t}</option>`).join('');
+
+          return `
+            <div class="cloud-drive-card ${isEnabled ? 'is-enabled' : ''}">
+              <div class="cloud-drive-card-header">
+                <div class="cloud-drive-card-meta">
+                  <div class="cloud-drive-title-row">
+                    <span class="cloud-drive-name">${meta.icon} ${escapeHtml(drvLabel)}</span>
+                    ${statusBadgeHtml}
+                    ${indexedBadgeHtml}
+                    ${meshBadgeHtml}
+                  </div>
+                  ${rootHtml}
+                </div>
+                <div class="cloud-drive-card-actions">
+                  <select id="sel-cloud-tier-${escapeHtml(drvId)}" class="settings-select" ${isBusy ? 'disabled' : ''} data-change-action="cloud-drive-set-tier" data-drive-id="${escapeHtml(drvId)}" title="Access Tier">${tierOptions}</select>
+                  <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="cloud-drives" data-drive-id="${escapeHtml(drvId)}" ${isBusy ? 'disabled' : ''}>📁 Select Folder</button>
+                  <button type="button" class="pill-btn" data-action="cloud-drive-reindex" data-drive-id="${escapeHtml(drvId)}" ${(!canReindex || isBusy) ? 'disabled' : ''} title="${canReindex ? 'Trigger immediate reindex for this drive' : 'Enable drive with a mounted root or custom folder first'}">🔄 Reindex Now</button>
+                  <input id="chk-cloud-drive-${escapeHtml(drvId)}" type="checkbox" class="quorum-switch" ${isEnabled ? 'checked' : ''} ${isBusy ? 'disabled' : ''} data-change-action="cloud-drive-toggle" data-drive-id="${escapeHtml(drvId)}" aria-label="Enable ${escapeHtml(drvLabel)}">
+                </div>
+              </div>
+              <div style="font-size:12px; color:var(--text-muted);">
+                Local-only by default — never shared over P2P Mesh unless explicitly added in Mesh &amp; Shared Folders with Tier &lt; 3. Disabling purges this drive's indexed chunks and AtlasKV triples.
+              </div>
+              ${sessionNoticeHtml}
+              ${customFoldersHtml}
+            </div>
+          `;
+        }).join('');
+
+        drivesSectionHtml = `
+          <div class="settings-card">
+            <div class="settings-card-title">
+              <span>☁️ Discovered &amp; Opt-In Cloud Sync Providers</span>
+              <button type="button" class="pill-btn" data-action="cloud-drive-refresh">🔄 Refresh Discovery</button>
+            </div>
+            ${cards}
+          </div>
+        `;
+      }
+
+      settingsContent.innerHTML = `
+        <div class="settings-centered-container">
+          <h2 class="settings-page-title">☁️ Cloud Drives</h2>
+          <p class="settings-page-subtitle">Optional, opt-in local sync indexing for cloud drives (all disabled by default). Cloud drives stay local-only unless explicitly added in Mesh &amp; Shared Folders with Tier &lt; 3.</p>
+          <input type="hidden" id="cloud-drives-selected-folder-input" value="">
+          ${bannerHtml}
+          ${errorBannerHtml}
+          ${hydrationCardHtml}
+          ${drivesSectionHtml}
         </div>
       `;
     } else if (tab === 'personalization') {
@@ -10773,8 +11472,21 @@ function secureRandomIndex(n) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ forensics_enabled: false })
     }).catch(() => {});
+    await fetch('/api/cloud-drives/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'set_hydration',
+        placeholder_mode: 'locally_synced_only',
+        hydration_max_file_size_mb: 25
+      })
+    }).catch(() => {});
     cachedArtemisStatus = null;
     cachedArtemisConfig = null;
+    cachedCloudDrivesData = null;
+    if (activeSettingsTab === 'cloud-drives') {
+      await fetchCloudDrivesData(true);
+    }
     await loadFullSettings();
     renderSettingsTabContent(activeSettingsTab, '');
     showSettingsToast('Settings reset to defaults');
@@ -10786,6 +11498,19 @@ function secureRandomIndex(n) {
 
   window._saveAllPreferencesFromFooter = async function() {
     syncPendingMarketplaceInputsFromDom();
+    const chkCloudHydrate = document.getElementById('chk-cloud-hydrate-on-demand');
+    const inpCloudMaxMb = document.getElementById('cloud-hydration-max-mb');
+    if (chkCloudHydrate && inpCloudMaxMb) {
+      const rawMax = String(inpCloudMaxMb.value || '').trim();
+      const parsedMb = rawMax === '' ? NaN : Number(rawMax);
+      const safeMb = Number.isFinite(parsedMb) ? Math.max(1, Math.min(2048, Math.round(parsedMb))) : 25;
+      inpCloudMaxMb.value = String(safeMb);
+      await postCloudDrivesConfig({
+        action: 'set_hydration',
+        placeholder_mode: chkCloudHydrate.checked ? 'hydrate_on_demand' : 'locally_synced_only',
+        hydration_max_file_size_mb: safeMb
+      }).catch(() => null);
+    }
     const chkMkt = document.getElementById('chk-mkt-consent');
     const chkGen = document.getElementById('chk-general-optin-consent');
     const consentBox = chkMkt || chkGen;

@@ -68,6 +68,10 @@ pub struct IngestConfig {
     /// (e.g. internal database storage directories, cache folders).
     #[serde(default)]
     pub excluded_paths: Vec<PathBuf>,
+
+    /// Policy governing cloud-only Files-On-Demand placeholders (default: LocallySyncedOnly).
+    #[serde(default)]
+    pub placeholder_policy: quorum_types::CloudPlaceholderPolicy,
 }
 
 impl Default for IngestConfig {
@@ -92,8 +96,27 @@ impl Default for IngestConfig {
             exclude_source_code: false,
             dedup_catalog_path: None,
             excluded_paths: Vec::new(),
+            placeholder_policy: quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
         }
     }
+}
+
+/// Normalizes a `Path` for prefix comparison (strips `\\?\` when non-UNC, normalizes
+/// separators and case on Windows/drive paths, rejects empty/`..`/encoded traversal).
+pub fn normalize_path_for_prefix(path: &std::path::Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    match quorum_types::normalize_prefix_for_match(&raw) {
+        Ok(norm) => PathBuf::from(norm),
+        Err(_) => PathBuf::new(),
+    }
+}
+
+/// Component-boundary-safe prefix check between `candidate` and `prefix`, failing closed
+/// on empty or malformed paths.
+pub fn path_matches_prefix(candidate: &std::path::Path, prefix: &std::path::Path) -> bool {
+    let cand_str = candidate.to_string_lossy();
+    let pref_str = prefix.to_string_lossy();
+    quorum_types::path_matches_prefix(&cand_str, &pref_str).unwrap_or(false)
 }
 
 impl IngestConfig {
@@ -105,22 +128,73 @@ impl IngestConfig {
         Duration::from_millis(self.batch_timeout_ms)
     }
 
-    /// Resolve access tier for a path based on longest matching prefix in access_tier_rules.
-    pub fn resolve_access_tier(&self, path: &std::path::Path) -> u8 {
+    /// Validates all configured `access_tier_rules` fail-closed (`0..=3` and safe paths).
+    pub fn validate_access_tier_rules(&self) -> Result<(), quorum_types::TypeError> {
+        for (prefix, tier) in &self.access_tier_rules {
+            quorum_types::AccessTier::from_u8(*tier)?;
+            quorum_types::normalize_prefix_for_match(&prefix.to_string_lossy())?;
+        }
+        Ok(())
+    }
+
+    /// Checked access-tier resolution returning `Err` on invalid paths or invalid tiers (`> 3`).
+    pub fn try_resolve_access_tier(&self, path: &std::path::Path) -> Result<u8, quorum_types::TypeError> {
+        let norm_path = quorum_types::normalize_prefix_for_match(&path.to_string_lossy())?;
         let mut best_tier = 0u8;
-        let mut longest_match = 0;
+        let mut longest_match = 0usize;
 
         for (prefix, tier) in &self.access_tier_rules {
-            if path.starts_with(prefix) {
-                let match_len = prefix.as_os_str().len();
+            let valid_tier = quorum_types::AccessTier::from_u8(*tier)?.as_u8();
+            let norm_prefix = quorum_types::normalize_prefix_for_match(&prefix.to_string_lossy())?;
+            if quorum_types::path_matches_prefix(&norm_path, &norm_prefix)? {
+                let match_len = norm_prefix.len();
                 if match_len > longest_match {
                     longest_match = match_len;
-                    best_tier = *tier;
+                    best_tier = valid_tier;
+                } else if match_len == longest_match {
+                    best_tier = best_tier.max(valid_tier);
+                }
+            }
+        }
+
+        Ok(best_tier)
+    }
+
+    /// Shared fail-closed tier resolution helper used by `IngestConfig` and `DriftHealer`.
+    /// Fails closed to `Tier3Restricted` (3) if `path` is invalid or if the matching rule has `tier > 3`.
+    pub fn resolve_tier_from_rules(rules: &[(PathBuf, u8)], path: &std::path::Path) -> u8 {
+        let Ok(norm_path) = quorum_types::normalize_prefix_for_match(&path.to_string_lossy()) else {
+            return quorum_types::AccessTier::Tier3Restricted.as_u8();
+        };
+
+        let mut best_tier = 0u8;
+        let mut longest_match = 0usize;
+
+        for (prefix, tier) in rules {
+            let Ok(norm_prefix) = quorum_types::normalize_prefix_for_match(&prefix.to_string_lossy()) else {
+                continue;
+            };
+            if quorum_types::path_matches_prefix(&norm_path, &norm_prefix).unwrap_or(false) {
+                let match_len = norm_prefix.len();
+                let resolved_tier = quorum_types::AccessTier::from_u8(*tier)
+                    .map(|t| t.as_u8())
+                    .unwrap_or(quorum_types::AccessTier::Tier3Restricted.as_u8());
+                if match_len > longest_match {
+                    longest_match = match_len;
+                    best_tier = resolved_tier;
+                } else if match_len == longest_match {
+                    best_tier = best_tier.max(resolved_tier);
                 }
             }
         }
 
         best_tier
+    }
+
+    /// Resolve access tier for a path based on longest normalized matching prefix in `access_tier_rules`.
+    /// Fails closed to `Tier3Restricted` (3) on invalid paths or invalid tiers (`> 3`).
+    pub fn resolve_access_tier(&self, path: &std::path::Path) -> u8 {
+        Self::resolve_tier_from_rules(&self.access_tier_rules, path)
     }
 
     /// Discovers all mounted fixed physical drives on the host system (excluding CD-ROMs like `F:\`,
@@ -510,112 +584,149 @@ impl IngestConfig {
         profiles
     }
 
+    /// Discovers real human user profile directories across the host system in Session 0,
+    /// strictly avoiding system profiles (`systemprofile`, `LocalService`, `NetworkService`),
+    /// virtual/junction directories (`All Users`, `Default User`), and hidden system profiles (`Default`).
+    #[cfg(target_os = "windows")]
+    pub fn discover_user_profile_dirs() -> Vec<PathBuf> {
+        use std::os::windows::fs::MetadataExt;
+
+        const SKIP_PROFILE_NAMES: &[&str] = &[
+            "all users",
+            "default",
+            "default user",
+            "public",
+            "systemprofile",
+            "localservice",
+            "networkservice",
+            "defaultapppool",
+            "wdigest",
+        ];
+
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
+        const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+        let mut candidate_profiles = Vec::new();
+
+        // 1. Discover user profiles via Windows Registry ProfileList (Session 0 LocalSystem support)
+        for reg_profile in Self::discover_profiles_from_registry() {
+            let name = reg_profile
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !name.starts_with('.')
+                && !name.starts_with('$')
+                && !SKIP_PROFILE_NAMES.contains(&name.as_str())
+                && reg_profile.is_dir()
+                && std::fs::read_dir(&reg_profile).is_ok()
+                && !candidate_profiles.contains(&reg_profile)
+            {
+                candidate_profiles.push(reg_profile);
+            }
+        }
+
+        // 2. Discover user profiles via SystemDrive Users directory (usually C:\Users)
+        let mut candidate_user_dirs = Vec::new();
+        let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        let primary_users = PathBuf::from(format!("{}\\Users", sys_drive));
+        if primary_users.is_dir() {
+            candidate_user_dirs.push(primary_users);
+        }
+
+        // 3. Discover Users directory on any other fixed physical data drives
+        for drive in Self::discover_physical_drives() {
+            let users_dir = drive.join("Users");
+            if users_dir.is_dir() && !candidate_user_dirs.contains(&users_dir) {
+                candidate_user_dirs.push(users_dir);
+            }
+        }
+
+        for users_base in candidate_user_dirs {
+            let Ok(entries) = std::fs::read_dir(&users_base) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+
+                if name.starts_with('.') || name.starts_with('$') {
+                    continue;
+                }
+                if SKIP_PROFILE_NAMES.contains(&name.as_str()) {
+                    continue;
+                }
+
+                // Check metadata: must be a real directory
+                let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+
+                if sym_meta.file_type().is_symlink() || !path.is_dir() {
+                    continue;
+                }
+
+                let attrs = sym_meta.file_attributes();
+                // Reject junctions or hidden/system directories at the profile folder level
+                // (e.g. All Users junction, Default User junction, Default profile)
+                if (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 {
+                    continue;
+                }
+
+                // Must be readable by service account
+                if std::fs::read_dir(&path).is_err() {
+                    continue;
+                }
+
+                if !candidate_profiles.contains(&path) {
+                    candidate_profiles.push(path);
+                }
+            }
+        }
+
+        candidate_profiles
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn discover_user_profile_dirs() -> Vec<PathBuf> {
+        let mut profiles = Vec::new();
+        for base in &["/home", "/Users"] {
+            let base_path = PathBuf::from(base);
+            if let Ok(entries) = std::fs::read_dir(base_path) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') || name == "lost+found" || name == "Shared" {
+                        continue;
+                    }
+                    if p.is_dir() && !profiles.contains(&p) {
+                        profiles.push(p);
+                    }
+                }
+            }
+        }
+        profiles
+    }
+
     /// Discovers real human user document roots across the host system in Session 0,
     /// strictly avoiding system profiles (LocalSystem systemprofile, LocalService, NetworkService),
     /// virtual/junction directories (All Users, Default User), hidden system profiles (Default),
-    /// and non-directory files (desktop.ini), while supporting OneDrive and cloud-sync directory
-    /// reparse points without infinite recursion.
+    /// and non-directory files (desktop.ini). Cloud drives (including OneDrive*) are decoupled
+    /// into opt-in `cloud_drives::discover_cloud_drives()` so they are never auto-shared,
+    /// and profiles lacking standard document subfolders never fall back to the raw profile root.
     pub fn discover_user_document_roots() -> Vec<PathBuf> {
+        let candidate_profiles = Self::discover_user_profile_dirs();
+        Self::discover_user_document_roots_in_profiles(&candidate_profiles)
+    }
+
+    pub(crate) fn discover_user_document_roots_in_profiles(
+        candidate_profiles: &[PathBuf],
+    ) -> Vec<PathBuf> {
         let mut roots = Vec::new();
 
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::fs::MetadataExt;
-
-            const SKIP_PROFILE_NAMES: &[&str] = &[
-                "all users",
-                "default",
-                "default user",
-                "public",
-                "systemprofile",
-                "localservice",
-                "networkservice",
-                "defaultapppool",
-                "wdigest",
-            ];
-
-            const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
-            const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-
-            let mut candidate_profiles = Vec::new();
-
-            // 1. Discover user profiles via Windows Registry ProfileList (Session 0 LocalSystem support)
-            for reg_profile in Self::discover_profiles_from_registry() {
-                let name = reg_profile
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_ascii_lowercase())
-                    .unwrap_or_default();
-                if !name.starts_with('.')
-                    && !name.starts_with('$')
-                    && !SKIP_PROFILE_NAMES.contains(&name.as_str())
-                    && reg_profile.is_dir()
-                    && std::fs::read_dir(&reg_profile).is_ok()
-                    && !candidate_profiles.contains(&reg_profile)
-                {
-                    candidate_profiles.push(reg_profile);
-                }
-            }
-
-            // 2. Discover user profiles via SystemDrive Users directory (usually C:\Users)
-            let mut candidate_user_dirs = Vec::new();
-            let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
-            let primary_users = PathBuf::from(format!("{}\\Users", sys_drive));
-            if primary_users.is_dir() {
-                candidate_user_dirs.push(primary_users);
-            }
-
-            // 3. Discover Users directory on any other fixed physical data drives
-            for drive in Self::discover_physical_drives() {
-                let users_dir = drive.join("Users");
-                if users_dir.is_dir() && !candidate_user_dirs.contains(&users_dir) {
-                    candidate_user_dirs.push(users_dir);
-                }
-            }
-
-            for users_base in candidate_user_dirs {
-                let Ok(entries) = std::fs::read_dir(&users_base) else {
-                    continue;
-                };
-
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-
-                    if name.starts_with('.') || name.starts_with('$') {
-                        continue;
-                    }
-                    if SKIP_PROFILE_NAMES.contains(&name.as_str()) {
-                        continue;
-                    }
-
-                    // Check metadata: must be a real directory
-                    let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
-                        continue;
-                    };
-
-                    if sym_meta.file_type().is_symlink() || !path.is_dir() {
-                        continue;
-                    }
-
-                    let attrs = sym_meta.file_attributes();
-                    // Reject junctions or hidden/system directories at the profile folder level
-                    // (e.g. All Users junction, Default User junction, Default profile)
-                    if (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 {
-                        continue;
-                    }
-
-                    // Must be readable by service account
-                    if std::fs::read_dir(&path).is_err() {
-                        continue;
-                    }
-
-                    if !candidate_profiles.contains(&path) {
-                        candidate_profiles.push(path);
-                    }
-                }
-            }
-
             fn strip_verbatim_unc_prefix(p: &std::path::Path) -> PathBuf {
                 let s = p.to_string_lossy();
                 if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
@@ -631,13 +742,11 @@ impl IngestConfig {
 
             for path in candidate_profiles {
                 let mut user_roots = Vec::new();
-                let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                let canon_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
                 let clean_root = strip_verbatim_unc_prefix(&canon_path);
-                let raw_clean_root = strip_verbatim_unc_prefix(&path);
+                let raw_clean_root = strip_verbatim_unc_prefix(path);
 
-                // Helper to validate and add document roots safely:
-                // allows directory reparse points (OneDrive, cloud sync, junctions to real folders)
-                // while strictly rejecting cyclic directory loops or symlinks.
+                // Helper to validate and add document roots safely while rejecting cyclic loops or symlinks.
                 let mut try_add_folder = |dir: PathBuf, target_vec: &mut Vec<PathBuf>| {
                     if !dir.is_dir() || std::fs::read_dir(&dir).is_err() {
                         return;
@@ -688,72 +797,25 @@ impl IngestConfig {
                     }
                 };
 
-                // Standard document subfolders
+                // Standard document subfolders (cloud drives are opt-in via cloud_drives.rs;
+                // never fall back to the raw profile root if absent).
                 for sub in ["Documents", "Desktop", "Downloads", "Pictures"] {
                     let sub_path = path.join(sub);
                     try_add_folder(sub_path, &mut user_roots);
                 }
 
-                // OneDrive & Cloud-sync sync directories (OneDrive, OneDrive - Business, etc.)
-                if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                    for entry in sub_entries.flatten() {
-                        let sub_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                        if sub_name.starts_with("onedrive") {
-                            let onedrive_dir = entry.path();
-                            if onedrive_dir.is_dir() && std::fs::read_dir(&onedrive_dir).is_ok() {
-                                for one_sub in ["Documents", "Desktop", "Pictures"] {
-                                    let one_sub_path = onedrive_dir.join(one_sub);
-                                    try_add_folder(one_sub_path, &mut user_roots);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if user_roots.is_empty() {
-                    if let Ok(canon) = std::fs::canonicalize(&path) {
-                        if seen_canonicals.insert(canon) {
-                            roots.push(path);
-                        }
-                    } else if !roots.contains(&path) {
-                        roots.push(path);
-                    }
-                } else {
-                    roots.extend(user_roots);
-                }
+                roots.extend(user_roots);
             }
         }
 
         #[cfg(not(target_os = "windows"))]
         {
-            let mut candidate_bases = Vec::new();
-            for base in &["/home", "/Users"] {
-                let p = PathBuf::from(base);
-                if p.is_dir() {
-                    candidate_bases.push(p);
-                }
-            }
-
-            for base in candidate_bases {
-                if let Ok(entries) = std::fs::read_dir(base) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with('.') || name == "lost+found" || name == "Shared" {
-                            continue;
-                        }
-                        if path.is_dir() {
-                            let mut found_sub = false;
-                            for sub in &["Documents", "Desktop", "Downloads", "Pictures"] {
-                                let sub_path = path.join(sub);
-                                if sub_path.is_dir() {
-                                    roots.push(sub_path);
-                                    found_sub = true;
-                                }
-                            }
-                            if !found_sub {
-                                roots.push(path);
-                            }
+            for path in candidate_profiles {
+                if path.is_dir() {
+                    for sub in &["Documents", "Desktop", "Downloads", "Pictures"] {
+                        let sub_path = path.join(sub);
+                        if sub_path.is_dir() {
+                            roots.push(sub_path);
                         }
                     }
                 }
@@ -899,6 +961,36 @@ mod tests {
                 assert!(!lower.contains("desktop.ini"));
             }
         }
+    }
+
+    #[test]
+    fn test_discover_user_document_roots_does_not_fall_back_to_profile_root_with_cloud_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let kfm_profile = dir.path().join("KfmUser");
+        for cloud in [
+            "OneDrive",
+            "OneDrive - Business",
+            "Dropbox",
+            "iCloudDrive",
+            "Box",
+            "Nextcloud",
+            "Proton Drive",
+            "pCloud Drive",
+        ] {
+            std::fs::create_dir_all(kfm_profile.join(cloud).join("Documents")).unwrap();
+        }
+
+        let roots = IngestConfig::discover_user_document_roots_in_profiles(&[kfm_profile.clone()]);
+        assert!(
+            roots.is_empty(),
+            "Profile lacking standard subfolders must NOT fall back to profile root containing cloud folders: {:?}",
+            roots
+        );
+
+        let local_docs = kfm_profile.join("Documents");
+        std::fs::create_dir_all(&local_docs).unwrap();
+        let roots_with_docs = IngestConfig::discover_user_document_roots_in_profiles(&[kfm_profile]);
+        assert_eq!(roots_with_docs, vec![local_docs]);
     }
 }
 

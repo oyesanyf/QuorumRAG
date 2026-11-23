@@ -379,6 +379,89 @@ fn run_default_desktop_launcher() -> i32 {
     0
 }
 
+fn send_cloud_drive_relay_registration(port: u16) -> bool {
+    let is_test_override = env::var("QUORUM_CLOUD_TEST_PROFILE_DIR")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if is_test_override {
+        return false;
+    }
+
+    #[cfg(windows)]
+    let (session_id, drives_json): (Option<u32>, Vec<serde_json::Value>) = {
+        let sid = win_native::current_session_id();
+        let hints = win_native::probe_current_user_virtual_drives();
+        let items = hints
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "id": h.provider_id,
+                    "provider": h.provider_id,
+                    "root_path": h.root_path,
+                    "virtual_drive": true,
+                    "readable": true
+                })
+            })
+            .collect();
+        (sid, items)
+    };
+    #[cfg(not(windows))]
+    let (session_id, drives_json): (Option<u32>, Vec<serde_json::Value>) = (None, Vec::new());
+
+    let body = serde_json::json!({
+        "session_id": session_id,
+        "drives": drives_json,
+    })
+    .to_string();
+
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let timeout = Duration::from_secs(2);
+    let mut stream = match TcpStream::connect_timeout(&addr, timeout) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let req = format!(
+        "POST /api/cloud-drives/relay/register HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+
+    let mut buf = [0u8; 256];
+    match stream.read(&mut buf) {
+        Ok(n) if n >= 12 => {
+            let head = String::from_utf8_lossy(&buf[..n]);
+            head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+        }
+        _ => false,
+    }
+}
+
+fn run_cloud_drive_relay(args: &[String]) -> i32 {
+    let port = parse_u16_flag(args, "--port", default_http_port());
+    let interval_secs = parse_u64_flag(args, "--interval-secs", 15).max(5);
+    let once = args.iter().any(|a| a == "--once");
+
+    if once {
+        return if send_cloud_drive_relay_registration(port) {
+            0
+        } else {
+            1
+        };
+    }
+
+    loop {
+        let _ = send_cloud_drive_relay_registration(port);
+        std::thread::sleep(Duration::from_secs(interval_secs));
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -475,6 +558,9 @@ fn main() {
                 let _ = remove_quorum_data_dir_safe(&target);
             }
             std::process::exit(0);
+        }
+        "--cloud-drive-relay" => {
+            std::process::exit(run_cloud_drive_relay(&args));
         }
         _ => {
             // Forward explicit CLI flags directly to `quorumrag` without console window allocation.

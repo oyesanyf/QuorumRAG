@@ -303,26 +303,630 @@ pub fn parse_structured_response(raw: &str) -> Option<StructuredSynthesisRespons
     None
 }
 
-/// Repairs unbalanced Markdown `**` bold delimiters line-by-line so a stray `**` from an
-/// extracted document chunk never bleeds bold styling across paragraphs or citations (`[6]**`).
+/// Returns the JSON Schema for a single multi-pass cluster batch (`StructuredDomainSection`),
+/// inlined under Draft-07 so Ollama's GBNF grammar decoder constrains multi-pass cluster batches too.
+pub fn ollama_batch_section_json_schema() -> serde_json::Value {
+    static BATCH_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+    BATCH_SCHEMA
+        .get_or_init(|| {
+            let settings = schemars::gen::SchemaSettings::draft07().with(|s| {
+                s.inline_subschemas = true;
+            });
+            let generator = settings.into_generator();
+            let root = generator.into_root_schema_for::<StructuredDomainSection>();
+            serde_json::to_value(&root).unwrap_or_else(|_| serde_json::json!("json"))
+        })
+        .clone()
+}
+
+/// Parses raw Ollama structured output for a single multi-pass cluster batch into `StructuredDomainSection`.
+pub fn parse_structured_batch_section(raw: &str) -> Option<StructuredDomainSection> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = if let Some(rest) = trimmed.strip_prefix("```json") {
+        rest.trim().trim_end_matches("```").trim()
+    } else if let Some(rest) = trimmed.strip_prefix("```") {
+        rest.trim().trim_end_matches("```").trim()
+    } else {
+        trimmed
+    };
+    if let Ok(parsed) = serde_json::from_str::<StructuredDomainSection>(candidate) {
+        if !parsed.narrative_paragraphs.is_empty() || !parsed.key_facts.is_empty() {
+            return Some(parsed);
+        }
+    }
+    if let (Some(start), Some(end)) = (candidate.find('{'), candidate.rfind('}')) {
+        if end > start {
+            if let Ok(parsed) =
+                serde_json::from_str::<StructuredDomainSection>(&candidate[start..=end])
+            {
+                if !parsed.narrative_paragraphs.is_empty() || !parsed.key_facts.is_empty() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Renders a validated `StructuredDomainSection` batch into clean Markdown prose + structured key facts
+/// (without repeating the cluster `###` heading, which the multi-pass coordinator emits once per cluster).
+pub fn render_structured_batch_markdown(sec: &StructuredDomainSection, max_cite: usize) -> String {
+    let mut md = String::new();
+    if !sec.key_facts.is_empty() {
+        for fact in &sec.key_facts {
+            let cat = fact.category.trim();
+            let det = balance_markdown_emphasis(&clean_truncated_word_stubs(
+                &strip_extraction_field_artifacts(fact.detail.trim()),
+            ));
+            if cat.is_empty() || det.is_empty() {
+                continue;
+            }
+            let valid_cites: Vec<String> = fact
+                .citations
+                .iter()
+                .copied()
+                .filter(|&n| n >= 1 && n <= max_cite)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|n| format!("[{n}]"))
+                .collect();
+            if valid_cites.is_empty() {
+                md.push_str(&format!("- **{}:** {}\n", cat, det));
+            } else {
+                md.push_str(&format!("- **{}:** {} {}\n", cat, det, valid_cites.join(", ")));
+            }
+        }
+        md.push('\n');
+    }
+    for para in &sec.narrative_paragraphs {
+        let clean_p = clean_truncated_word_stubs(&demote_retrieved_headings_and_orphan_quotes(
+            &expand_inline_bullet_runs(&balance_markdown_emphasis(
+                &strip_extraction_field_artifacts(para.trim()),
+            )),
+        ));
+        if !clean_p.is_empty() {
+            md.push_str(&clean_p);
+            md.push_str("\n\n");
+        }
+    }
+    md.trim().to_string()
+}
+
+/// Renders a collapsible `<details>` Verified Document Excerpts drawer preserving 100% of
+/// cleaned source text across all referenced documents without cluttering top-level prose.
+pub fn render_verified_excerpts_drawer(docs: &[(usize, &ScoredChunk)]) -> String {
+    if docs.is_empty() {
+        return String::new();
+    }
+    let mut md = format!(
+        "<details>\n<summary>Verified Document Excerpts ({} sources)</summary>\n\n",
+        docs.len()
+    );
+    let mut emitted = 0usize;
+    for &(cite_num, sc) in docs {
+        let doc_name = sc
+            .chunk
+            .file_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&sc.chunk.file_path);
+        let cleaned = demote_retrieved_headings_and_orphan_quotes(&expand_inline_bullet_runs(
+            &balance_markdown_emphasis(&heal_leading_fragment(&strip_chatgpt_export_chatter(
+                &strip_extraction_field_artifacts(
+                    &crate::offline_engine::DeterministicOfflineSynthesisEngine::clean_chunk_text(
+                        &sc.chunk.text_content,
+                    ),
+                ),
+            ))),
+        ));
+        if cleaned.trim().is_empty() {
+            continue;
+        }
+        md.push_str(&format!(
+            "#### [{}] `{}`\n\n{}\n\n",
+            cite_num,
+            doc_name,
+            cleaned.trim()
+        ));
+        emitted += 1;
+    }
+    if emitted == 0 {
+        return String::new();
+    }
+    md.push_str("</details>\n");
+    md
+}
+
+/// Repairs unbalanced Markdown `**` bold AND single `*` italic delimiters line-by-line so stray
+/// asterisks from extracted chunks (`company board**`, `[6]**`, `*ordina [6].`) never bleed styling.
 pub fn balance_markdown_emphasis(input: &str) -> String {
     let mut out_lines: Vec<String> = Vec::new();
     for line in input.lines() {
         let mut s = line.to_string();
-        // Remove malformed trailing `**` immediately attached to citations like `[6]**` when unmatched
+        // 1. Collapse accidental empty `****` artifacts
+        while s.contains("****") {
+            s = s.replace("****", "");
+        }
+        // 2. Balance `**` bold delimiters
         let bold_count = s.matches("**").count();
         if bold_count % 2 != 0 {
             if let Some(pos) = s.rfind("**") {
                 s.replace_range(pos..pos + 2, "");
             }
         }
-        // Also collapse accidental empty `****` artifacts
-        while s.contains("****") {
-            s = s.replace("****", "");
+        // 3. Balance unmatched single `*` italic delimiters (skipping leading `* ` bullet markers and `**` pairs)
+        let bytes = s.as_bytes();
+        let leading_ws = bytes.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+        let bullet_star = bytes.get(leading_ws) == Some(&b'*')
+            && bytes.get(leading_ws + 1) == Some(&b' ');
+        let mut single_star_positions: Vec<usize> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'*' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    i += 2;
+                    continue;
+                }
+                if bullet_star && i == leading_ws {
+                    i += 1;
+                    continue;
+                }
+                // Ignore literal math/wildcard `*:*` or `a * b`
+                let prev_space = i == 0 || bytes[i - 1].is_ascii_whitespace();
+                let next_space = i + 1 >= bytes.len() || bytes[i + 1].is_ascii_whitespace();
+                let is_wild = (i > 0 && bytes[i - 1] == b':') || (i + 1 < bytes.len() && bytes[i + 1] == b':');
+                if !(prev_space && next_space) && !is_wild {
+                    single_star_positions.push(i);
+                }
+            }
+            i += 1;
+        }
+        if single_star_positions.len() % 2 != 0 {
+            if let Some(&pos) = single_star_positions.last() {
+                s.remove(pos);
+            }
         }
         out_lines.push(s);
     }
     out_lines.join("\n")
+}
+
+/// Expands collapsed inline bullet runs inside a single paragraph line (e.g.
+/// `...sexual exploitation. - Abolition and women's rights — ... - Racism within...`)
+/// into proper newline-separated Markdown list items so each theme renders as its own `<li>`.
+pub fn expand_inline_bullet_runs(input: &str) -> String {
+    static INLINE_DASH_BULLET_RE: OnceLock<Regex> = OnceLock::new();
+    // Matches `. - <Capitalized>` / `: - <Capitalized>` / `; - <Capitalized>` / `— - <Capitalized>`
+    // or repeated ` - <Title> —` sequences outside table rows and code blocks.
+    let re_inline = INLINE_DASH_BULLET_RE.get_or_init(|| {
+        Regex::new(r#"([.!?:;”"\)])\s+-\s+([A-Z“"])"#).expect("valid inline bullet regex")
+    });
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if in_fence || trimmed.starts_with('|') || trimmed.starts_with('#') || trimmed.starts_with('<') {
+            out_lines.push(line.to_string());
+            continue;
+        }
+        // Only split when a line clearly contains >= 2 inline ` - <Topic>` markers OR
+        // already starts as a bullet/intro line with an embedded `. - <Capitalized>` continuation.
+        let match_count = re_inline.find_iter(line).count();
+        let starts_as_bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
+        let has_colon_list_lead = trimmed.contains(": - ");
+        if match_count >= 2 || (match_count >= 1 && (starts_as_bullet || has_colon_list_lead)) {
+            let expanded = re_inline.replace_all(line, "$1\n- $2");
+            // Ensure leading theme before first split is also bulleted if it uses em-dash topic style (`Topic — ...`)
+            let expanded_str = expanded.into_owned();
+            if !starts_as_bullet && expanded_str.contains("\n- ") {
+                if let Some(first_nl) = expanded_str.find('\n') {
+                    let first_part = expanded_str[..first_nl].trim();
+                    if first_part.contains(" — ") && !first_part.ends_with(':') {
+                        out_lines.push(format!("- {}{}", first_part, &expanded_str[first_nl..]));
+                        continue;
+                    }
+                }
+            }
+            out_lines.push(expanded_str);
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    out_lines.join("\n")
+}
+
+/// Demotes false conversational headings (`### And your "big sister" instinct? ...`) and unwraps
+/// orphaned short blockquotes (`> Join Rev.`) inherited from retrieved chats/documents, while
+/// preserving canonical QuorumRAG section headings and substantive blockquotes verbatim.
+pub fn demote_retrieved_headings_and_orphan_quotes(input: &str) -> String {
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if in_fence {
+            out_lines.push(line.to_string());
+            continue;
+        }
+        // Check headings `# `..`#### ` (never demote canonical `#### [N] `file`` drawer items or clean short titles)
+        if let Some(rest) = trimmed
+            .strip_prefix("#### ")
+            .or_else(|| trimmed.strip_prefix("### "))
+            .or_else(|| trimmed.strip_prefix("## "))
+            .or_else(|| trimmed.strip_prefix("# "))
+        {
+            let rest_trim = rest.trim();
+            let rest_low = rest_trim.to_ascii_lowercase();
+            let is_drawer_doc_heading = rest_trim.starts_with('[') && rest_trim.contains('`');
+            let is_conversational = !is_drawer_doc_heading
+                && (rest_trim.contains('?')
+                    || rest_trim.len() > 82
+                    || rest_low.starts_with("and your ")
+                    || rest_low.starts_with("but ")
+                    || rest_low.starts_with("so ")
+                    || rest_low.starts_with("you wrote")
+                    || rest_low.starts_with("what if ")
+                    || rest_low.starts_with("i ")
+                    || rest_low.starts_with("we "));
+            if is_conversational {
+                out_lines.push(rest_trim.to_string());
+                continue;
+            }
+        }
+        // Unwrap orphaned tiny blockquotes (`> Join Rev.` with < 5 words)
+        if let Some(qrest) = trimmed.strip_prefix("> ") {
+            let qtrim = qrest.trim();
+            if qtrim.split_whitespace().count() < 5 && !qtrim.starts_with("**Notice**") {
+                out_lines.push(qtrim.to_string());
+                continue;
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+    out_lines.join("\n")
+}
+
+/// Removes mid-word truncation stubs (`al...`, `rev...`, `visibil...`, `n...`), broken micro-bullets
+/// (`- A v`), and orphan single-letter citation stubs (`s [1]`, `t [2]`) while keeping intact prose.
+pub fn clean_truncated_word_stubs(input: &str) -> String {
+    static MIDWORD_ELLIPSIS_RE: OnceLock<Regex> = OnceLock::new();
+    static ORPHAN_LETTER_CITE_RE: OnceLock<Regex> = OnceLock::new();
+    static CITE_SPACE_PUNCT_RE: OnceLock<Regex> = OnceLock::new();
+
+    // Matches a short dangling truncated stem ending in `...` at end of line/sentence (e.g. `will n...`, `been rev...`, `visibil...`)
+    let re_midword = MIDWORD_ELLIPSIS_RE.get_or_init(|| {
+        Regex::new(r"(?m)(?:\s+\b[A-Za-z]{1,9})\.{3}(?:\s*)$").expect("valid midword ellipsis regex")
+    });
+    // Matches a lone broken letter + citation stub at start of line or after sentence end (e.g. `s [1]. `, `t [2] `)
+    let re_orphan_letter = ORPHAN_LETTER_CITE_RE.get_or_init(|| {
+        Regex::new(r"(?m)(^|[.!?]\s+)(?:[-*•]\s+)?[a-zA-Z]\s+\*{0,2}\[\d+\]\*{0,2}\.?\s*")
+            .expect("valid orphan letter cite regex")
+    });
+    // Removes stray space between citation bracket and trailing punctuation (`[1] .` -> `[1].`)
+    let re_cite_space_punct = CITE_SPACE_PUNCT_RE.get_or_init(|| {
+        Regex::new(r"(\*{0,2}\[\d+\]\*{0,2}) +([.,;:])").expect("valid cite punct regex")
+    });
+
+    let mut cleaned_lines: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            cleaned_lines.push(line.to_string());
+            continue;
+        }
+        if in_fence || trimmed.starts_with('|') {
+            cleaned_lines.push(line.to_string());
+            continue;
+        }
+        // Drop broken micro-bullet lines with <= 3 alphabetic chars total (e.g. `- A v`, `* a`)
+        if let Some(brest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("• "))
+        {
+            let alpha_cnt = brest.chars().filter(|c| c.is_alphabetic()).count();
+            if alpha_cnt <= 3 && !brest.contains('[') {
+                continue;
+            }
+        }
+        let s1 = re_midword.replace_all(line, ".");
+        let s2 = re_orphan_letter.replace_all(&s1, "$1");
+        let s3 = re_cite_space_punct.replace_all(&s2, "$1$2");
+        cleaned_lines.push(s3.into_owned());
+    }
+    cleaned_lines.join("\n")
+}
+
+/// Structural AST verification report produced by `pulldown-cmark` (CommonMark + GFM).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GfmAstReport {
+    pub table_count: usize,
+    pub mismatched_table_rows: usize,
+    pub heading_count: usize,
+    pub list_count: usize,
+    pub unsafe_raw_html_tags: Vec<String>,
+    pub unbalanced_details_tags: bool,
+    pub stray_literal_bold_markers: usize,
+}
+
+impl GfmAstReport {
+    pub fn is_clean(&self) -> bool {
+        self.mismatched_table_rows == 0
+            && self.unsafe_raw_html_tags.is_empty()
+            && !self.unbalanced_details_tags
+            && self.stray_literal_bold_markers == 0
+    }
+}
+
+fn is_allowlisted_markdown_html_tag(raw: &str) -> bool {
+    let norm = raw.trim().to_ascii_lowercase();
+    norm == "<details>"
+        || norm == "<details open>"
+        || norm == "</details>"
+        || norm == "<summary>"
+        || norm == "</summary>"
+        || (norm.starts_with("<summary>") && norm.ends_with("</summary>"))
+        || norm == "<br>"
+        || norm == "<br/>"
+        || norm == "<br />"
+}
+
+fn is_dangerous_html_tag(raw: &str) -> bool {
+    let low = raw.trim().to_ascii_lowercase();
+    low.starts_with("<script")
+        || low.starts_with("</script")
+        || low.starts_with("<iframe")
+        || low.starts_with("</iframe")
+        || low.starts_with("<object")
+        || low.starts_with("</object")
+        || low.starts_with("<embed")
+        || low.starts_with("<style")
+        || low.starts_with("</style")
+}
+
+/// Parses Markdown with `pulldown-cmark` (CommonMark + GFM tables/strikethrough/tasklists) to
+/// verify table column consistency, detect unescaped non-allowlisted HTML tags (`<unknown process>`,
+/// `<script>`), check `<details>` balance, and flag stray literal `**` markers in text nodes.
+pub fn validate_gfm_ast(markdown: &str) -> GfmAstReport {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS;
+    let parser = Parser::new_ext(markdown, opts);
+
+    let mut table_count = 0usize;
+    let mut mismatched_table_rows = 0usize;
+    let mut heading_count = 0usize;
+    let mut list_count = 0usize;
+    let mut unsafe_raw_html_tags: Vec<String> = Vec::new();
+    let mut stray_literal_bold_markers = 0usize;
+
+    let mut expected_cols: Option<usize> = None;
+    let mut current_row_cols = 0usize;
+    let mut in_table_head = false;
+    let mut details_balance: isize = 0;
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::Table(aligns)) => {
+                table_count += 1;
+                expected_cols = Some(aligns.len());
+            }
+            Event::End(TagEnd::Table) => {
+                expected_cols = None;
+            }
+            Event::Start(Tag::TableHead) => {
+                in_table_head = true;
+                current_row_cols = 0;
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(exp) = expected_cols {
+                    if current_row_cols != exp {
+                        mismatched_table_rows += 1;
+                    }
+                }
+                in_table_head = false;
+            }
+            Event::Start(Tag::TableRow) => {
+                current_row_cols = 0;
+            }
+            Event::End(TagEnd::TableRow) => {
+                if !in_table_head {
+                    if let Some(exp) = expected_cols {
+                        if current_row_cols != exp {
+                            mismatched_table_rows += 1;
+                        }
+                    }
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                current_row_cols += 1;
+            }
+            Event::Start(Tag::Heading { .. }) => {
+                heading_count += 1;
+            }
+            Event::Start(Tag::List(_)) => {
+                list_count += 1;
+            }
+            Event::Html(raw) | Event::InlineHtml(raw) => {
+                let s = raw.trim();
+                let low = s.to_ascii_lowercase();
+                if low.starts_with("<details") {
+                    details_balance += 1;
+                } else if low.starts_with("</details") {
+                    details_balance -= 1;
+                }
+                for segment in s.lines() {
+                    let seg = segment.trim();
+                    if seg.is_empty() {
+                        continue;
+                    }
+                    if !is_allowlisted_markdown_html_tag(seg) {
+                        // Allow `<summary>...</summary>` block lines with inner text
+                        let seg_low = seg.to_ascii_lowercase();
+                        if seg_low.starts_with("<summary>") && seg_low.ends_with("</summary>") {
+                            continue;
+                        }
+                        if seg.starts_with('<') && seg.ends_with('>') {
+                            unsafe_raw_html_tags.push(seg.to_string());
+                        }
+                    }
+                }
+            }
+            Event::Text(txt) => {
+                if txt.contains("**") {
+                    stray_literal_bold_markers += txt.matches("**").count();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    GfmAstReport {
+        table_count,
+        mismatched_table_rows,
+        heading_count,
+        list_count,
+        unsafe_raw_html_tags,
+        unbalanced_details_tags: details_balance != 0,
+        stray_literal_bold_markers,
+    }
+}
+
+/// Uses `pulldown-cmark` AST byte offsets to neutralize raw non-allowlisted inline HTML / angle-bracket
+/// tokens (e.g., Sysmon `<unknown process>`, `<SYSTEM>`, `<script>`) while preserving allowlisted
+/// `<details>` / `<summary>` drawers and avoiding double-escaping in frontend HTML renderers.
+pub fn sanitize_raw_markdown_html_tags(markdown: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser};
+
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS;
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    for (event, range) in Parser::new_ext(markdown, opts).into_offset_iter() {
+        if let Event::InlineHtml(raw) | Event::Html(raw) = event {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || is_allowlisted_markdown_html_tag(trimmed) {
+                continue;
+            }
+            let low = trimmed.to_ascii_lowercase();
+            if low.starts_with("<details")
+                || low.starts_with("</details")
+                || low.starts_with("<summary")
+                || low.starts_with("</summary")
+            {
+                continue;
+            }
+            if is_dangerous_html_tag(trimmed) {
+                replacements.push((range.start, range.end, String::new()));
+            } else if trimmed.starts_with('<') && trimmed.ends_with('>') && !trimmed.contains('\n') {
+                // Wrap literal OS/log tokens like `<unknown process>` in inline code spans so both
+                // CommonMark/GFM parsers and the WebUI render them visibly without swallowing tags.
+                let safe_code = format!("`{}`", trimmed.replace('`', ""));
+                replacements.push((range.start, range.end, safe_code));
+            }
+        }
+    }
+
+    if replacements.is_empty() {
+        return markdown.to_string();
+    }
+
+    // Apply non-overlapping replacements from back to front so byte ranges stay exact
+    replacements.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = markdown.to_string();
+    let mut last_start = usize::MAX;
+    for (start, end, repl) in replacements {
+        if end <= last_start && start <= end && end <= out.len() && out.is_char_boundary(start) && out.is_char_boundary(end) {
+            out.replace_range(start..end, &repl);
+            last_start = start;
+        }
+    }
+    out
+}
+
+/// Renders Markdown to sanitized HTML natively in Rust via `pulldown-cmark` (CommonMark + GFM),
+/// allowing `<details>`/`<summary>` while HTML-escaping any other raw angle-bracket tags.
+pub fn render_safe_gfm_html(markdown: &str) -> String {
+    use pulldown_cmark::{html, CowStr, Event, Options, Parser};
+
+    let sanitized_md = sanitize_raw_markdown_html_tags(markdown);
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS;
+    let mapped = Parser::new_ext(&sanitized_md, opts).map(|ev| match ev {
+        Event::Html(raw) | Event::InlineHtml(raw) => {
+            let trimmed = raw.trim();
+            if is_allowlisted_markdown_html_tag(trimmed)
+                || trimmed.to_ascii_lowercase().starts_with("<details")
+                || trimmed.to_ascii_lowercase().starts_with("</details")
+                || trimmed.to_ascii_lowercase().starts_with("<summary")
+                || trimmed.to_ascii_lowercase().starts_with("</summary")
+            {
+                Event::Html(raw)
+            } else {
+                let escaped = raw
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                Event::Text(CowStr::Boxed(escaped.into_boxed_str()))
+            }
+        }
+        other => other,
+    });
+    let mut html_out = String::with_capacity(sanitized_md.len() + 128);
+    html::push_html(&mut html_out, mapped);
+    html_out
+}
+
+/// Sanitizes summary text placed inside a Markdown GFM table cell so raw `---`, inline `- ` bullets,
+/// heading hashes (`###`), stray `*`/`**`, and mid-word truncation stubs never corrupt table layout.
+pub fn sanitize_table_cell_text(raw: &str) -> String {
+    static HR_RE: OnceLock<Regex> = OnceLock::new();
+    static CELL_BULLET_RE: OnceLock<Regex> = OnceLock::new();
+    static CELL_HASH_RE: OnceLock<Regex> = OnceLock::new();
+    static CELL_TRUNC_RE: OnceLock<Regex> = OnceLock::new();
+
+    let hr_re = HR_RE.get_or_init(|| Regex::new(r"(?:^|\s)[-*_]{3,}(?:\s|$)").expect("hr regex"));
+    let bullet_re = CELL_BULLET_RE
+        .get_or_init(|| Regex::new(r"(?:^|[\s.!?:;])-\s+").expect("cell bullet regex"));
+    let hash_re = CELL_HASH_RE.get_or_init(|| Regex::new(r"(?:^|\s)#{1,6}\s+").expect("hash regex"));
+    let trunc_re =
+        CELL_TRUNC_RE.get_or_init(|| Regex::new(r"\s+\b[A-Za-z]{1,9}\.{3}$").expect("trunc regex"));
+
+    let base = strip_extraction_field_artifacts(raw)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let s1 = hr_re.replace_all(&base, " ");
+    let s2 = hash_re.replace_all(&s1, " ");
+    let s3 = bullet_re.replace_all(&s2, "; ");
+    let s4 = balance_markdown_emphasis(&s3);
+    let s5 = trunc_re.replace_all(s4.trim(), ".");
+    s5.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_start_matches([';', '-', '—', ' '])
+        .replace('|', "\\|")
 }
 
 /// Strips raw Word/ODT `HYPERLINK "..."` field codes, `MERGEFORMAT` instructions, and decorative
@@ -472,13 +1076,7 @@ pub fn heal_leading_fragment(input: &str) -> String {
 
 /// Escapes Markdown table cell values and prevents empty cells.
 fn clean_table_cell(raw: &str, fallback: &str) -> String {
-    let cleaned = balance_markdown_emphasis(&strip_extraction_field_artifacts(raw))
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace('|', "\\|");
+    let cleaned = sanitize_table_cell_text(raw);
     if cleaned.trim().is_empty() {
         fallback.to_string()
     } else {
@@ -589,6 +1187,42 @@ pub fn render_structured_response_markdown(
                 };
                 table_rows.push((row.ref_num, doc_name, origin, summary));
             }
+        }
+    }
+
+    // Backfill any retrieved source [1..=docs.len()] omitted by the LLM so the summary matrix is 100% complete
+    for (idx, sc) in docs.iter().enumerate() {
+        let ref_num = idx + 1;
+        if seen_table_refs.insert(ref_num) {
+            let doc_name = sc
+                .chunk
+                .file_path
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&sc.chunk.file_path)
+                .to_string();
+            let origin = if sc.is_remote
+                && !sc.source_peer.is_empty()
+                && !sc.source_peer.eq_ignore_ascii_case("local")
+            {
+                let short_p: String = sc.source_peer.chars().take(12).collect();
+                format!("Mesh Peer (`{}`)", short_p)
+            } else {
+                "Local Host".to_string()
+            };
+            let cleaned_body = crate::offline_engine::DeterministicOfflineSynthesisEngine::clean_chunk_text(
+                &sc.chunk.text_content,
+            );
+            let snippet: String = sanitize_table_cell_text(&cleaned_body)
+                .chars()
+                .take(180)
+                .collect();
+            let summary = if snippet.trim().is_empty() {
+                "Grounded source record".to_string()
+            } else {
+                snippet
+            };
+            table_rows.push((ref_num, doc_name, origin, summary));
         }
     }
 
@@ -760,5 +1394,64 @@ mod tests {
             balance_markdown_emphasis(unbalanced),
             "Proposal to form an official company board within six months."
         );
+        // Single unmatched `*` (e.g. `*ordina [6].`) must also be stripped without touching bullet `* item`
+        assert_eq!(balance_markdown_emphasis("Fragment *ordina [6]."), "Fragment ordina [6].");
+        assert_eq!(balance_markdown_emphasis("* Valid bullet item"), "* Valid bullet item");
+    }
+
+    #[test]
+    fn test_phase1_inline_bullets_table_sanitization_headings_and_stubs() {
+        let collapsed = "Slavery and Black womanhood — endured exploitation. - Abolition and women's rights — Sojourner Truth. - Racism within suffrage — marginalized Black women.";
+        let expanded = expand_inline_bullet_runs(collapsed);
+        assert_eq!(
+            expanded.lines().filter(|l| l.starts_with("- ")).count(),
+            3,
+            "Collapsed inline bullets must expand into 3 separate Markdown list items:\n{expanded}"
+        );
+
+        let noisy_cell = "profitability. --- - Proposal to **form an official company board** within six months. been rev...";
+        let clean_cell = sanitize_table_cell_text(noisy_cell);
+        assert!(!clean_cell.contains("---"), "Table cell must strip ---: {clean_cell}");
+        assert!(!clean_cell.contains(" - "), "Table cell must strip inline bullets: {clean_cell}");
+        assert!(!clean_cell.contains("rev..."), "Table cell must strip mid-word ellipsis: {clean_cell}");
+
+        let bad_headings = "### Academic Scholarship, Published Works & Critical Theory\n#### And your “big sister” instinct? That’s actually right.\n> Join Rev.\n> The struggles against racism, sexism, and economic exploitation are interconnected across history.";
+        let fixed_h = demote_retrieved_headings_and_orphan_quotes(bad_headings);
+        assert!(fixed_h.contains("### Academic Scholarship, Published Works & Critical Theory"));
+        assert!(!fixed_h.contains("#### And your"));
+        assert!(fixed_h.contains("And your “big sister” instinct?"));
+        assert!(!fixed_h.contains("> Join Rev."));
+        assert!(fixed_h.contains("> The struggles against racism"));
+
+        let stubby = "United States [1] .\n- A v\nYou wrote that Darin Jr. will n...\ns [1]. Real sentence follows [2] .";
+        let clean_stub = clean_truncated_word_stubs(stubby);
+        assert!(clean_stub.contains("United States [1]."), "Must remove space before period: {clean_stub}");
+        assert!(!clean_stub.contains("- A v"), "Must drop micro-bullet stub: {clean_stub}");
+        assert!(!clean_stub.contains("n..."), "Must clean mid-word trailing ellipsis: {clean_stub}");
+        assert!(!clean_stub.contains("\ns [1]."), "Must clean orphan letter before cite: {clean_stub}");
+        assert!(clean_stub.contains("\nReal sentence follows [2]."), "Must preserve following real sentence cleanly: {clean_stub}");
+    }
+
+    #[test]
+    fn test_pulldown_cmark_ast_validation_and_raw_angle_tag_sanitization() {
+        let raw_sysmon = "### Forensic DNS Event\n\nProcess <unknown process> queried `api.example.com` [1].\n<script>alert(1)</script>\n\n| Ref | Process |\n|---|---|\n| **[1]** | `<unknown process>` |\n\n<details>\n<summary>Verified Document Excerpts (1 sources)</summary>\n\nRecord body.\n\n</details>\n";
+        let sanitized = sanitize_raw_markdown_html_tags(raw_sysmon);
+        assert!(
+            sanitized.contains("`<unknown process>`"),
+            "Raw <unknown process> must be wrapped as inline code: {sanitized}"
+        );
+        assert!(!sanitized.contains("<script>"), "Dangerous script tags must be stripped: {sanitized}");
+        assert!(sanitized.contains("<details>"), "Allowlisted <details> must remain intact");
+
+        let ast = validate_gfm_ast(&sanitized);
+        assert_eq!(ast.table_count, 1);
+        assert_eq!(ast.mismatched_table_rows, 0);
+        assert!(!ast.unbalanced_details_tags);
+        assert!(ast.is_clean(), "Sanitized GFM must pass pulldown-cmark AST check: {:?}", ast);
+
+        let html = render_safe_gfm_html(raw_sysmon);
+        assert!(html.contains("<table>"), "Must render real GFM HTML table: {html}");
+        assert!(html.contains("<code>&lt;unknown process&gt;</code>"), "Must render escaped process token: {html}");
+        assert!(!html.contains("<script>"), "Must never emit raw script tag in HTML: {html}");
     }
 }

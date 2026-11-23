@@ -25,6 +25,7 @@ zeroize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { version = "0.8", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
 

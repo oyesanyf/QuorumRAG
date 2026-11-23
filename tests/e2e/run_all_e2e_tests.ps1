@@ -13,7 +13,12 @@ $targets = @(
     "test_web_endpoints",
     "test_cross_feature_combinations",
     "test_real_world_scenarios",
-    "test_artemis_dfir"
+    "test_artemis_dfir",
+    "test_cloud_drives_tier1_discovery",
+    "test_cloud_drives_tier1_pipeline_api_ui",
+    "test_cloud_drives_tier2_boundaries",
+    "test_cloud_drives_tier3_4_e2e",
+    "test_cloud_drives_tier5_adversarial"
 )
 
 $totalPassed = 0

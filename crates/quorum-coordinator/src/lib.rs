@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod adaptive_rag;
 pub mod agentic;
 pub mod answer_orchestrator;
 pub mod artemis_airgap;
@@ -18,13 +19,16 @@ pub mod mesh;
 pub mod model_router;
 pub mod nimble_client;
 pub mod offline_engine;
+pub mod rag_eval;
 pub mod relevance_attestor;
+pub mod reranker;
 pub mod response_formatter_watchdog;
 pub mod rlm_orchestrator;
 pub mod scatter_gather;
 pub mod structured_output;
 pub mod telemetry;
 pub mod tpm;
+pub mod typed_extractor;
 pub mod types;
 pub mod dfir_consensus;
 pub mod vision;
@@ -96,15 +100,33 @@ pub use marketplace_engine::{
 
 pub use bounty_runner::{BountyMatchResult, BountyRunner};
 pub use artemis_airgap::{
-    contains_artemis_query, default_allowed_categories, is_airgap_restricted_chunk,
-    is_airgap_restricted_chunk_dto, is_artemis_uri, is_forensics_enabled,
-    percent_decode_ascii_lossy, prohibited_categories, ArtemisDfirSettings,
+    contains_artemis_query, default_allowed_categories, has_cloud_drive_metadata,
+    is_airgap_restricted_chunk, is_airgap_restricted_chunk_dto, is_artemis_dfir_chunk,
+    is_artemis_uri, is_forensic_query_text, is_forensics_enabled, percent_decode_ascii_lossy,
+    prohibited_categories, resolve_local_retrieval_policy, ArtemisDfirSettings,
+    LocalRetrievalPolicy,
+};
+pub use quorum_types::{
+    CloudDriveConfigEntry, CloudDriveMountStatus, CloudDriveProvider, CloudDrivesSettings,
+    CloudPlaceholderMode, CloudPlaceholderPolicy, DlpContentGate,
 };
 pub use forensic_normalizer::{
     is_internal_private_ip, ArtifactCategoryGate, ForensicStructuralNormalizer, NormalizerPreview,
 };
 pub use offline_engine::ForensicQueryIntent;
 pub use response_formatter_watchdog::{ResponseFormatterWatchdog, WatchdogAuditReport};
+pub use adaptive_rag::{
+    build_adaptive_hyde_passage, decompose_compound_query, extract_clean_primary_subject,
+    generate_query_variants, plan_adaptive_query, AdaptiveQueryPlan, RetrievalDepth,
+};
+pub use typed_extractor::{
+    compile_json_schema_to_gbnf, generate_inlined_draft07_schema, is_loopback_endpoint,
+    LlmJudgeEvaluation, SelfRagCritique, TypedStructuredExtractor,
+};
+pub use reranker::{
+    CrossSignalReranker, NeuralRerankBackend, NeuralReranker, RerankedCandidate, RerankerConfig,
+};
+pub use rag_eval::{score_markdown_hygiene, RagEvalHarness, RagEvalReport};
 pub use dfir_consensus::{
     DfirConsensusVerdict, DfirTelemetryInput, DfirVoterReport, MultiVoterConsensusEngine,
 };

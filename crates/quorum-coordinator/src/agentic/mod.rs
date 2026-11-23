@@ -207,16 +207,16 @@ impl AgenticStateGraphRunner {
                     cache_key_query = graph_state.current_query.clone();
 
                     let epoch = engine.local_storage.index_epoch();
-                    let p2p_active = crate::dlp_mesh::global_mesh_dlp_controller()
-                        .settings
-                        .read()
-                        .map(|s| s.mesh.p2p_enabled)
-                        .unwrap_or(true)
-                        && engine.mesh_dispatcher.peer_count() > 0;
-                    let forensics_enabled = crate::artemis_airgap::is_forensics_enabled();
+                    let settings_snapshot = crate::dlp_mesh::global_mesh_dlp_controller().get_settings();
+                    let p2p_active =
+                        settings_snapshot.mesh.p2p_enabled && engine.mesh_dispatcher.peer_count() > 0;
+                    let cache_policy = crate::artemis_airgap::resolve_local_retrieval_policy(
+                        &settings_snapshot,
+                        access_tier,
+                        &[&graph_state.original_prompt, &cache_key_query],
+                    );
                     let query_targets_forensics =
-                        crate::offline_engine::ForensicQueryIntent::detect(&cache_key_query).is_some()
-                            || crate::artemis_airgap::contains_artemis_query(&cache_key_query);
+                        crate::artemis_airgap::is_forensic_query_text(&cache_key_query);
                     let maybe_cached = if is_continuation {
                         None
                     } else {
@@ -226,23 +226,33 @@ impl AgenticStateGraphRunner {
                                 &cache_key_query,
                                 graph_state.search_mode,
                                 graph_state.model_family,
-                                access_tier,
+                                cache_policy.local_access_tier,
                                 epoch,
                                 p2p_active,
                             )
                             .filter(|cached| {
                                 let resp_txt = cached.synthesized_response.as_deref().unwrap_or_default();
-                                if forensics_enabled {
+                                if cache_policy.allow_artemis_local {
                                     !resp_txt.contains("forensics subsystem is currently disabled")
                                         && !cached
                                             .synthesis_prompt
                                             .contains("forensics subsystem is currently disabled")
+                                        && cached
+                                            .chunks
+                                            .iter()
+                                            .all(|c| cache_policy.permits_local_scored_chunk(c))
                                 } else {
                                     cached.chunks.iter().all(|c| {
-                                        !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
-                                            && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
-                                    }) && (!query_targets_forensics
-                                        || resp_txt.contains("forensics subsystem is currently disabled"))
+                                        !crate::artemis_airgap::is_artemis_dfir_chunk(&c.chunk)
+                                            && cache_policy.permits_local_scored_chunk(c)
+                                    }) && !resp_txt.to_ascii_lowercase().contains("artemis://")
+                                        && !cached
+                                            .synthesis_prompt
+                                            .to_ascii_lowercase()
+                                            .contains("artemis://")
+                                        && (!query_targets_forensics
+                                            || resp_txt
+                                                .contains("forensics subsystem is currently disabled"))
                                 }
                             })
                     };
@@ -397,12 +407,15 @@ impl AgenticStateGraphRunner {
                     let effective_vec = rewritten_vector.as_deref().unwrap_or(vector);
 
                     // Launch AtlasKV 3-level HiKVP pruning concurrently off the async runtime thread
-                    let atlaskv_cfg = crate::dlp_mesh::global_mesh_dlp_controller()
-                        .settings
-                        .read()
-                        .map(|s| s.atlaskv.clone())
-                        .unwrap_or_default();
-                    let forensics_on = crate::artemis_airgap::is_forensics_enabled();
+                    let settings_snapshot =
+                        crate::dlp_mesh::global_mesh_dlp_controller().get_settings();
+                    let atlaskv_cfg = settings_snapshot.atlaskv.clone();
+                    let local_policy = crate::artemis_airgap::resolve_local_retrieval_policy(
+                        &settings_snapshot,
+                        access_tier,
+                        &[&graph_state.original_prompt, &graph_state.current_query],
+                    );
+                    let local_kv_tier = local_policy.local_access_tier;
                     let atlaskv_fut = {
                         let store_opt = engine.local_storage.atlaskv();
                         let qvec = effective_vec.to_vec();
@@ -411,7 +424,7 @@ impl AgenticStateGraphRunner {
                         async move {
                             let store = if enabled { store_opt? } else { return None };
                             tokio::task::spawn_blocking(move || {
-                                store.hikvp_search(&qvec, access_tier, leaf_k, None).ok()
+                                store.hikvp_search(&qvec, local_kv_tier, leaf_k, None).ok()
                             })
                             .await
                             .ok()
@@ -432,11 +445,7 @@ impl AgenticStateGraphRunner {
                     let latency = start.elapsed().as_millis() as u64;
 
                     if let Some((mut kg_triples, kg_trace)) = atlaskv_res {
-                        if !forensics_on {
-                            kg_triples.retain(|t| {
-                                !crate::artemis_airgap::is_artemis_uri(&t.triple.file_path)
-                            });
-                        }
+                        kg_triples.retain(|t| local_policy.permits_local_triple(&t.triple));
                         let formatted_kg = quorum_atlaskv::format_grounded_kg_context(&kg_triples);
                         let injected = kg_triples.len();
                         graph_state.atlaskv_triples = kg_triples;
@@ -559,6 +568,14 @@ impl AgenticStateGraphRunner {
                 }
 
                 AgenticStateName::SynthesizeWithCitations => {
+                    let settings_snapshot =
+                        crate::dlp_mesh::global_mesh_dlp_controller().get_settings();
+                    let synth_policy = crate::artemis_airgap::resolve_local_retrieval_policy(
+                        &settings_snapshot,
+                        access_tier,
+                        &[&graph_state.original_prompt, &graph_state.current_query],
+                    );
+
                     // Live Concurrent RLM Parent-Document Enrichment: concurrently expand local chunks
                     // into surrounding parent-document byte windows and regex-grep uncovered query terms
                     // bounded by RlmDepthAwareSemaphore over a JoinSet.
@@ -566,7 +583,7 @@ impl AgenticStateGraphRunner {
                         &graph_state.current_query,
                         &mut graph_state.retrieved_chunks,
                         Arc::clone(&engine.local_storage),
-                        access_tier,
+                        synth_policy.local_access_tier,
                         Arc::clone(&self.rlm_semaphore),
                         Some(Arc::clone(&self.rlm_slice_cache)),
                     )
@@ -675,7 +692,7 @@ impl AgenticStateGraphRunner {
                             &cache_key_query,
                             graph_state.search_mode,
                             graph_state.model_family,
-                            access_tier,
+                            synth_policy.local_access_tier,
                             epoch,
                             graph_state.retrieved_chunks.clone(),
                             crate::offline_engine::DeterministicOfflineSynthesisEngine::build_synthesis_prompt(

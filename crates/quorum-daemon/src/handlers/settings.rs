@@ -260,7 +260,8 @@ pub async fn mesh_status_handler(State(state): State<Arc<DaemonState>>) -> impl 
 
     let epoch_sig = controller.sign_epoch_token(&local_peer_id, mesh.hmac_epoch, "master_core");
     let wan_tel = crate::wan_mesh::cached_wan_telemetry();
-    let effective_targets = quorum_coordinator::mesh::collect_trusted_bootstrap_multiaddrs(&mesh, &[]);
+    let effective_targets =
+        quorum_coordinator::mesh::collect_trusted_bootstrap_multiaddrs(&mesh, &[]);
 
     Json(serde_json::json!({
         "status": "ok",
@@ -418,10 +419,16 @@ pub async fn manage_shared_folders_handler(
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<SharedFolderActionPayload>,
 ) -> impl IntoResponse {
+    let discovered = tokio::task::spawn_blocking(quorum_ingest::discover_cloud_drives)
+        .await
+        .unwrap_or_default();
     let controller = global_mesh_dlp_controller();
+    crate::handlers::cloud_drives::reconcile_discovered_cloud_drives(&controller, &discovered);
     let raw_path = payload.path.trim();
 
-    let Some(norm_target) = quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(raw_path) else {
+    let Some(norm_target) =
+        quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(raw_path)
+    else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -433,6 +440,64 @@ pub async fn manage_shared_folders_handler(
     };
 
     let action = payload.action.trim().to_ascii_lowercase();
+    let mut clean_add_path: Option<std::path::PathBuf> = None;
+
+    if action == "add" {
+        let p = Path::new(raw_path);
+        if !p.exists() || !p.is_dir() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!("Directory '{}' does not exist on disk.", raw_path)
+                })),
+            )
+                .into_response();
+        }
+        let Some(clean_p) = crate::handlers::cloud_drives::canonicalize_for_cloud_filter(p) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": "Invalid, unsafe, or non-canonical folder path."
+                })),
+            )
+                .into_response();
+        };
+        if !clean_p.exists() || !clean_p.is_dir() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!("Directory '{}' does not exist on disk.", raw_path)
+                })),
+            )
+                .into_response();
+        }
+        if crate::handlers::cloud_drives::is_user_profile_root_dir(&clean_p) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": "Cannot share a protected user profile root directory."
+                })),
+            )
+                .into_response();
+        }
+        clean_add_path = Some(clean_p);
+    }
+
+    let persisted_norm_target = clean_add_path
+        .as_ref()
+        .and_then(|cp| {
+            quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(
+                &cp.to_string_lossy(),
+            )
+        })
+        .unwrap_or_else(|| norm_target.clone());
+    let mut index_target_path = clean_add_path
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(raw_path));
     let mut should_index_target = false;
     {
         let mut guard = controller
@@ -442,22 +507,14 @@ pub async fn manage_shared_folders_handler(
 
         match action.as_str() {
             "add" => {
-                let p = Path::new(raw_path);
-                if !p.exists() || !p.is_dir() {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "status": "error",
-                            "error": format!("Directory '{}' does not exist on disk.", raw_path)
-                        })),
-                    )
-                        .into_response();
-                }
-
+                let clean_p = clean_add_path
+                    .as_ref()
+                    .expect("clean_add_path populated for add");
+                let clean_str = clean_p.to_string_lossy().to_string();
                 let existing = guard.mesh.shared_folders.iter_mut().find(|f| {
                     quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(&f.path)
                         .as_deref()
-                        == Some(norm_target.as_str())
+                        == Some(persisted_norm_target.as_str())
                 });
 
                 if let Some(entry) = existing {
@@ -467,14 +524,15 @@ pub async fn manage_shared_folders_handler(
                         entry.access_tier = tier.min(3);
                     }
                     if let Some(ref mode_str) = payload.dlp_mode_override {
-                        entry.dlp_mode_override = if mode_str.eq_ignore_ascii_case("default") || mode_str.is_empty() {
-                            None
-                        } else {
-                            Some(DlpEnforcementMode::from_str_lossy(mode_str))
-                        };
+                        entry.dlp_mode_override =
+                            if mode_str.eq_ignore_ascii_case("default") || mode_str.is_empty() {
+                                None
+                            } else {
+                                Some(DlpEnforcementMode::from_str_lossy(mode_str))
+                            };
                     }
                 } else {
-                    let default_label = p
+                    let default_label = clean_p
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or(raw_path)
@@ -489,7 +547,7 @@ pub async fn manage_shared_folders_handler(
                     let enabled = payload.enabled.unwrap_or(true);
                     should_index_target = enabled;
                     guard.mesh.shared_folders.push(SharedFolderEntry {
-                        path: raw_path.to_string(),
+                        path: clean_str,
                         label: payload.label.unwrap_or(default_label),
                         enabled,
                         access_tier: payload.access_tier.unwrap_or(0).min(3),
@@ -513,6 +571,13 @@ pub async fn manage_shared_folders_handler(
                     {
                         f.enabled = payload.enabled.unwrap_or(!f.enabled);
                         if f.enabled {
+                            if let Some(cp) =
+                                crate::handlers::cloud_drives::canonicalize_for_cloud_filter(
+                                    Path::new(&f.path),
+                                )
+                            {
+                                index_target_path = cp;
+                            }
                             should_index_target = true;
                         }
                     }
@@ -527,6 +592,13 @@ pub async fn manage_shared_folders_handler(
                         if let Some(en) = payload.enabled {
                             f.enabled = en;
                             if en {
+                                if let Some(cp) =
+                                    crate::handlers::cloud_drives::canonicalize_for_cloud_filter(
+                                        Path::new(&f.path),
+                                    )
+                                {
+                                    index_target_path = cp;
+                                }
                                 should_index_target = true;
                             }
                         }
@@ -551,9 +623,7 @@ pub async fn manage_shared_folders_handler(
 
     controller.save_to_disk();
     if should_index_target {
-        let _ = state
-            .watch_and_index_paths(vec![std::path::PathBuf::from(raw_path)])
-            .await;
+        let _ = state.watch_and_index_paths(vec![index_target_path]).await;
     }
 
     let shared_folders = controller
@@ -571,33 +641,53 @@ pub async fn manage_shared_folders_handler(
     .into_response()
 }
 
-/// Pure Rust helper that validates a single new subfolder name (no traversal, drive letters, or separators).
-fn is_safe_single_folder_name(name: &str) -> bool {
+/// Helper that validates a single new subfolder name (no traversal, drive letters, separators, trailing dots, control, or bidi chars).
+pub fn is_safe_single_folder_name(name: &str) -> bool {
+    if name.chars().any(|c| c.is_control()) {
+        return false;
+    }
     let trimmed = name.trim();
     if trimmed.is_empty()
         || trimmed == "."
         || trimmed == ".."
+        || trimmed.ends_with('.')
         || trimmed.contains(':')
         || trimmed.contains('/')
         || trimmed.contains('\\')
         || trimmed.contains('%')
         || trimmed.contains('\0')
+        || trimmed.chars().any(|c| {
+            matches!(
+                c,
+                '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+            )
+        })
     {
         return false;
     }
     let mut components = Path::new(trimmed).components();
-    matches!(components.next(), Some(std::path::Component::Normal(_))) && components.next().is_none()
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
-/// Pure Rust helper that detects non-interactive OS service/system profile directories
-/// (e.g. Windows `LocalSystem` `C:\Windows\System32` or `systemprofile`, macOS `/var/root`)
+/// Helper that detects non-interactive OS service/system profile directories
+/// (e.g. Windows `LocalSystem` `C:\Windows\System32`, `systemprofile`, `LocalService`, `NetworkService`, `Public`, macOS `/var/root`)
 /// so folder pickers and Quick Access always surface real user directories across Windows, Linux, and macOS.
-fn is_service_or_system_profile_path(path_str: &str) -> bool {
+pub fn is_service_or_system_profile_path(path_str: &str) -> bool {
     let norm = path_str.trim().replace('/', "\\").to_ascii_lowercase();
     if norm.is_empty() {
         return true;
     }
-    norm.contains("\\systemprofile")
+    let trimmed_norm = norm.trim_end_matches('\\');
+    let leaf = trimmed_norm.rsplit('\\').next().unwrap_or("");
+    let has_service_segment = trimmed_norm
+        .split('\\')
+        .any(|seg| matches!(seg, "systemprofile" | "localservice" | "networkservice"));
+    let is_public_profile = leaf == "public"
+        || trimmed_norm.contains("\\users\\public\\")
+        || trimmed_norm.ends_with("\\users\\public");
+    has_service_segment
+        || is_public_profile
         || norm.contains("\\serviceprofiles\\")
         || norm.contains("\\windows\\system32")
         || norm.contains("\\windows\\syswow64")
@@ -632,6 +722,17 @@ fn canonical_fs_compare_key(raw: &str) -> String {
 /// Discovery of real interactive user home directories across Windows (`C:\Users\*`),
 /// macOS (`/Users/*`), and Linux (`/home/*`), even when the daemon runs as `LocalSystem`, `systemd`, or `launchd`.
 fn discover_interactive_user_homes() -> Vec<std::path::PathBuf> {
+    if let Ok(test_profile) = std::env::var("QUORUM_CLOUD_TEST_PROFILE_DIR") {
+        let trimmed = test_profile.trim();
+        if !trimmed.is_empty() {
+            let candidate = Path::new(trimmed).to_path_buf();
+            if candidate.is_dir() && !is_service_or_system_profile_path(trimmed) {
+                return vec![candidate];
+            }
+            return Vec::new();
+        }
+    }
+
     let mut homes: Vec<std::path::PathBuf> = Vec::new();
     let mut push_unique = |candidate: std::path::PathBuf| {
         let s = candidate.to_string_lossy().to_string();
@@ -724,12 +825,36 @@ fn discover_interactive_user_homes() -> Vec<std::path::PathBuf> {
     homes
 }
 
-/// Pure Rust directory enumeration and folder picker engine (`std::fs::read_dir` + physical drive discovery).
+/// Directory enumeration and folder picker engine (`std::fs::read_dir` + physical drive discovery).
 /// Never spawns external OS dialogs (`powershell`, `explorer.exe`, `osascript`, or `zenity`).
 async fn pure_rust_browse_directory(
     requested_path: &str,
     create_subfolder: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let req_trimmed = requested_path.trim();
+    if !req_trimmed.is_empty() {
+        if let Err(e) = quorum_types::validate_cloud_drive_path(req_trimmed) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": e.to_string(),
+                })),
+            ));
+        }
+    }
+    if let Some(sub_name) = create_subfolder {
+        let sub_trimmed = sub_name.trim();
+        if !sub_trimmed.is_empty() && !is_safe_single_folder_name(sub_name) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": "Invalid subfolder name",
+                })),
+            ));
+        }
+    }
     let controller = global_mesh_dlp_controller();
     let shared_folders = controller
         .settings
@@ -753,7 +878,12 @@ async fn pure_rust_browse_directory(
         })
     };
 
-    let drives_raw = quorum_ingest::IngestConfig::discover_physical_drives();
+    let test_profile_override = crate::handlers::cloud_drives::is_test_profile_override_active();
+    let drives_raw = if test_profile_override {
+        Vec::new()
+    } else {
+        quorum_ingest::IngestConfig::discover_physical_drives()
+    };
     let physical_drives: Vec<String> = drives_raw
         .iter()
         .map(|d| d.to_string_lossy().to_string())
@@ -813,14 +943,15 @@ async fn pure_rust_browse_directory(
         }
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_str = cwd.to_string_lossy().to_string();
-        if cwd.is_dir() && !is_service_or_system_profile_path(&cwd_str) {
-            push_quick("Workspace".to_string(), cwd);
+    if !test_profile_override {
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_str = cwd.to_string_lossy().to_string();
+            if cwd.is_dir() && !is_service_or_system_profile_path(&cwd_str) {
+                push_quick("Workspace".to_string(), cwd);
+            }
         }
     }
 
-    let req_trimmed = requested_path.trim();
     if req_trimmed.is_empty() {
         let mut entries: Vec<serde_json::Value> = drives_raw
             .into_iter()
@@ -837,9 +968,9 @@ async fn pure_rust_browse_directory(
             .collect();
         entries.extend(quick_access.iter().cloned());
 
-        return serde_json::json!({
+        return Ok(serde_json::json!({
             "status": "ok",
-            "engine": "pure_rust_std_fs",
+            "engine": "native_std_fs",
             "path": "",
             "current_path": "",
             "parent_path": "",
@@ -847,7 +978,7 @@ async fn pure_rust_browse_directory(
             "quick_access": quick_access,
             "directories": entries,
             "cancelled": false
-        });
+        }));
     }
 
     let mut target_dir_buf = Path::new(req_trimmed).to_path_buf();
@@ -855,7 +986,7 @@ async fn pure_rust_browse_directory(
 
     if let Some(sub_name) = create_subfolder {
         let sub_trimmed = sub_name.trim();
-        if is_safe_single_folder_name(sub_trimmed) && target_dir_buf.is_dir() {
+        if is_safe_single_folder_name(sub_name) && target_dir_buf.is_dir() {
             let candidate = target_dir_buf.join(sub_trimmed);
             if std::fs::create_dir_all(&candidate).is_ok() {
                 created_folder_path = Some(candidate.to_string_lossy().to_string());
@@ -940,9 +1071,9 @@ async fn pure_rust_browse_directory(
     .await
     .unwrap_or_default();
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "status": "ok",
-        "engine": "pure_rust_std_fs",
+        "engine": "native_std_fs",
         "path": resolved_path_str,
         "current_path": resolved_path_str,
         "parent_path": parent_path,
@@ -951,20 +1082,23 @@ async fn pure_rust_browse_directory(
         "quick_access": quick_access,
         "directories": dirs,
         "cancelled": false
-    })
+    }))
 }
 
-/// GET /api/fs/browse-folders?path=... (and /api/mesh/browse-folders) - Lists real directories on physical drives and quick-access user folders in Pure Rust.
+/// GET /api/fs/browse-folders?path=... (and /api/mesh/browse-folders) - Lists real directories on physical drives and quick-access user folders.
 pub async fn browse_folders_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let requested_path = params.get("path").map(|s| s.trim()).unwrap_or("");
     let create_subfolder = params.get("create_subfolder").map(|s| s.as_str());
-    Json(pure_rust_browse_directory(requested_path, create_subfolder).await)
+    match pure_rust_browse_directory(requested_path, create_subfolder).await {
+        Ok(val) => Json(val).into_response(),
+        Err((code, body)) => (code, body).into_response(),
+    }
 }
 
-/// POST /api/fs/pick-folder - Pure Rust folder selection & directory browser endpoint.
-/// Operates 100% in Pure Rust (`std::fs`) without spawning Windows Explorer or OS shell subprocesses.
+/// POST /api/fs/pick-folder - Native folder selection & directory browser endpoint.
+/// Operates directly via `std::fs` without spawning Windows Explorer or OS shell subprocesses.
 pub async fn pick_folder_dialog_handler(
     Query(params): Query<HashMap<String, String>>,
     body: Option<Json<serde_json::Value>>,
@@ -1001,14 +1135,17 @@ pub async fn pick_folder_dialog_handler(
             .filter(|p| p.is_dir() && !is_service_or_system_profile_path(&p.to_string_lossy()))
             .map(|p| p.to_string_lossy().to_string())
             .or_else(|| {
-                discover_interactive_user_homes().into_iter().next().map(|h| {
-                    let docs = h.join("Documents");
-                    if docs.is_dir() {
-                        docs.to_string_lossy().to_string()
-                    } else {
-                        h.to_string_lossy().to_string()
-                    }
-                })
+                discover_interactive_user_homes()
+                    .into_iter()
+                    .next()
+                    .map(|h| {
+                        let docs = h.join("Documents");
+                        if docs.is_dir() {
+                            docs.to_string_lossy().to_string()
+                        } else {
+                            h.to_string_lossy().to_string()
+                        }
+                    })
             })
             .or_else(|| {
                 quorum_ingest::IngestConfig::discover_physical_drives()
@@ -1020,8 +1157,10 @@ pub async fn pick_folder_dialog_handler(
         requested_path
     };
 
-    Json(pure_rust_browse_directory(&effective_path, create_subfolder.as_deref()).await)
-        .into_response()
+    match pure_rust_browse_directory(&effective_path, create_subfolder.as_deref()).await {
+        Ok(val) => Json(val).into_response(),
+        Err((code, body)) => (code, body).into_response(),
+    }
 }
 
 /// GET /api/dlp/status - Returns HIPAA PHI/PII DLP policy and live audit telemetry.
@@ -1141,10 +1280,12 @@ pub async fn update_dlp_policy_handler(
 }
 
 /// POST /api/dlp/test - Live PHI/PII DLP Inspection & Redaction/Blocking simulator.
-pub async fn test_dlp_inspection_handler(
-    Json(payload): Json<DlpTestPayload>,
-) -> impl IntoResponse {
+pub async fn test_dlp_inspection_handler(Json(payload): Json<DlpTestPayload>) -> impl IntoResponse {
+    let discovered = tokio::task::spawn_blocking(quorum_ingest::discover_cloud_drives)
+        .await
+        .unwrap_or_default();
     let controller = global_mesh_dlp_controller();
+    crate::handlers::cloud_drives::reconcile_discovered_cloud_drives(&controller, &discovered);
     let file_path = payload
         .file_path
         .as_deref()
@@ -1222,10 +1363,13 @@ pub async fn probe_endpoint_handler(
                     if let Some(idx) = resp.find("\r\n\r\n") {
                         let body = &resp[idx + 4..];
                         if let (Some(s), Some(e)) = (body.find('{'), body.rfind('}')) {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body[s..=e]) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body[s..=e])
+                            {
                                 if let Some(arr) = val.get("models").and_then(|m| m.as_array()) {
                                     for item in arr {
-                                        if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                        if let Some(name) =
+                                            item.get("name").and_then(|n| n.as_str())
+                                        {
                                             models.push(name.to_string());
                                         }
                                     }
@@ -1359,7 +1503,9 @@ mod tests {
             r"C:\WINDOWS\system32\config\systemprofile\Documents"
         ));
         assert!(is_service_or_system_profile_path(r"C:\Windows\System32"));
-        assert!(is_service_or_system_profile_path(r"C:\Users\Default\Desktop"));
+        assert!(is_service_or_system_profile_path(
+            r"C:\Users\Default\Desktop"
+        ));
         assert!(is_service_or_system_profile_path("/var/root/Documents"));
         assert!(!is_service_or_system_profile_path(
             r"C:\Users\alice\Documents"
@@ -1367,7 +1513,7 @@ mod tests {
         assert!(!is_service_or_system_profile_path("/Users/alice/Documents"));
         assert!(!is_service_or_system_profile_path("/home/alice/Documents"));
 
-        let browse_root = pure_rust_browse_directory("", None).await;
+        let browse_root = pure_rust_browse_directory("", None).await.unwrap();
         if let Some(qa_arr) = browse_root["quick_access"].as_array() {
             for qa in qa_arr {
                 let p = qa["path"].as_str().unwrap_or("");

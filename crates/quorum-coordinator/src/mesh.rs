@@ -1577,7 +1577,10 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
         }
 
         let effective_tier = match verified_tier {
-            Some(tier) => tier.as_u8().min(max_tier),
+            Some(tier) => tier
+                .as_u8()
+                .min(max_tier)
+                .min(quorum_types::AccessTier::Tier2Confidential.as_u8()),
             None => {
                 tracing::warn!(
                     "Rejecting unverified or stale query signature (>60s drift) from peer: {}",
@@ -1885,7 +1888,17 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             }
         }
 
-        scored.retain(|c| !crate::artemis_airgap::is_airgap_restricted_chunk(&c.chunk));
+        scored.retain(|c| {
+            if crate::artemis_airgap::is_airgap_restricted_chunk(&c.chunk) {
+                return false;
+            }
+            if crate::artemis_airgap::has_cloud_drive_metadata(&c.chunk) {
+                return controller
+                    .check_file_shared_with_mesh_with_hint(&c.chunk.file_path, true)
+                    .is_some();
+            }
+            true
+        });
 
         // Cap per-document-family candidates (max 3 per family) and bound total candidates to 128 before parent-window expansion,
         // and expand 10KB parent windows on the top 32 unique-family candidates.
@@ -1958,6 +1971,9 @@ impl quorum_network::InboundQueryHandler for OsoosiMeshInboundHandler {
             if let Ok(Some(relayed_resps)) = jh.await {
                 for resp in relayed_resps {
                     for mut chunk in resp.chunks {
+                        if crate::artemis_airgap::is_airgap_restricted_chunk_dto(&chunk) {
+                            continue;
+                        }
                         if chunk
                             .origin_peer_id
                             .as_deref()

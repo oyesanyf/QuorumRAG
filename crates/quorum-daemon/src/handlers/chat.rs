@@ -192,11 +192,17 @@ pub async fn cancel_chat_handler(
     Json(payload): Json<CancelChatRequest>,
 ) -> impl IntoResponse {
     let (cancelled, _qid, sid) = if let Some(ref qid) = payload.query_id {
-        let sid = state.in_flight_queries.get_by_query_id(qid).map(|t| t.session_id.clone());
+        let sid = state
+            .in_flight_queries
+            .get_by_query_id(qid)
+            .map(|t| t.session_id.clone());
         let res = state.in_flight_queries.cancel(qid);
         (res, Some(qid.clone()), sid)
     } else if let Some(ref sid) = payload.session_id {
-        let qid = state.in_flight_queries.get_by_session_id(sid).map(|t| t.query_id.clone());
+        let qid = state
+            .in_flight_queries
+            .get_by_session_id(sid)
+            .map(|t| t.query_id.clone());
         let res = state.in_flight_queries.cancel_session(sid);
         (res, qid, Some(sid.clone()))
     } else {
@@ -207,7 +213,8 @@ pub async fn cancel_chat_handler(
     if cancelled {
         if let Some(ref session_id) = sid {
             if let Ok(hist_store) = state.history_store() {
-                let _ = hist_store.record_cancelled_turn(session_id, "*[Generation stopped by user]*");
+                let _ =
+                    hist_store.record_cancelled_turn(session_id, "*[Generation stopped by user]*");
             }
         }
     }
@@ -231,9 +238,7 @@ pub async fn cancel_chat_handler(
 }
 
 /// Returns active running chat tasks: `GET /api/chat/active`.
-pub async fn active_chat_tasks_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+pub async fn active_chat_tasks_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let tasks = state.in_flight_queries.list_active();
     (
         axum::http::StatusCode::OK,
@@ -262,7 +267,11 @@ pub fn create_chat_task_sse_stream(
                     | AgenticTelemetryEvent::ExecutionError { .. }
             );
             let json_line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-            if sse_tx.send(Ok(Event::default().data(json_line))).await.is_err() {
+            if sse_tx
+                .send(Ok(Event::default().data(json_line)))
+                .await
+                .is_err()
+            {
                 return;
             }
             if is_terminal {
@@ -283,8 +292,13 @@ pub fn create_chat_task_sse_stream(
                         AgenticTelemetryEvent::ExecutionFinished { .. }
                             | AgenticTelemetryEvent::ExecutionError { .. }
                     );
-                    let json_line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-                    if sse_tx.send(Ok(Event::default().data(json_line))).await.is_err() {
+                    let json_line =
+                        serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                    if sse_tx
+                        .send(Ok(Event::default().data(json_line)))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     if is_terminal {
@@ -348,10 +362,18 @@ pub async fn chat_sse_handler(
     let _access_tier = payload.access_tier.unwrap_or(0);
 
     let family = match payload.model_family.as_deref() {
-        Some("Glm4Agentic") | Some("glm4") | Some("glm-4") | Some("glm4:9b") => SynthesisModelFamily::Glm4Agentic,
-        Some("Qwen25Code") | Some("qwen") | Some("qwen2.5") | Some("qwen2.5:32b") | Some("qwen2.5:14b") | Some("qwen2.5:7b") | Some("qwen2.5:3b") | Some("qwen2.5:1.5b") => SynthesisModelFamily::Qwen25Code,
-        Some("Gemma4_26b") | Some("gemma4_26b") | Some("gemma4:26b") | Some("gemma4") => SynthesisModelFamily::Gemma4_26b,
-        Some("GemmaProse") | Some("gemma") | Some("gemma3") | Some("gemma2:9b") | Some("gemma2:2b") | Some("gemma3:4b") => SynthesisModelFamily::GemmaProse,
+        Some("Glm4Agentic") | Some("glm4") | Some("glm-4") | Some("glm4:9b") => {
+            SynthesisModelFamily::Glm4Agentic
+        }
+        Some("Qwen25Code") | Some("qwen") | Some("qwen2.5") | Some("qwen2.5:32b")
+        | Some("qwen2.5:14b") | Some("qwen2.5:7b") | Some("qwen2.5:3b") | Some("qwen2.5:1.5b") => {
+            SynthesisModelFamily::Qwen25Code
+        }
+        Some("Gemma4_26b") | Some("gemma4_26b") | Some("gemma4:26b") | Some("gemma4") => {
+            SynthesisModelFamily::Gemma4_26b
+        }
+        Some("GemmaProse") | Some("gemma") | Some("gemma3") | Some("gemma2:9b")
+        | Some("gemma2:2b") | Some("gemma3:4b") => SynthesisModelFamily::GemmaProse,
         Some("AutoFusion") | Some("auto_fusion") => SynthesisModelFamily::AutoFusion,
         _ => state.default_model_family,
     };
@@ -390,14 +412,18 @@ pub async fn chat_sse_handler(
             // Ensure a terminal event exists in the event log if coordinator aborted without one
             let has_terminal = {
                 let log = task.event_log.lock().unwrap();
-                log.iter().any(|e| matches!(e,
-                    AgenticTelemetryEvent::ExecutionFinished { .. } |
-                    AgenticTelemetryEvent::ExecutionError { .. }
-                ))
+                log.iter().any(|e| {
+                    matches!(
+                        e,
+                        AgenticTelemetryEvent::ExecutionFinished { .. }
+                            | AgenticTelemetryEvent::ExecutionError { .. }
+                    )
+                })
             };
             if !has_terminal {
                 task.record_event(AgenticTelemetryEvent::ExecutionError {
-                    failed_state: quorum_coordinator::types::AgenticStateName::SynthesizeWithCitations,
+                    failed_state:
+                        quorum_coordinator::types::AgenticStateName::SynthesizeWithCitations,
                     error_message: "Query execution stopped".to_string(),
                     fallback_action: "Terminated in-flight stream".to_string(),
                 });
@@ -409,8 +435,11 @@ pub async fn chat_sse_handler(
     let bypass_cache = payload.bypass_cache;
     let prompt_lower = prompt.to_ascii_lowercase();
     let is_continuation_or_exclusion =
-        quorum_coordinator::DeterministicOfflineSynthesisEngine::is_continuation_query(&prompt_lower)
-            || quorum_coordinator::DeterministicOfflineSynthesisEngine::is_exclusion_query(&prompt_lower);
+        quorum_coordinator::DeterministicOfflineSynthesisEngine::is_continuation_query(
+            &prompt_lower,
+        ) || quorum_coordinator::DeterministicOfflineSynthesisEngine::is_exclusion_query(
+            &prompt_lower,
+        );
 
     let session_seen = if is_continuation_or_exclusion {
         let mut seen = state.sessions.get_seen_chunks(&session_id);
@@ -451,7 +480,14 @@ pub async fn chat_sse_handler(
             ensure_live_forensics_for_query(&state_for_history, &prompt).await;
 
             match coordinator
-                .query_agentic_with_history_and_session(&prompt, history, family, top_k, session_seen, Some(task_tx.clone()))
+                .query_agentic_with_history_and_session(
+                    &prompt,
+                    history,
+                    family,
+                    top_k,
+                    session_seen,
+                    Some(task_tx.clone()),
+                )
                 .await
             {
                 Ok(_result) => {
@@ -463,7 +499,8 @@ pub async fn chat_sse_handler(
                     sessions_registry.record_seen_chunks(&session_id_task, &newly_seen);
 
                     if let Ok(hist_store) = state_for_history.history_store() {
-                        let responder_peer = if coordinator.engine.sender_peer_id.trim().is_empty() {
+                        let responder_peer = if coordinator.engine.sender_peer_id.trim().is_empty()
+                        {
                             "local"
                         } else {
                             coordinator.engine.sender_peer_id.as_str()
@@ -559,10 +596,18 @@ pub async fn query_handler(
 
     let top_k = payload.top_k.unwrap_or(32).clamp(24, 50);
     let family = match payload.model_family.as_deref() {
-        Some("Glm4Agentic") | Some("glm4") | Some("glm-4") | Some("glm4:9b") => SynthesisModelFamily::Glm4Agentic,
-        Some("Qwen25Code") | Some("qwen") | Some("qwen2.5") | Some("qwen2.5:32b") | Some("qwen2.5:14b") | Some("qwen2.5:7b") | Some("qwen2.5:3b") | Some("qwen2.5:1.5b") => SynthesisModelFamily::Qwen25Code,
-        Some("Gemma4_26b") | Some("gemma4_26b") | Some("gemma4:26b") | Some("gemma4") => SynthesisModelFamily::Gemma4_26b,
-        Some("GemmaProse") | Some("gemma") | Some("gemma3") | Some("gemma2:9b") | Some("gemma2:2b") | Some("gemma3:4b") => SynthesisModelFamily::GemmaProse,
+        Some("Glm4Agentic") | Some("glm4") | Some("glm-4") | Some("glm4:9b") => {
+            SynthesisModelFamily::Glm4Agentic
+        }
+        Some("Qwen25Code") | Some("qwen") | Some("qwen2.5") | Some("qwen2.5:32b")
+        | Some("qwen2.5:14b") | Some("qwen2.5:7b") | Some("qwen2.5:3b") | Some("qwen2.5:1.5b") => {
+            SynthesisModelFamily::Qwen25Code
+        }
+        Some("Gemma4_26b") | Some("gemma4_26b") | Some("gemma4:26b") | Some("gemma4") => {
+            SynthesisModelFamily::Gemma4_26b
+        }
+        Some("GemmaProse") | Some("gemma") | Some("gemma3") | Some("gemma2:9b")
+        | Some("gemma2:2b") | Some("gemma3:4b") => SynthesisModelFamily::GemmaProse,
         Some("AutoFusion") | Some("auto_fusion") => SynthesisModelFamily::AutoFusion,
         _ => state.default_model_family,
     };
@@ -573,8 +618,11 @@ pub async fn query_handler(
         .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
     let prompt_lower = prompt.to_ascii_lowercase();
     let is_continuation_or_exclusion =
-        quorum_coordinator::DeterministicOfflineSynthesisEngine::is_continuation_query(&prompt_lower)
-            || quorum_coordinator::DeterministicOfflineSynthesisEngine::is_exclusion_query(&prompt_lower);
+        quorum_coordinator::DeterministicOfflineSynthesisEngine::is_continuation_query(
+            &prompt_lower,
+        ) || quorum_coordinator::DeterministicOfflineSynthesisEngine::is_exclusion_query(
+            &prompt_lower,
+        );
 
     let session_seen = if is_continuation_or_exclusion {
         let mut seen = state.sessions.get_seen_chunks(&session_id);
@@ -590,7 +638,14 @@ pub async fn query_handler(
 
     match state
         .coordinator
-        .query_agentic_with_history_and_session(prompt, payload.history, family, top_k, session_seen, None)
+        .query_agentic_with_history_and_session(
+            prompt,
+            payload.history,
+            family,
+            top_k,
+            session_seen,
+            None,
+        )
         .await
     {
         Ok(result) => {
@@ -616,7 +671,8 @@ pub async fn query_handler(
                 );
             }
 
-            let mut contributing_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut contributing_peers: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             contributing_peers.insert(local_peer_id.clone());
             for c in &result.chunks {
                 if !c.source_peer.is_empty() && c.source_peer != "local" {
@@ -628,7 +684,10 @@ pub async fn query_handler(
                     contributing_peers.insert(cit.peer_id.clone());
                 }
             }
-            let contributing_str = contributing_peers.into_iter().collect::<Vec<_>>().join(", ");
+            let contributing_str = contributing_peers
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
 
             let connected_peers: Vec<String> = {
                 let registry = quorum_coordinator::mesh::global_peer_health_registry();

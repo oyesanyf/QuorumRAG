@@ -7,19 +7,19 @@
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::classifier_router::CandidateKind;
+use crate::audio_indexer::AudioIndexer;
 use crate::chunker::TextChunker;
+use crate::classifier_router::CandidateKind;
 use crate::config::{ChunkerConfig, IngestConfig, ReindexOptions};
 use crate::crawler::{DiscoveredCandidate, FilesystemCrawler};
 use crate::dedup::{DedupAction, FileCatalogEntry, Level1DedupCatalog, TwoLevelDedupEngine};
 use crate::document_extractor::DocumentExtractor;
-use crate::audio_indexer::AudioIndexer;
 use crate::error::IngestError;
 use crate::image_indexer::ImageIndexer;
 use quorum_classifier::FileTypeClassifier;
@@ -61,17 +61,38 @@ pub struct ReindexProgress {
     pub error_message: Option<String>,
 }
 
+/// Guard that decrements `in_flight_tasks` and wakes `task_done_notify` on any exit or panic.
+struct InFlightTaskGuard {
+    in_flight: Arc<AtomicUsize>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for InFlightTaskGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
 /// Dedicated Reindex Worker.
 pub struct ReindexWorker {
-    config: IngestConfig,
+    config: Arc<RwLock<IngestConfig>>,
     storage: Arc<StorageEngine>,
     classifier: Arc<FileTypeClassifier>,
     embedder: Arc<dyn EmbeddingGenerator>,
     dedup: Arc<TwoLevelDedupEngine>,
     active_task: Arc<RwLock<Option<ReindexProgress>>>,
     cancel_flag: Arc<AtomicBool>,
+    cancel_tx: Arc<tokio::sync::watch::Sender<u64>>,
+    purge_epoch: Arc<AtomicU64>,
+    blocked_prefixes: Arc<std::sync::RwLock<Vec<String>>>,
+    task_done_notify: Arc<tokio::sync::Notify>,
+    in_flight_tasks: Arc<AtomicUsize>,
+    commit_gate: Arc<tokio::sync::RwLock<()>>,
+    static_watch_paths: Arc<std::sync::RwLock<Vec<std::path::PathBuf>>>,
     dynamic_watch_paths: Arc<std::sync::RwLock<Vec<std::path::PathBuf>>>,
-    pending_priority_paths: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+    pending_priority_paths: Arc<tokio::sync::Mutex<Vec<std::path::PathBuf>>>,
+    dlp_gate: Arc<RwLock<Option<Arc<dyn quorum_types::DlpContentGate>>>>,
 }
 
 impl ReindexWorker {
@@ -87,45 +108,208 @@ impl ReindexWorker {
             config.excluded_paths.push(storage_path);
         }
         if let Some(ref cat_path) = config.dedup_catalog_path {
-            if !cat_path.as_os_str().is_empty() && !config.excluded_paths.iter().any(|p| p == cat_path) {
+            if !cat_path.as_os_str().is_empty()
+                && !config.excluded_paths.iter().any(|p| p == cat_path)
+            {
                 config.excluded_paths.push(cat_path.clone());
             }
         }
+        let initial_watch = config.watch_paths.clone();
         Self {
-            config,
+            config: Arc::new(RwLock::new(config)),
             storage,
             classifier,
             embedder,
             dedup,
             active_task: Arc::new(RwLock::new(None)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancel_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
+            purge_epoch: Arc::new(AtomicU64::new(0)),
+            blocked_prefixes: Arc::new(std::sync::RwLock::new(Vec::new())),
+            task_done_notify: Arc::new(tokio::sync::Notify::new()),
+            in_flight_tasks: Arc::new(AtomicUsize::new(0)),
+            commit_gate: Arc::new(tokio::sync::RwLock::new(())),
+            static_watch_paths: Arc::new(std::sync::RwLock::new(initial_watch)),
             dynamic_watch_paths: Arc::new(std::sync::RwLock::new(Vec::new())),
-            pending_priority_paths: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_priority_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            dlp_gate: Arc::new(RwLock::new(None)),
         }
     }
 
-    pub fn config(&self) -> &IngestConfig {
-        &self.config
+    /// Attaches an optional fail-closed `DlpContentGate` (builder helper).
+    pub fn with_dlp_gate(self, gate: Arc<dyn quorum_types::DlpContentGate>) -> Self {
+        Self {
+            dlp_gate: Arc::new(RwLock::new(Some(gate))),
+            ..self
+        }
+    }
+
+    pub(crate) fn set_dlp_gate_try(&self, gate: Arc<dyn quorum_types::DlpContentGate>) {
+        if let Ok(mut guard) = self.dlp_gate.try_write() {
+            *guard = Some(gate);
+        }
+    }
+
+    /// Returns a cloned snapshot of the current live `IngestConfig`.
+    pub async fn config_snapshot(&self) -> IngestConfig {
+        self.config.read().await.clone()
+    }
+
+    /// Dynamically updates the active `DlpContentGate`.
+    pub async fn set_dlp_gate(&self, gate: Option<Arc<dyn quorum_types::DlpContentGate>>) {
+        *self.dlp_gate.write().await = gate;
+    }
+
+    /// Dynamically updates `placeholder_policy` on the live `IngestConfig`.
+    pub async fn update_placeholder_policy(&self, policy: quorum_types::CloudPlaceholderPolicy) {
+        self.config.write().await.placeholder_policy = policy;
+    }
+
+    /// Dynamically updates `max_file_size_bytes` on the live `IngestConfig`.
+    pub async fn update_max_file_size_bytes(&self, max_file_size_bytes: u64) {
+        self.config.write().await.max_file_size_bytes = max_file_size_bytes.max(1);
+    }
+
+    /// Dynamically validates and replaces `access_tier_rules` fail-closed (`0..=3` & valid paths).
+    pub async fn update_access_tier_rules(
+        &self,
+        rules: Vec<(std::path::PathBuf, u8)>,
+    ) -> Result<(), IngestError> {
+        let mut normalized_rules = Vec::with_capacity(rules.len());
+        for (prefix, tier) in rules {
+            quorum_types::AccessTier::from_u8(tier)?;
+            let norm = quorum_types::normalize_prefix_for_match(&prefix.to_string_lossy())?;
+            normalized_rules.push((std::path::PathBuf::from(norm), tier));
+        }
+        self.config.write().await.access_tier_rules = normalized_rules;
+        Ok(())
+    }
+
+    /// Dynamically updates the normalized list of blocked (e.g., disabled cloud-drive) path
+    /// prefixes enforced across watch registration, target filtering, and storage commits.
+    pub fn update_blocked_prefixes(&self, prefixes: Vec<String>) {
+        let mut clean = Vec::with_capacity(prefixes.len());
+        for p in prefixes {
+            if let Ok(norm) = quorum_types::normalize_prefix_for_match(&p) {
+                if !clean.contains(&norm) {
+                    clean.push(norm);
+                }
+            }
+        }
+        if let Ok(mut guard) = self.blocked_prefixes.write() {
+            *guard = clean;
+        }
+    }
+
+    /// Returns a snapshot of the currently blocked normalized prefixes.
+    pub fn blocked_prefixes_snapshot(&self) -> Vec<String> {
+        self.blocked_prefixes
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns the current monotonic purge epoch counter.
+    pub fn current_purge_epoch(&self) -> u64 {
+        self.purge_epoch.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    fn is_path_str_blocked(raw: &str, blocked: &[String]) -> bool {
+        !blocked.is_empty()
+            && blocked
+                .iter()
+                .any(|pref| quorum_types::path_matches_prefix(raw, pref).unwrap_or(false))
+    }
+
+    /// Returns true if `path` (or its canonical target) resides under any blocked prefix.
+    pub fn is_path_blocked(&self, path: &std::path::Path) -> bool {
+        let blocked = self.blocked_prefixes_snapshot();
+        if blocked.is_empty() {
+            return false;
+        }
+        let raw = path.to_string_lossy();
+        if Self::is_path_str_blocked(&raw, &blocked) {
+            return true;
+        }
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            let cs = canon.to_string_lossy();
+            let stripped = cs.strip_prefix(r"\\?\").unwrap_or(&cs);
+            if Self::is_path_str_blocked(stripped, &blocked) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Dynamically registers new directories or file paths to be watched and included in continuous reindexing.
     pub fn add_watch_paths(&self, paths: &[std::path::PathBuf]) {
+        let blocked = self.blocked_prefixes_snapshot();
+        let static_guard = self.static_watch_paths.read().ok();
         if let Ok(mut guard) = self.dynamic_watch_paths.write() {
             for p in paths {
-                if p.as_os_str().is_empty() {
+                if p.as_os_str().is_empty()
+                    || Self::is_path_str_blocked(&p.to_string_lossy(), &blocked)
+                {
                     continue;
                 }
-                let watch_target = if p.is_file() {
-                    p.parent().map(|parent| parent.to_path_buf()).unwrap_or_else(|| p.clone())
-                } else {
-                    p.clone()
-                };
-                if !guard.iter().any(|existing| existing == &watch_target)
-                    && !self.config.watch_paths.iter().any(|existing| existing == &watch_target)
-                {
+                let watch_target = p.clone();
+                let in_static = static_guard
+                    .as_ref()
+                    .map(|sg| sg.iter().any(|existing| existing == &watch_target))
+                    .unwrap_or(false);
+                if !guard.iter().any(|existing| existing == &watch_target) && !in_static {
                     guard.push(watch_target);
                 }
             }
+        }
+    }
+
+    /// Dynamically removes watch paths (and any matching descendants in `pending_priority_paths`)
+    /// using normalized component-boundary prefix matching.
+    pub async fn remove_watch_paths(&self, paths: &[std::path::PathBuf]) {
+        let prefixes: Vec<std::path::PathBuf> = paths
+            .iter()
+            .filter(|p| {
+                !crate::config::normalize_path_for_prefix(p)
+                    .as_os_str()
+                    .is_empty()
+            })
+            .cloned()
+            .collect();
+        if prefixes.is_empty() {
+            return;
+        }
+
+        {
+            let mut cfg = self.config.write().await;
+            cfg.watch_paths.retain(|w| {
+                !prefixes
+                    .iter()
+                    .any(|r| crate::config::path_matches_prefix(w, r))
+            });
+        }
+        if let Ok(mut sg) = self.static_watch_paths.write() {
+            sg.retain(|w| {
+                !prefixes
+                    .iter()
+                    .any(|r| crate::config::path_matches_prefix(w, r))
+            });
+        }
+        if let Ok(mut dg) = self.dynamic_watch_paths.write() {
+            dg.retain(|w| {
+                !prefixes
+                    .iter()
+                    .any(|r| crate::config::path_matches_prefix(w, r))
+            });
+        }
+        {
+            let mut pending = self.pending_priority_paths.lock().await;
+            pending.retain(|p| {
+                !prefixes
+                    .iter()
+                    .any(|r| crate::config::path_matches_prefix(p, r))
+            });
         }
     }
 
@@ -139,7 +323,11 @@ impl ReindexWorker {
 
     /// Returns the union of static `config.watch_paths` and dynamically registered watch paths.
     pub fn all_watch_paths(&self) -> Vec<std::path::PathBuf> {
-        let mut all = self.config.watch_paths.clone();
+        let mut all = self
+            .static_watch_paths
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         for p in self.dynamic_watch_paths() {
             if !all.iter().any(|existing| existing == &p) {
                 all.push(p);
@@ -153,7 +341,7 @@ impl ReindexWorker {
     pub async fn trigger_paths(&self, paths: Vec<std::path::PathBuf>) -> Result<Uuid, IngestError> {
         let clean_paths: Vec<std::path::PathBuf> = paths
             .into_iter()
-            .filter(|p| !p.as_os_str().is_empty() && p.exists())
+            .filter(|p| !p.as_os_str().is_empty() && p.exists() && !self.is_path_blocked(p))
             .collect();
         if clean_paths.is_empty() {
             return Err(IngestError::Io(std::io::Error::new(
@@ -173,11 +361,12 @@ impl ReindexWorker {
                         | ReindexPhase::WritingToStorage
                         | ReindexPhase::CompactingIndexes
                 ) {
-                    if let Ok(mut pending) = self.pending_priority_paths.lock() {
-                        for p in clean_paths {
-                            if !pending.iter().any(|existing| existing == &p) {
-                                pending.push(p);
-                            }
+                    let mut pending = self.pending_priority_paths.lock().await;
+                    for p in clean_paths {
+                        if !self.is_path_blocked(&p)
+                            && !pending.iter().any(|existing| existing == &p)
+                        {
+                            pending.push(p);
                         }
                     }
                     return Ok(current.task_id);
@@ -214,10 +403,29 @@ impl ReindexWorker {
 
     /// Triggers an asynchronous reindex task, returning immediately with a task UUID.
     pub async fn start_reindex(&self, options: ReindexOptions) -> Result<Uuid, IngestError> {
-        if !options.target_paths.is_empty() {
-            self.add_watch_paths(&options.target_paths);
+        struct TaskDoneGuard {
+            in_flight: Arc<AtomicUsize>,
+            notify: Arc<tokio::sync::Notify>,
         }
+        impl Drop for TaskDoneGuard {
+            fn drop(&mut self) {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                self.notify.notify_waiters();
+            }
+        }
+        self.in_flight_tasks.fetch_add(1, Ordering::SeqCst);
+        let done_guard = TaskDoneGuard {
+            in_flight: Arc::clone(&self.in_flight_tasks),
+            notify: Arc::clone(&self.task_done_notify),
+        };
+
+        let task_purge_epoch = self.purge_epoch.load(Ordering::SeqCst);
+        let cancel_baseline_seq = *self.cancel_tx.borrow();
+
         let mut active = self.active_task.write().await;
+        if self.purge_epoch.load(Ordering::SeqCst) != task_purge_epoch {
+            return Err(IngestError::Cancelled);
+        }
         if let Some(ref current) = *active {
             if matches!(
                 current.phase,
@@ -232,8 +440,16 @@ impl ReindexWorker {
             }
         }
 
+        if self.purge_epoch.load(Ordering::SeqCst) != task_purge_epoch {
+            return Err(IngestError::Cancelled);
+        }
+
         let task_id = Uuid::new_v4();
         self.cancel_flag.store(false, Ordering::SeqCst);
+
+        if !options.target_paths.is_empty() {
+            self.add_watch_paths(&options.target_paths);
+        }
 
         let initial_progress = ReindexProgress {
             task_id,
@@ -255,21 +471,32 @@ impl ReindexWorker {
         *active = Some(initial_progress);
         drop(active);
 
-        let mut worker_config = self.config.clone();
-        worker_config.watch_paths = self.all_watch_paths();
+        let config_lock = Arc::clone(&self.config);
+        let dlp_gate_lock = Arc::clone(&self.dlp_gate);
+        let dynamic_watch_lock = Arc::clone(&self.dynamic_watch_paths);
         let worker_storage = Arc::clone(&self.storage);
         let worker_classifier = Arc::clone(&self.classifier);
         let worker_embedder = Arc::clone(&self.embedder);
         let worker_dedup = Arc::clone(&self.dedup);
         let worker_progress = Arc::clone(&self.active_task);
         let cancel_flag = Arc::clone(&self.cancel_flag);
+        let cancel_tx = Arc::clone(&self.cancel_tx);
+        let purge_epoch = Arc::clone(&self.purge_epoch);
+        let blocked_prefixes_lock = Arc::clone(&self.blocked_prefixes);
+        let commit_gate = Arc::clone(&self.commit_gate);
         let pending_priority = Arc::clone(&self.pending_priority_paths);
 
         tokio::spawn(async move {
+            let _done_guard = done_guard;
+            let cancel_rx_check = cancel_tx.subscribe();
+
             let mut loop_options = options;
             loop {
                 let res = Self::execute_pipeline(
-                    worker_config.clone(),
+                    Arc::clone(&config_lock),
+                    Arc::clone(&dlp_gate_lock),
+                    Arc::clone(&dynamic_watch_lock),
+                    Arc::clone(&blocked_prefixes_lock),
                     loop_options.clone(),
                     task_id,
                     Arc::clone(&worker_storage),
@@ -278,18 +505,29 @@ impl ReindexWorker {
                     Arc::clone(&worker_dedup),
                     worker_progress.clone(),
                     Arc::clone(&cancel_flag),
+                    cancel_tx.subscribe(),
+                    cancel_baseline_seq,
+                    Arc::clone(&purge_epoch),
+                    task_purge_epoch,
                     Arc::clone(&pending_priority),
+                    Arc::clone(&commit_gate),
                 )
                 .await;
 
+                let leftover_priority: Vec<std::path::PathBuf> = {
+                    let mut g = pending_priority.lock().await;
+                    std::mem::take(&mut *g)
+                };
                 let mut final_lock = worker_progress.write().await;
-                let leftover_priority: Vec<std::path::PathBuf> = pending_priority
-                    .lock()
-                    .map(|mut g| std::mem::take(&mut *g))
-                    .unwrap_or_default();
 
                 if res.is_ok()
-                    && !cancel_flag.load(Ordering::SeqCst)
+                    && !Self::is_pipeline_cancelled(
+                        &cancel_flag,
+                        &cancel_rx_check,
+                        cancel_baseline_seq,
+                        &purge_epoch,
+                        task_purge_epoch,
+                    )
                     && !leftover_priority.is_empty()
                 {
                     if let Some(ref mut prog) = *final_lock {
@@ -335,16 +573,94 @@ impl ReindexWorker {
         }
     }
 
+    fn enter_in_flight_task(&self) -> InFlightTaskGuard {
+        self.in_flight_tasks.fetch_add(1, Ordering::SeqCst);
+        InFlightTaskGuard {
+            in_flight: Arc::clone(&self.in_flight_tasks),
+            notify: Arc::clone(&self.task_done_notify),
+        }
+    }
+
+    pub(crate) async fn acquire_commit_read_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.commit_gate.read().await
+    }
+
+    #[inline]
+    fn is_upgrade_cancelled(
+        cancel_rx: &tokio::sync::watch::Receiver<u64>,
+        baseline_seq: u64,
+        purge_epoch: &AtomicU64,
+        task_purge_epoch: u64,
+    ) -> bool {
+        *cancel_rx.borrow() != baseline_seq
+            || purge_epoch.load(Ordering::SeqCst) != task_purge_epoch
+    }
+
+    async fn wait_upgrade_cancelled(
+        cancel_rx: &mut tokio::sync::watch::Receiver<u64>,
+        baseline_seq: u64,
+        purge_epoch: &AtomicU64,
+        task_purge_epoch: u64,
+    ) {
+        loop {
+            if *cancel_rx.borrow_and_update() != baseline_seq
+                || purge_epoch.load(Ordering::SeqCst) != task_purge_epoch
+            {
+                return;
+            }
+            if cancel_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Scans stored chunks, identifies legacy image chunks lacking OCR text,
     /// re-indexes them using ImageIndexer, and replaces them in storage
     /// preserving the exact chunk ID formula {file_b3}:img:0 without re-downloading.
     pub async fn upgrade_legacy_image_chunks(&self) -> Result<usize, IngestError> {
+        let _done_guard = self.enter_in_flight_task();
+        let task_purge_epoch = self.purge_epoch.load(Ordering::SeqCst);
+        let mut cancel_rx = self.cancel_tx.subscribe();
+        let cancel_baseline_seq = *cancel_rx.borrow();
+
+        if Self::is_upgrade_cancelled(
+            &cancel_rx,
+            cancel_baseline_seq,
+            &self.purge_epoch,
+            task_purge_epoch,
+        ) {
+            return Err(IngestError::Cancelled);
+        }
+
         let all_chunks = self.storage.scan_all_chunks().await?;
+        if Self::is_upgrade_cancelled(
+            &cancel_rx,
+            cancel_baseline_seq,
+            &self.purge_epoch,
+            task_purge_epoch,
+        ) {
+            return Err(IngestError::Cancelled);
+        }
+
+        let cfg_snapshot = self.config.read().await.clone();
+        let dlp_gate = self.dlp_gate.read().await.clone();
         let mut upgraded_count = 0;
 
         for chunk in &all_chunks {
+            if Self::is_upgrade_cancelled(
+                &cancel_rx,
+                cancel_baseline_seq,
+                &self.purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
+
             let is_image = chunk.chunk_id.ends_with(":img:0")
-                || chunk.text_content.trim_start().starts_with("[Image Document:");
+                || chunk
+                    .text_content
+                    .trim_start()
+                    .starts_with("[Image Document:");
             if !is_image {
                 continue;
             }
@@ -357,82 +673,188 @@ impl ReindexWorker {
             }
 
             let file_path = std::path::Path::new(&chunk.file_path);
-            if !file_path.exists() {
+            if self.is_path_blocked(file_path) || !file_path.exists() {
                 continue;
             }
 
-            let bytes = match std::fs::read(file_path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+            let classifier_c = Arc::clone(&self.classifier);
+            let embedder_c = Arc::clone(&self.embedder);
+            let dlp_gate_c = dlp_gate.clone();
+            let file_path_buf = file_path.to_path_buf();
+            let chunk_id = chunk.chunk_id.clone();
+            let chunk_doc_id = chunk.document_id.clone();
+            let chunk_file_path = chunk.file_path.clone();
+            let placeholder_policy = cfg_snapshot.placeholder_policy;
+            let access_tier = cfg_snapshot.resolve_access_tier(file_path);
 
-            // Verify file hash matches document_id
-            let file_b3 = blake3::hash(&bytes).to_hex().to_string();
-            if file_b3 != chunk.document_id {
-                // File content changed on disk; normal reindexer will handle it
-                continue;
-            }
+            let blocking_fut = tokio::task::spawn_blocking(move || {
+                let bytes = match crate::cloud_drives::read_bytes_with_placeholder_policy(
+                    &file_path_buf,
+                    placeholder_policy,
+                ) {
+                    Ok(b) => b,
+                    Err(_) => return None,
+                };
 
-            let identity = match self.classifier.classify_file(file_path) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-            let access_tier = self.config.resolve_access_tier(file_path);
+                // Verify file hash matches document_id
+                let file_b3 = blake3::hash(&bytes).to_hex().to_string();
+                if file_b3 != chunk_doc_id {
+                    // File content changed on disk; normal reindexer will handle it
+                    return None;
+                }
 
-            if let Ok(upgraded_chunk) = ImageIndexer::index_image(
-                file_path,
-                &bytes,
-                &identity,
-                access_tier,
-                self.embedder.as_ref(),
-            ) {
+                let identity = classifier_c.classify_file(&file_path_buf).ok()?;
+                let mut upgraded_chunk = ImageIndexer::index_image_with_policy(
+                    &file_path_buf,
+                    &bytes,
+                    &identity,
+                    access_tier,
+                    embedder_c.as_ref(),
+                    placeholder_policy,
+                )
+                .ok()?;
+
                 // Ensure chunk_id and document_id are strictly preserved
-                assert_eq!(upgraded_chunk.chunk_id, chunk.chunk_id);
-                assert_eq!(upgraded_chunk.document_id, chunk.document_id);
+                assert_eq!(upgraded_chunk.chunk_id, chunk_id);
+                assert_eq!(upgraded_chunk.document_id, chunk_doc_id);
 
-                // Collect other chunks sharing this file_path so they are retained across replacement
-                let other_chunks: Vec<DocumentChunk> = all_chunks
-                    .iter()
-                    .filter(|c| c.file_path == chunk.file_path && c.chunk_id != chunk.chunk_id)
-                    .cloned()
-                    .collect();
+                let gated_text = crate::secret_scrubber::sanitize_and_gate_text(
+                    &chunk_file_path,
+                    &upgraded_chunk.text_content,
+                    access_tier,
+                    dlp_gate_c.as_deref(),
+                )
+                .ok()?;
+                let gated_meta_json = crate::secret_scrubber::sanitize_and_gate_metadata_json(
+                    &chunk_file_path,
+                    &upgraded_chunk.metadata_json,
+                    access_tier,
+                    dlp_gate_c.as_deref(),
+                )
+                .ok()?;
+                upgraded_chunk.metadata_json = gated_meta_json;
+                if gated_text != upgraded_chunk.text_content {
+                    upgraded_chunk.text_content = gated_text;
+                    upgraded_chunk.blake3_hash =
+                        DocumentChunk::compute_blake3_hash(&upgraded_chunk.text_content);
+                    upgraded_chunk.vector = embedder_c
+                        .embed_text(&upgraded_chunk.text_content)
+                        .unwrap_or_else(|_| vec![0.0; embedder_c.dimension()]);
+                }
 
-                // Replace stale chunk in LanceDB and Tantivy
-                Self::replace_existing_file_chunks(&self.storage, std::slice::from_ref(&upgraded_chunk)).await;
-                let mut chunks_to_insert = vec![upgraded_chunk.clone()];
-                chunks_to_insert.extend(other_chunks);
-                self.storage.insert_chunks(&chunks_to_insert).await?;
-
-                let mtime_secs = std::fs::metadata(file_path)
+                let mtime_secs = std::fs::metadata(&file_path_buf)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                let parent_doc = DocumentExtractor::build_ingested_parent_document(
-                    file_path,
+                let parent_doc = DocumentExtractor::build_ingested_parent_document_with_policy(
+                    &file_path_buf,
                     &upgraded_chunk.document_id,
                     &upgraded_chunk.document_id,
                     &upgraded_chunk.text_content,
                     mtime_secs,
                     bytes.len() as u64,
                     Some(quorum_types::DocumentFormat::ImageFile),
+                    placeholder_policy,
                 );
-                let _ = self.storage.upsert_parent_document(&parent_doc, access_tier);
 
-                self.dedup.register_entry(FileCatalogEntry {
-                    file_path: file_path.to_path_buf(),
-                    file_blake3: file_b3,
+                Some((
+                    upgraded_chunk,
+                    file_b3,
+                    bytes.len() as u64,
                     mtime_secs,
-                    size_bytes: bytes.len() as u64,
-                    chunk_hashes: vec![upgraded_chunk.blake3_hash],
-                });
+                    parent_doc,
+                ))
+            });
 
-                upgraded_count += 1;
+            let built = tokio::select! {
+                biased;
+                _ = Self::wait_upgrade_cancelled(
+                    &mut cancel_rx,
+                    cancel_baseline_seq,
+                    &self.purge_epoch,
+                    task_purge_epoch,
+                ) => {
+                    return Err(IngestError::Cancelled);
+                }
+                join_res = blocking_fut => match join_res {
+                    Ok(Some(res)) => res,
+                    Ok(None) | Err(_) => continue,
+                }
+            };
+
+            if Self::is_upgrade_cancelled(
+                &cancel_rx,
+                cancel_baseline_seq,
+                &self.purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
             }
+            if self.is_path_blocked(file_path) {
+                continue;
+            }
+
+            let (upgraded_chunk, file_b3, size_bytes, mtime_secs, parent_doc) = built;
+            let other_chunks: Vec<DocumentChunk> = all_chunks
+                .iter()
+                .filter(|c| c.file_path == chunk.file_path && c.chunk_id != chunk.chunk_id)
+                .cloned()
+                .collect();
+
+            let _commit_permit = crate::thread_pool::IngestThreadPool::shared()
+                .permit_tiers()
+                .acquire_storage_commit()
+                .await?;
+            let _commit_guard = self.commit_gate.read().await;
+            if Self::is_upgrade_cancelled(
+                &cancel_rx,
+                cancel_baseline_seq,
+                &self.purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
+            if self.is_path_blocked(file_path) {
+                continue;
+            }
+
+            // Replace stale chunk in LanceDB and Tantivy
+            Self::replace_existing_file_chunks(
+                &self.storage,
+                std::slice::from_ref(&upgraded_chunk),
+            )
+            .await;
+            let mut chunks_to_insert = vec![upgraded_chunk.clone()];
+            chunks_to_insert.extend(other_chunks);
+            self.storage.insert_chunks(&chunks_to_insert).await?;
+
+            let _ = self
+                .storage
+                .upsert_parent_document(&parent_doc, access_tier);
+
+            self.dedup.register_entry(FileCatalogEntry {
+                file_path: file_path.to_path_buf(),
+                file_blake3: file_b3,
+                mtime_secs,
+                size_bytes,
+                chunk_hashes: vec![upgraded_chunk.blake3_hash],
+            });
+
+            upgraded_count += 1;
         }
 
         if upgraded_count > 0 {
+            let _commit_guard = self.commit_gate.read().await;
+            if Self::is_upgrade_cancelled(
+                &cancel_rx,
+                cancel_baseline_seq,
+                &self.purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
             let _ = self.storage.bump_index_epoch("image_chunks_ocr_upgraded");
         }
 
@@ -444,11 +866,39 @@ impl ReindexWorker {
     /// filenames `[Content_Types].xml` / `word/document.xml` or body-less PDF trailer metadata),
     /// re-extracts them using the native Rust `DocumentExtractor`, and replaces them in storage.
     pub async fn upgrade_degraded_document_chunks(&self) -> Result<usize, IngestError> {
+        let _done_guard = self.enter_in_flight_task();
+        let task_purge_epoch = self.purge_epoch.load(Ordering::SeqCst);
+        let mut cancel_rx = self.cancel_tx.subscribe();
+        let cancel_baseline_seq = *cancel_rx.borrow();
+
+        if Self::is_upgrade_cancelled(
+            &cancel_rx,
+            cancel_baseline_seq,
+            &self.purge_epoch,
+            task_purge_epoch,
+        ) {
+            return Err(IngestError::Cancelled);
+        }
+
         let all_chunks = self.storage.scan_all_chunks().await?;
-        let mut degraded_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if Self::is_upgrade_cancelled(
+            &cancel_rx,
+            cancel_baseline_seq,
+            &self.purge_epoch,
+            task_purge_epoch,
+        ) {
+            return Err(IngestError::Cancelled);
+        }
+
+        let mut degraded_paths: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
 
         for chunk in &all_chunks {
-            if DocumentExtractor::is_degraded_document_chunk(&chunk.file_path, &chunk.text_content) {
+            if self.is_path_blocked(std::path::Path::new(&chunk.file_path)) {
+                continue;
+            }
+            if DocumentExtractor::is_degraded_document_chunk(&chunk.file_path, &chunk.text_content)
+            {
                 degraded_paths.insert(chunk.file_path.clone());
             }
         }
@@ -457,131 +907,252 @@ impl ReindexWorker {
             return Ok(0);
         }
 
+        let cfg_snapshot = self.config.read().await.clone();
+        let dlp_gate = self.dlp_gate.read().await.clone();
         let chunker = TextChunker::new(ChunkerConfig::default());
         let mut upgraded_files = 0usize;
 
         for path_str in degraded_paths {
+            if Self::is_upgrade_cancelled(
+                &cancel_rx,
+                cancel_baseline_seq,
+                &self.purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
+
             let file_path = std::path::Path::new(&path_str);
-            if !file_path.exists() {
+            if self.is_path_blocked(file_path) || !file_path.exists() {
                 continue;
             }
-            let identity = match self.classifier.classify_file(file_path) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-            let content = match DocumentExtractor::extract_text(file_path, &identity) {
-                Ok(c) if !c.trim().is_empty() => c,
-                _ => continue,
-            };
-            if DocumentExtractor::is_degraded_document_chunk(&path_str, &content) {
+            if crate::cloud_drives::ensure_open_allowed_for_placeholder(
+                file_path,
+                cfg_snapshot.placeholder_policy,
+            )
+            .is_err()
+            {
                 continue;
             }
 
-            let access_tier = self.config.resolve_access_tier(file_path);
-            let file_b3 = Level1DedupCatalog::hash_file_stream(file_path)
-                .unwrap_or_else(|_| blake3::hash(content.as_bytes()).to_hex().to_string());
-            let raw_chunks = chunker.chunk_text_structure_aware(&content);
-            if raw_chunks.is_empty() {
-                continue;
-            }
+            let classifier_c = Arc::clone(&self.classifier);
+            let embedder_c = Arc::clone(&self.embedder);
+            let dedup_c = Arc::clone(&self.dedup);
+            let purge_epoch_c = Arc::clone(&self.purge_epoch);
+            let dlp_gate_c = dlp_gate.clone();
+            let chunker_c = chunker.clone();
+            let file_path_buf = file_path.to_path_buf();
+            let path_str_c = path_str.clone();
+            let placeholder_policy = cfg_snapshot.placeholder_policy;
+            let access_tier = cfg_snapshot.resolve_access_tier(file_path);
 
-            let resolved_meta = crate::chunker::resolve_document_metadata(file_path, &content);
-            let header = crate::chunker::build_contextual_header(file_path, &content);
-            let contract_hash = self.embedder.contract().derive_contract_hash_hex();
-            let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
-            let mut doc_chunks = Vec::with_capacity(raw_chunks.len());
-
-            for raw in raw_chunks {
-                let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
-                let chunk_content = crate::chunker::prepend_contextual_header_with_section(
-                    &header,
-                    &raw.section_path,
-                    raw.text_slice,
-                );
-                file_chunk_hashes.push(raw_b3.clone());
-
-                let vector = if let Some(cached) = self.dedup.cache().get(&raw_b3) {
-                    cached
-                } else {
-                    let vec = self
-                        .embedder
-                        .embed_text(raw.text_slice)
-                        .unwrap_or_else(|_| vec![0.0; self.embedder.dimension()]);
-                    self.dedup.cache().insert(raw_b3, vec.clone());
-                    vec
-                };
-
-                let chunk_id = format!("{}:{}", file_b3, raw.chunk_index);
-                let metadata_json = serde_json::json!({
-                    "char_start": raw.char_start,
-                    "char_end": raw.char_end,
-                    "chunk_index": raw.chunk_index,
-                    "contract_hash": contract_hash,
-                    "parent_doc_id": file_b3.clone(),
-                    "parent_chunk_id": format!("{}:p{}", file_b3, raw.parent_chunk_index),
-                    "doc_title": resolved_meta.title,
-                    "doc_author": resolved_meta.author,
-                    "doc_revision": resolved_meta.revision,
-                    "heading_path": raw.section_path,
-                    "section_path": raw.section_path,
-                    "section_title": raw.section_title,
-                    "section_hierarchy": raw.section_hierarchy,
-                    "section_level": raw.section_level,
-                    "source_path": path_str.clone(),
-                })
-                .to_string();
-
-                if let Ok(dc) = DocumentChunk::new(
-                    chunk_id,
-                    file_b3.clone(),
-                    &path_str,
-                    raw.line_start,
-                    raw.line_end,
-                    access_tier,
-                    vector,
-                    &chunk_content,
-                    Some(metadata_json),
+            let blocking_fut = tokio::task::spawn_blocking(move || {
+                let identity = classifier_c.classify_file(&file_path_buf).ok()?;
+                let raw_content = match DocumentExtractor::extract_text_with_policy(
+                    &file_path_buf,
+                    &identity,
+                    placeholder_policy,
                 ) {
-                    doc_chunks.push(dc);
+                    Ok(c) if !c.trim().is_empty() => c,
+                    _ => return None,
+                };
+                if DocumentExtractor::is_degraded_document_chunk(&path_str_c, &raw_content) {
+                    return None;
                 }
+
+                let content = crate::secret_scrubber::sanitize_and_gate_text(
+                    &path_str_c,
+                    &raw_content,
+                    access_tier,
+                    dlp_gate_c.as_deref(),
+                )
+                .ok()?;
+
+                let file_b3 = Level1DedupCatalog::hash_file_stream_with_policy(
+                    &file_path_buf,
+                    placeholder_policy,
+                )
+                .unwrap_or_else(|_| blake3::hash(content.as_bytes()).to_hex().to_string());
+                let raw_chunks = chunker_c.chunk_text_structure_aware(&content);
+                if raw_chunks.is_empty() {
+                    return None;
+                }
+
+                let mut resolved_meta = crate::chunker::resolve_document_metadata_with_policy(
+                    &file_path_buf,
+                    &content,
+                    placeholder_policy,
+                );
+                crate::secret_scrubber::sanitize_and_gate_resolved_metadata(
+                    &path_str_c,
+                    &mut resolved_meta,
+                    access_tier,
+                    dlp_gate_c.as_deref(),
+                )
+                .ok()?;
+
+                let file_meta = std::fs::metadata(&file_path_buf).ok();
+                let upgraded_mtime = file_meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let upgraded_size = file_meta
+                    .as_ref()
+                    .map(|m| m.len())
+                    .unwrap_or(content.len() as u64);
+                let mut parent_doc = DocumentExtractor::build_ingested_parent_document_with_policy(
+                    &file_path_buf,
+                    &file_b3,
+                    &file_b3,
+                    &content,
+                    upgraded_mtime,
+                    upgraded_size,
+                    None,
+                    placeholder_policy,
+                );
+                crate::secret_scrubber::sanitize_and_gate_parent_document(
+                    &mut parent_doc,
+                    access_tier,
+                    dlp_gate_c.as_deref(),
+                )
+                .ok()?;
+
+                let header = crate::chunker::format_contextual_header_from_meta(&resolved_meta);
+                let contract_hash = embedder_c.contract().derive_contract_hash_hex();
+                let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
+                let mut doc_chunks = Vec::with_capacity(raw_chunks.len());
+
+                for raw in raw_chunks {
+                    if purge_epoch_c.load(Ordering::SeqCst) != task_purge_epoch {
+                        return None;
+                    }
+                    let raw_b3 = DocumentChunk::compute_blake3_hash(raw.text_slice);
+                    let chunk_content = crate::chunker::prepend_contextual_header_with_section(
+                        &header,
+                        &raw.section_path,
+                        raw.text_slice,
+                    );
+                    file_chunk_hashes.push(raw_b3.clone());
+
+                    let vector = if let Some(cached) = dedup_c.cache().get(&raw_b3) {
+                        cached
+                    } else {
+                        let vec = embedder_c
+                            .embed_text(raw.text_slice)
+                            .unwrap_or_else(|_| vec![0.0; embedder_c.dimension()]);
+                        dedup_c.cache().insert(raw_b3, vec.clone());
+                        vec
+                    };
+
+                    let chunk_id = format!("{}:{}", file_b3, raw.chunk_index);
+                    let metadata_json = serde_json::json!({
+                        "char_start": raw.char_start,
+                        "char_end": raw.char_end,
+                        "chunk_index": raw.chunk_index,
+                        "contract_hash": contract_hash,
+                        "parent_doc_id": file_b3.clone(),
+                        "parent_chunk_id": format!("{}:p{}", file_b3, raw.parent_chunk_index),
+                        "doc_title": resolved_meta.title,
+                        "doc_author": resolved_meta.author,
+                        "doc_revision": resolved_meta.revision,
+                        "heading_path": raw.section_path,
+                        "section_path": raw.section_path,
+                        "section_title": raw.section_title,
+                        "section_hierarchy": raw.section_hierarchy,
+                        "section_level": raw.section_level,
+                        "source_path": path_str_c.clone(),
+                    })
+                    .to_string();
+
+                    if let Ok(dc) = DocumentChunk::new(
+                        chunk_id,
+                        file_b3.clone(),
+                        &path_str_c,
+                        raw.line_start,
+                        raw.line_end,
+                        access_tier,
+                        vector,
+                        &chunk_content,
+                        Some(metadata_json),
+                    ) {
+                        doc_chunks.push(dc);
+                    }
+                }
+
+                if doc_chunks.is_empty() {
+                    return None;
+                }
+
+                Some((
+                    doc_chunks,
+                    parent_doc,
+                    file_b3,
+                    file_chunk_hashes,
+                    file_meta.map(|m| (upgraded_mtime, m.len())),
+                ))
+            });
+
+            let built = tokio::select! {
+                biased;
+                _ = Self::wait_upgrade_cancelled(
+                    &mut cancel_rx,
+                    cancel_baseline_seq,
+                    &self.purge_epoch,
+                    task_purge_epoch,
+                ) => {
+                    return Err(IngestError::Cancelled);
+                }
+                join_res = blocking_fut => match join_res {
+                    Ok(Some(res)) => res,
+                    Ok(None) | Err(_) => continue,
+                }
+            };
+
+            if Self::is_upgrade_cancelled(
+                &cancel_rx,
+                cancel_baseline_seq,
+                &self.purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
+            if self.is_path_blocked(file_path) {
+                continue;
             }
 
-            if doc_chunks.is_empty() {
+            let (doc_chunks, parent_doc, file_b3, file_chunk_hashes, catalog_meta) = built;
+
+            let _commit_permit = crate::thread_pool::IngestThreadPool::shared()
+                .permit_tiers()
+                .acquire_storage_commit()
+                .await?;
+            let _commit_guard = self.commit_gate.read().await;
+            if Self::is_upgrade_cancelled(
+                &cancel_rx,
+                cancel_baseline_seq,
+                &self.purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
+            if self.is_path_blocked(file_path) {
                 continue;
             }
 
             let _ = self.storage.delete_by_file_path(&path_str).await;
             self.storage.insert_chunks(&doc_chunks).await?;
-            let upgraded_mtime = std::fs::metadata(file_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let upgraded_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(content.len() as u64);
-            let parent_doc = DocumentExtractor::build_ingested_parent_document(
-                file_path,
-                &file_b3,
-                &file_b3,
-                &content,
-                upgraded_mtime,
-                upgraded_size,
-                None,
-            );
-            let _ = self.storage.upsert_parent_document(&parent_doc, access_tier);
+            let _ = self
+                .storage
+                .upsert_parent_document(&parent_doc, access_tier);
 
-            if let Ok(meta) = std::fs::metadata(file_path) {
-                let mtime_secs = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
+            if let Some((mtime_secs, size_bytes)) = catalog_meta {
                 self.dedup.register_entry(FileCatalogEntry {
                     file_path: file_path.to_path_buf(),
                     file_blake3: file_b3,
                     mtime_secs,
-                    size_bytes: meta.len(),
+                    size_bytes,
                     chunk_hashes: file_chunk_hashes,
                 });
             }
@@ -589,10 +1160,21 @@ impl ReindexWorker {
         }
 
         if upgraded_files > 0 {
-            if let Some(ref cat_path) = self.config.dedup_catalog_path {
+            let _commit_guard = self.commit_gate.read().await;
+            if Self::is_upgrade_cancelled(
+                &cancel_rx,
+                cancel_baseline_seq,
+                &self.purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
+            if let Some(ref cat_path) = cfg_snapshot.dedup_catalog_path {
                 let _ = self.dedup.save_catalog_to_file(cat_path);
             }
-            let _ = self.storage.bump_index_epoch("degraded_doc_chunks_upgraded");
+            let _ = self
+                .storage
+                .bump_index_epoch("degraded_doc_chunks_upgraded");
             info!(
                 upgraded_files,
                 "Self-healed degraded DOCX/PDF chunks using native Rust extractor"
@@ -602,11 +1184,109 @@ impl ReindexWorker {
         Ok(upgraded_files)
     }
 
+    #[inline]
+    fn is_pipeline_cancelled(
+        cancel_flag: &AtomicBool,
+        cancel_rx: &tokio::sync::watch::Receiver<u64>,
+        baseline_seq: u64,
+        purge_epoch: &AtomicU64,
+        task_purge_epoch: u64,
+    ) -> bool {
+        cancel_flag.load(Ordering::SeqCst)
+            || *cancel_rx.borrow() != baseline_seq
+            || purge_epoch.load(Ordering::SeqCst) != task_purge_epoch
+    }
+
+    async fn wait_pipeline_cancelled(
+        cancel_flag: &AtomicBool,
+        cancel_rx: &mut tokio::sync::watch::Receiver<u64>,
+        baseline_seq: u64,
+        purge_epoch: &AtomicU64,
+        task_purge_epoch: u64,
+    ) {
+        loop {
+            if cancel_flag.load(Ordering::SeqCst)
+                || *cancel_rx.borrow_and_update() != baseline_seq
+                || purge_epoch.load(Ordering::SeqCst) != task_purge_epoch
+            {
+                return;
+            }
+            if cancel_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 
     /// Cooperative cancellation of an ongoing reindex task.
     pub fn cancel_reindex(&self) -> bool {
         self.cancel_flag.store(true, Ordering::SeqCst);
+        self.cancel_tx.send_modify(|seq| *seq = seq.wrapping_add(1));
         true
+    }
+
+    /// Acquires an exclusive storage/dedup purge barrier serialized against all
+    /// `ReindexWorker` batch storage commits so prefix purges cannot interleave with
+    /// late chunk, parent-document, or dedup-catalog writes.
+    pub async fn acquire_purge_barrier(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.commit_gate.write().await
+    }
+
+    /// Returns shared purge-barrier synchronization handles (`purge_epoch`, `blocked_prefixes`,
+    /// `commit_gate`) so sibling workers such as `DriftHealer` serialize storage/dedup commits
+    /// against prefix purges and observe monotonic purge epochs immediately.
+    pub fn purge_barrier_handles(
+        &self,
+    ) -> (
+        Arc<AtomicU64>,
+        Arc<std::sync::RwLock<Vec<String>>>,
+        Arc<RwLock<()>>,
+    ) {
+        (
+            Arc::clone(&self.purge_epoch),
+            Arc::clone(&self.blocked_prefixes),
+            Arc::clone(&self.commit_gate),
+        )
+    }
+
+    /// Cancels all ongoing reindex tasks (including concurrent `run_reindex_sync` calls)
+    /// and waits up to `timeout` for every in-flight worker to reach a terminal state so
+    /// subsequent storage/dedup purges cannot race with an in-flight batch write.
+    pub async fn cancel_and_drain(&self, timeout: std::time::Duration) -> bool {
+        self.purge_epoch.fetch_add(1, Ordering::SeqCst);
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        self.cancel_tx.send_modify(|seq| *seq = seq.wrapping_add(1));
+        let is_active = |phase: ReindexPhase| {
+            matches!(
+                phase,
+                ReindexPhase::ScanningFilesystem
+                    | ReindexPhase::ChunkingAndVectorizing
+                    | ReindexPhase::WritingToStorage
+                    | ReindexPhase::CompactingIndexes
+            )
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.task_done_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let shared_running = {
+                let guard = self.active_task.read().await;
+                guard.as_ref().is_some_and(|p| is_active(p.phase))
+            };
+            let any_in_flight = self.in_flight_tasks.load(Ordering::SeqCst) > 0;
+            if !shared_running && !any_in_flight {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let _ = tokio::time::timeout(
+                remaining.min(std::time::Duration::from_millis(50)),
+                notified,
+            )
+            .await;
+        }
     }
 
     /// Fetches the latest live progress of the reindex worker.
@@ -616,12 +1296,11 @@ impl ReindexWorker {
     }
 
     /// Synchronous reindex execution (used by CLI commands, `POST /api/documents/add`, or unit tests).
-    pub async fn run_reindex_sync(&self, options: ReindexOptions) -> Result<ReindexProgress, IngestError> {
-        if !options.target_paths.is_empty() {
-            self.add_watch_paths(&options.target_paths);
-        }
+    pub async fn run_reindex_sync(
+        &self,
+        options: ReindexOptions,
+    ) -> Result<ReindexProgress, IngestError> {
         let task_id = Uuid::new_v4();
-        self.cancel_flag.store(false, Ordering::SeqCst);
 
         let initial_progress = ReindexProgress {
             task_id,
@@ -641,11 +1320,33 @@ impl ReindexWorker {
             error_message: None,
         };
 
+        struct SyncTaskDoneGuard {
+            in_flight: Arc<AtomicUsize>,
+            notify: Arc<tokio::sync::Notify>,
+        }
+        impl Drop for SyncTaskDoneGuard {
+            fn drop(&mut self) {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                self.notify.notify_waiters();
+            }
+        }
+        self.in_flight_tasks.fetch_add(1, Ordering::SeqCst);
+        let _done_guard = SyncTaskDoneGuard {
+            in_flight: Arc::clone(&self.in_flight_tasks),
+            notify: Arc::clone(&self.task_done_notify),
+        };
+
+        let task_purge_epoch = self.purge_epoch.load(Ordering::SeqCst);
+        let cancel_baseline_seq = *self.cancel_tx.borrow();
+
         // If no background task is currently running in `self.active_task`, publish live progress
         // directly to `self.active_task` so `GET /api/reindex/status` and the sidebar UI update in real time.
         let use_shared_active = {
             let mut active_guard = self.active_task.write().await;
-            let is_busy = active_guard.as_ref().map(|c| {
+            if self.purge_epoch.load(Ordering::SeqCst) != task_purge_epoch {
+                return Err(IngestError::Cancelled);
+            }
+            let is_busy = active_guard.as_ref().is_some_and(|c| {
                 matches!(
                     c.phase,
                     ReindexPhase::ScanningFilesystem
@@ -653,8 +1354,12 @@ impl ReindexWorker {
                         | ReindexPhase::WritingToStorage
                         | ReindexPhase::CompactingIndexes
                 )
-            }).unwrap_or(false);
+            });
             if !is_busy {
+                if self.purge_epoch.load(Ordering::SeqCst) != task_purge_epoch {
+                    return Err(IngestError::Cancelled);
+                }
+                self.cancel_flag.store(false, Ordering::SeqCst);
                 *active_guard = Some(initial_progress.clone());
                 true
             } else {
@@ -662,51 +1367,114 @@ impl ReindexWorker {
             }
         };
 
+        if !options.target_paths.is_empty() {
+            self.add_watch_paths(&options.target_paths);
+        }
+
         let progress_state = if use_shared_active {
             Arc::clone(&self.active_task)
         } else {
             Arc::new(RwLock::new(Some(initial_progress)))
         };
 
-        let local_pending = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut worker_config = self.config.clone();
-        worker_config.watch_paths = self.all_watch_paths();
+        let pending_queue = if use_shared_active {
+            Arc::clone(&self.pending_priority_paths)
+        } else {
+            Arc::new(tokio::sync::Mutex::new(Vec::new()))
+        };
 
-        Self::execute_pipeline(
-            worker_config,
-            options,
-            task_id,
-            Arc::clone(&self.storage),
-            Arc::clone(&self.classifier),
-            Arc::clone(&self.embedder),
-            Arc::clone(&self.dedup),
-            progress_state.clone(),
-            Arc::clone(&self.cancel_flag),
-            local_pending,
-        )
-        .await?;
+        let cancel_rx_check = self.cancel_tx.subscribe();
+        let mut loop_options = options;
+        let final_res = loop {
+            let res = Self::execute_pipeline(
+                Arc::clone(&self.config),
+                Arc::clone(&self.dlp_gate),
+                Arc::clone(&self.dynamic_watch_paths),
+                Arc::clone(&self.blocked_prefixes),
+                loop_options.clone(),
+                task_id,
+                Arc::clone(&self.storage),
+                Arc::clone(&self.classifier),
+                Arc::clone(&self.embedder),
+                Arc::clone(&self.dedup),
+                progress_state.clone(),
+                Arc::clone(&self.cancel_flag),
+                self.cancel_tx.subscribe(),
+                cancel_baseline_seq,
+                Arc::clone(&self.purge_epoch),
+                task_purge_epoch,
+                Arc::clone(&pending_queue),
+                Arc::clone(&self.commit_gate),
+            )
+            .await;
+
+            if use_shared_active
+                && res.is_ok()
+                && !Self::is_pipeline_cancelled(
+                    &self.cancel_flag,
+                    &cancel_rx_check,
+                    cancel_baseline_seq,
+                    &self.purge_epoch,
+                    task_purge_epoch,
+                )
+            {
+                let leftover_priority: Vec<std::path::PathBuf> = {
+                    let mut g = pending_queue.lock().await;
+                    std::mem::take(&mut *g)
+                };
+                if !leftover_priority.is_empty() {
+                    let mut lock = progress_state.write().await;
+                    if let Some(ref mut prog) = *lock {
+                        prog.files_total_estimated =
+                            prog.files_total_estimated.max(prog.files_scanned);
+                        prog.phase = ReindexPhase::ScanningFilesystem;
+                    }
+                    drop(lock);
+                    loop_options.target_paths = leftover_priority;
+                    loop_options.full_rebuild = false;
+                    loop_options.force_reembed = false;
+                    continue;
+                }
+            }
+            break res;
+        };
 
         let mut lock = progress_state.write().await;
         let mut final_prog = lock.clone().ok_or_else(|| {
             IngestError::WatcherError("reindex finished without a progress record".into())
         })?;
-        final_prog.files_total_estimated = final_prog.files_total_estimated.max(final_prog.files_scanned);
-        final_prog.phase = ReindexPhase::Completed;
+        final_prog.files_total_estimated = final_prog
+            .files_total_estimated
+            .max(final_prog.files_scanned);
         final_prog.completed_at = Some(Utc::now());
         final_prog.elapsed_secs = (Utc::now() - final_prog.started_at).num_seconds().max(0) as u64;
+        match &final_res {
+            Ok(_) => final_prog.phase = ReindexPhase::Completed,
+            Err(IngestError::Cancelled) => final_prog.phase = ReindexPhase::Cancelled,
+            Err(e) => {
+                final_prog.phase = ReindexPhase::Failed;
+                final_prog.error_message = Some(e.to_string());
+            }
+        }
         if use_shared_active {
             *lock = Some(final_prog.clone());
         } else {
             *lock = None;
         }
+        drop(lock);
+        drop(_done_guard);
 
+        final_res?;
         Ok(final_prog)
     }
 
     /// Internal execution loop for reindexing.
     #[allow(clippy::too_many_arguments)]
     async fn execute_pipeline(
-        mut config: IngestConfig,
+        config_lock: Arc<RwLock<IngestConfig>>,
+        dlp_gate_lock: Arc<RwLock<Option<Arc<dyn quorum_types::DlpContentGate>>>>,
+        dynamic_watch_lock: Arc<std::sync::RwLock<Vec<std::path::PathBuf>>>,
+        blocked_prefixes_lock: Arc<std::sync::RwLock<Vec<String>>>,
         options: ReindexOptions,
         _task_id: Uuid,
         storage: Arc<StorageEngine>,
@@ -715,7 +1483,12 @@ impl ReindexWorker {
         dedup: Arc<TwoLevelDedupEngine>,
         progress: Arc<RwLock<Option<ReindexProgress>>>,
         cancel_flag: Arc<AtomicBool>,
-        pending_priority_paths: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+        mut cancel_rx: tokio::sync::watch::Receiver<u64>,
+        cancel_baseline_seq: u64,
+        purge_epoch: Arc<AtomicU64>,
+        task_purge_epoch: u64,
+        pending_priority_paths: Arc<tokio::sync::Mutex<Vec<std::path::PathBuf>>>,
+        commit_gate: Arc<tokio::sync::RwLock<()>>,
     ) -> Result<(), IngestError> {
         // RAII guard to ensure bulk indexing is restored when this reindex pass terminates
         struct BulkIndexReset;
@@ -727,9 +1500,31 @@ impl ReindexWorker {
         crate::image_indexer::ImageIndexer::set_bulk_indexing(true);
         let _bulk_reset = BulkIndexReset;
 
+        if Self::is_pipeline_cancelled(
+            &cancel_flag,
+            &cancel_rx,
+            cancel_baseline_seq,
+            &purge_epoch,
+            task_purge_epoch,
+        ) {
+            return Err(IngestError::Cancelled);
+        }
+
         // Hydrate deduplication state from SQLite document catalog before processing candidates
         if let Err(e) = dedup.hydrate_from_catalog(&storage) {
-            warn!("Failed to hydrate dedup catalog from document_catalog.db: {}", e);
+            warn!(
+                "Failed to hydrate dedup catalog from document_catalog.db: {}",
+                e
+            );
+        }
+
+        let mut config = config_lock.read().await.clone();
+        if let Ok(dyn_guard) = dynamic_watch_lock.read() {
+            for p in dyn_guard.iter() {
+                if !config.watch_paths.iter().any(|existing| existing == p) {
+                    config.watch_paths.push(p.clone());
+                }
+            }
         }
 
         let storage_path = storage.config().storage_path.clone();
@@ -737,8 +1532,20 @@ impl ReindexWorker {
             config.excluded_paths.push(storage_path);
         }
         if let Some(ref cat_path) = config.dedup_catalog_path {
-            if !cat_path.as_os_str().is_empty() && !config.excluded_paths.iter().any(|p| p == cat_path) {
+            if !cat_path.as_os_str().is_empty()
+                && !config.excluded_paths.iter().any(|p| p == cat_path)
+            {
                 config.excluded_paths.push(cat_path.clone());
+            }
+        }
+        let blocked_initial = blocked_prefixes_lock
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        for bp in &blocked_initial {
+            let bp_pb = std::path::PathBuf::from(bp);
+            if !config.excluded_paths.iter().any(|ex| ex == &bp_pb) {
+                config.excluded_paths.push(bp_pb);
             }
         }
 
@@ -756,22 +1563,57 @@ impl ReindexWorker {
         let targets = Self::expand_drive_roots(&raw_targets);
         let targets: Vec<std::path::PathBuf> = targets
             .into_iter()
-            .filter(|t| !config.excluded_paths.iter().any(|ex| t == ex || t.starts_with(ex)))
+            .filter(|t| {
+                !config
+                    .excluded_paths
+                    .iter()
+                    .any(|ex| t == ex || t.starts_with(ex))
+                    && !Self::is_path_str_blocked(&t.to_string_lossy(), &blocked_initial)
+            })
             .collect();
+        if targets.is_empty() {
+            return Ok(());
+        }
         let chunker = TextChunker::new(ChunkerConfig::default());
 
         // Phase 1: Decoupled Upfront Discovery across all target slices (Unified work-stealing parallel crawl)
         let crawler = Arc::new(FilesystemCrawler::new(config.clone()));
         let crawler_c = Arc::clone(&crawler);
         let targets_c = targets.clone();
-        let all_candidates = tokio::task::spawn_blocking(move || {
+        if Self::is_pipeline_cancelled(
+            &cancel_flag,
+            &cancel_rx,
+            cancel_baseline_seq,
+            &purge_epoch,
+            task_purge_epoch,
+        ) {
+            return Err(IngestError::Cancelled);
+        }
+        let crawl_fut = tokio::task::spawn_blocking(move || {
             crate::throttling::set_background_thread_priority();
             let res = crawler_c.crawl_multi_root_sync(&targets_c);
             crate::throttling::end_background_thread_priority();
             res
-        })
-        .await
-        .map_err(|e| IngestError::Io(std::io::Error::other(format!("Crawler task join failed: {}", e))))??;
+        });
+        let all_candidates = tokio::select! {
+            biased;
+            _ = Self::wait_pipeline_cancelled(&cancel_flag, &mut cancel_rx, cancel_baseline_seq, &purge_epoch, task_purge_epoch) => {
+                return Err(IngestError::Cancelled);
+            }
+            join_res = crawl_fut => {
+                join_res
+                    .map_err(|e| IngestError::Io(std::io::Error::other(format!("Crawler task join failed: {}", e))))??
+            }
+        };
+        if Self::is_pipeline_cancelled(
+            &cancel_flag,
+            &cancel_rx,
+            cancel_baseline_seq,
+            &purge_epoch,
+            task_purge_epoch,
+        ) {
+            return Err(IngestError::Cancelled);
+        }
 
         let mut candidate_queue: std::collections::VecDeque<DiscoveredCandidate> =
             all_candidates.into_iter().collect();
@@ -807,28 +1649,56 @@ impl ReindexWorker {
         let thread_pool = crate::thread_pool::IngestThreadPool::shared();
 
         let mut batch_chunks: Vec<DocumentChunk> = Vec::with_capacity(options.batch_size.max(64));
-        let mut batch_parents: Vec<(quorum_types::IngestedParentDocument, u8)> = Vec::with_capacity(options.batch_size.max(64));
+        let mut batch_parents: Vec<(quorum_types::IngestedParentDocument, u8)> =
+            Vec::with_capacity(options.batch_size.max(64));
+        let mut batch_catalog_entries: Vec<FileCatalogEntry> =
+            Vec::with_capacity(options.batch_size.max(64));
 
         let mut futures = FuturesUnordered::new();
         let mut last_catalog_save = std::time::Instant::now();
+        let mut committed_any_non_blocked = false;
 
         loop {
-            if cancel_flag.load(Ordering::SeqCst) {
+            if Self::is_pipeline_cancelled(
+                &cancel_flag,
+                &cancel_rx,
+                cancel_baseline_seq,
+                &purge_epoch,
+                task_purge_epoch,
+            ) {
                 return Err(IngestError::Cancelled);
             }
 
             // Drain any priority paths dynamically added via watcher or folder upload while running
-            let newly_queued_paths: Vec<std::path::PathBuf> = pending_priority_paths
-                .lock()
-                .map(|mut g| std::mem::take(&mut *g))
-                .unwrap_or_default();
+            let newly_queued_paths: Vec<std::path::PathBuf> = {
+                let mut g = pending_priority_paths.lock().await;
+                std::mem::take(&mut *g)
+            };
             if !newly_queued_paths.is_empty() {
-                let expanded_priority: Vec<std::path::PathBuf> = Self::expand_drive_roots(&newly_queued_paths)
-                    .into_iter()
-                    .filter(|t| !config.excluded_paths.iter().any(|ex| t == ex || t.starts_with(ex)))
-                    .collect();
+                let blocked_now = blocked_prefixes_lock
+                    .read()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let mut live_cfg = config_lock.read().await.clone();
+                for bp in &blocked_now {
+                    let bp_pb = std::path::PathBuf::from(bp);
+                    if !live_cfg.excluded_paths.iter().any(|ex| ex == &bp_pb) {
+                        live_cfg.excluded_paths.push(bp_pb);
+                    }
+                }
+                let expanded_priority: Vec<std::path::PathBuf> =
+                    Self::expand_drive_roots(&newly_queued_paths)
+                        .into_iter()
+                        .filter(|t| {
+                            !live_cfg
+                                .excluded_paths
+                                .iter()
+                                .any(|ex| t == ex || t.starts_with(ex))
+                                && !Self::is_path_str_blocked(&t.to_string_lossy(), &blocked_now)
+                        })
+                        .collect();
                 if !expanded_priority.is_empty() {
-                    let crawler_p = Arc::clone(&crawler);
+                    let crawler_p = Arc::new(FilesystemCrawler::new(live_cfg));
                     if let Ok(Ok(priority_candidates)) = tokio::task::spawn_blocking(move || {
                         crawler_p.crawl_multi_root_sync(&expanded_priority)
                     })
@@ -850,31 +1720,89 @@ impl ReindexWorker {
 
             // Fill concurrency slots up to capacity
             while futures.len() < concurrency {
-                let Some(candidate) = candidate_queue.pop_front() else { break };
+                let Some(candidate) = candidate_queue.pop_front() else {
+                    break;
+                };
 
                 let path = candidate.path.clone();
-                let access_tier = config.resolve_access_tier(&path);
+                let blocked_now = blocked_prefixes_lock
+                    .read()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                if Self::is_path_str_blocked(&path.to_string_lossy(), &blocked_now) {
+                    continue;
+                }
+                let (access_tier, placeholder_policy) = {
+                    let live_cfg = config_lock.read().await;
+                    (
+                        live_cfg.resolve_access_tier(&path),
+                        live_cfg.placeholder_policy,
+                    )
+                };
+                let dlp_gate = dlp_gate_lock.read().await.clone();
 
                 // Level-1 Evaluation: skip unmodified unless full_rebuild is forced
                 let mut precomputed_file_b3 = None;
                 if !options.full_rebuild {
-                    if let Ok(action) = dedup.evaluate_file(&path, candidate.mtime_secs, candidate.size_bytes) {
+                    if let Ok(action) = dedup.evaluate_file_with_policy(
+                        &path,
+                        candidate.mtime_secs,
+                        candidate.size_bytes,
+                        placeholder_policy,
+                    ) {
                         match action {
                             DedupAction::Unchanged { .. } => {
                                 let mut lock = progress.write().await;
                                 if let Some(ref mut p) = *lock {
                                     p.files_scanned += 1;
-                                    p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
+                                    p.files_total_estimated =
+                                        p.files_total_estimated.max(p.files_scanned);
                                     p.files_skipped_unmodified += 1;
                                     p.bytes_processed += candidate.size_bytes;
                                 }
-                                if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                                if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30)
+                                {
+                                    let _commit_guard = commit_gate.read().await;
+                                    if Self::is_pipeline_cancelled(
+                                        &cancel_flag,
+                                        &cancel_rx,
+                                        cancel_baseline_seq,
+                                        &purge_epoch,
+                                        task_purge_epoch,
+                                    ) {
+                                        return Err(IngestError::Cancelled);
+                                    }
                                     let _ = dedup.save_catalog_to_file(&catalog_path);
                                     last_catalog_save = std::time::Instant::now();
                                 }
                                 continue;
                             }
-                            DedupAction::MovedOrRenamed { old_path, new_path, file_blake3, chunk_hashes } => {
+                            DedupAction::MovedOrRenamed {
+                                old_path,
+                                new_path,
+                                file_blake3,
+                                chunk_hashes,
+                            } => {
+                                let _commit_guard = commit_gate.read().await;
+                                if Self::is_pipeline_cancelled(
+                                    &cancel_flag,
+                                    &cancel_rx,
+                                    cancel_baseline_seq,
+                                    &purge_epoch,
+                                    task_purge_epoch,
+                                ) {
+                                    return Err(IngestError::Cancelled);
+                                }
+                                let blocked_now = blocked_prefixes_lock
+                                    .read()
+                                    .map(|g| g.clone())
+                                    .unwrap_or_default();
+                                if Self::is_path_str_blocked(
+                                    &new_path.to_string_lossy(),
+                                    &blocked_now,
+                                ) {
+                                    continue;
+                                }
                                 info!(old = %old_path.display(), new = %new_path.display(), "Detected moved/renamed file during reindex; updating path with 0 re-embeddings");
                                 dedup.register_entry(FileCatalogEntry {
                                     file_path: new_path,
@@ -886,11 +1814,13 @@ impl ReindexWorker {
                                 let mut lock = progress.write().await;
                                 if let Some(ref mut p) = *lock {
                                     p.files_scanned += 1;
-                                    p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
+                                    p.files_total_estimated =
+                                        p.files_total_estimated.max(p.files_scanned);
                                     p.files_indexed += 1;
                                     p.bytes_processed += candidate.size_bytes;
                                 }
-                                if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                                if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30)
+                                {
                                     let _ = dedup.save_catalog_to_file(&catalog_path);
                                     last_catalog_save = std::time::Instant::now();
                                 }
@@ -920,6 +1850,8 @@ impl ReindexWorker {
                     let outcome = process_candidate_sync(
                         candidate,
                         access_tier,
+                        placeholder_policy,
+                        dlp_gate,
                         force_reembed || full_rebuild,
                         storage_c,
                         embedder_c,
@@ -958,28 +1890,52 @@ impl ReindexWorker {
             }
 
             if futures.is_empty() {
-                let has_more_priority = pending_priority_paths
-                    .lock()
-                    .map(|g| !g.is_empty())
-                    .unwrap_or(false);
+                let has_more_priority = !pending_priority_paths.lock().await.is_empty();
                 if has_more_priority {
                     continue;
                 }
                 break;
             }
 
-            if let Some(join_res) = futures.next().await {
+            if Self::is_pipeline_cancelled(
+                &cancel_flag,
+                &cancel_rx,
+                cancel_baseline_seq,
+                &purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
+            let next_join_res = tokio::select! {
+                biased;
+                _ = Self::wait_pipeline_cancelled(&cancel_flag, &mut cancel_rx, cancel_baseline_seq, &purge_epoch, task_purge_epoch) => {
+                    return Err(IngestError::Cancelled);
+                }
+                res = futures.next() => res,
+            };
+            if Self::is_pipeline_cancelled(
+                &cancel_flag,
+                &cancel_rx,
+                cancel_baseline_seq,
+                &purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
+
+            if let Some(join_res) = next_join_res {
                 match join_res {
                     Ok(outcome) => match outcome {
                         CandidateOutcome::AlreadyIndexedInFts {
                             catalog_entry,
                             size_bytes,
                         } => {
-                            dedup.register_entry(catalog_entry);
+                            batch_catalog_entries.push(catalog_entry);
                             let mut lock = progress.write().await;
                             if let Some(ref mut p) = *lock {
                                 p.files_scanned += 1;
-                                p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
+                                p.files_total_estimated =
+                                    p.files_total_estimated.max(p.files_scanned);
                                 p.files_skipped_unmodified += 1;
                                 p.bytes_processed += size_bytes;
                             }
@@ -992,7 +1948,7 @@ impl ReindexWorker {
                             chunks_reused,
                             chunks_new,
                         } => {
-                            dedup.register_entry(catalog_entry);
+                            batch_catalog_entries.push(catalog_entry);
                             if let Some(parent) = parent_doc {
                                 batch_parents.push(parent);
                             }
@@ -1001,7 +1957,8 @@ impl ReindexWorker {
                             let mut lock = progress.write().await;
                             if let Some(ref mut p) = *lock {
                                 p.files_scanned += 1;
-                                p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
+                                p.files_total_estimated =
+                                    p.files_total_estimated.max(p.files_scanned);
                                 p.files_indexed += 1;
                                 p.bytes_processed += size_bytes;
                                 p.chunks_reused_from_cache += chunks_reused;
@@ -1013,7 +1970,8 @@ impl ReindexWorker {
                             let mut lock = progress.write().await;
                             if let Some(ref mut p) = *lock {
                                 p.files_scanned += 1;
-                                p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
+                                p.files_total_estimated =
+                                    p.files_total_estimated.max(p.files_scanned);
                                 p.files_failed += 1;
                             }
                         }
@@ -1030,24 +1988,89 @@ impl ReindexWorker {
                 }
 
                 if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                    let _commit_guard = commit_gate.read().await;
+                    if Self::is_pipeline_cancelled(
+                        &cancel_flag,
+                        &cancel_rx,
+                        cancel_baseline_seq,
+                        &purge_epoch,
+                        task_purge_epoch,
+                    ) {
+                        return Err(IngestError::Cancelled);
+                    }
+                    let blocked_now = blocked_prefixes_lock
+                        .read()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    for entry in batch_catalog_entries.drain(..) {
+                        if !Self::is_path_str_blocked(
+                            &entry.file_path.to_string_lossy(),
+                            &blocked_now,
+                        ) {
+                            dedup.register_entry(entry);
+                        }
+                    }
                     let _ = dedup.save_catalog_to_file(&catalog_path);
                     last_catalog_save = std::time::Instant::now();
                 }
 
-                // If micro-batch is full, flush to storage
+                // If micro-batch is full, flush to storage under commit_gate + cancellation + blocked-prefix check
                 if batch_chunks.len() >= options.batch_size {
+                    if Self::is_pipeline_cancelled(
+                        &cancel_flag,
+                        &cancel_rx,
+                        cancel_baseline_seq,
+                        &purge_epoch,
+                        task_purge_epoch,
+                    ) {
+                        return Err(IngestError::Cancelled);
+                    }
                     if !options.dry_run {
                         let _commit_permit = permit_tiers.acquire_storage_commit().await?;
-                        Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
-                        let _ = storage.insert_chunks(&batch_chunks).await?;
-                        for (pdoc, ptier) in batch_parents.drain(..) {
-                            let _ = storage.upsert_parent_document(&pdoc, ptier);
+                        let _commit_guard = commit_gate.read().await;
+                        if Self::is_pipeline_cancelled(
+                            &cancel_flag,
+                            &cancel_rx,
+                            cancel_baseline_seq,
+                            &purge_epoch,
+                            task_purge_epoch,
+                        ) {
+                            return Err(IngestError::Cancelled);
                         }
-                        let _ = dedup.save_catalog_to_file(&catalog_path);
-                        last_catalog_save = std::time::Instant::now();
-                        let _ = storage.bump_index_epoch("reindex_micro_batch");
+                        let blocked_now = blocked_prefixes_lock
+                            .read()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+                        batch_chunks
+                            .retain(|c| !Self::is_path_str_blocked(&c.file_path, &blocked_now));
+                        batch_parents.retain(|(p, _)| {
+                            !Self::is_path_str_blocked(&p.source_path, &blocked_now)
+                        });
+                        batch_catalog_entries.retain(|e| {
+                            !Self::is_path_str_blocked(&e.file_path.to_string_lossy(), &blocked_now)
+                        });
+                        if !batch_chunks.is_empty()
+                            || !batch_parents.is_empty()
+                            || !batch_catalog_entries.is_empty()
+                        {
+                            if !batch_chunks.is_empty() {
+                                Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
+                                let _ = storage.insert_chunks(&batch_chunks).await?;
+                                committed_any_non_blocked = true;
+                            }
+                            for (pdoc, ptier) in batch_parents.drain(..) {
+                                let _ = storage.upsert_parent_document(&pdoc, ptier);
+                            }
+                            for entry in batch_catalog_entries.drain(..) {
+                                dedup.register_entry(entry);
+                            }
+                            let _ = dedup.save_catalog_to_file(&catalog_path);
+                            last_catalog_save = std::time::Instant::now();
+                            let _ = storage.bump_index_epoch("reindex_micro_batch");
+                        }
                     } else {
                         batch_parents.clear();
+                        batch_catalog_entries.clear();
                     }
                     batch_chunks.clear();
                     tokio::task::yield_now().await;
@@ -1057,27 +2080,77 @@ impl ReindexWorker {
             }
         }
 
-        // Flush remaining micro-batch
-        if !batch_chunks.is_empty() && !options.dry_run {
+        // Flush remaining micro-batch under commit_gate + cancellation + blocked-prefix check
+        if Self::is_pipeline_cancelled(
+            &cancel_flag,
+            &cancel_rx,
+            cancel_baseline_seq,
+            &purge_epoch,
+            task_purge_epoch,
+        ) {
+            return Err(IngestError::Cancelled);
+        }
+        if !options.dry_run
+            && (!batch_chunks.is_empty()
+                || !batch_parents.is_empty()
+                || !batch_catalog_entries.is_empty())
+        {
             let _commit_permit = permit_tiers.acquire_storage_commit().await?;
-            Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
-            let _ = storage.insert_chunks(&batch_chunks).await?;
-            for (pdoc, ptier) in batch_parents.drain(..) {
-                let _ = storage.upsert_parent_document(&pdoc, ptier);
+            let _commit_guard = commit_gate.read().await;
+            if Self::is_pipeline_cancelled(
+                &cancel_flag,
+                &cancel_rx,
+                cancel_baseline_seq,
+                &purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
             }
-            let _ = dedup.save_catalog_to_file(&catalog_path);
-            let _ = storage.bump_index_epoch("reindex_final_flush");
+            let blocked_now = blocked_prefixes_lock
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            batch_chunks.retain(|c| !Self::is_path_str_blocked(&c.file_path, &blocked_now));
+            batch_parents.retain(|(p, _)| !Self::is_path_str_blocked(&p.source_path, &blocked_now));
+            batch_catalog_entries.retain(|e| {
+                !Self::is_path_str_blocked(&e.file_path.to_string_lossy(), &blocked_now)
+            });
+            if !batch_chunks.is_empty()
+                || !batch_parents.is_empty()
+                || !batch_catalog_entries.is_empty()
+            {
+                if !batch_chunks.is_empty() {
+                    Self::replace_existing_file_chunks(&storage, &batch_chunks).await;
+                    let _ = storage.insert_chunks(&batch_chunks).await?;
+                    batch_chunks.clear();
+                    committed_any_non_blocked = true;
+                }
+                for (pdoc, ptier) in batch_parents.drain(..) {
+                    let _ = storage.upsert_parent_document(&pdoc, ptier);
+                }
+                for entry in batch_catalog_entries.drain(..) {
+                    dedup.register_entry(entry);
+                }
+                let _ = dedup.save_catalog_to_file(&catalog_path);
+                let _ = storage.bump_index_epoch("reindex_final_flush");
+            }
+        } else {
             batch_chunks.clear();
-        } else if !batch_parents.is_empty() && !options.dry_run {
-            let _commit_permit = permit_tiers.acquire_storage_commit().await?;
-            for (pdoc, ptier) in batch_parents.drain(..) {
-                let _ = storage.upsert_parent_document(&pdoc, ptier);
-            }
-            let _ = dedup.save_catalog_to_file(&catalog_path);
+            batch_parents.clear();
+            batch_catalog_entries.clear();
         }
 
         // Compaction phase if full rebuild
         if options.full_rebuild && !options.dry_run {
+            if Self::is_pipeline_cancelled(
+                &cancel_flag,
+                &cancel_rx,
+                cancel_baseline_seq,
+                &purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
+            }
             let mut lock = progress.write().await;
             if let Some(ref mut p) = *lock {
                 p.phase = ReindexPhase::CompactingIndexes;
@@ -1086,38 +2159,53 @@ impl ReindexWorker {
             let _ = storage.compact().await;
         }
 
-        // Cache coherence hook: bump index_epoch if any mutations occurred
-        let has_mutated = {
+        // Cache coherence hook: bump index_epoch if any non-blocked mutations occurred
+        let has_mutated = committed_any_non_blocked && {
             let lock = progress.read().await;
             lock.as_ref()
                 .map(|p| p.files_indexed > 0 || p.chunks_newly_embedded > 0 || options.full_rebuild)
                 .unwrap_or(false)
         };
 
-        if has_mutated && !options.dry_run {
-            let reason = if options.full_rebuild {
-                "reindex_full_rebuild"
-            } else {
-                "reindex_completed"
-            };
-            let _ = storage.bump_index_epoch(reason)?;
-
-            let catalog_path = config
-                .dedup_catalog_path
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| storage.config().storage_path.join("dedup_catalog.json"));
-            if let Err(e) = dedup.save_catalog_to_file(&catalog_path) {
-                warn!("Failed to auto-save dedup catalog after reindex pass: {}", e);
-            } else {
-                info!(
-                    path = %catalog_path.display(),
-                    tracked_files = dedup.catalog().read().map(|c| c.len()).unwrap_or(0),
-                    "Auto-saved Level-1 dedup catalog to disk after reindex pass"
-                );
+        if !options.dry_run {
+            let _commit_guard = commit_gate.read().await;
+            if Self::is_pipeline_cancelled(
+                &cancel_flag,
+                &cancel_rx,
+                cancel_baseline_seq,
+                &purge_epoch,
+                task_purge_epoch,
+            ) {
+                return Err(IngestError::Cancelled);
             }
-        } else if !options.dry_run {
-            let _ = dedup.save_catalog_to_file(&catalog_path);
+            if has_mutated || (options.full_rebuild && committed_any_non_blocked) {
+                let reason = if options.full_rebuild {
+                    "reindex_full_rebuild"
+                } else {
+                    "reindex_completed"
+                };
+                let _ = storage.bump_index_epoch(reason)?;
+
+                let catalog_path = config
+                    .dedup_catalog_path
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| storage.config().storage_path.join("dedup_catalog.json"));
+                if let Err(e) = dedup.save_catalog_to_file(&catalog_path) {
+                    warn!(
+                        "Failed to auto-save dedup catalog after reindex pass: {}",
+                        e
+                    );
+                } else {
+                    info!(
+                        path = %catalog_path.display(),
+                        tracked_files = dedup.catalog().read().map(|c| c.len()).unwrap_or(0),
+                        "Auto-saved Level-1 dedup catalog to disk after reindex pass"
+                    );
+                }
+            } else {
+                let _ = dedup.save_catalog_to_file(&catalog_path);
+            }
         }
 
         Ok(())
@@ -1125,7 +2213,7 @@ impl ReindexWorker {
 
     /// Expands drive roots (e.g., `D:\`, `C:\`) into incremental top-level slices so user documents
     /// are indexed and searchable within seconds rather than waiting for a multi-terabyte full-drive walk.
-    pub fn expand_drive_roots(raw_targets: &[ std::path::PathBuf ]) -> Vec<std::path::PathBuf> {
+    pub fn expand_drive_roots(raw_targets: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
         const SKIP_DIRS: &[&str] = &[
             "$recycle.bin",
             "system volume information",
@@ -1171,10 +2259,16 @@ impl ReindexWorker {
         for target in raw_targets {
             let is_drive_root = target.parent().is_none()
                 || target.to_string_lossy().len() <= 3
-                || target.file_name().map(|n| {
-                    let s = n.to_string_lossy();
-                    s.starts_with(".tmp") || s.starts_with("tmp") || s.contains("mock_drive") || s.contains("test")
-                }).unwrap_or(false);
+                || target
+                    .file_name()
+                    .map(|n| {
+                        let s = n.to_string_lossy();
+                        s.starts_with(".tmp")
+                            || s.starts_with("tmp")
+                            || s.contains("mock_drive")
+                            || s.contains("test")
+                    })
+                    .unwrap_or(false);
             if !is_drive_root {
                 expanded.push(target.clone());
                 continue;
@@ -1194,10 +2288,7 @@ impl ReindexWorker {
                     continue;
                 }
                 let path = entry.path();
-                let name_lower = entry
-                    .file_name()
-                    .to_string_lossy()
-                    .to_ascii_lowercase();
+                let name_lower = entry.file_name().to_string_lossy().to_ascii_lowercase();
                 if SKIP_DIRS.contains(&name_lower.as_str()) {
                     continue;
                 }
@@ -1297,9 +2388,12 @@ enum CandidateOutcome {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_candidate_sync(
     candidate: DiscoveredCandidate,
     access_tier: u8,
+    placeholder_policy: quorum_types::CloudPlaceholderPolicy,
+    dlp_gate: Option<Arc<dyn quorum_types::DlpContentGate>>,
     force_reembed: bool,
     storage: Arc<StorageEngine>,
     embedder: Arc<dyn EmbeddingGenerator>,
@@ -1308,9 +2402,14 @@ fn process_candidate_sync(
     precomputed_file_b3: Option<String>,
 ) -> CandidateOutcome {
     let path = &candidate.path;
+    let path_str = path.to_string_lossy().to_string();
     match candidate.kind {
         CandidateKind::Text { .. } => {
-            let content = match DocumentExtractor::extract_text(path, &candidate.file_identity) {
+            let raw_content = match DocumentExtractor::extract_text_with_policy(
+                path,
+                &candidate.file_identity,
+                placeholder_policy,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     return CandidateOutcome::Failed {
@@ -1322,10 +2421,12 @@ fn process_candidate_sync(
 
             let file_b3 = match precomputed_file_b3 {
                 Some(b3) => b3,
-                None => Level1DedupCatalog::hash_file_stream(path)
-                    .unwrap_or_else(|_| blake3::hash(content.as_bytes()).to_hex().to_string()),
+                None => Level1DedupCatalog::hash_file_stream_with_policy(path, placeholder_policy)
+                    .unwrap_or_else(|_| blake3::hash(raw_content.as_bytes()).to_hex().to_string()),
             };
-            if !force_reembed && storage.has_chunk_id_in_fts(&format!("{}:0", file_b3)) {
+            if !force_reembed
+                && storage.has_chunk_id_for_file_in_fts(&format!("{}:0", file_b3), &path_str)
+            {
                 return CandidateOutcome::AlreadyIndexedInFts {
                     catalog_entry: FileCatalogEntry {
                         file_path: path.clone(),
@@ -1337,11 +2438,66 @@ fn process_candidate_sync(
                     size_bytes: candidate.size_bytes,
                 };
             }
+
+            let content = match crate::secret_scrubber::sanitize_and_gate_text(
+                &path_str,
+                &raw_content,
+                access_tier,
+                dlp_gate.as_deref(),
+            ) {
+                Ok(sanitized) => sanitized,
+                Err(reason) => {
+                    return CandidateOutcome::Failed {
+                        path: path.clone(),
+                        error: format!("Blocked by DLP policy: {reason}"),
+                    };
+                }
+            };
+
             let raw_chunks = chunker.chunk_text_structure_aware(&content);
             let mut file_chunk_hashes = Vec::with_capacity(raw_chunks.len());
-            let path_str = path.to_string_lossy().to_string();
-            let resolved_meta = crate::chunker::resolve_document_metadata(path, &content);
-            let header = crate::chunker::build_contextual_header(path, &content);
+            let mut resolved_meta = crate::chunker::resolve_document_metadata_with_policy(
+                path,
+                &content,
+                placeholder_policy,
+            );
+            if let Err(reason) = crate::secret_scrubber::sanitize_and_gate_resolved_metadata(
+                &path_str,
+                &mut resolved_meta,
+                access_tier,
+                dlp_gate.as_deref(),
+            ) {
+                return CandidateOutcome::Failed {
+                    path: path.clone(),
+                    error: format!("Blocked by DLP policy: {reason}"),
+                };
+            }
+            let parent_doc = if !content.is_empty() {
+                let mut pdoc = DocumentExtractor::build_ingested_parent_document_with_policy(
+                    path,
+                    &file_b3,
+                    &file_b3,
+                    &content,
+                    candidate.mtime_secs,
+                    candidate.size_bytes,
+                    None,
+                    placeholder_policy,
+                );
+                if let Err(reason) = crate::secret_scrubber::sanitize_and_gate_parent_document(
+                    &mut pdoc,
+                    access_tier,
+                    dlp_gate.as_deref(),
+                ) {
+                    return CandidateOutcome::Failed {
+                        path: path.clone(),
+                        error: format!("Blocked by DLP policy: {reason}"),
+                    };
+                }
+                Some((pdoc, access_tier))
+            } else {
+                None
+            };
+            let header = crate::chunker::format_contextual_header_from_meta(&resolved_meta);
 
             let mut chunks = Vec::with_capacity(raw_chunks.len());
             let mut chunks_reused = 0;
@@ -1413,23 +2569,6 @@ fn process_candidate_sync(
                 }
             }
 
-            let parent_doc = if !content.is_empty() {
-                Some((
-                    DocumentExtractor::build_ingested_parent_document(
-                        path,
-                        &file_b3,
-                        &file_b3,
-                        &content,
-                        candidate.mtime_secs,
-                        candidate.size_bytes,
-                        None,
-                    ),
-                    access_tier,
-                ))
-            } else {
-                None
-            };
-
             let catalog_entry = FileCatalogEntry {
                 file_path: path.clone(),
                 file_blake3: file_b3,
@@ -1448,7 +2587,10 @@ fn process_candidate_sync(
             }
         }
         CandidateKind::Image { .. } => {
-            let bytes = match std::fs::read(path) {
+            let bytes = match crate::cloud_drives::read_bytes_with_placeholder_policy(
+                path,
+                placeholder_policy,
+            ) {
                 Ok(b) => b,
                 Err(e) => {
                     return CandidateOutcome::Failed {
@@ -1462,7 +2604,11 @@ fn process_candidate_sync(
                 Some(b3) => b3,
                 None => blake3::hash(&bytes).to_hex().to_string(),
             };
-            if !force_reembed && (storage.has_chunk_id_in_fts(&format!("{}:img:0", img_b3)) || storage.has_chunk_id_in_fts(&format!("{}:image:0", img_b3))) {
+            if !force_reembed
+                && (storage.has_chunk_id_for_file_in_fts(&format!("{}:img:0", img_b3), &path_str)
+                    || storage
+                        .has_chunk_id_for_file_in_fts(&format!("{}:image:0", img_b3), &path_str))
+            {
                 return CandidateOutcome::AlreadyIndexedInFts {
                     catalog_entry: FileCatalogEntry {
                         file_path: path.clone(),
@@ -1475,17 +2621,55 @@ fn process_candidate_sync(
                 };
             }
 
-            match ImageIndexer::index_image(
+            match ImageIndexer::index_image_with_policy(
                 path,
                 &bytes,
                 &candidate.file_identity,
                 access_tier,
                 embedder.as_ref(),
+                placeholder_policy,
             ) {
-                Ok(doc_chunk) => {
+                Ok(mut doc_chunk) => {
+                    let gated_text = match crate::secret_scrubber::sanitize_and_gate_text(
+                        &path_str,
+                        &doc_chunk.text_content,
+                        access_tier,
+                        dlp_gate.as_deref(),
+                    ) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            return CandidateOutcome::Failed {
+                                path: path.clone(),
+                                error: format!("Blocked by DLP policy: {reason}"),
+                            };
+                        }
+                    };
+                    doc_chunk.metadata_json =
+                        match crate::secret_scrubber::sanitize_and_gate_metadata_json(
+                            &path_str,
+                            &doc_chunk.metadata_json,
+                            access_tier,
+                            dlp_gate.as_deref(),
+                        ) {
+                            Ok(m) => m,
+                            Err(reason) => {
+                                return CandidateOutcome::Failed {
+                                    path: path.clone(),
+                                    error: format!("Blocked by DLP policy: {reason}"),
+                                };
+                            }
+                        };
+                    if gated_text != doc_chunk.text_content {
+                        doc_chunk.text_content = gated_text;
+                        doc_chunk.blake3_hash =
+                            DocumentChunk::compute_blake3_hash(&doc_chunk.text_content);
+                        doc_chunk.vector = embedder
+                            .embed_text(&doc_chunk.text_content)
+                            .unwrap_or_else(|_| vec![0.0; embedder.dimension()]);
+                    }
                     let file_b3 = doc_chunk.document_id.clone();
                     let parent_doc = Some((
-                        DocumentExtractor::build_ingested_parent_document(
+                        DocumentExtractor::build_ingested_parent_document_with_policy(
                             path,
                             &file_b3,
                             &file_b3,
@@ -1493,6 +2677,7 @@ fn process_candidate_sync(
                             candidate.mtime_secs,
                             candidate.size_bytes,
                             Some(quorum_types::DocumentFormat::ImageFile),
+                            placeholder_policy,
                         ),
                         access_tier,
                     ));
@@ -1519,7 +2704,10 @@ fn process_candidate_sync(
             }
         }
         CandidateKind::Audio { .. } => {
-            let bytes = match std::fs::read(path) {
+            let bytes = match crate::cloud_drives::read_bytes_with_placeholder_policy(
+                path,
+                placeholder_policy,
+            ) {
                 Ok(b) => b,
                 Err(e) => {
                     return CandidateOutcome::Failed {
@@ -1529,14 +2717,52 @@ fn process_candidate_sync(
                 }
             };
 
-            match AudioIndexer::index_audio(
+            match AudioIndexer::index_audio_with_policy(
                 path,
                 &bytes,
                 &candidate.file_identity,
                 access_tier,
                 embedder.as_ref(),
+                placeholder_policy,
             ) {
-                Ok(doc_chunk) => {
+                Ok(mut doc_chunk) => {
+                    let gated_text = match crate::secret_scrubber::sanitize_and_gate_text(
+                        &path_str,
+                        &doc_chunk.text_content,
+                        access_tier,
+                        dlp_gate.as_deref(),
+                    ) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            return CandidateOutcome::Failed {
+                                path: path.clone(),
+                                error: format!("Blocked by DLP policy: {reason}"),
+                            };
+                        }
+                    };
+                    doc_chunk.metadata_json =
+                        match crate::secret_scrubber::sanitize_and_gate_metadata_json(
+                            &path_str,
+                            &doc_chunk.metadata_json,
+                            access_tier,
+                            dlp_gate.as_deref(),
+                        ) {
+                            Ok(m) => m,
+                            Err(reason) => {
+                                return CandidateOutcome::Failed {
+                                    path: path.clone(),
+                                    error: format!("Blocked by DLP policy: {reason}"),
+                                };
+                            }
+                        };
+                    if gated_text != doc_chunk.text_content {
+                        doc_chunk.text_content = gated_text;
+                        doc_chunk.blake3_hash =
+                            DocumentChunk::compute_blake3_hash(&doc_chunk.text_content);
+                        doc_chunk.vector = embedder
+                            .embed_text(&doc_chunk.text_content)
+                            .unwrap_or_else(|_| vec![0.0; embedder.dimension()]);
+                    }
                     let file_b3 = doc_chunk.document_id.clone();
                     let catalog_entry = FileCatalogEntry {
                         file_path: path.clone(),

@@ -440,10 +440,10 @@ impl MarketplaceStore {
         let timestamp_unix_secs = now_dt.timestamp();
         let timestamp_iso = now_dt.to_rfc3339();
         let entry_id = format!("consent-{}", uuid::Uuid::new_v4());
-        let folders_json = serde_json::to_string(opt_in_folders)
-            .unwrap_or_else(|_| "[]".to_string());
-        let allowed_json = serde_json::to_string(allowed_jurisdictions)
-            .unwrap_or_else(|_| "[\"US\"]".to_string());
+        let folders_json =
+            serde_json::to_string(opt_in_folders).unwrap_or_else(|_| "[]".to_string());
+        let allowed_json =
+            serde_json::to_string(allowed_jurisdictions).unwrap_or_else(|_| "[\"US\"]".to_string());
 
         let canonical_payload = format!(
             "QuorumRAG-ConsentLedger-v2|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
@@ -459,7 +459,9 @@ impl MarketplaceStore {
             prev_hash,
             timestamp_unix_secs
         );
-        let entry_hash_blake3 = blake3::hash(canonical_payload.as_bytes()).to_hex().to_string();
+        let entry_hash_blake3 = blake3::hash(canonical_payload.as_bytes())
+            .to_hex()
+            .to_string();
         let signing_key = SigningKey::from_bytes(&self.node_seed);
         let sig = signing_key.sign(entry_hash_blake3.as_bytes());
         let ed25519_signature_hex = bytes_to_hex(&sig.to_bytes());
@@ -527,11 +529,11 @@ impl MarketplaceStore {
         };
         let Ok(rows) = stmt.query_map(params![limit.max(1) as i64], |r| {
             let folders_str: String = r.get(5).unwrap_or_else(|_| "[]".to_string());
-            let opt_in_folders: Vec<String> = serde_json::from_str(&folders_str)
-                .unwrap_or_default();
+            let opt_in_folders: Vec<String> =
+                serde_json::from_str(&folders_str).unwrap_or_default();
             let allowed_str: String = r.get(6)?;
-            let allowed_jurisdictions: Vec<String> = serde_json::from_str(&allowed_str)
-                .unwrap_or_else(|_| vec!["US".to_string()]);
+            let allowed_jurisdictions: Vec<String> =
+                serde_json::from_str(&allowed_str).unwrap_or_else(|_| vec!["US".to_string()]);
             Ok(ConsentLedgerEntry {
                 entry_id: r.get(0)?,
                 action: r.get(1)?,
@@ -620,10 +622,7 @@ impl MarketplaceStore {
         })
     }
 
-    pub fn update_config(
-        &self,
-        req: OptInConfigRequest,
-    ) -> Result<MarketplaceConfigState, String> {
+    pub fn update_config(&self, req: OptInConfigRequest) -> Result<MarketplaceConfigState, String> {
         if req.opt_in_enabled && req.user_consent_checked == Some(false) {
             return Err(
                 "Explicit user consent checkbox agreement is required to Opt-In to sell de-identified data (Opt-Out by default)."
@@ -704,7 +703,10 @@ impl MarketplaceStore {
         if let Some(auth_hex) = req.authority_pubkey_hex {
             let clean = auth_hex.trim().to_ascii_lowercase();
             if clean.len() != 64 || !clean.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("authority_pubkey_hex must be a valid 64-character hex Ed25519 public key".to_string());
+                return Err(
+                    "authority_pubkey_hex must be a valid 64-character hex Ed25519 public key"
+                        .to_string(),
+                );
             }
             current.authority_pubkey_hex = clean;
         }
@@ -712,16 +714,26 @@ impl MarketplaceStore {
         let conn = self.connect()?;
         let folders_json =
             serde_json::to_string(&current.opt_in_folders).unwrap_or_else(|_| "[]".to_string());
-        let allowed_json =
-            serde_json::to_string(&current.allowed_jurisdictions).unwrap_or_else(|_| "[\"US\"]".to_string());
+        let allowed_json = serde_json::to_string(&current.allowed_jurisdictions)
+            .unwrap_or_else(|_| "[\"US\"]".to_string());
         let updates = [
             (
                 "opt_in_enabled",
-                if current.opt_in_enabled { "true" } else { "false" }.to_string(),
+                if current.opt_in_enabled {
+                    "true"
+                } else {
+                    "false"
+                }
+                .to_string(),
             ),
             (
                 "user_consent_checked",
-                if current.user_consent_checked { "true" } else { "false" }.to_string(),
+                if current.user_consent_checked {
+                    "true"
+                } else {
+                    "false"
+                }
+                .to_string(),
             ),
             ("consent_statement", current.consent_statement.clone()),
             ("opt_in_folders", folders_json),
@@ -992,7 +1004,9 @@ struct CallerNetworkContext {
     presented_tpm_pubkey_blake3: Option<String>,
 }
 
-fn extract_caller_network_context(headers: &HeaderMap) -> Result<CallerNetworkContext, &'static str> {
+fn extract_caller_network_context(
+    headers: &HeaderMap,
+) -> Result<CallerNetworkContext, &'static str> {
     let mut forwarded_ips = Vec::new();
     if let Some(xff_val) = headers.get("x-forwarded-for") {
         let xff_str = xff_val
@@ -1010,7 +1024,10 @@ fn extract_caller_network_context(headers: &HeaderMap) -> Result<CallerNetworkCo
     }
     for extra_hdr in ["cf-connecting-ip", "x-real-ip"] {
         if let Some(val) = headers.get(extra_hdr) {
-            let s = val.to_str().map_err(|_| "Malformed proxy IP header")?.trim();
+            let s = val
+                .to_str()
+                .map_err(|_| "Malformed proxy IP header")?
+                .trim();
             if !s.is_empty() {
                 let ip: IpAddr = s.parse().map_err(|_| "Invalid IP in proxy header")?;
                 if !forwarded_ips.contains(&ip) {
@@ -1101,7 +1118,9 @@ fn check_layer2_network_perimeter(
     Ok(())
 }
 
-fn parse_header_buyer_cert(headers: &HeaderMap) -> Result<Option<BuyerJurisdictionCertificate>, &'static str> {
+fn parse_header_buyer_cert(
+    headers: &HeaderMap,
+) -> Result<Option<BuyerJurisdictionCertificate>, &'static str> {
     let Some(val) = headers.get("x-quorum-buyer-cert") else {
         return Ok(None);
     };
@@ -1117,7 +1136,9 @@ fn parse_header_buyer_cert(headers: &HeaderMap) -> Result<Option<BuyerJurisdicti
     Ok(Some(cert))
 }
 
-fn parse_header_escrow_receipt(headers: &HeaderMap) -> Result<Option<EscrowReceiptToken>, &'static str> {
+fn parse_header_escrow_receipt(
+    headers: &HeaderMap,
+) -> Result<Option<EscrowReceiptToken>, &'static str> {
     let Some(val) = headers.get("x-quorum-escrow-receipt") else {
         return Ok(None);
     };
@@ -1145,7 +1166,9 @@ fn forbidden_json(reason: impl Into<String>) -> Response {
 }
 
 /// GET /api/v1/marketplace/status
-pub async fn marketplace_status_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+pub async fn marketplace_status_handler(
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
     let store = match state.marketplace_store() {
         Ok(s) => s,
         Err(e) => {
@@ -1168,11 +1191,7 @@ pub async fn marketplace_status_handler(State(state): State<Arc<DaemonState>>) -
     };
 
     let (staged_batches_count, approved_batches_count) = store.batch_counts();
-    let latest_manifest = store
-        .load_batch(None)
-        .ok()
-        .flatten()
-        .map(|(m, _, _)| m);
+    let latest_manifest = store.load_batch(None).ok().flatten().map(|(m, _, _)| m);
     let latest_ledger = store.latest_ledger();
     let all_ledgers = store.all_ledgers();
     let consent_ledger = store.list_consent_ledger(50);
@@ -1214,8 +1233,80 @@ pub async fn marketplace_status_handler(State(state): State<Arc<DaemonState>>) -
 /// POST /api/v1/marketplace/opt-in
 pub async fn marketplace_opt_in_handler(
     State(state): State<Arc<DaemonState>>,
-    Json(req): Json<OptInConfigRequest>,
+    Json(mut req): Json<OptInConfigRequest>,
 ) -> impl IntoResponse {
+    if let Some(ref folders) = req.opt_in_folders {
+        let discovered = tokio::task::spawn_blocking(quorum_ingest::discover_cloud_drives)
+            .await
+            .unwrap_or_default();
+        let controller = quorum_coordinator::global_mesh_dlp_controller();
+        let disabled_cloud_roots =
+            crate::handlers::cloud_drives::collect_disabled_cloud_roots(&controller, &discovered);
+
+        let mut clean_folders = Vec::with_capacity(folders.len());
+        let mut had_non_empty = false;
+        for raw in folders {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            had_non_empty = true;
+            let Some(clean_p) =
+                crate::handlers::cloud_drives::canonicalize_for_cloud_filter(Path::new(trimmed))
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Invalid, unsafe, or non-canonical folder path in opt_in_folders"
+                    })),
+                )
+                    .into_response();
+            };
+            if crate::handlers::cloud_drives::is_disabled_cloud_root(
+                &clean_p,
+                &disabled_cloud_roots,
+            ) || crate::handlers::cloud_drives::is_user_profile_root_dir(&clean_p)
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "Cannot opt in a disabled cloud drive or protected user profile root"
+                    })),
+                )
+                    .into_response();
+            }
+            let mut expanded = Vec::new();
+            if clean_p.exists() && clean_p.is_dir() {
+                crate::handlers::cloud_drives::push_watch_root_excluding_disabled(
+                    &clean_p,
+                    &disabled_cloud_roots,
+                    &mut expanded,
+                );
+            } else if !crate::handlers::cloud_drives::is_strict_ancestor_of_disabled_cloud_root(
+                &clean_p,
+                &disabled_cloud_roots,
+            ) {
+                expanded.push(clean_p);
+            }
+            for ep in expanded {
+                let ep_str = ep.to_string_lossy().to_string();
+                if !clean_folders.contains(&ep_str) {
+                    clean_folders.push(ep_str);
+                }
+            }
+        }
+        if had_non_empty && clean_folders.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "No permitted folders remain in opt_in_folders after excluding disabled cloud drives and protected roots"
+                })),
+            )
+                .into_response();
+        }
+        req.opt_in_folders = Some(clean_folders);
+    }
+
     let store = match state.marketplace_store() {
         Ok(s) => s,
         Err(e) => {
@@ -1370,8 +1461,13 @@ pub async fn marketplace_harvest_handler(
         }
     };
 
-    let gate = quorum_coordinator::ArtifactCategoryGate::new(&settings.artemis.allowed_artifact_categories);
-    let mut normalizer = quorum_coordinator::ForensicStructuralNormalizer::from_node_seed(&store.node_seed, &batch_id);
+    let gate = quorum_coordinator::ArtifactCategoryGate::new(
+        &settings.artemis.allowed_artifact_categories,
+    );
+    let mut normalizer = quorum_coordinator::ForensicStructuralNormalizer::from_node_seed(
+        &store.node_seed,
+        &batch_id,
+    );
 
     let mut sanitized_records = Vec::new();
     let mut rejected_candidates = Vec::new();
@@ -1390,13 +1486,10 @@ pub async fn marketplace_harvest_handler(
                 .source_file_path
                 .as_deref()
                 .map_or(false, quorum_coordinator::artemis_airgap::is_artemis_uri)
-                || cand
-                    .citations
-                    .iter()
-                    .any(|(src, snippet)| {
-                        quorum_coordinator::artemis_airgap::is_artemis_uri(src)
-                            || quorum_coordinator::artemis_airgap::is_artemis_uri(snippet)
-                    })
+                || cand.citations.iter().any(|(src, snippet)| {
+                    quorum_coordinator::artemis_airgap::is_artemis_uri(src)
+                        || quorum_coordinator::artemis_airgap::is_artemis_uri(snippet)
+                })
                 || cand.domain_tags.iter().any(|t| {
                     let tl = t.to_ascii_lowercase();
                     tl.contains("artemis") || tl.contains("dfir") || tl.contains("forensic")
@@ -1421,7 +1514,8 @@ pub async fn marketplace_harvest_handler(
         };
         let cand = &cand_to_eval;
 
-        let actual_tokens = cand.prompt.split_whitespace().count() + cand.chosen_response.split_whitespace().count();
+        let actual_tokens = cand.prompt.split_whitespace().count()
+            + cand.chosen_response.split_whitespace().count();
         let verdict = store.synthetic_pipeline.evaluate_candidate(
             &cand.prompt,
             &cand.chosen_response,
@@ -1559,10 +1653,8 @@ pub async fn marketplace_approve_batch_handler(
     }
 
     let req = body_opt.map(|Json(r)| r).unwrap_or_default();
-    let Some((manifest, encrypted_jsonl, _)) = store
-        .load_batch(req.batch_id.as_deref())
-        .ok()
-        .flatten()
+    let Some((manifest, encrypted_jsonl, _)) =
+        store.load_batch(req.batch_id.as_deref()).ok().flatten()
     else {
         return (
             StatusCode::NOT_FOUND,
@@ -1667,9 +1759,14 @@ pub async fn marketplace_preview_handler(
         Err(e) => return forbidden_json(e),
     };
     let query_cert = match query_params.get("buyer_cert_json") {
-        Some(raw) if !raw.trim().is_empty() => match serde_json::from_str::<BuyerJurisdictionCertificate>(raw) {
+        Some(raw) if !raw.trim().is_empty() => match serde_json::from_str::<
+            BuyerJurisdictionCertificate,
+        >(raw)
+        {
             Ok(c) => Some(c),
-            Err(_) => return forbidden_json("Invalid BuyerJurisdictionCertificate in buyer_cert_json"),
+            Err(_) => {
+                return forbidden_json("Invalid BuyerJurisdictionCertificate in buyer_cert_json")
+            }
         },
         _ => None,
     };
@@ -1704,9 +1801,12 @@ pub async fn marketplace_preview_handler(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEFAULT_PREVIEW_RATE_LIMIT_PER_HOUR);
 
-    if let Err(limit_err) =
-        store.check_and_record_preview_rate_limit(&cert.buyer_id, net_ctx.caller_ip, now, rate_limit)
-    {
+    if let Err(limit_err) = store.check_and_record_preview_rate_limit(
+        &cert.buyer_id,
+        net_ctx.caller_ip,
+        now,
+        rate_limit,
+    ) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
@@ -1792,8 +1892,8 @@ pub async fn marketplace_unlock_handler(
     };
 
     let total_records = (manifest.sft_record_count + manifest.dpo_record_count).max(1) as u64;
-    let default_amount =
-        ((total_records * manifest.price_per_1k_records_cents) / 1000).max(manifest.price_per_1k_records_cents);
+    let default_amount = ((total_records * manifest.price_per_1k_records_cents) / 1000)
+        .max(manifest.price_per_1k_records_cents);
     let amount_paid_cents = req.amount_paid_cents.unwrap_or(default_amount);
 
     let mut receipt = EscrowReceiptToken {
@@ -1884,24 +1984,35 @@ pub async fn marketplace_download_handler(
         Some(raw) if !raw.trim().is_empty() => {
             match serde_json::from_str::<BuyerJurisdictionCertificate>(raw) {
                 Ok(c) => Some(c),
-                Err(_) => return forbidden_json("Invalid BuyerJurisdictionCertificate in buyer_cert_json"),
+                Err(_) => {
+                    return forbidden_json(
+                        "Invalid BuyerJurisdictionCertificate in buyer_cert_json",
+                    )
+                }
             }
         }
         _ => None,
     };
     let Some(cert) = body_req.buyer_cert.or(header_cert).or(query_cert) else {
-        return forbidden_json("Missing BuyerJurisdictionCertificate required by SovereignJurisdictionGuard");
+        return forbidden_json(
+            "Missing BuyerJurisdictionCertificate required by SovereignJurisdictionGuard",
+        );
     };
 
     let header_rcpt = match parse_header_escrow_receipt(&headers) {
         Ok(r) => r,
         Err(e) => return forbidden_json(e),
     };
-    let query_rcpt = match query_params.get("receipt_token_json").or_else(|| query_params.get("receipt_token")) {
-        Some(raw) if !raw.trim().is_empty() => match serde_json::from_str::<EscrowReceiptToken>(raw) {
-            Ok(r) => Some(r),
-            Err(_) => return forbidden_json("Invalid EscrowReceiptToken in query parameter"),
-        },
+    let query_rcpt = match query_params
+        .get("receipt_token_json")
+        .or_else(|| query_params.get("receipt_token"))
+    {
+        Some(raw) if !raw.trim().is_empty() => {
+            match serde_json::from_str::<EscrowReceiptToken>(raw) {
+                Ok(r) => Some(r),
+                Err(_) => return forbidden_json("Invalid EscrowReceiptToken in query parameter"),
+            }
+        }
         _ => None,
     };
     let Some(receipt) = body_req.receipt_token.or(header_rcpt).or(query_rcpt) else {
@@ -1930,11 +2041,15 @@ pub async fn marketplace_download_handler(
         return forbidden_json(reason);
     }
     if receipt.buyer_id.trim() != cert.buyer_id.trim() {
-        return forbidden_json("EscrowReceiptToken buyer_id does not match BuyerJurisdictionCertificate");
+        return forbidden_json(
+            "EscrowReceiptToken buyer_id does not match BuyerJurisdictionCertificate",
+        );
     }
     let rcpt_tpm = receipt.bound_tpm_pubkey_blake3.trim().to_ascii_lowercase();
     let cert_tpm = cert.bound_tpm_pubkey_blake3.trim().to_ascii_lowercase();
-    if rcpt_tpm.len() != cert_tpm.len() || !bool::from(rcpt_tpm.as_bytes().ct_eq(cert_tpm.as_bytes())) {
+    if rcpt_tpm.len() != cert_tpm.len()
+        || !bool::from(rcpt_tpm.as_bytes().ct_eq(cert_tpm.as_bytes()))
+    {
         return forbidden_json("EscrowReceiptToken TPM hardware binding mismatch");
     }
 
@@ -1955,7 +2070,9 @@ pub async fn marketplace_download_handler(
     };
 
     if manifest.merkle_root_blake3 != receipt.batch_merkle_root_blake3 {
-        return forbidden_json("EscrowReceiptToken batch_merkle_root_blake3 does not match sealed batch Merkle root");
+        return forbidden_json(
+            "EscrowReceiptToken batch_merkle_root_blake3 does not match sealed batch Merkle root",
+        );
     }
 
     let records = match store.decrypt_batch_records(&manifest.batch_id, &encrypted_jsonl) {
@@ -1976,7 +2093,10 @@ pub async fn marketplace_download_handler(
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8".to_string()),
+            (
+                header::CONTENT_TYPE,
+                "application/x-ndjson; charset=utf-8".to_string(),
+            ),
             ("x-quorum-batch-id".parse().unwrap(), manifest.batch_id),
             (
                 "x-quorum-batch-merkle-root".parse().unwrap(),
@@ -2064,7 +2184,9 @@ pub async fn marketplace_pool_merge_handler(
 }
 
 /// GET /api/v1/marketplace/ledger
-pub async fn marketplace_ledger_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+pub async fn marketplace_ledger_handler(
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
     let store = match state.marketplace_store() {
         Ok(s) => s,
         Err(e) => {
@@ -2104,7 +2226,9 @@ pub async fn marketplace_ledger_handler(State(state): State<Arc<DaemonState>>) -
 }
 
 /// GET /api/v1/marketplace/bounties
-pub async fn marketplace_bounties_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+pub async fn marketplace_bounties_handler(
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
     let store = match state.marketplace_store() {
         Ok(s) => s,
         Err(e) => {
@@ -2175,7 +2299,9 @@ pub async fn marketplace_bounty_submit_handler(
 
     let bounties = store.list_bounties(&cfg.allowed_jurisdictions);
     let Some(bounty) = bounties.into_iter().find(|b| b.bounty_id == req.bounty_id) else {
-        return forbidden_json("Requested bounty_id is not active or outside allowed_jurisdictions");
+        return forbidden_json(
+            "Requested bounty_id is not active or outside allowed_jurisdictions",
+        );
     };
 
     let Some((manifest, encrypted_jsonl, _)) =
@@ -2193,11 +2319,8 @@ pub async fn marketplace_bounty_submit_handler(
         .unwrap_or_default();
     let payout_cents = (records.len() as u64) * bounty.payout_per_record_cents;
     let pool_id = format!("{}-{}", bounty.bounty_id, manifest.batch_id);
-    let (ledger, _) = ContributionLedger::merge_and_deduplicate_mesh_records(
-        &pool_id,
-        records,
-        payout_cents,
-    );
+    let (ledger, _) =
+        ContributionLedger::merge_and_deduplicate_mesh_records(&pool_id, records, payout_cents);
     let _ = store.save_ledger(&ledger);
 
     (
@@ -2293,8 +2416,8 @@ async fn synthesize_artemis_storage_candidates(
     };
     let mut out = Vec::new();
     for chunk in all_chunks {
-        let is_artemis = chunk.chunk_id.starts_with("artemis:")
-            || chunk.file_path.starts_with("artemis://");
+        let is_artemis =
+            chunk.chunk_id.starts_with("artemis:") || chunk.file_path.starts_with("artemis://");
         if !is_artemis || chunk.text_content.trim().is_empty() {
             continue;
         }
@@ -2595,10 +2718,17 @@ pub async fn marketplace_test_execute_transaction_handler(
         let now = Utc::now().timestamp();
         let batch_id = format!("batch-localhost-test-{}", uuid::Uuid::new_v4());
         let default_tags = vec!["rust-security".to_string(), "sovereign-ai".to_string()];
-        let raw_cands = synthesize_default_local_candidates(&store.origin_node_id, &batch_id, &default_tags, &[], now);
+        let raw_cands = synthesize_default_local_candidates(
+            &store.origin_node_id,
+            &batch_id,
+            &default_tags,
+            &[],
+            now,
+        );
         let mut sanitized = Vec::new();
         for cand in &raw_cands {
-            if let Ok(rec) = MarketplaceSanitizer::sanitize_and_sign_record(cand, &store.node_seed) {
+            if let Ok(rec) = MarketplaceSanitizer::sanitize_and_sign_record(cand, &store.node_seed)
+            {
                 sanitized.push(rec);
             }
         }
@@ -2639,7 +2769,9 @@ pub async fn marketplace_test_execute_transaction_handler(
     // 3. Issue a test certificate supporting 127.0.0.1/32
     let buyer_id = "localhost-dev-buyer".to_string();
     let cidr = req.buyer_cidr.unwrap_or_else(|| "127.0.0.1/32".to_string());
-    let tpm_hash = blake3::hash(b"localhost-dev-tpm-ek-primary").to_hex().to_string();
+    let tpm_hash = blake3::hash(b"localhost-dev-tpm-ek-primary")
+        .to_hex()
+        .to_string();
     let now = Utc::now().timestamp();
 
     let mut cert = BuyerJurisdictionCertificate {
@@ -2687,8 +2819,8 @@ pub async fn marketplace_test_execute_transaction_handler(
 
     // 5. Issue EscrowReceiptToken (Unlock)
     let total_records = (manifest.sft_record_count + manifest.dpo_record_count).max(1) as u64;
-    let default_amount =
-        ((total_records * manifest.price_per_1k_records_cents) / 1000).max(manifest.price_per_1k_records_cents);
+    let default_amount = ((total_records * manifest.price_per_1k_records_cents) / 1000)
+        .max(manifest.price_per_1k_records_cents);
     let amount_paid = req.amount_paid_cents.unwrap_or(default_amount);
 
     let mut receipt = EscrowReceiptToken {

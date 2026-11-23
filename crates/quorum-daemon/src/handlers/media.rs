@@ -53,24 +53,85 @@ impl MediaPathError {
     fn into_response(self) -> Response {
         let (code, msg) = match self {
             Self::Invalid => (StatusCode::BAD_REQUEST, "Invalid media path"),
-            Self::Executable => (StatusCode::FORBIDDEN, "Executables and shared libraries are never served"),
-            Self::NotIndexed => (StatusCode::FORBIDDEN, "Access denied: file is not part of the indexed knowledge base"),
-            Self::TierDenied => (StatusCode::FORBIDDEN, "Access denied: file is above the permitted access tier"),
-            Self::NotFound => (StatusCode::NOT_FOUND, "Indexed file no longer exists on disk"),
+            Self::Executable => (
+                StatusCode::FORBIDDEN,
+                "Executables and shared libraries are never served",
+            ),
+            Self::NotIndexed => (
+                StatusCode::FORBIDDEN,
+                "Access denied: file is not part of the indexed knowledge base",
+            ),
+            Self::TierDenied => (
+                StatusCode::FORBIDDEN,
+                "Access denied: file is above the permitted access tier",
+            ),
+            Self::NotFound => (
+                StatusCode::NOT_FOUND,
+                "Indexed file no longer exists on disk",
+            ),
         };
         (code, msg).into_response()
     }
 }
 
-/// Lexical validation shared by both endpoints (no I/O).
-pub fn validate_media_path_syntax(raw: &str) -> Result<PathBuf, MediaPathError> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw.len() > 4096 || raw.contains('\0') {
+fn validate_media_lexical_and_traversal(raw: &str) -> Result<(), MediaPathError> {
+    if raw.len() > 4096 {
+        return Err(MediaPathError::Invalid);
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || raw != trimmed
+        || raw.contains('\0')
+        || raw.chars().any(|c| c.is_control())
+        || raw.chars().any(|c| {
+            matches!(
+                c,
+                '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+            )
+        })
+    {
         return Err(MediaPathError::Invalid);
     }
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") || lower.contains("%00") {
+    if lower.contains("%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || lower.contains("%00")
+        || lower.contains("%252e")
+        || lower.contains("%252f")
+        || lower.contains("%255c")
+        || lower.contains("%2500")
+        || lower.contains("%25")
+    {
         return Err(MediaPathError::Invalid);
+    }
+    if raw.contains("..") {
+        return Err(MediaPathError::Invalid);
+    }
+    Ok(())
+}
+
+/// Lexical validation shared by both endpoints (no I/O).
+pub fn validate_media_path_syntax(raw: &str) -> Result<PathBuf, MediaPathError> {
+    validate_media_lexical_and_traversal(raw)?;
+    if quorum_coordinator::artemis_airgap::is_artemis_uri(raw) {
+        return Err(MediaPathError::Invalid);
+    }
+    let lower = raw.to_ascii_lowercase();
+    if raw.starts_with(r"\\")
+        || raw.starts_with("//")
+        || lower.contains(r"\\?\unc\")
+        || lower.contains("//?/unc/")
+    {
+        return Err(MediaPathError::Invalid);
+    }
+    for seg in raw.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg != seg.trim() || seg.ends_with('.') || seg.ends_with(' ') {
+            return Err(MediaPathError::Invalid);
+        }
     }
     let path = PathBuf::from(raw);
     if !path.is_absolute() {
@@ -79,11 +140,16 @@ pub fn validate_media_path_syntax(raw: &str) -> Result<PathBuf, MediaPathError> 
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(MediaPathError::Invalid);
     }
-    // NTFS alternate data streams: a ':' anywhere after the drive designator.
+    // NTFS alternate data streams and drive-relative paths: require valid `X:\` or `X:/`
+    // prefix and reject any ':' outside index 1.
     #[cfg(windows)]
     {
-        let s = raw.strip_prefix(r"\\?\").unwrap_or(raw);
-        if s.get(2..).map_or(false, |rest| rest.contains(':')) {
+        let bytes = raw.as_bytes();
+        let is_windows_drive = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/');
+        if !is_windows_drive || bytes[2..].contains(&b':') {
             return Err(MediaPathError::Invalid);
         }
     }
@@ -95,22 +161,79 @@ pub fn validate_media_path_syntax(raw: &str) -> Result<PathBuf, MediaPathError> 
     Ok(path)
 }
 
-/// Full gate: syntax, index membership at tier 0, and on-disk existence.
-pub fn authorize_media_path(state: &DaemonState, raw: &str) -> Result<PathBuf, MediaPathError> {
-    let path = validate_media_path_syntax(raw)?;
+/// Full gate: syntax, cloud-drive / Artemis fail-closed check, index membership, tier policy, and on-disk existence.
+pub fn authorize_media_path_with_loopback(
+    state: &DaemonState,
+    raw: &str,
+    is_loopback: bool,
+) -> Result<PathBuf, MediaPathError> {
+    validate_media_lexical_and_traversal(raw)?;
     let key = raw.trim();
+    if quorum_coordinator::artemis_airgap::is_artemis_uri(key) {
+        return Err(MediaPathError::TierDenied);
+    }
+    let path = validate_media_path_syntax(raw)?;
+
+    let settings = quorum_coordinator::global_mesh_dlp_controller()
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
+    let mut matched_prefixes: Vec<(usize, &str, bool)> = Vec::new();
+    for drv in &settings.cloud_drives.drives {
+        for p in drv.root_path.iter().chain(drv.custom_paths.iter()) {
+            if quorum_types::path_matches_prefix(key, p).unwrap_or(false) {
+                let norm_len = quorum_types::normalize_prefix_for_match(p)
+                    .map(|n| n.len())
+                    .unwrap_or(p.len());
+                matched_prefixes.push((norm_len, p.as_str(), drv.enabled));
+            }
+        }
+    }
+    if !matched_prefixes.is_empty() {
+        let max_len = matched_prefixes
+            .iter()
+            .map(|(len, _, _)| *len)
+            .max()
+            .unwrap_or(0);
+        let best_matches: Vec<&(usize, &str, bool)> = matched_prefixes
+            .iter()
+            .filter(|(len, _, _)| *len == max_len)
+            .collect();
+        let any_disabled = best_matches.iter().any(|(_, _, enabled)| !*enabled);
+        let any_enabled_mounted = best_matches
+            .iter()
+            .any(|(_, p, enabled)| *enabled && Path::new(p).is_dir());
+        if any_disabled || !any_enabled_mounted {
+            return Err(MediaPathError::TierDenied);
+        }
+    }
+
     let tier = state
         .storage
         .indexed_path_min_tier(key)
         .map_err(|_| MediaPathError::NotIndexed)?
         .ok_or(MediaPathError::NotIndexed)?;
     if tier > MEDIA_MAX_TIER {
-        return Err(MediaPathError::TierDenied);
+        if !is_loopback {
+            return Err(MediaPathError::TierDenied);
+        }
+        let policy =
+            quorum_coordinator::resolve_local_retrieval_policy(&settings, MEDIA_MAX_TIER, &[]);
+        if !policy.permits_local_path_and_tier(key, tier, false) {
+            return Err(MediaPathError::TierDenied);
+        }
     }
     match std::fs::metadata(&path) {
         Ok(m) if m.is_file() => Ok(path),
         _ => Err(MediaPathError::NotFound),
     }
+}
+
+/// Full gate (strict Tier 0 compatibility entrypoint used by `export.rs`).
+pub fn authorize_media_path(state: &DaemonState, raw: &str) -> Result<PathBuf, MediaPathError> {
+    authorize_media_path_with_loopback(state, raw, false)
 }
 
 fn mime_for(path: &Path) -> String {
@@ -125,7 +248,13 @@ fn content_disposition(path: &Path, attachment: bool) -> HeaderValue {
     // ASCII fallback + RFC 5987 UTF-8 filename.
     let ascii: String = name
         .chars()
-        .map(|c| if (c.is_ascii_graphic() && c != '"' && c != '\\') || c == ' ' { c } else { '_' })
+        .map(|c| {
+            if (c.is_ascii_graphic() && c != '"' && c != '\\') || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let encoded: String = name
         .bytes()
@@ -138,17 +267,23 @@ fn content_disposition(path: &Path, attachment: bool) -> HeaderValue {
         })
         .collect();
     let kind = if attachment { "attachment" } else { "inline" };
-    HeaderValue::from_str(&format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}"))
-        .unwrap_or_else(|_| HeaderValue::from_static("inline"))
+    HeaderValue::from_str(&format!(
+        "{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}"
+    ))
+    .unwrap_or_else(|_| HeaderValue::from_static("inline"))
 }
 
 /// GET /api/media?path=... streams an indexed file with MIME type and HTTP Range support.
 pub async fn serve_media_handler(
     State(state): State<Arc<DaemonState>>,
+    connect: Option<ConnectInfo<SocketAddr>>,
     Query(q): Query<MediaQuery>,
     req: Request,
 ) -> Response {
-    let path = match authorize_media_path(&state, &q.path) {
+    let is_loopback = connect
+        .map(|ConnectInfo(addr)| addr.ip().is_loopback())
+        .unwrap_or(true);
+    let path = match authorize_media_path_with_loopback(&state, &q.path, is_loopback) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -157,7 +292,12 @@ pub async fn serve_media_handler(
 
     // Forward only the conditional/range headers ServeFile understands.
     let mut fwd = Request::builder().method("GET").uri("/");
-    for h in [header::RANGE, header::IF_RANGE, header::IF_MODIFIED_SINCE, header::IF_NONE_MATCH] {
+    for h in [
+        header::RANGE,
+        header::IF_RANGE,
+        header::IF_MODIFIED_SINCE,
+        header::IF_NONE_MATCH,
+    ] {
         if let Some(v) = req.headers().get(&h) {
             fwd = fwd.header(h, v.clone());
         }
@@ -167,7 +307,8 @@ pub async fn serve_media_handler(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let mime_hv = HeaderValue::from_str(&mime).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let mime_hv = HeaderValue::from_str(&mime)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     let resp = match ServeFile::new(&path).oneshot(fwd).await {
         Ok(r) => r,
         Err(never) => match never {},
@@ -177,10 +318,19 @@ pub async fn serve_media_handler(
     let h = resp.headers_mut();
     if status.is_success() {
         h.insert(header::CONTENT_TYPE, mime_hv);
-        h.insert(header::CONTENT_DISPOSITION, content_disposition(&path, attachment));
+        h.insert(
+            header::CONTENT_DISPOSITION,
+            content_disposition(&path, attachment),
+        );
     }
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=300"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=300"),
+    );
     // Indexed HTML or SVG must never execute script in the UI origin.
     h.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -196,7 +346,9 @@ pub async fn open_file_handler(
     connect: Option<ConnectInfo<SocketAddr>>,
     Json(payload): Json<OpenFileRequest>,
 ) -> Response {
-    let is_loopback = connect.map(|ConnectInfo(addr)| addr.ip().is_loopback()).unwrap_or(true);
+    let is_loopback = connect
+        .map(|ConnectInfo(addr)| addr.ip().is_loopback())
+        .unwrap_or(true);
     if !is_loopback {
         return (
             StatusCode::FORBIDDEN,
@@ -204,7 +356,7 @@ pub async fn open_file_handler(
         )
             .into_response();
     }
-    let path = match authorize_media_path(&state, &payload.path) {
+    let path = match authorize_media_path_with_loopback(&state, &payload.path, true) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -228,13 +380,28 @@ mod tests {
     #[test]
     fn rejects_traversal_relative_nul_and_encoded() {
         assert_eq!(validate_media_path_syntax(""), Err(MediaPathError::Invalid));
-        assert_eq!(validate_media_path_syntax("relative/dog.jpg"), Err(MediaPathError::Invalid));
-        assert_eq!(validate_media_path_syntax("a\0b"), Err(MediaPathError::Invalid));
+        assert_eq!(
+            validate_media_path_syntax("relative/dog.jpg"),
+            Err(MediaPathError::Invalid)
+        );
+        assert_eq!(
+            validate_media_path_syntax("a\0b"),
+            Err(MediaPathError::Invalid)
+        );
         #[cfg(windows)]
         {
-            assert_eq!(validate_media_path_syntax(r"D:\dataset\..\Windows\win.ini"), Err(MediaPathError::Invalid));
-            assert_eq!(validate_media_path_syntax(r"D:\dataset\%2e%2e\x.jpg"), Err(MediaPathError::Invalid));
-            assert_eq!(validate_media_path_syntax(r"D:\dataset\dog.jpg:secret"), Err(MediaPathError::Invalid));
+            assert_eq!(
+                validate_media_path_syntax(r"D:\dataset\..\Windows\win.ini"),
+                Err(MediaPathError::Invalid)
+            );
+            assert_eq!(
+                validate_media_path_syntax(r"D:\dataset\%2e%2e\x.jpg"),
+                Err(MediaPathError::Invalid)
+            );
+            assert_eq!(
+                validate_media_path_syntax(r"D:\dataset\dog.jpg:secret"),
+                Err(MediaPathError::Invalid)
+            );
             assert!(validate_media_path_syntax(r"D:\dataset\images\data\dogs\dog.119.jpg").is_ok());
         }
     }
@@ -243,13 +410,25 @@ mod tests {
     fn refuses_executables_and_libraries() {
         #[cfg(windows)]
         {
-            assert_eq!(validate_media_path_syntax(r"C:\Windows\System32\cmd.exe"), Err(MediaPathError::Executable));
-            assert_eq!(validate_media_path_syntax(r"C:\x\lib.dll"), Err(MediaPathError::Executable));
+            assert_eq!(
+                validate_media_path_syntax(r"C:\Windows\System32\cmd.exe"),
+                Err(MediaPathError::Executable)
+            );
+            assert_eq!(
+                validate_media_path_syntax(r"C:\x\lib.dll"),
+                Err(MediaPathError::Executable)
+            );
         }
         #[cfg(not(windows))]
         {
-            assert_eq!(validate_media_path_syntax("/usr/lib/libc.so"), Err(MediaPathError::Executable));
-            assert_eq!(validate_media_path_syntax("/x/libfoo.dylib"), Err(MediaPathError::Executable));
+            assert_eq!(
+                validate_media_path_syntax("/usr/lib/libc.so"),
+                Err(MediaPathError::Executable)
+            );
+            assert_eq!(
+                validate_media_path_syntax("/x/libfoo.dylib"),
+                Err(MediaPathError::Executable)
+            );
         }
     }
 
@@ -257,7 +436,13 @@ mod tests {
     fn content_disposition_is_header_safe() {
         let hv = content_disposition(Path::new("Savannah Woman \"x\".mp3"), true);
         let s = hv.to_str().unwrap();
-        assert!(s.starts_with("attachment; filename=\"Savannah Woman _x_.mp3\""), "{s}");
-        assert!(s.contains("filename*=UTF-8''Savannah%20Woman%20%22x%22.mp3"), "{s}");
+        assert!(
+            s.starts_with("attachment; filename=\"Savannah Woman _x_.mp3\""),
+            "{s}"
+        );
+        assert!(
+            s.contains("filename*=UTF-8''Savannah%20Woman%20%22x%22.mp3"),
+            "{s}"
+        );
     }
 }

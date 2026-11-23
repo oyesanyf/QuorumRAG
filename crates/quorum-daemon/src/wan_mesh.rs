@@ -101,12 +101,14 @@ pub fn parse_tailscale_status_json(raw_json: &str, preferred_ports: &[u16]) -> T
                         for &port in &ports {
                             match ip {
                                 IpAddr::V4(v4) => {
-                                    snap.peer_multiaddrs.push(format!("/ip4/{}/tcp/{}", v4, port));
+                                    snap.peer_multiaddrs
+                                        .push(format!("/ip4/{}/tcp/{}", v4, port));
                                     snap.peer_multiaddrs
                                         .push(format!("/ip4/{}/udp/{}/quic-v1", v4, port));
                                 }
                                 IpAddr::V6(v6) => {
-                                    snap.peer_multiaddrs.push(format!("/ip6/{}/tcp/{}", v6, port));
+                                    snap.peer_multiaddrs
+                                        .push(format!("/ip6/{}/tcp/{}", v6, port));
                                     snap.peer_multiaddrs
                                         .push(format!("/ip6/{}/udp/{}/quic-v1", v6, port));
                                 }
@@ -119,7 +121,8 @@ pub fn parse_tailscale_status_json(raw_json: &str, preferred_ports: &[u16]) -> T
                 let clean = dns_name.trim().trim_end_matches('.');
                 if !clean.is_empty() && clean.contains('.') {
                     for &port in &ports {
-                        snap.peer_multiaddrs.push(format!("/dns4/{}/tcp/{}", clean, port));
+                        snap.peer_multiaddrs
+                            .push(format!("/dns4/{}/tcp/{}", clean, port));
                     }
                 }
             }
@@ -238,14 +241,18 @@ async fn lan_http_exchange(
     timeout_ms: u64,
 ) -> Option<String> {
     let sock = SocketAddr::V4(SocketAddrV4::new(gateway.host_ip, gateway.port));
-    let mut stream = tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(sock))
-        .await
-        .ok()?
-        .ok()?;
-    tokio::time::timeout(Duration::from_millis(timeout_ms), stream.write_all(req_bytes))
-        .await
-        .ok()?
-        .ok()?;
+    let mut stream =
+        tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(sock))
+            .await
+            .ok()?
+            .ok()?;
+    tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        stream.write_all(req_bytes),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 2048];
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
@@ -469,7 +476,9 @@ pub async fn collect_wan_and_overlay_dial_targets(
 ) -> Vec<String> {
     let ts_fut = probe_tailscale_status(mesh.mesh_port);
     let fqdn_opt = if mesh.auto_bootstrap_duckdns {
-        mesh.duckdns_domain.as_deref().and_then(normalize_duckdns_fqdn)
+        mesh.duckdns_domain
+            .as_deref()
+            .and_then(normalize_duckdns_fqdn)
     } else {
         None
     };
@@ -613,10 +622,19 @@ mod tests {
         }"#;
         let snap = parse_tailscale_status_json(sample, &[3032]);
         assert_eq!(snap.self_ips, vec!["100.77.10.2", "fd7a:115c::1"]);
-        assert!(snap.peer_multiaddrs.contains(&"/ip4/100.88.20.9/tcp/3032".to_string()));
-        assert!(snap.peer_multiaddrs.contains(&"/ip4/100.88.20.9/udp/3032/quic-v1".to_string()));
-        assert!(snap.peer_multiaddrs.contains(&"/dns4/home-desktop.tailnet-abc.ts.net/tcp/3032".to_string()));
-        assert!(!snap.peer_multiaddrs.iter().any(|m| m.contains("100.88.20.99")));
+        assert!(snap
+            .peer_multiaddrs
+            .contains(&"/ip4/100.88.20.9/tcp/3032".to_string()));
+        assert!(snap
+            .peer_multiaddrs
+            .contains(&"/ip4/100.88.20.9/udp/3032/quic-v1".to_string()));
+        assert!(snap
+            .peer_multiaddrs
+            .contains(&"/dns4/home-desktop.tailnet-abc.ts.net/tcp/3032".to_string()));
+        assert!(!snap
+            .peer_multiaddrs
+            .iter()
+            .any(|m| m.contains("100.88.20.99")));
 
         let filtered = filter_self_dial_targets(
             vec![

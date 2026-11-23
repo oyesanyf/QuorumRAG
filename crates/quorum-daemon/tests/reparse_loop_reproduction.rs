@@ -71,12 +71,17 @@ fn test_rejection_of_onedrive_documents_pointing_to_profile_root() {
     let onedrive = cloud_user.join("OneDrive");
     let onedrive_docs = onedrive.join("Documents");
     let onedrive_desktop = onedrive.join("Desktop");
+    let cloud_user_downloads = cloud_user.join("Downloads");
+    let cloud_user_desktop = cloud_user.join("Desktop");
 
     std::fs::create_dir_all(&onedrive).expect("create onedrive dir");
     std::fs::create_dir_all(&onedrive_desktop).expect("create onedrive desktop");
+    std::fs::create_dir_all(&cloud_user_desktop).expect("create cloud_user desktop");
 
-    // Create OneDrive\Documents as an NTFS junction pointing back to CloudUser (cyclic loop)
-    create_junction(&onedrive_docs, &cloud_user).expect("create cyclic junction loop");
+    // Create OneDrive\Documents and CloudUser\Downloads as NTFS junctions pointing back to CloudUser
+    create_junction(&onedrive_docs, &cloud_user).expect("create onedrive cyclic junction loop");
+    create_junction(&cloud_user_downloads, &cloud_user)
+        .expect("create standard profile cyclic junction loop");
 
     let temp_root_str = temp.path().to_str().expect("temp path to str");
     let _env_guard = EnvGuard::set("SystemDrive", temp_root_str);
@@ -89,17 +94,23 @@ fn test_rejection_of_onedrive_documents_pointing_to_profile_root() {
         .collect();
 
     let _ = std::fs::remove_dir(&onedrive_docs);
+    let _ = std::fs::remove_dir(&cloud_user_downloads);
 
     assert!(
-        !synthetic_roots.contains(&onedrive_docs),
+        !synthetic_roots.contains(&onedrive_docs) && !synthetic_roots.contains(&onedrive_desktop),
+        "OneDrive folders must remain decoupled from discover_user_document_roots(): {:?}",
+        synthetic_roots
+    );
+    assert!(
+        !synthetic_roots.contains(&cloud_user_downloads),
         "CRITICAL BUG: Cyclic junction {:?} pointing back to profile root {:?} was NOT rejected! Discovered roots: {:?}",
-        onedrive_docs,
+        cloud_user_downloads,
         cloud_user,
         synthetic_roots
     );
     assert!(
-        synthetic_roots.contains(&onedrive_desktop),
-        "Must contain non-cyclic CloudUser/OneDrive/Desktop"
+        synthetic_roots.contains(&cloud_user_desktop),
+        "Must contain non-cyclic CloudUser/Desktop"
     );
 }
 

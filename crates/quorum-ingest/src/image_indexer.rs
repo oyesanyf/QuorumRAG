@@ -108,11 +108,27 @@ impl ImageIndexer {
             )
     }
 
-    /// Extract metadata from image bytes using robust pure-Rust binary header inspections.
+    /// Extract metadata from image bytes using robust pure-Rust binary header inspections
+    /// (defaults fail-closed to `LocallySyncedOnly` for PowerShell WinRT OCR fallback).
     pub fn extract_metadata(
         path: &Path,
         bytes: &[u8],
         identity: &FileIdentity,
+    ) -> ImageMetadata {
+        Self::extract_metadata_with_policy(
+            path,
+            bytes,
+            identity,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Extract metadata from image bytes while enforcing `policy` on any secondary file access.
+    pub fn extract_metadata_with_policy(
+        path: &Path,
+        bytes: &[u8],
+        identity: &FileIdentity,
+        policy: quorum_types::CloudPlaceholderPolicy,
     ) -> ImageMetadata {
         let size_bytes = bytes.len() as u64;
         let path_tokens = Self::extract_path_tokens(path);
@@ -244,12 +260,14 @@ impl ImageIndexer {
                 }
                 OcrOutcome::Failed => {
                     #[cfg(windows)]
-                    if let Some(ocr) = Self::run_powershell_winrt_ocr(path) {
+                    if let Some(ocr) = Self::run_powershell_winrt_ocr_with_policy(path, policy) {
                         let trimmed = ocr.trim();
                         if !trimmed.is_empty() {
                             ocr_text = Some(trimmed.to_string());
                         }
                     }
+                    #[cfg(not(windows))]
+                    let _ = policy;
                 }
             }
             if !Self::is_bulk_indexing() {
@@ -632,7 +650,34 @@ impl ImageIndexer {
         lines.join("\n")
     }
 
-    /// Index an image file into a `DocumentChunk` ready for LanceDB and Tantivy.
+    /// Scrubs text-bearing metadata fields with `SecretScrubber::scrub_text_preserving_layout`
+    /// so neither `text_content` nor serialized `metadata_json` retains raw secrets.
+    pub fn sanitize_metadata(meta: &mut ImageMetadata) {
+        if let Some(ref mut comment) = meta.user_comment {
+            *comment = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(comment);
+        }
+        if let Some(ref mut text) = meta.extracted_text {
+            *text = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(text);
+        }
+        if let Some(ref mut vis) = meta.visual_description {
+            *vis = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(vis);
+        }
+        if let Some(ref mut ocr) = meta.ocr_text {
+            *ocr = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(ocr);
+        }
+        if let Some(ref mut sw) = meta.software {
+            *sw = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(sw);
+        }
+        if let Some(ref mut loc) = meta.location_name {
+            *loc = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(loc);
+        }
+        for kw in &mut meta.keywords {
+            *kw = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(kw);
+        }
+    }
+
+    /// Index an image file into a `DocumentChunk` ready for LanceDB and Tantivy
+    /// (defaults fail-closed to `LocallySyncedOnly`).
     pub fn index_image(
         path: &Path,
         bytes: &[u8],
@@ -640,7 +685,27 @@ impl ImageIndexer {
         access_tier: u8,
         embedding_generator: &dyn EmbeddingGenerator,
     ) -> Result<DocumentChunk, TypeError> {
-        let metadata = Self::extract_metadata(path, bytes, identity);
+        Self::index_image_with_policy(
+            path,
+            bytes,
+            identity,
+            access_tier,
+            embedding_generator,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Index an image file into a `DocumentChunk` while enforcing `policy` and scrubbing metadata.
+    pub fn index_image_with_policy(
+        path: &Path,
+        bytes: &[u8],
+        identity: &FileIdentity,
+        access_tier: u8,
+        embedding_generator: &dyn EmbeddingGenerator,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> Result<DocumentChunk, TypeError> {
+        let mut metadata = Self::extract_metadata_with_policy(path, bytes, identity, policy);
+        Self::sanitize_metadata(&mut metadata);
         let search_text = Self::build_search_text(&metadata, path);
         let file_b3 = blake3::hash(bytes).to_hex().to_string();
 
@@ -798,11 +863,23 @@ impl ImageIndexer {
     /// PowerShell WinRT fallback for Windows when in-process COM apartment or stream parsing needs an external runner.
     #[cfg(windows)]
     pub fn run_powershell_winrt_ocr(path: &Path) -> Option<String> {
+        Self::run_powershell_winrt_ocr_with_policy(
+            path,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    #[cfg(windows)]
+    pub fn run_powershell_winrt_ocr_with_policy(
+        path: &Path,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> Option<String> {
         use std::process::Command;
 
         if !path.exists() {
             return None;
         }
+        crate::cloud_drives::ensure_open_allowed_for_placeholder(path, policy).ok()?;
 
         let script = r#"
 param([string]$ImagePath)
@@ -869,6 +946,14 @@ if ($engine) {
 
     #[cfg(not(windows))]
     pub fn run_powershell_winrt_ocr(_path: &Path) -> Option<String> {
+        None
+    }
+
+    #[cfg(not(windows))]
+    pub fn run_powershell_winrt_ocr_with_policy(
+        _path: &Path,
+        _policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> Option<String> {
         None
     }
 
@@ -976,7 +1061,11 @@ if ($engine) {
         ollama_url: &str,
         vision_model: &str,
     ) -> Result<String, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("Failed to read image {}: {}", path.display(), e))?;
+        let bytes = crate::cloud_drives::read_bytes_with_placeholder_policy(
+            path,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+        .map_err(|e| format!("Failed to read image {}: {}", path.display(), e))?;
         let trimmed_url = ollama_url
             .trim()
             .trim_start_matches("http://")
@@ -1106,9 +1195,22 @@ if ($engine) {
     }
 
 
-    /// Universal OCR entry point for a file on disk.
+    /// Universal OCR entry point for a file on disk (fails closed under `LocallySyncedOnly`).
     pub fn run_ocr_on_file(path: &Path) -> Option<String> {
-        if let Ok(bytes) = std::fs::read(path) {
+        Self::run_ocr_on_file_with_policy(
+            path,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Universal OCR entry point enforcing `policy` before reading or invoking WinRT OCR.
+    pub fn run_ocr_on_file_with_policy(
+        path: &Path,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> Option<String> {
+        crate::cloud_drives::ensure_open_allowed_for_placeholder(path, policy).ok()?;
+
+        if let Ok(bytes) = crate::cloud_drives::read_bytes_with_placeholder_policy(path, policy) {
             if let Some(text) = Self::run_native_windows_ocr(&bytes) {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
@@ -1119,7 +1221,7 @@ if ($engine) {
 
         #[cfg(windows)]
         {
-            if let Some(text) = Self::run_powershell_winrt_ocr(path) {
+            if let Some(text) = Self::run_powershell_winrt_ocr_with_policy(path, policy) {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
                     return Some(trimmed.to_string());
@@ -1127,7 +1229,7 @@ if ($engine) {
             }
         }
 
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) = crate::cloud_drives::read_bytes_with_placeholder_policy(path, policy) {
             if let Some(text) = Self::extract_vision_description(&bytes) {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {

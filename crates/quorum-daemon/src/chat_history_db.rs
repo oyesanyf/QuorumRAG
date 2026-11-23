@@ -125,8 +125,7 @@ impl ChatHistoryStore {
         }
 
         let now = Utc::now().timestamp_millis();
-        let citations_json =
-            serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
+        let citations_json = serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
         let resp_peer = if responder_peer_id.trim().is_empty() {
             "local"
         } else {
@@ -184,7 +183,13 @@ impl ChatHistoryStore {
                 "UPDATE chat_messages
                  SET content = ?1, citations_json = ?2, responder_peer_id = ?3, created_at = ?4
                  WHERE id = ?5",
-                params![assistant_answer, citations_json, resp_peer, now, asst_row_id],
+                params![
+                    assistant_answer,
+                    citations_json,
+                    resp_peer,
+                    now,
+                    asst_row_id
+                ],
             )?;
         } else {
             tx.execute(
@@ -481,7 +486,8 @@ mod tests {
             let store = ChatHistoryStore::open(&db_file).expect("open store");
             let cit = Citation {
                 peer_id: "12D3KooWRemotePeer".to_string(),
-                file_path: "D:\\docs\\Femi_Oyesanya_AI_Security_Resume_Timeline_Fixed.pdf".to_string(),
+                file_path: "D:\\docs\\Femi_Oyesanya_AI_Security_Resume_Timeline_Fixed.pdf"
+                    .to_string(),
                 line_start: 1,
                 line_end: 42,
                 score: 0.96,

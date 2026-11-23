@@ -49,12 +49,7 @@ pub struct ActiveChatTask {
 }
 
 impl ActiveChatTask {
-    pub fn new(
-        query_id: String,
-        session_id: String,
-        prompt: String,
-        model_family: String,
-    ) -> Self {
+    pub fn new(query_id: String, session_id: String, prompt: String, model_family: String) -> Self {
         let (broadcaster, _) = broadcast::channel(8192);
         let started_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -105,8 +100,8 @@ impl ActiveChatTask {
     }
 
     pub fn cancel(&self) -> bool {
-        let was_running = !self.completed.load(Ordering::SeqCst)
-            && !self.cancelled.swap(true, Ordering::SeqCst);
+        let was_running =
+            !self.completed.load(Ordering::SeqCst) && !self.cancelled.swap(true, Ordering::SeqCst);
         if was_running {
             self.token.cancel();
             self.record_event(AgenticTelemetryEvent::ExecutionError {
@@ -137,7 +132,10 @@ impl ActiveChatTask {
     /// Takes a consistent snapshot of all buffered events and subscribes to future broadcast events atomically.
     pub fn snapshot_and_subscribe(
         &self,
-    ) -> (Vec<AgenticTelemetryEvent>, broadcast::Receiver<AgenticTelemetryEvent>) {
+    ) -> (
+        Vec<AgenticTelemetryEvent>,
+        broadcast::Receiver<AgenticTelemetryEvent>,
+    ) {
         if let Ok(log) = self.event_log.lock() {
             let snapshot = log.clone();
             let rx = self.broadcaster.subscribe();
@@ -194,7 +192,8 @@ impl Drop for InFlightGuard {
             }
             // Opportunistic prune of stale completed tasks exceeding retention window
             map.retain(|_, task| {
-                if !task.completed.load(Ordering::SeqCst) && !task.cancelled.load(Ordering::SeqCst) {
+                if !task.completed.load(Ordering::SeqCst) && !task.cancelled.load(Ordering::SeqCst)
+                {
                     true
                 } else {
                     let completed_at = task.completed_at_ms.load(Ordering::SeqCst);
@@ -371,7 +370,8 @@ impl InFlightQueryRegistry {
 
         if let Ok(mut map) = self.queries.write() {
             map.retain(|_, task| {
-                if !task.completed.load(Ordering::SeqCst) && !task.cancelled.load(Ordering::SeqCst) {
+                if !task.completed.load(Ordering::SeqCst) && !task.cancelled.load(Ordering::SeqCst)
+                {
                     true
                 } else {
                     let completed_at = task.completed_at_ms.load(Ordering::SeqCst);
@@ -399,6 +399,25 @@ pub struct ChatSessionData {
     pub last_active: Instant,
 }
 
+/// Snapshot of per-user interactive session virtual drives reported by `quorum-desktop --cloud-drive-relay`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RelayedCloudDriveEntry {
+    pub id: String,
+    pub provider: String,
+    pub root_path: String,
+    #[serde(default)]
+    pub virtual_drive: bool,
+    #[serde(default)]
+    pub readable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CloudDriveRelaySnapshot {
+    pub session_id: Option<u32>,
+    pub drives: Vec<RelayedCloudDriveEntry>,
+    pub updated_at: Instant,
+}
+
 /// Thread-safe registry mapping session IDs to their active continuation state, seen chunk IDs,
 /// and lazily-initialized SQLite chat history store.
 #[derive(Clone, Default)]
@@ -406,9 +425,12 @@ pub struct ChatSessionRegistry {
     sessions: Arc<RwLock<HashMap<String, ChatSessionData>>>,
     history_db: Arc<RwLock<Option<Arc<crate::chat_history_db::ChatHistoryStore>>>>,
     pub(crate) p2p_watcher_runtime: Arc<RwLock<Option<Arc<crate::p2p_watcher::P2pWatcherRuntime>>>>,
-    pub(crate) marketplace_db: Arc<RwLock<Option<Arc<crate::handlers::marketplace::MarketplaceStore>>>>,
+    pub(crate) marketplace_db:
+        Arc<RwLock<Option<Arc<crate::handlers::marketplace::MarketplaceStore>>>>,
     pub(crate) fs_watcher_handle: Arc<RwLock<Option<Arc<quorum_ingest::WatcherHandle>>>>,
-    pub(crate) nimble_provisioner: Arc<RwLock<Option<Arc<crate::nimble_provisioner::NimbleProvisioner>>>>,
+    pub(crate) nimble_provisioner:
+        Arc<RwLock<Option<Arc<crate::nimble_provisioner::NimbleProvisioner>>>>,
+    pub(crate) cloud_drive_relay: Arc<RwLock<Option<CloudDriveRelaySnapshot>>>,
 }
 
 impl ChatSessionRegistry {
@@ -420,6 +442,7 @@ impl ChatSessionRegistry {
             marketplace_db: Arc::new(RwLock::new(None)),
             fs_watcher_handle: Arc::new(RwLock::new(None)),
             nimble_provisioner: Arc::new(RwLock::new(None)),
+            cloud_drive_relay: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -435,11 +458,13 @@ impl ChatSessionRegistry {
 
     pub fn record_seen_chunks(&self, session_id: &str, chunk_ids: &[String]) {
         if let Ok(mut map) = self.sessions.write() {
-            let entry = map.entry(session_id.to_string()).or_insert_with(|| ChatSessionData {
-                session_id: session_id.to_string(),
-                seen_chunk_ids: HashSet::new(),
-                last_active: Instant::now(),
-            });
+            let entry = map
+                .entry(session_id.to_string())
+                .or_insert_with(|| ChatSessionData {
+                    session_id: session_id.to_string(),
+                    seen_chunk_ids: HashSet::new(),
+                    last_active: Instant::now(),
+                });
             entry.last_active = Instant::now();
             for id in chunk_ids {
                 entry.seen_chunk_ids.insert(id.clone());
@@ -504,13 +529,34 @@ impl DaemonState {
             .and_then(|g| g.clone())
     }
 
-    /// Dynamically registers directories with the live OS `FilesystemWatcher` and immediately
-    /// triggers (or priority-queues) reindexing on `paths`.
+    /// Dynamically registers permitted directories with the live OS `FilesystemWatcher` and
+    /// immediately triggers (or priority-queues) reindexing on `paths`, canonicalizing paths and
+    /// splitting/excluding any disabled cloud drives or user profile roots fail-closed.
     pub async fn watch_and_index_paths(&self, paths: Vec<PathBuf>) -> Option<uuid::Uuid> {
-        let clean_paths: Vec<PathBuf> = paths
-            .into_iter()
-            .filter(|p| !p.as_os_str().is_empty() && p.exists())
-            .collect();
+        let discovered = tokio::task::spawn_blocking(quorum_ingest::discover_cloud_drives)
+            .await
+            .unwrap_or_default();
+        let controller = quorum_coordinator::global_mesh_dlp_controller();
+        crate::handlers::cloud_drives::reconcile_discovered_cloud_drives(&controller, &discovered);
+        let disabled_cloud_roots =
+            crate::handlers::cloud_drives::collect_disabled_cloud_roots(&controller, &discovered);
+
+        let mut clean_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        for p in paths {
+            if p.as_os_str().is_empty() {
+                continue;
+            }
+            if let Some(clean_p) = crate::handlers::cloud_drives::canonicalize_for_cloud_filter(&p)
+            {
+                if clean_p.exists() {
+                    crate::handlers::cloud_drives::push_watch_root_excluding_disabled(
+                        &clean_p,
+                        &disabled_cloud_roots,
+                        &mut clean_paths,
+                    );
+                }
+            }
+        }
         if clean_paths.is_empty() {
             return None;
         }
@@ -522,14 +568,258 @@ impl DaemonState {
                     p.parent()
                 };
                 if let Some(d) = dir_to_watch {
-                    if d.exists() {
-                        let _ = watcher.watch_path(d);
+                    if let Some(clean_d) =
+                        crate::handlers::cloud_drives::canonicalize_for_cloud_filter(d)
+                    {
+                        if clean_d.exists()
+                            && !crate::handlers::cloud_drives::is_user_profile_root_dir(&clean_d)
+                            && !crate::handlers::cloud_drives::is_disabled_cloud_root(
+                                &clean_d,
+                                &disabled_cloud_roots,
+                            )
+                            && !crate::handlers::cloud_drives::is_strict_ancestor_of_disabled_cloud_root(
+                                &clean_d,
+                                &disabled_cloud_roots,
+                            )
+                        {
+                            let _ = watcher.watch_path(&clean_d);
+                        }
                     }
                 }
             }
         }
         self.reindex_worker.add_watch_paths(&clean_paths);
         self.reindex_worker.trigger_paths(clean_paths).await.ok()
+    }
+
+    /// Stores the latest user-session virtual drive relay snapshot (ignored under hermetic test override).
+    pub fn set_cloud_drive_relay(
+        &self,
+        session_id: Option<u32>,
+        drives: Vec<RelayedCloudDriveEntry>,
+    ) {
+        let is_test_override = std::env::var("QUORUM_CLOUD_TEST_PROFILE_DIR")
+            .ok()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if is_test_override {
+            return;
+        }
+        if let Ok(mut guard) = self.sessions.cloud_drive_relay.write() {
+            *guard = Some(CloudDriveRelaySnapshot {
+                session_id,
+                drives,
+                updated_at: Instant::now(),
+            });
+        }
+    }
+
+    /// Returns the active user-session virtual drive relay snapshot if fresh (`<= max_age`)
+    /// and `QUORUM_CLOUD_TEST_PROFILE_DIR` is unset/empty.
+    pub fn active_cloud_drive_relay(&self, max_age: Duration) -> Option<CloudDriveRelaySnapshot> {
+        let is_test_override = std::env::var("QUORUM_CLOUD_TEST_PROFILE_DIR")
+            .ok()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if is_test_override {
+            return None;
+        }
+        self.sessions
+            .cloud_drive_relay
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|snap| snap.updated_at.elapsed() <= max_age)
+    }
+
+    /// Reconciles discovered cloud drives and filters `DriftHealer`'s `watch_paths`
+    /// through `push_watch_root_excluding_disabled` so `DriftHealer` never walks
+    /// disabled cloud drives or unsplit strict ancestors.
+    pub async fn sync_drift_healer_watch_paths(&self) {
+        let discovered = tokio::task::spawn_blocking(quorum_ingest::discover_cloud_drives)
+            .await
+            .unwrap_or_default();
+        let controller = quorum_coordinator::global_mesh_dlp_controller();
+        crate::handlers::cloud_drives::reconcile_discovered_cloud_drives(&controller, &discovered);
+        let disabled_cloud_roots =
+            crate::handlers::cloud_drives::collect_disabled_cloud_roots(&controller, &discovered);
+        self.drift_healer
+            .update_blocked_prefixes(disabled_cloud_roots.clone());
+        let current_paths = self.drift_healer.config_snapshot().await.watch_paths;
+        let mut filtered = Vec::with_capacity(current_paths.len());
+        for p in &current_paths {
+            crate::handlers::cloud_drives::push_watch_root_excluding_disabled(
+                p,
+                &disabled_cloud_roots,
+                &mut filtered,
+            );
+        }
+        self.drift_healer.update_watch_paths(filtered).await;
+    }
+
+    /// Synchronizes current persisted Cloud Drives settings (`placeholder_policy`,
+    /// `access_tier_rules`, `max_file_size_bytes`, and `blocked_prefixes`) onto both
+    /// `ReindexWorker` and `DriftHealer` without holding any synchronous lock across `.await`.
+    pub async fn sync_cloud_drives_config_to_workers(&self) -> Result<(), String> {
+        let controller = quorum_coordinator::global_mesh_dlp_controller();
+        let rules = controller.cloud_drive_access_tier_rules();
+        let settings = controller.get_cloud_drives_settings();
+        let policy = settings.placeholder_policy().map_err(|e| e.to_string())?;
+        let effective_max_bytes =
+            crate::handlers::cloud_drives::effective_ingest_max_file_size_bytes(&settings);
+        let discovered = tokio::task::spawn_blocking(quorum_ingest::discover_cloud_drives)
+            .await
+            .unwrap_or_default();
+        let disabled_roots =
+            crate::handlers::cloud_drives::collect_disabled_cloud_roots(&controller, &discovered);
+
+        self.reindex_worker
+            .update_blocked_prefixes(disabled_roots.clone());
+        self.drift_healer.update_blocked_prefixes(disabled_roots);
+        self.reindex_worker.update_placeholder_policy(policy).await;
+        self.drift_healer.update_placeholder_policy(policy).await;
+        self.reindex_worker
+            .update_max_file_size_bytes(effective_max_bytes)
+            .await;
+        self.drift_healer
+            .update_max_file_size_bytes(effective_max_bytes)
+            .await;
+        self.reindex_worker
+            .update_access_tier_rules(rules.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        self.drift_healer
+            .update_access_tier_rules(rules)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Unwatches ONLY the exact directory prefix from the filesystem watcher and
+    /// `ReindexWorker::watch_paths` without deleting storage/dedup records or active child
+    /// watches. Used when removing a parent `custom_paths` entry that still has active
+    /// descendant cloud roots or folders underneath it.
+    pub async fn unwatch_exact_prefix(&self, raw_prefix: &str) -> Result<(), String> {
+        let norm =
+            quorum_types::normalize_prefix_for_match(raw_prefix).map_err(|e| e.to_string())?;
+        let raw_buf = PathBuf::from(raw_prefix.trim());
+        let norm_buf = PathBuf::from(&norm);
+
+        if let Some(watcher) = self.fs_watcher() {
+            let _ = watcher.unwatch_path(&raw_buf);
+            let _ = watcher.unwatch_path(&norm_buf);
+            for wp in watcher.watched_paths() {
+                if quorum_types::normalize_prefix_for_match(&wp.to_string_lossy())
+                    .ok()
+                    .as_deref()
+                    == Some(norm.as_str())
+                {
+                    let _ = watcher.unwatch_path(&wp);
+                }
+            }
+        }
+
+        self.reindex_worker
+            .remove_watch_paths(&[raw_buf.clone(), norm_buf.clone()])
+            .await;
+        self.drift_healer
+            .remove_watch_paths(&[raw_buf, norm_buf])
+            .await;
+        Ok(())
+    }
+
+    /// Unwatches `raw_prefix` from the live filesystem watcher and `ReindexWorker`, purges
+    /// matching prefix records across LanceDB/Tantivy/SQLite/AtlasKV, cleans Level-1 & Level-2
+    /// dedup caches, and invalidates `QueryCoordinator` caches.
+    pub async fn unwatch_and_purge_prefix(
+        &self,
+        raw_prefix: &str,
+    ) -> Result<quorum_storage::PrefixPurgeReport, String> {
+        let norm =
+            quorum_types::normalize_prefix_for_match(raw_prefix).map_err(|e| e.to_string())?;
+        let raw_buf = PathBuf::from(raw_prefix.trim());
+        let norm_buf = PathBuf::from(&norm);
+
+        if let Some(watcher) = self.fs_watcher() {
+            let _ = watcher.unwatch_path(&raw_buf);
+            let _ = watcher.unwatch_path(&norm_buf);
+            for wp in watcher.watched_paths() {
+                let wp_str = wp.to_string_lossy();
+                if quorum_types::path_matches_prefix(&wp_str, &norm).unwrap_or(false) {
+                    let _ = watcher.unwatch_path(&wp);
+                }
+            }
+        }
+
+        self.reindex_worker
+            .remove_watch_paths(&[raw_buf.clone(), norm_buf.clone()])
+            .await;
+        self.drift_healer
+            .remove_watch_paths(&[raw_buf, norm_buf])
+            .await;
+
+        let drained = self
+            .reindex_worker
+            .cancel_and_drain(Duration::from_secs(5))
+            .await;
+        if !drained {
+            tracing::warn!(
+                prefix = %norm,
+                "ReindexWorker::cancel_and_drain timed out before prefix purge; acquiring commit barrier"
+            );
+        }
+        let drift_drained = self
+            .drift_healer
+            .cancel_and_drain(Duration::from_secs(5))
+            .await;
+        if !drift_drained {
+            tracing::warn!(
+                prefix = %norm,
+                "DriftHealer::cancel_and_drain timed out before prefix purge; acquiring commit barrier"
+            );
+        }
+        let _purge_barrier = self.reindex_worker.acquire_purge_barrier().await;
+        let _drift_purge_barrier = if !self
+            .drift_healer
+            .shares_commit_gate_with(&self.reindex_worker)
+        {
+            Some(self.drift_healer.acquire_purge_barrier().await)
+        } else {
+            None
+        };
+
+        let report = self
+            .storage
+            .delete_by_path_prefix(&norm)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let catalog_path = self.data_dir.join("dedup_catalog.json");
+        let _ = self
+            .dedup
+            .remove_by_prefix_and_save(std::path::Path::new(&norm), Some(&catalog_path));
+
+        let _ = self.coordinator.cache_clear_all();
+        Ok(report)
+    }
+
+    /// Synchronizes an updated `access_tier` (`0..=3`) across all storage engines (LanceDB,
+    /// Tantivy, SQLite, AtlasKV) for `raw_prefix` and clears query caches immediately.
+    pub async fn sync_cloud_drive_tier_prefix(
+        &self,
+        raw_prefix: &str,
+        new_tier: u8,
+    ) -> Result<quorum_storage::PrefixTierUpdateReport, String> {
+        quorum_types::AccessTier::from_u8(new_tier).map_err(|e| e.to_string())?;
+        let norm =
+            quorum_types::normalize_prefix_for_match(raw_prefix).map_err(|e| e.to_string())?;
+        let report = self
+            .storage
+            .update_path_prefix_access_tier(&norm, new_tier)
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = self.coordinator.cache_clear_all();
+        Ok(report)
     }
 
     /// Attaches an explicit `P2pWatcherRuntime` configured at daemon startup.
@@ -586,7 +876,10 @@ impl DaemonState {
     }
 
     /// Attaches an explicitly configured `NimbleProvisioner` at daemon startup.
-    pub fn set_nimble_provisioner(&self, provisioner: Arc<crate::nimble_provisioner::NimbleProvisioner>) {
+    pub fn set_nimble_provisioner(
+        &self,
+        provisioner: Arc<crate::nimble_provisioner::NimbleProvisioner>,
+    ) {
         if let Ok(mut guard) = self.sessions.nimble_provisioner.write() {
             *guard = Some(provisioner);
         }
@@ -616,7 +909,9 @@ impl DaemonState {
     }
 
     /// Returns the persistent SQLite `MarketplaceStore` backed by `<data_dir>/marketplace_ledger.db`.
-    pub fn marketplace_store(&self) -> Result<Arc<crate::handlers::marketplace::MarketplaceStore>, String> {
+    pub fn marketplace_store(
+        &self,
+    ) -> Result<Arc<crate::handlers::marketplace::MarketplaceStore>, String> {
         if let Ok(guard) = self.sessions.marketplace_db.read() {
             if let Some(ref existing) = *guard {
                 return Ok(Arc::clone(existing));

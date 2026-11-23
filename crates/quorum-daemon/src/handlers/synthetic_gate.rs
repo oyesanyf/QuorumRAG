@@ -295,8 +295,7 @@ pub fn split_sentences(text: &str) -> Vec<String> {
     while idx < len {
         let c = chars[idx];
         cur.push(c);
-        if (c == '.' || c == '!' || c == '?')
-            && (idx + 1 == len || chars[idx + 1].is_whitespace())
+        if (c == '.' || c == '!' || c == '?') && (idx + 1 == len || chars[idx + 1].is_whitespace())
         {
             // Skip common abbreviations like Dr., e.g., i.e.
             let trimmed = cur.trim();
@@ -519,7 +518,10 @@ pub fn detect_mixed_script_homoglyphs(text: &str) -> usize {
 }
 
 /// Strips zero-width and invisible watermark characters, checks homoglyphs, and scans for 27 AI clichés.
-pub fn scrub_and_scan_stage3_lexical(text: &str, _config: &SyntheticGateConfig) -> Stage3LexicalReport {
+pub fn scrub_and_scan_stage3_lexical(
+    text: &str,
+    _config: &SyntheticGateConfig,
+) -> Stage3LexicalReport {
     // 1. Strip invisible zero-width watermarks
     let mut cleaned_text = String::with_capacity(text.len());
     let mut stripped_watermark_chars = 0usize;
@@ -628,7 +630,10 @@ impl HumanTelemetryGuard {
         let mac = blake3::keyed_hash(&self.derived_nonce_key, payload.as_bytes())
             .to_hex()
             .to_string();
-        format!("{}:{}:{}:{}", trajectory_id, ts_secs, context_token_count, mac)
+        format!(
+            "{}:{}:{}:{}",
+            trajectory_id, ts_secs, context_token_count, mac
+        )
     }
 
     /// Verifies an interaction nonce: constant-time MAC match, reading time, GCRA burst limit, and cadence.
@@ -834,7 +839,8 @@ impl HumanTelemetryGuard {
             Err(p) => p.into_inner(),
         };
 
-        let emission_interval = Duration::from_secs_f64(60.0 / self.config.rate_limit_per_minute as f64);
+        let emission_interval =
+            Duration::from_secs_f64(60.0 / self.config.rate_limit_per_minute as f64);
         let burst_tolerance = emission_interval * self.config.rate_limit_burst;
 
         let theoretical_arrival = if *tat < now { now } else { *tat };
@@ -998,7 +1004,10 @@ impl SyntheticExclusionPipeline {
                 rejection_reason: if rate_limit_ok {
                     None
                 } else {
-                    Some("Stage 4 Rejection: Rate limit exceeded on unauthenticated submission".to_string())
+                    Some(
+                        "Stage 4 Rejection: Rate limit exceeded on unauthenticated submission"
+                            .to_string(),
+                    )
                 },
             }
         };
@@ -1052,12 +1061,19 @@ mod tests {
         assert_eq!(r_wm.cleaned_text, "Authentic text with hidden watermark.");
 
         // 2. AI cliché patterns
-        let cliche_text = "This stands as a beacon and testament to the rich tapestry of engineering.";
+        let cliche_text =
+            "This stands as a beacon and testament to the rich tapestry of engineering.";
         let r_cliche = scrub_and_scan_stage3_lexical(cliche_text, &config);
         assert!(!r_cliche.passed);
-        assert!(r_cliche.cliche_matches.contains(&"stands as a beacon".to_string()));
-        assert!(r_cliche.cliche_matches.contains(&"testament to".to_string()));
-        assert!(r_cliche.cliche_matches.contains(&"rich tapestry".to_string()));
+        assert!(r_cliche
+            .cliche_matches
+            .contains(&"stands as a beacon".to_string()));
+        assert!(r_cliche
+            .cliche_matches
+            .contains(&"testament to".to_string()));
+        assert!(r_cliche
+            .cliche_matches
+            .contains(&"rich tapestry".to_string()));
 
         // 3. Mixed-script homoglyphs: Cyrillic 'а' (\u{0430}) inside "pаssword"
         let homoglyph_text = "Security check for p\u{0430}ssword token.";
@@ -1071,7 +1087,8 @@ mod tests {
         let config = SyntheticGateConfig::default();
 
         // Monotonous uniform sentences -> low CV
-        let uniform = "We index all files. We parse all files. We check all files. We store all files.";
+        let uniform =
+            "We index all files. We parse all files. We check all files. We store all files.";
         let m_uni = evaluate_stage1_statistics(uniform, &config);
         assert!(m_uni.burstiness_cv < 0.20);
 
@@ -1109,15 +1126,8 @@ mod tests {
         let prompt = "How does QuorumRAG coordinate distributed search across local nodes?";
         let response = "QuorumRAG coordinates search via an Ed25519-signed mesh protocol. When a query arrives, the local node inspects Tantivy BM25 indices and LanceDB vector embeddings before fanning out scatter-gather sub-requests to verified peer nodes over libp2p. Every response is verified in constant time.";
 
-        let verdict = pipeline.evaluate_candidate(
-            prompt,
-            response,
-            &[],
-            None,
-            None,
-            60,
-            "traj-test-01",
-        );
+        let verdict =
+            pipeline.evaluate_candidate(prompt, response, &[], None, None, 60, "traj-test-01");
 
         assert!(verdict.passed);
         assert!(verdict.stage1.passed);

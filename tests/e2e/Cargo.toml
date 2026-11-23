@@ -31,6 +31,7 @@ tokio = { version = "1.40", features = ["full"] }
 tempfile = "3.10"
 sysinfo = "0.30"
 regex = "1.10"
+reqwest = { version = "0.12", features = ["json"] }
 
 [[test]]
 name = "test_artemis_dfir"
@@ -71,3 +72,23 @@ path = "test_live_ide_execution.rs"
 [[test]]
 name = "benchmarks_r4"
 path = "../benchmarks_r4.rs"
+
+[[test]]
+name = "test_cloud_drives_tier1_discovery"
+path = "tests/test_cloud_drives_tier1_discovery.rs"
+
+[[test]]
+name = "test_cloud_drives_tier1_pipeline_api_ui"
+path = "tests/test_cloud_drives_tier1_pipeline_api_ui.rs"
+
+[[test]]
+name = "test_cloud_drives_tier2_boundaries"
+path = "tests/test_cloud_drives_tier2_boundaries.rs"
+
+[[test]]
+name = "test_cloud_drives_tier3_4_e2e"
+path = "tests/test_cloud_drives_tier3_4_e2e.rs"
+
+[[test]]
+name = "test_cloud_drives_tier5_adversarial"
+path = "tests/test_cloud_drives_tier5_adversarial.rs"

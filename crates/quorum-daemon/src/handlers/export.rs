@@ -83,7 +83,8 @@ pub fn image_dims(bytes: &[u8]) -> Option<(u32, u32, bool, u8)> {
                 continue;
             }
             let marker = bytes[off + 1];
-            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) || marker == 0xFF {
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) || marker == 0xFF
+            {
                 off += if marker == 0xFF { 1 } else { 2 };
                 continue;
             }
@@ -139,10 +140,17 @@ pub fn parse_markdown(md: &str) -> Vec<Block> {
         let hashes = t.chars().take_while(|&c| c == '#').count();
         if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
             flush(&mut para, &mut blocks);
-            blocks.push(Block::Heading(hashes.min(3) as u8, t[hashes..].trim().to_string()));
+            blocks.push(Block::Heading(
+                hashes.min(3) as u8,
+                t[hashes..].trim().to_string(),
+            ));
             continue;
         }
-        if let Some(rest) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).or_else(|| t.strip_prefix("\u{2022} ")) {
+        if let Some(rest) = t
+            .strip_prefix("- ")
+            .or_else(|| t.strip_prefix("* "))
+            .or_else(|| t.strip_prefix("\u{2022} "))
+        {
             flush(&mut para, &mut blocks);
             blocks.push(Block::Bullet(rest.trim().to_string()));
             continue;
@@ -191,7 +199,11 @@ fn crc32(data: &[u8]) -> u32 {
         for (i, slot) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *slot = c;
         }
@@ -282,8 +294,15 @@ fn docx_runs(text: &str, force_bold: bool) -> String {
     inline_runs(text)
         .into_iter()
         .map(|(t, b)| {
-            let rpr = if b || force_bold { "<w:rPr><w:b/></w:rPr>" } else { "" };
-            format!("<w:r>{rpr}<w:t xml:space=\"preserve\">{}</w:t></w:r>", xml_escape(&t))
+            let rpr = if b || force_bold {
+                "<w:rPr><w:b/></w:rPr>"
+            } else {
+                ""
+            };
+            format!(
+                "<w:r>{rpr}<w:t xml:space=\"preserve\">{}</w:t></w:r>",
+                xml_escape(&t)
+            )
         })
         .collect()
 }
@@ -304,34 +323,57 @@ fn docx_para(style: Option<&str>, indent: bool, body: &str) -> String {
 }
 
 pub fn generate_docx(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
-    let title = req.title.clone().unwrap_or_else(|| "QuorumRAG Answer".to_string());
+    let title = req
+        .title
+        .clone()
+        .unwrap_or_else(|| "QuorumRAG Answer".to_string());
     let mut body = String::new();
     body.push_str(&docx_para(Some("Title"), false, &docx_runs(&title, false)));
     if let Some(p) = req.prompt.as_deref().filter(|p| !p.trim().is_empty()) {
-        body.push_str(&docx_para(None, false, &format!(
-            "<w:r><w:rPr><w:i/></w:rPr><w:t xml:space=\"preserve\">Question: {}</w:t></w:r>",
-            xml_escape(p)
-        )));
+        body.push_str(&docx_para(
+            None,
+            false,
+            &format!(
+                "<w:r><w:rPr><w:i/></w:rPr><w:t xml:space=\"preserve\">Question: {}</w:t></w:r>",
+                xml_escape(p)
+            ),
+        ));
     }
     for block in parse_markdown(&req.markdown_content) {
         match block {
-            Block::Heading(l, t) => body.push_str(&docx_para(Some(&format!("Heading{l}")), false, &docx_runs(&t, false))),
+            Block::Heading(l, t) => body.push_str(&docx_para(
+                Some(&format!("Heading{l}")),
+                false,
+                &docx_runs(&t, false),
+            )),
             Block::Paragraph(t) => body.push_str(&docx_para(None, false, &docx_runs(&t, false))),
-            Block::Bullet(t) => body.push_str(&docx_para(None, true, &format!(
-                "<w:r><w:t xml:space=\"preserve\">\u{2022}\t</w:t></w:r>{}",
-                docx_runs(&t, false)
-            ))),
-            Block::Numbered(n, t) => body.push_str(&docx_para(None, true, &format!(
-                "<w:r><w:t xml:space=\"preserve\">{n}.\t</w:t></w:r>{}",
-                docx_runs(&t, false)
-            ))),
+            Block::Bullet(t) => body.push_str(&docx_para(
+                None,
+                true,
+                &format!(
+                    "<w:r><w:t xml:space=\"preserve\">\u{2022}\t</w:t></w:r>{}",
+                    docx_runs(&t, false)
+                ),
+            )),
+            Block::Numbered(n, t) => body.push_str(&docx_para(
+                None,
+                true,
+                &format!(
+                    "<w:r><w:t xml:space=\"preserve\">{n}.\t</w:t></w:r>{}",
+                    docx_runs(&t, false)
+                ),
+            )),
         }
     }
 
     let mut rels_extra = String::new();
     let mut media_entries: Vec<(String, Vec<u8>)> = Vec::new();
     if !images.is_empty() {
-        body.push_str(&docx_para(Some("Heading2"), false, &docx_runs("Attached Images", false)));
+        body.push_str(&docx_para(
+            Some("Heading2"),
+            false,
+            &docx_runs("Attached Images", false),
+        ));
     }
     for (i, img) in images.iter().enumerate() {
         let id = i + 1;
@@ -352,17 +394,31 @@ pub fn generate_docx(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
         body.push_str(&format!(
             "<w:p><w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\"><wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:docPr id=\"{id}\" name=\"{name}\"/><a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:nvPicPr><pic:cNvPr id=\"{id}\" name=\"{name}\"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed=\"rIdImg{id}\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
         ));
-        body.push_str(&docx_para(None, false, &format!(
-            "<w:r><w:rPr><w:i/></w:rPr><w:t xml:space=\"preserve\">{name}</w:t></w:r>"
-        )));
+        body.push_str(&docx_para(
+            None,
+            false,
+            &format!("<w:r><w:rPr><w:i/></w:rPr><w:t xml:space=\"preserve\">{name}</w:t></w:r>"),
+        ));
     }
 
     if !req.sources.is_empty() {
-        body.push_str(&docx_para(Some("Heading2"), false, &docx_runs("Sources", false)));
+        body.push_str(&docx_para(
+            Some("Heading2"),
+            false,
+            &docx_runs("Sources", false),
+        ));
         for (i, s) in req.sources.iter().enumerate() {
             let n = s.cite_num.unwrap_or(i + 1);
-            let score = s.score_pct.map(|p| format!(" ({p:.0}%)")).unwrap_or_default();
-            let peer_badge = s.node_id.as_deref().or(s.source_peer.as_deref()).map(|p| format!(" [Node: {p}]")).unwrap_or_default();
+            let score = s
+                .score_pct
+                .map(|p| format!(" ({p:.0}%)"))
+                .unwrap_or_default();
+            let peer_badge = s
+                .node_id
+                .as_deref()
+                .or(s.source_peer.as_deref())
+                .map(|p| format!(" [Node: {p}]"))
+                .unwrap_or_default();
             body.push_str(&docx_para(None, true, &format!(
                 "<w:r><w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">[{n}] {}{score}{peer_badge}</w:t></w:r><w:r><w:br/><w:t xml:space=\"preserve\">{}</w:t></w:r>",
                 xml_escape(&s.file_name),
@@ -422,7 +478,10 @@ xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawin
     );
 
     let mut entries: Vec<(String, Vec<u8>)> = vec![
-        ("[Content_Types].xml".into(), content_types.as_bytes().to_vec()),
+        (
+            "[Content_Types].xml".into(),
+            content_types.as_bytes().to_vec(),
+        ),
         ("_rels/.rels".into(), root_rels.as_bytes().to_vec()),
         ("docProps/core.xml".into(), core.into_bytes()),
         ("word/document.xml".into(), document.into_bytes()),
@@ -430,7 +489,10 @@ xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawin
         ("word/_rels/document.xml.rels".into(), doc_rels.into_bytes()),
     ];
     entries.extend(media_entries);
-    let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let refs: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
     zip_store(&refs)
 }
 
@@ -440,11 +502,11 @@ xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawin
 
 /// Helvetica advance widths (1/1000 em) for ASCII 32..=126 (Adobe standard metrics).
 const HELV: [u16; 95] = [
-    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556, 556,
-    556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667, 611, 778,
-    722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278,
-    278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
-    556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
+    556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667,
+    611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
+    667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500,
+    222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
 ];
 
 /// Map a char to a single WinAnsiEncoding byte (lossy for characters outside the code page).
@@ -468,8 +530,16 @@ fn winansi(c: char) -> u8 {
 }
 
 fn char_width(b: u8, bold: bool) -> f64 {
-    let w = if (32..=126).contains(&b) { HELV[(b - 32) as usize] as f64 } else { 556.0 };
-    if bold { w * 1.08 } else { w }
+    let w = if (32..=126).contains(&b) {
+        HELV[(b - 32) as usize] as f64
+    } else {
+        556.0
+    };
+    if bold {
+        w * 1.08
+    } else {
+        w
+    }
 }
 
 fn text_width(bytes: &[u8], size: f64, bold: bool) -> f64 {
@@ -484,7 +554,9 @@ fn wrap(text: &str, size: f64, bold: bool, max_w: f64) -> Vec<Vec<u8>> {
         let candidate_w = if cur.is_empty() {
             text_width(&wb, size, bold)
         } else {
-            text_width(&cur, size, bold) + text_width(b" ", size, bold) + text_width(&wb, size, bold)
+            text_width(&cur, size, bold)
+                + text_width(b" ", size, bold)
+                + text_width(&wb, size, bold)
         };
         if candidate_w <= max_w || cur.is_empty() {
             if !cur.is_empty() {
@@ -494,7 +566,8 @@ fn wrap(text: &str, size: f64, bold: bool, max_w: f64) -> Vec<Vec<u8>> {
             if cur.is_empty() && text_width(&wb, size, bold) > max_w {
                 let mut piece = Vec::new();
                 for b in wb {
-                    if text_width(&piece, size, bold) + char_width(b, bold) * size / 1000.0 > max_w {
+                    if text_width(&piece, size, bold) + char_width(b, bold) * size / 1000.0 > max_w
+                    {
                         lines.push(std::mem::take(&mut piece));
                     }
                     piece.push(b);
@@ -541,7 +614,12 @@ const MARGIN: f64 = 54.0;
 
 impl PdfLayout {
     fn new() -> Self {
-        Self { pages: Vec::new(), cur: Vec::new(), y: PAGE_H - MARGIN, placements: Vec::new() }
+        Self {
+            pages: Vec::new(),
+            cur: Vec::new(),
+            y: PAGE_H - MARGIN,
+            placements: Vec::new(),
+        }
     }
     fn new_page(&mut self) {
         self.pages.push(std::mem::take(&mut self.cur));
@@ -557,7 +635,14 @@ impl PdfLayout {
         self.ensure(lead);
         self.y -= lead;
         let font = if bold { "F2" } else { "F1" };
-        self.cur.extend_from_slice(format!("BT /{font} {size} Tf {:.2} {:.2} Td ", MARGIN + indent, self.y).as_bytes());
+        self.cur.extend_from_slice(
+            format!(
+                "BT /{font} {size} Tf {:.2} {:.2} Td ",
+                MARGIN + indent,
+                self.y
+            )
+            .as_bytes(),
+        );
         self.cur.extend_from_slice(&pdf_str(bytes));
         self.cur.extend_from_slice(b" Tj ET\n");
     }
@@ -573,7 +658,12 @@ impl PdfLayout {
                     let font = if bold { "F2" } else { "F1" };
                     // Prefix is drawn in the hanging-indent gutter on the same baseline as line 1.
                     self.cur.extend_from_slice(
-                        format!("BT /{font} {size} Tf {:.2} {:.2} Td ", MARGIN + indent - 14.0, self.y - lead).as_bytes(),
+                        format!(
+                            "BT /{font} {size} Tf {:.2} {:.2} Td ",
+                            MARGIN + indent - 14.0,
+                            self.y - lead
+                        )
+                        .as_bytes(),
                     );
                     self.cur.extend_from_slice(&pdf_str(&pb));
                     self.cur.extend_from_slice(b" Tj ET\n");
@@ -594,7 +684,13 @@ impl PdfLayout {
         self.y -= h + 4.0;
         let page = self.pages.len();
         self.placements.push((page, idx, MARGIN, self.y, w, h));
-        self.cur.extend_from_slice(format!("q {w:.2} 0 0 {h:.2} {MARGIN:.2} {:.2} cm /Im{idx} Do Q\n", self.y).as_bytes());
+        self.cur.extend_from_slice(
+            format!(
+                "q {w:.2} 0 0 {h:.2} {MARGIN:.2} {:.2} cm /Im{idx} Do Q\n",
+                self.y
+            )
+            .as_bytes(),
+        );
         self.y -= 6.0;
     }
     fn finish(mut self) -> (Vec<Vec<u8>>, Vec<(usize, usize, f64, f64, f64, f64)>) {
@@ -606,7 +702,10 @@ impl PdfLayout {
 }
 
 pub fn generate_pdf(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
-    let title = req.title.clone().unwrap_or_else(|| "QuorumRAG Answer".to_string());
+    let title = req
+        .title
+        .clone()
+        .unwrap_or_else(|| "QuorumRAG Answer".to_string());
     let mut lay = PdfLayout::new();
     lay.para(&plain(&title), 18.0, true, 0.0, None);
     if let Some(p) = req.prompt.as_deref().filter(|p| !p.trim().is_empty()) {
@@ -619,7 +718,9 @@ pub fn generate_pdf(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
             Block::Heading(_, t) => lay.para(&plain(&t), 11.5, true, 0.0, None),
             Block::Paragraph(t) => lay.para(&plain(&t), 11.0, false, 0.0, None),
             Block::Bullet(t) => lay.para(&plain(&t), 11.0, false, 18.0, Some("\u{2022}")),
-            Block::Numbered(n, t) => lay.para(&plain(&t), 11.0, false, 18.0, Some(&format!("{n}."))),
+            Block::Numbered(n, t) => {
+                lay.para(&plain(&t), 11.0, false, 18.0, Some(&format!("{n}.")))
+            }
         }
     }
     let jpegs: Vec<(usize, &EmbedImage)> = images
@@ -638,9 +739,23 @@ pub fn generate_pdf(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
         lay.para("Sources", 13.0, true, 0.0, None);
         for (i, s) in req.sources.iter().enumerate() {
             let n = s.cite_num.unwrap_or(i + 1);
-            let score = s.score_pct.map(|p| format!(" ({p:.0}%)")).unwrap_or_default();
-            let peer_badge = s.node_id.as_deref().or(s.source_peer.as_deref()).map(|p| format!(" [Node: {p}]")).unwrap_or_default();
-            lay.para(&format!("[{n}] {}{score}{peer_badge}", s.file_name), 10.0, true, 0.0, None);
+            let score = s
+                .score_pct
+                .map(|p| format!(" ({p:.0}%)"))
+                .unwrap_or_default();
+            let peer_badge = s
+                .node_id
+                .as_deref()
+                .or(s.source_peer.as_deref())
+                .map(|p| format!(" [Node: {p}]"))
+                .unwrap_or_default();
+            lay.para(
+                &format!("[{n}] {}{score}{peer_badge}", s.file_name),
+                10.0,
+                true,
+                0.0,
+                None,
+            );
             lay.para(&s.file_path, 9.0, false, 12.0, None);
         }
     }
@@ -650,14 +765,33 @@ pub fn generate_pdf(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
     let mut objs: Vec<Vec<u8>> = Vec::new();
     let img_base = 5;
     let page_base = img_base + jpegs.len();
-    let kids: Vec<String> = (0..pages.len()).map(|i| format!("{} 0 R", page_base + i * 2 + 1)).collect();
+    let kids: Vec<String> = (0..pages.len())
+        .map(|i| format!("{} 0 R", page_base + i * 2 + 1))
+        .collect();
     objs.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
-    objs.push(format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), pages.len()).into_bytes());
-    objs.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec());
-    objs.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>".to_vec());
+    objs.push(
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {} >>",
+            kids.join(" "),
+            pages.len()
+        )
+        .into_bytes(),
+    );
+    objs.push(
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    );
+    objs.push(
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    );
     let mut xobjects = String::new();
     for (i, img) in &jpegs {
-        let cs = if img.components == 1 { "/DeviceGray" } else { "/DeviceRGB" };
+        let cs = if img.components == 1 {
+            "/DeviceGray"
+        } else {
+            "/DeviceRGB"
+        };
         let mut o = format!(
             "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace {cs} /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
             img.width, img.height, img.bytes.len()
@@ -699,7 +833,11 @@ pub fn generate_pdf(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
         out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
     }
     out.extend_from_slice(
-        format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n", objs.len() + 1).as_bytes(),
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+            objs.len() + 1
+        )
+        .as_bytes(),
     );
     out
 }
@@ -711,25 +849,47 @@ pub fn generate_pdf(req: &ExportRequest, images: &[EmbedImage]) -> Vec<u8> {
 fn safe_file_stem(title: &str) -> String {
     let s: String = title
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let s = s.split_whitespace().collect::<Vec<_>>().join("_");
     let s: String = s.chars().take(80).collect();
-    if s.is_empty() { "quorumrag-answer".to_string() } else { s }
+    if s.is_empty() {
+        "quorumrag-answer".to_string()
+    } else {
+        s
+    }
 }
 
 fn load_images(state: &DaemonState, paths: &[String]) -> Vec<EmbedImage> {
     let mut out = Vec::new();
     for p in paths.iter().take(12) {
-        let Ok(path) = crate::handlers::media::authorize_media_path(state, p) else { continue };
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let Ok(path) = crate::handlers::media::authorize_media_path(state, p) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
         if meta.len() > 15 * 1024 * 1024 {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let Some((w, h, is_jpeg, comps)) = image_dims(&bytes) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some((w, h, is_jpeg, comps)) = image_dims(&bytes) else {
+            continue;
+        };
         out.push(EmbedImage {
-            name: path.file_name().and_then(|n| n.to_str()).unwrap_or("image").to_string(),
+            name: path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("image")
+                .to_string(),
             bytes,
             width: w,
             height: h,
@@ -740,7 +900,10 @@ fn load_images(state: &DaemonState, paths: &[String]) -> Vec<EmbedImage> {
     out
 }
 
-pub async fn export_handler(State(state): State<Arc<DaemonState>>, Json(req): Json<ExportRequest>) -> Response {
+pub async fn export_handler(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<ExportRequest>,
+) -> Response {
     if req.markdown_content.len() > 4 * 1024 * 1024 {
         return (StatusCode::PAYLOAD_TOO_LARGE, "Export content too large").into_response();
     }
@@ -759,8 +922,18 @@ pub async fn export_handler(State(state): State<Arc<DaemonState>>, Json(req): Js
                 "docx",
             )
         }
-        "md" | "markdown" => (req.markdown_content.clone().into_bytes(), "text/markdown; charset=utf-8", "md"),
-        _ => return (StatusCode::BAD_REQUEST, "Unsupported format: use pdf, docx, or md").into_response(),
+        "md" | "markdown" => (
+            req.markdown_content.clone().into_bytes(),
+            "text/markdown; charset=utf-8",
+            "md",
+        ),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Unsupported format: use pdf, docx, or md",
+            )
+                .into_response()
+        }
     };
     let disp = format!("attachment; filename=\"{stem}.{ext}\"");
     let mut resp = (StatusCode::OK, bytes).into_response();
@@ -821,11 +994,20 @@ mod tests {
         assert!(pdf[xref_at..].starts_with(b"xref\n"));
         let xref_text = std::str::from_utf8(&pdf[xref_at..]).unwrap();
         // Every xref entry must point at "N 0 obj".
-        let entries: Vec<&str> = xref_text.lines().skip(3).take_while(|l| l.ends_with(" n ")).collect();
+        let entries: Vec<&str> = xref_text
+            .lines()
+            .skip(3)
+            .take_while(|l| l.ends_with(" n "))
+            .collect();
         assert!(!entries.is_empty());
         for (i, e) in entries.iter().enumerate() {
             let off: usize = e[..10].parse().unwrap();
-            assert!(pdf[off..].starts_with(format!("{} 0 obj", i + 1).as_bytes()), "obj {} at {}", i + 1, off);
+            assert!(
+                pdf[off..].starts_with(format!("{} 0 obj", i + 1).as_bytes()),
+                "obj {} at {}",
+                i + 1,
+                off
+            );
         }
         assert!(find(&pdf, b"(Summary) Tj").is_some());
         assert!(find(&pdf, b"\\(with parentheses\\)").is_some());
@@ -848,7 +1030,13 @@ mod tests {
         let docx = generate_docx(&sample(), &[]);
         assert!(docx.starts_with(b"PK\x03\x04"));
         let s = String::from_utf8_lossy(&docx);
-        for part in ["[Content_Types].xml", "_rels/.rels", "word/document.xml", "word/styles.xml", "word/_rels/document.xml.rels"] {
+        for part in [
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "word/document.xml",
+            "word/styles.xml",
+            "word/_rels/document.xml.rels",
+        ] {
             assert!(s.contains(part), "missing {part}");
         }
         assert!(s.contains("<w:pStyle w:val=\"Heading1\"/>"));
@@ -865,7 +1053,10 @@ mod tests {
 
     #[test]
     fn jpeg_dims_parse() {
-        let jpeg = [0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x01, 0x90, 0x01, 0x18, 0x03, 0x01, 0x11, 0x00, 0xFF, 0xD9];
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x01, 0x90, 0x01, 0x18, 0x03, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
         assert_eq!(image_dims(&jpeg), Some((280, 400, true, 3)));
     }
 }

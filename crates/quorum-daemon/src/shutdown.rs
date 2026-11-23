@@ -1,7 +1,7 @@
+use crate::state::DaemonState;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{info, warn};
-use crate::state::DaemonState;
 
 /// Bounded shutdown phases. The Windows SCM gives the service roughly the
 /// duration of the reported `dwWaitHint` (~15s) to report STOPPED; the MSI's
@@ -94,7 +94,10 @@ pub async fn execute_graceful_shutdown(state: Arc<DaemonState>) {
     // 3b. Checkpoint persistent SQLite chat history database
     if let Ok(hist_store) = state.history_store() {
         if let Err(e) = hist_store.checkpoint() {
-            warn!("Failed to checkpoint SQLite chat history during shutdown: {}", e);
+            warn!(
+                "Failed to checkpoint SQLite chat history during shutdown: {}",
+                e
+            );
         } else {
             info!("Persisted SQLite chat history WAL checkpoint cleanly committed");
         }
@@ -103,7 +106,10 @@ pub async fn execute_graceful_shutdown(state: Arc<DaemonState>) {
     // 4. Persist Level-1 deduplication catalog to disk
     let catalog_path = state.data_dir.join("dedup_catalog.json");
     if let Err(e) = state.dedup.save_catalog_to_file(&catalog_path) {
-        warn!("Failed to persist dedup catalog during graceful shutdown: {}", e);
+        warn!(
+            "Failed to persist dedup catalog during graceful shutdown: {}",
+            e
+        );
     } else {
         info!(
             path = %catalog_path.display(),

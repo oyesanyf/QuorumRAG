@@ -5,6 +5,7 @@
 pub mod artemis;
 pub mod audio_indexer;
 pub mod classifier_router;
+pub mod cloud_drives;
 pub mod chunker;
 pub mod config;
 pub mod crawler;
@@ -32,13 +33,25 @@ pub use artemis::{
 };
 pub use audio_indexer::{AudioIndexer, AudioMetadata};
 pub use classifier_router::{CandidateKind, ClassifierRouter, FilterDecision};
+pub use cloud_drives::{
+    build_default_cloud_drives_settings, discover_cloud_drives, discover_cloud_drives_with_env,
+    ensure_open_allowed_for_placeholder, is_cloud_placeholder_metadata,
+    is_macos_cloud_placeholder_flags, is_windows_cloud_placeholder_attrs,
+    read_bytes_with_placeholder_policy, should_skip_cloud_placeholder, CloudDiscoveryEnv,
+    DiscoveredCloudDrive, LiveCloudDiscoveryEnv, RegistrySyncRoot, TargetOs, WindowsDriveMount,
+    FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    MACOS_SF_DATALESS, WINDOWS_CLOUD_PLACEHOLDER_MASK,
+};
 pub use chunker::{
     build_contextual_header, parse_section_header_line, prepend_contextual_header,
     prepend_contextual_header_with_section, resolve_document_metadata, RawTextChunk,
     ResolvedDocumentMetadata, SectionHeader, SectionHierarchyStack, StructureAwareRawChunk,
     TextChunker,
 };
-pub use config::{ChunkerConfig, DriftFixOptions, DriftType, IngestConfig, ReindexOptions};
+pub use config::{
+    normalize_path_for_prefix, path_matches_prefix, ChunkerConfig, DriftFixOptions, DriftType,
+    IngestConfig, ReindexOptions,
+};
 pub use crawler::{CrawlerStats, DiscoveredCandidate, FilesystemCrawler};
 pub use dedup::{
     CacheStats, DedupAction, FileCatalogEntry, Level1DedupCatalog, Level2ChunkCache,
@@ -52,8 +65,10 @@ pub use image_indexer::{ImageIndexer, ImageMetadata, OcrOutcome};
 pub use reindex::{ReindexPhase, ReindexProgress, ReindexWorker};
 pub use reverse_geocoder::{resolve_location, GeoLocation};
 pub use secret_scrubber::{
-    has_mixed_classes, is_high_entropy_secret, is_uuid_or_path, scrub_high_entropy_tokens,
-    scrub_regex_secrets, scrub_text, shannon_entropy_bits, SecretScrubber,
+    has_mixed_classes, is_high_entropy_secret, is_uuid_or_path, sanitize_and_gate_metadata_json,
+    sanitize_and_gate_parent_document, sanitize_and_gate_resolved_metadata, sanitize_and_gate_text,
+    scrub_high_entropy_tokens, scrub_high_entropy_tokens_preserving_layout, scrub_regex_secrets,
+    scrub_text, scrub_text_preserving_layout, shannon_entropy_bits, SecretScrubber,
 };
 pub use throttling::{
     current_process_rss_bytes, end_background_thread_priority,

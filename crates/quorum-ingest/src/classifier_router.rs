@@ -57,6 +57,8 @@ pub enum FilterDecision {
     SkipHidden,
     /// Skipped because symlink following is disabled.
     SkipSymlink,
+    /// Skipped because file is a cloud-only placeholder under current placeholder policy.
+    SkipCloudPlaceholder,
     /// Skipped due to inaccessible or locked file after retry.
     SkipIoError {
         error: String,
@@ -78,8 +80,14 @@ impl ClassifierRouter {
         }
     }
 
-    /// Evaluates a candidate path on disk and returns the definitive routing decision.
+    /// Evaluates a candidate path on disk using `self.config`.
     pub fn evaluate_file(&self, path: &Path) -> FilterDecision {
+        self.evaluate_file_with_config(path, &self.config)
+    }
+
+    /// Evaluates a candidate path on disk against an explicit `IngestConfig` snapshot
+    /// (enabling live dynamic placeholder & exclusion updates without reconstructing the router).
+    pub fn evaluate_file_with_config(&self, path: &Path, config: &IngestConfig) -> FilterDecision {
         // Fast-path binary/executable/DLL exclusion:
         // Exclude compiled binaries immediately BEFORE executing std::fs::metadata or File::open
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -98,12 +106,14 @@ impl ClassifierRouter {
         }
 
         // 0. Check excluded paths
-        if self.config.excluded_paths.iter().any(|ex| path == ex || path.starts_with(ex)) {
+        if config.excluded_paths.iter().any(|ex| {
+            path == ex || path.starts_with(ex) || crate::config::path_matches_prefix(path, ex)
+        }) {
             return FilterDecision::SkipHidden;
         }
 
         // 1. Check symlink policy
-        if !self.config.follow_symlinks {
+        if !config.follow_symlinks {
             if let Ok(meta) = std::fs::symlink_metadata(path) {
                 if meta.file_type().is_symlink() {
                     return FilterDecision::SkipSymlink;
@@ -113,7 +123,7 @@ impl ClassifierRouter {
 
         // 2. Check hidden file policy and Office temporary lock files
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if self.config.skip_hidden && file_name.starts_with('.') {
+            if config.skip_hidden && file_name.starts_with('.') {
                 return FilterDecision::SkipHidden;
             }
             let lower_name = file_name.to_ascii_lowercase();
@@ -142,7 +152,7 @@ impl ClassifierRouter {
             {
                 return FilterDecision::SkipHidden;
             }
-            if self.config.exclude_source_code {
+            if config.exclude_source_code {
                 const EXCLUDED_SOURCE_EXTS: &[&str] = &[
                     ".rs", ".py", ".js", ".ts", ".jsx", ".tsx", ".c", ".cpp", ".h", ".hpp",
                     ".cc", ".cs", ".java", ".go", ".kt", ".rb", ".php", ".swift", ".scala",
@@ -169,10 +179,26 @@ impl ClassifierRouter {
         }
 
         let size = metadata.len();
-        if size > self.config.max_file_size_bytes {
+
+        // 3a. Cloud-placeholder gate (strictly BEFORE size-cap return, File::open, or classify_file)
+        if crate::cloud_drives::should_skip_cloud_placeholder(
+            crate::cloud_drives::is_cloud_placeholder_metadata(&metadata),
+            size,
+            config.placeholder_policy,
+        ) {
+            debug!(
+                path = %path.display(),
+                size_bytes = size,
+                policy = ?config.placeholder_policy,
+                "Skipped cloud-only placeholder without opening file data stream"
+            );
+            return FilterDecision::SkipCloudPlaceholder;
+        }
+
+        if size > config.max_file_size_bytes {
             return FilterDecision::SkipExceedsSizeCap {
                 size_bytes: size,
-                max_bytes: self.config.max_file_size_bytes,
+                max_bytes: config.max_file_size_bytes,
             };
         }
 
@@ -256,7 +282,7 @@ impl ClassifierRouter {
         }
 
         // 6. Text / Source Code / Structured Data Routing
-        if self.config.exclude_source_code && identity.category == FileCategory::Code {
+        if config.exclude_source_code && identity.category == FileCategory::Code {
             return FilterDecision::SkipBinary { identity };
         }
         // Structured text data (JSON, YAML, TOML, CSV, TSV) matches via `identity.is_text == true`.

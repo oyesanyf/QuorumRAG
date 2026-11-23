@@ -260,8 +260,12 @@ pub fn load_known_peers_from_dir(data_dir: &Path) -> PersistedKnownPeers {
     let path = data_dir.join("p2p_known_peers.json");
     if let Ok(raw) = std::fs::read_to_string(&path) {
         if let Ok(mut parsed) = serde_json::from_str::<PersistedKnownPeers>(&raw) {
-            parsed.multiaddrs.retain(|a| is_dialable_lan_or_wan_multiaddr(a));
-            parsed.peer_map.retain(|_, a| is_dialable_lan_or_wan_multiaddr(a));
+            parsed
+                .multiaddrs
+                .retain(|a| is_dialable_lan_or_wan_multiaddr(a));
+            parsed
+                .peer_map
+                .retain(|_, a| is_dialable_lan_or_wan_multiaddr(a));
             return parsed;
         }
     }
@@ -948,7 +952,8 @@ pub async fn build_watcher_status_dto(state: &Arc<DaemonState>) -> P2pWatcherSta
     let known = watcher.load_known_peers();
 
     P2pWatcherStatusDto {
-        active: watcher.enabled.load(Ordering::Acquire) && (pid_raw > 0 || state.swarm_handle.is_some()),
+        active: watcher.enabled.load(Ordering::Acquire)
+            && (pid_raw > 0 || state.swarm_handle.is_some()),
         watcher_pid: if pid_raw > 0 { Some(pid_raw) } else { None },
         daemon_pid: std::process::id(),
         watcher_restarts: watcher.watcher_restarts.load(Ordering::Relaxed),
@@ -1000,11 +1005,8 @@ pub async fn post_p2p_watcher_heal_handler(
 #[cfg(target_os = "windows")]
 pub fn ensure_windows_p2p_firewall_rules(http_port: u16, p2p_port: u16) {
     let exe_path = std::env::current_exe().ok();
-    let _ = crate::win_native::ensure_quorum_firewall_rules(
-        exe_path.as_deref(),
-        http_port,
-        p2p_port,
-    );
+    let _ =
+        crate::win_native::ensure_quorum_firewall_rules(exe_path.as_deref(), http_port, p2p_port);
 }
 
 /// Spawns `quorumrag watch-p2p` as an independent OS child process and supervises it continuously,
@@ -1268,7 +1270,10 @@ pub async fn run_standalone_p2p_watcher(
                 if !is_os_pid_alive(ppid) {
                     append_watcher_log(
                         &cli.data_dir,
-                        &format!("INFO: Parent daemon pid {} exited; stopping P2P Watcher.", ppid),
+                        &format!(
+                            "INFO: Parent daemon pid {} exited; stopping P2P Watcher.",
+                            ppid
+                        ),
                     );
                     break;
                 }
@@ -1311,7 +1316,11 @@ pub async fn run_standalone_p2p_watcher(
                         let isolated_mesh =
                             status_dto.p2p_enabled && status_dto.connected_peers == 0;
 
-                        if has_failed_peer || missing_reachable_peers || isolated_mesh || !tcp_listener_ok {
+                        if has_failed_peer
+                            || missing_reachable_peers
+                            || isolated_mesh
+                            || !tcp_listener_ok
+                        {
                             let reason = if has_failed_peer {
                                 "unresponsive_peer_canary_probe"
                             } else if missing_reachable_peers {
@@ -1328,7 +1337,9 @@ pub async fn run_standalone_p2p_watcher(
                                 discovered_ips: ip_strings.clone(),
                                 force_redial_all: has_failed_peer,
                             };
-                            if let Ok(heal_http) = client.post(&heal_url).json(&heal_req).send().await {
+                            if let Ok(heal_http) =
+                                client.post(&heal_url).json(&heal_req).send().await
+                            {
                                 if let Ok(mut healed_dto) =
                                     heal_http.json::<P2pWatcherStatusDto>().await
                                 {
@@ -1396,18 +1407,25 @@ mod tests {
 
     #[test]
     fn test_strip_p2p_suffix_and_socket_formatting() {
-        let ma = "/ip4/10.0.0.165/tcp/3032/p2p/12D3KooWKHc3HiYDTmS9jymRJxHjuBEQ6Z3veB21KmzuH52iRFYu";
+        let ma =
+            "/ip4/10.0.0.165/tcp/3032/p2p/12D3KooWKHc3HiYDTmS9jymRJxHjuBEQ6Z3veB21KmzuH52iRFYu";
         assert_eq!(strip_p2p_suffix(ma), "/ip4/10.0.0.165/tcp/3032");
         assert_eq!(
             format_socket_from_multiaddr(ma),
             Some("10.0.0.165:3032".to_string())
         );
         assert!(is_dialable_lan_or_wan_multiaddr("/ip4/10.0.0.165/tcp/3032"));
-        assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/10.0.0.165/tcp/4001"));
-        assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/10.0.0.165/udp/4001"));
+        assert!(!is_dialable_lan_or_wan_multiaddr(
+            "/ip4/10.0.0.165/tcp/4001"
+        ));
+        assert!(!is_dialable_lan_or_wan_multiaddr(
+            "/ip4/10.0.0.165/udp/4001"
+        ));
         assert!(!is_dialable_lan_or_wan_multiaddr("/dns4/ipfs.io/tcp/4001"));
         assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/127.0.0.1/tcp/3032"));
-        assert!(!is_dialable_lan_or_wan_multiaddr("/ip4/10.0.0.255/tcp/3032"));
+        assert!(!is_dialable_lan_or_wan_multiaddr(
+            "/ip4/10.0.0.255/tcp/3032"
+        ));
     }
 
     #[test]

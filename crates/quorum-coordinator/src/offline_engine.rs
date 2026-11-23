@@ -5563,6 +5563,8 @@ impl DeterministicOfflineSynthesisEngine {
                             }
 
                             prev.chunk.line_end = prev.chunk.line_end.max(chunk.chunk.line_end);
+                            prev.chunk.access_tier =
+                                prev.chunk.access_tier.max(chunk.chunk.access_tier);
                             prev.score = prev.score.max(chunk.score);
                             *prev_best_rank = (*prev_best_rank).min(rank);
                             continue;
@@ -7266,9 +7268,14 @@ impl DeterministicOfflineSynthesisEngine {
             let final_span = if end == chars.len() && slice.chars().count() <= avail {
                 slice.trim().to_string()
             } else {
+                // Never clip mid-word BEFORE snapping to a clean sentence/word boundary
                 let s_chars: Vec<char> = slice.chars().collect();
                 let clipped: String = if s_chars.len() > avail {
-                    s_chars[..avail].iter().collect()
+                    let mut cut = avail;
+                    while cut > avail / 2 && !s_chars[cut - 1].is_whitespace() {
+                        cut -= 1;
+                    }
+                    s_chars[..cut].iter().collect()
                 } else {
                     slice
                 };
@@ -7284,7 +7291,7 @@ impl DeterministicOfflineSynthesisEngine {
             let slice: String = chars[..max_chars].iter().collect();
             Self::truncate_to_sentence_boundary(&slice, max_chars).to_string()
         } else {
-            parts.join("\n...\n")
+            parts.join("\n\n")
         }
     }
 
@@ -7801,7 +7808,8 @@ impl DeterministicOfflineSynthesisEngine {
             || trimmed.ends_with("?\"")
             || trimmed.ends_with("```")
             || trimmed.ends_with("---")
-            || trimmed.ends_with('|');
+            || trimmed.ends_with('|')
+            || trimmed.ends_with("</details>");
 
         if is_clean {
             return;
@@ -8887,6 +8895,90 @@ impl DeterministicOfflineSynthesisEngine {
         crate::structured_output::parse_structured_response(content)
     }
 
+    /// Executes a schema-constrained local Ollama `/api/chat` call for a single multi-pass cluster batch
+    /// passing `ollama_batch_section_json_schema()` (`StructuredDomainSection`) in Ollama's `"format"` field.
+    /// Returns `Ok(StructuredDomainSection)` when Ollama honors the GBNF JSON schema, or `Err(plain_prose)`
+    /// when a legacy server returns non-empty plain prose (avoiding a duplicate LLM round-trip), or `None`
+    /// on network/HTTP/Ollama error so the caller falls back to streaming.
+    #[allow(clippy::too_many_arguments)]
+    fn query_ollama_structured_batch_json(
+        addr: &std::net::SocketAddr,
+        host_port: &str,
+        target_model: &str,
+        initial_messages: &[serde_json::Value],
+        temp: f32,
+        num_predict: usize,
+        num_ctx: usize,
+    ) -> Option<Result<crate::structured_output::StructuredDomainSection, String>> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let mut stream = TcpStream::connect_timeout(addr, Duration::from_millis(800)).ok()?;
+        let read_timeout = Self::socket_read_timeout_for_model(target_model);
+        let _ = stream.set_read_timeout(Some(read_timeout));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+
+        let mut messages_with_schema_note = initial_messages.to_vec();
+        if let Some(last) = messages_with_schema_note.last_mut() {
+            if let Some(content) = last.get("content").and_then(|v| v.as_str()) {
+                let enriched = format!(
+                    "{}\n\nSTRICT STRUCTURED JSON OUTPUT REQUIREMENT: Populate EVERY field of the `StructuredDomainSection` schema thoroughly with ZERO content reduction. Cover EVERY numbered document [N] in this batch inside `narrative_paragraphs` and `key_facts` with inline `[N]` citations and complete sentences (no raw document walls, no mid-word ellipsis, no echoed question headings).",
+                    content
+                );
+                if let Some(obj) = last.as_object_mut() {
+                    obj.insert("content".to_string(), serde_json::Value::String(enriched));
+                }
+            }
+        }
+
+        let mut payload_val = serde_json::json!({
+            "model": target_model,
+            "messages": messages_with_schema_note,
+            "stream": false,
+            "keep_alive": "24h",
+            "format": crate::structured_output::ollama_batch_section_json_schema(),
+            "options": Self::build_ollama_chat_options(temp, num_predict, num_ctx)
+        });
+        if Self::model_uses_thinking_flag(target_model) {
+            if let Some(obj) = payload_val.as_object_mut() {
+                obj.insert("think".to_string(), serde_json::Value::Bool(false));
+            }
+        }
+        let payload = payload_val.to_string();
+        let request = format!(
+            "POST /api/chat HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            host_port,
+            payload.len(),
+            payload
+        );
+        stream.write_all(request.as_bytes()).ok()?;
+
+        let mut resp_bytes = Vec::new();
+        stream.read_to_end(&mut resp_bytes).ok()?;
+        let resp_str = String::from_utf8_lossy(&resp_bytes);
+        let body = resp_str
+            .split_once("\r\n\r\n")
+            .or_else(|| resp_str.split_once("\n\n"))
+            .map(|(_, b)| b)
+            .unwrap_or("");
+        let json_body: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+        if json_body.get("error").is_some() {
+            return None;
+        }
+        let content = json_body
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())?;
+        if let Some(sec) = crate::structured_output::parse_structured_batch_section(content) {
+            Some(Ok(sec))
+        } else if !content.trim().is_empty() {
+            Some(Err(content.to_string()))
+        } else {
+            None
+        }
+    }
+
     /// Executes a single streaming `/api/chat` conversation (including `done_reason == "length"`
     /// continuation hops and repetition detection) and returns the raw generated text.
     fn stream_ollama_chat_messages(
@@ -9943,7 +10035,9 @@ impl DeterministicOfflineSynthesisEngine {
                         }),
                     ];
 
-                    let raw_batch = Self::stream_ollama_chat_messages(
+                    // Attempt schema-constrained structured JSON decoding for this multi-pass cluster batch first;
+                    // reuses plain prose if a legacy server ignores `format`, or falls back to streaming on error.
+                    let raw_batch = match Self::query_ollama_structured_batch_json(
                         &addr,
                         host_port,
                         target_model,
@@ -9951,11 +10045,54 @@ impl DeterministicOfflineSynthesisEngine {
                         temp,
                         batch_predict,
                         num_ctx,
-                        max_hops,
-                        max_output_tokens,
-                        "",
-                        telemetry_tx,
-                    );
+                    ) {
+                        Some(Ok(sec)) => {
+                            let rendered_sec = crate::structured_output::render_structured_batch_markdown(
+                                &sec,
+                                unique_file_chunks.len(),
+                            );
+                            if !rendered_sec.trim().is_empty() {
+                                if let Some(tx) = telemetry_tx {
+                                    let _ = Self::send_telemetry(
+                                        tx,
+                                        AgenticTelemetryEvent::TokenDelta {
+                                            delta: format!("{}\n\n", rendered_sec),
+                                        },
+                                    );
+                                }
+                                Some(rendered_sec)
+                            } else {
+                                None
+                            }
+                        }
+                        Some(Err(plain_prose)) => {
+                            if let Some(tx) = telemetry_tx {
+                                let _ = Self::send_telemetry(
+                                    tx,
+                                    AgenticTelemetryEvent::TokenDelta {
+                                        delta: format!("{}\n\n", plain_prose.trim()),
+                                    },
+                                );
+                            }
+                            Some(plain_prose)
+                        }
+                        None => None,
+                    }
+                    .or_else(|| {
+                        Self::stream_ollama_chat_messages(
+                            &addr,
+                            host_port,
+                            target_model,
+                            &batch_messages,
+                            temp,
+                            batch_predict,
+                            num_ctx,
+                            max_hops,
+                            max_output_tokens,
+                            "",
+                            telemetry_tx,
+                        )
+                    });
                     let mut batch_prose = match raw_batch {
                         Some(txt) => {
                             first_batch_attempted = true;
@@ -10143,7 +10280,7 @@ impl DeterministicOfflineSynthesisEngine {
 
                 let mut assembled = String::new();
                 assembled.push_str(&overview_banner);
-                for (cluster_label, _, prose_acc) in cluster_sections {
+                for (cluster_label, _docs_acc, prose_acc) in cluster_sections {
                     if prose_acc.trim().is_empty() {
                         continue;
                     }
@@ -10302,12 +10439,19 @@ impl DeterministicOfflineSynthesisEngine {
                         &sections_prose,
                         &unique_file_chunks,
                     );
-                if has_multi_domain_homonyms
-                    && !compacted_prose.contains("### Identity & Domain Cluster Summary")
+                if (has_multi_domain_homonyms || compacted_chunks.len() >= 2)
+                    && !compacted_prose.contains("| Ref | Source Document |")
                 {
-                    let matrix = crate::answer_orchestrator::render_homonym_cluster_summary_table(
+                    let mut matrix = crate::answer_orchestrator::render_homonym_cluster_summary_table(
                         &compacted_chunks,
                     );
+                    if !has_multi_domain_homonyms {
+                        matrix = matrix.replacen(
+                            "### Identity & Domain Cluster Summary",
+                            "### Grounded Source Summary",
+                            1,
+                        );
+                    }
                     if !matrix.is_empty() {
                         compacted_prose =
                             format!("{}\n\n{}", compacted_prose.trim_end(), matrix.trim());
@@ -10328,8 +10472,19 @@ impl DeterministicOfflineSynthesisEngine {
                     &sanitized_prose,
                     &compacted_chunks,
                 );
-                let compacted_prose =
+                let mut compacted_prose =
                     crate::structured_output::balance_markdown_emphasis(&watchdog_report.cleaned_prose);
+                if use_multipass && !compacted_prose.contains("<details>") && !compacted_chunks.is_empty() {
+                    let drawer_docs: Vec<(usize, &ScoredChunk)> = compacted_chunks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, sc)| (i + 1, *sc))
+                        .collect();
+                    let drawer = crate::structured_output::render_verified_excerpts_drawer(&drawer_docs);
+                    if !drawer.is_empty() {
+                        compacted_prose = format!("{}\n\n{}", compacted_prose.trim_end(), drawer.trim());
+                    }
+                }
                 let sources_block = Self::format_sources_block(&compacted_chunks);
                 let final_with_sources = format!("{}{}", compacted_prose.trim(), sources_block);
                 let mut turn_citations = Self::build_deduplicated_citations(&compacted_chunks);

@@ -6,10 +6,13 @@
 use std::fs::create_dir_all;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt8Type;
+use arrow_array::Array;
 use futures::StreamExt;
 use lancedb::index::vector::{IvfHnswSqIndexBuilder, IvfPqIndexBuilder};
 use lancedb::index::Index;
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::OptimizeAction;
 use lancedb::{Connection, DistanceType, Table};
 use quorum_types::{DocumentChunk, ScoredChunk};
@@ -41,9 +44,8 @@ pub(crate) fn select_adaptive_vector_index_strategy(
 }
 
 fn current_available_ram_bytes() -> u64 {
-    let sys = System::new_with_specifics(
-        RefreshKind::new().with_memory(MemoryRefreshKind::everything()),
-    );
+    let sys =
+        System::new_with_specifics(RefreshKind::new().with_memory(MemoryRefreshKind::everything()));
     let avail = sys.available_memory();
     if avail > 0 {
         avail
@@ -115,7 +117,10 @@ impl VectorStore {
     }
 
     /// Appends new chunks into the vector table.
-    pub(crate) async fn insert_chunks(&self, chunks: &[DocumentChunk]) -> Result<usize, StorageError> {
+    pub(crate) async fn insert_chunks(
+        &self,
+        chunks: &[DocumentChunk],
+    ) -> Result<usize, StorageError> {
         if chunks.is_empty() {
             return Ok(0);
         }
@@ -132,10 +137,14 @@ impl VectorStore {
         drop(table);
 
         // Auto-index at most once when crossing threshold (never rebuild IVF_PQ on every batch!)
-        if !self.ivf_index_built.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .ivf_index_built
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             let total_rows = self.count().await.unwrap_or(0);
             if total_rows >= self.config.auto_index_threshold {
-                self.ivf_index_built.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.ivf_index_built
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = self.create_ivf_pq_index().await;
             }
         }
@@ -167,7 +176,8 @@ impl VectorStore {
 
         let mut all_scored = Vec::new();
         while let Some(batch_result) = stream.next().await {
-            let batch = batch_result.map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let batch = batch_result
+                .map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
             let scored = extract_scored_chunks(&batch, self.config.vector_dimension, Some(vector))?;
             all_scored.extend(scored);
         }
@@ -205,35 +215,252 @@ impl VectorStore {
         Ok(count > 0)
     }
 
-    /// Deletes all chunks associated with `file_path`.
+    /// Deletes all chunks associated with `file_path` (matching exact or Windows slash/case-normalized paths).
     pub(crate) async fn delete_by_file_path(&self, file_path: &str) -> Result<usize, StorageError> {
         let table = self.table.read().await;
         let escaped = file_path.replace('\'', "''");
         let filter = format!("file_path = '{}'", escaped);
         let before_count = table.count_rows(Some(filter.clone())).await.unwrap_or(0);
-        table
-            .delete(&filter)
+        if before_count > 0 {
+            table
+                .delete(&filter)
+                .await
+                .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
+            return Ok(before_count);
+        }
+
+        let target_key = crate::file_path_compare_key(file_path);
+        let mut stream = table
+            .query()
+            .select(Select::columns(&["file_path"]))
+            .execute()
             .await
-            .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
-        Ok(before_count)
+            .map_err(|e| StorageError::Lance(format!("File path scan query failed: {}", e)))?;
+
+        let mut matching_set = std::collections::HashSet::new();
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let path_col = batch
+                .column_by_name("file_path")
+                .ok_or_else(|| StorageError::Schema("Missing 'file_path' column".into()))?
+                .as_string::<i32>();
+            for i in 0..batch.num_rows() {
+                if path_col.is_null(i) {
+                    continue;
+                }
+                let raw_fp = path_col.value(i);
+                if crate::file_path_compare_key(raw_fp) == target_key {
+                    matching_set.insert(raw_fp.to_string());
+                }
+            }
+        }
+        if matching_set.is_empty() {
+            return Ok(0);
+        }
+
+        let mut matching_paths: Vec<String> = matching_set.into_iter().collect();
+        matching_paths.sort();
+        let mut deleted_rows = 0usize;
+        for batch in matching_paths.chunks(256) {
+            let list = batch
+                .iter()
+                .map(|p| format!("'{}'", p.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let del = table
+                .delete(&format!("file_path IN ({list})"))
+                .await
+                .map_err(|e| StorageError::Lance(format!("Normalized file delete error: {}", e)))?;
+            deleted_rows = deleted_rows.saturating_add(del.num_deleted_rows as usize);
+        }
+        Ok(deleted_rows)
     }
 
-    /// Deletes all chunks for any of `file_paths` with a single `IN (...)` predicate.
-    pub(crate) async fn delete_by_file_paths(&self, file_paths: &[String]) -> Result<(), StorageError> {
+    /// Deletes all chunks for any of `file_paths` (matching exact or Windows slash/case-normalized paths).
+    pub(crate) async fn delete_by_file_paths(
+        &self,
+        file_paths: &[String],
+    ) -> Result<(), StorageError> {
         if file_paths.is_empty() {
             return Ok(());
         }
-        let list = file_paths
+        let target_keys: std::collections::HashSet<String> = file_paths
             .iter()
-            .map(|p| format!("'{}'", p.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .map(|p| crate::file_path_compare_key(p))
+            .collect();
         let table = self.table.read().await;
-        table
-            .delete(&format!("file_path IN ({list})"))
+        let mut stream = table
+            .query()
+            .select(Select::columns(&["file_path"]))
+            .execute()
             .await
-            .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
+            .map_err(|e| StorageError::Lance(format!("File paths scan query failed: {}", e)))?;
+
+        let mut matching_set = std::collections::HashSet::new();
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let path_col = batch
+                .column_by_name("file_path")
+                .ok_or_else(|| StorageError::Schema("Missing 'file_path' column".into()))?
+                .as_string::<i32>();
+            for i in 0..batch.num_rows() {
+                if path_col.is_null(i) {
+                    continue;
+                }
+                let raw_fp = path_col.value(i);
+                if target_keys.contains(&crate::file_path_compare_key(raw_fp)) {
+                    matching_set.insert(raw_fp.to_string());
+                }
+            }
+        }
+        if matching_set.is_empty() {
+            return Ok(());
+        }
+
+        let mut matching_paths: Vec<String> = matching_set.into_iter().collect();
+        matching_paths.sort();
+        for batch in matching_paths.chunks(256) {
+            let list = batch
+                .iter()
+                .map(|p| format!("'{}'", p.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            table
+                .delete(&format!("file_path IN ({list})"))
+                .await
+                .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
+        }
         Ok(())
+    }
+
+    /// Deletes all chunks whose raw `file_path` matches `prefix` on strict component boundaries.
+    pub(crate) async fn delete_by_path_prefix(&self, prefix: &str) -> Result<usize, StorageError> {
+        let norm_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+        let table = self.table.read().await;
+        let mut stream = table
+            .query()
+            .select(Select::columns(&["file_path"]))
+            .execute()
+            .await
+            .map_err(|e| StorageError::Lance(format!("Prefix scan query failed: {}", e)))?;
+
+        let mut matching_set = std::collections::HashSet::new();
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let path_col = batch
+                .column_by_name("file_path")
+                .ok_or_else(|| StorageError::Schema("Missing 'file_path' column".into()))?
+                .as_string::<i32>();
+            for i in 0..batch.num_rows() {
+                if path_col.is_null(i) {
+                    continue;
+                }
+                let raw_fp = path_col.value(i);
+                if quorum_types::path_matches_prefix(raw_fp, &norm_prefix).unwrap_or(false) {
+                    matching_set.insert(raw_fp.to_string());
+                }
+            }
+        }
+
+        if matching_set.is_empty() {
+            return Ok(0);
+        }
+
+        let mut matching_paths: Vec<String> = matching_set.into_iter().collect();
+        matching_paths.sort();
+
+        let mut deleted_rows = 0usize;
+        for batch in matching_paths.chunks(256) {
+            let list = batch
+                .iter()
+                .map(|p| format!("'{}'", p.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let del = table
+                .delete(&format!("file_path IN ({list})"))
+                .await
+                .map_err(|e| StorageError::Lance(format!("Prefix delete error: {}", e)))?;
+            deleted_rows = deleted_rows.saturating_add(del.num_deleted_rows as usize);
+        }
+
+        Ok(deleted_rows)
+    }
+
+    /// Updates `access_tier` in-place for all LanceDB chunks whose raw `file_path` matches
+    /// `prefix` on strict component boundaries.
+    pub(crate) async fn update_access_tier_by_path_prefix(
+        &self,
+        prefix: &str,
+        new_tier: u8,
+    ) -> Result<usize, StorageError> {
+        quorum_types::AccessTier::from_u8(new_tier)?;
+        let norm_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+        let table = self.table.read().await;
+        let mut stream = table
+            .query()
+            .select(Select::columns(&["file_path", "access_tier"]))
+            .execute()
+            .await
+            .map_err(|e| StorageError::Lance(format!("Prefix tier scan query failed: {}", e)))?;
+
+        let mut matching_set = std::collections::HashSet::new();
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let path_col = batch
+                .column_by_name("file_path")
+                .ok_or_else(|| StorageError::Schema("Missing 'file_path' column".into()))?
+                .as_string::<i32>();
+            let tier_col = batch
+                .column_by_name("access_tier")
+                .ok_or_else(|| StorageError::Schema("Missing 'access_tier' column".into()))?
+                .as_primitive::<UInt8Type>();
+            for i in 0..batch.num_rows() {
+                if path_col.is_null(i) || tier_col.is_null(i) {
+                    continue;
+                }
+                if tier_col.value(i) == new_tier {
+                    continue;
+                }
+                let raw_fp = path_col.value(i);
+                if quorum_types::path_matches_prefix(raw_fp, &norm_prefix).unwrap_or(false) {
+                    matching_set.insert(raw_fp.to_string());
+                }
+            }
+        }
+
+        if matching_set.is_empty() {
+            return Ok(0);
+        }
+
+        let mut matching_paths: Vec<String> = matching_set.into_iter().collect();
+        matching_paths.sort();
+
+        let mut updated_rows = 0usize;
+        for batch in matching_paths.chunks(256) {
+            let list = batch
+                .iter()
+                .map(|p| format!("'{}'", p.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let upd = table
+                .update()
+                .only_if(format!(
+                    "file_path IN ({list}) AND access_tier != {new_tier}"
+                ))
+                .column("access_tier", new_tier.to_string())
+                .execute()
+                .await
+                .map_err(|e| {
+                    StorageError::Lance(format!("Prefix access_tier update error: {}", e))
+                })?;
+            updated_rows = updated_rows.saturating_add(upd.rows_updated as usize);
+        }
+
+        Ok(updated_rows)
     }
 
     /// Creates scalar pre-filter indices (including `blake3_hash` BTree for O(log N) dedup)
@@ -308,7 +535,10 @@ impl VectorStore {
                             .execute()
                             .await
                             .map_err(|e| {
-                                StorageError::Lance(format!("Create IVF_PQ fallback index error: {}", e))
+                                StorageError::Lance(format!(
+                                    "Create IVF_PQ fallback index error: {}",
+                                    e
+                                ))
                             })?;
                     }
                 }
@@ -321,7 +551,9 @@ impl VectorStore {
                     .create_index(&["vector"], Index::IvfPq(pq_builder))
                     .execute()
                     .await
-                    .map_err(|e| StorageError::Lance(format!("Create IVF_PQ index error: {}", e)))?;
+                    .map_err(|e| {
+                        StorageError::Lance(format!("Create IVF_PQ index error: {}", e))
+                    })?;
                 tracing::info!(
                     num_rows,
                     num_partitions,
@@ -387,8 +619,10 @@ impl VectorStore {
 
         let mut chunks = Vec::new();
         while let Some(batch_result) = stream.next().await {
-            let batch = batch_result.map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
-            let batch_chunks = crate::arrow_interop::record_batch_to_chunks(&batch, self.config.vector_dimension)?;
+            let batch = batch_result
+                .map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let batch_chunks =
+                crate::arrow_interop::record_batch_to_chunks(&batch, self.config.vector_dimension)?;
             chunks.extend(batch_chunks);
         }
         Ok(chunks)
@@ -421,8 +655,10 @@ impl VectorStore {
 
         let mut chunks = Vec::with_capacity(chunk_ids.len());
         while let Some(batch_result) = stream.next().await {
-            let batch = batch_result.map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
-            let batch_chunks = crate::arrow_interop::record_batch_to_chunks(&batch, self.config.vector_dimension)?;
+            let batch = batch_result
+                .map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let batch_chunks =
+                crate::arrow_interop::record_batch_to_chunks(&batch, self.config.vector_dimension)?;
             chunks.extend(batch_chunks);
         }
         Ok(chunks)
@@ -439,6 +675,130 @@ impl VectorStore {
             .await
             .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
         Ok(before_count)
+    }
+
+    /// Retrieves a specific chunk matching both `(chunk_id, file_path)` (normalizing Windows slash/case variants).
+    pub(crate) async fn get_chunk_by_id_and_file_path(
+        &self,
+        chunk_id: &str,
+        file_path: &str,
+    ) -> Result<Option<DocumentChunk>, StorageError> {
+        let escaped_id = chunk_id.replace('\'', "''");
+        let escaped_path = file_path.replace('\'', "''");
+        let predicate = format!(
+            "chunk_id = '{}' AND file_path = '{}'",
+            escaped_id, escaped_path
+        );
+
+        let table = self.table.read().await;
+        let mut stream = table
+            .query()
+            .only_if(predicate)
+            .limit(1)
+            .execute()
+            .await
+            .map_err(|e| StorageError::Lance(format!("Get chunk by (id, path) failed: {}", e)))?;
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let batch_chunks =
+                crate::arrow_interop::record_batch_to_chunks(&batch, self.config.vector_dimension)?;
+            if let Some(chunk) = batch_chunks.into_iter().next() {
+                return Ok(Some(chunk));
+            }
+        }
+        drop(table);
+
+        let target_key = crate::file_path_compare_key(file_path);
+        let candidates = self.get_chunks_for_id(chunk_id).await?;
+        Ok(candidates
+            .into_iter()
+            .find(|c| crate::file_path_compare_key(&c.file_path) == target_key))
+    }
+
+    /// Retrieves all copies matching `chunk_id` across distinct `file_path`s.
+    pub(crate) async fn get_chunks_for_id(
+        &self,
+        chunk_id: &str,
+    ) -> Result<Vec<DocumentChunk>, StorageError> {
+        let escaped = chunk_id.replace('\'', "''");
+        let predicate = format!("chunk_id = '{}'", escaped);
+
+        let table = self.table.read().await;
+        let mut stream = table
+            .query()
+            .only_if(predicate)
+            .execute()
+            .await
+            .map_err(|e| StorageError::Lance(format!("Get chunks for id failed: {}", e)))?;
+
+        let mut chunks = Vec::new();
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|e| StorageError::Lance(format!("RecordBatch stream error: {}", e)))?;
+            let batch_chunks =
+                crate::arrow_interop::record_batch_to_chunks(&batch, self.config.vector_dimension)?;
+            chunks.extend(batch_chunks);
+        }
+        Ok(chunks)
+    }
+
+    /// Deletes a specific chunk matching both `(chunk_id, file_path)`, preserving sibling copies.
+    pub(crate) async fn delete_by_chunk_id_and_file_path(
+        &self,
+        chunk_id: &str,
+        file_path: &str,
+    ) -> Result<usize, StorageError> {
+        let escaped_id = chunk_id.replace('\'', "''");
+        let escaped_path = file_path.replace('\'', "''");
+        let filter = format!(
+            "chunk_id = '{}' AND file_path = '{}'",
+            escaped_id, escaped_path
+        );
+        {
+            let table = self.table.read().await;
+            let before_count = table.count_rows(Some(filter.clone())).await.unwrap_or(0);
+            if before_count > 0 {
+                table
+                    .delete(&filter)
+                    .await
+                    .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
+                return Ok(before_count);
+            }
+        }
+
+        let target_key = crate::file_path_compare_key(file_path);
+        let candidates = self.get_chunks_for_id(chunk_id).await?;
+        let mut matching_paths: Vec<String> = candidates
+            .into_iter()
+            .filter(|c| crate::file_path_compare_key(&c.file_path) == target_key)
+            .map(|c| c.file_path)
+            .collect();
+        matching_paths.sort();
+        matching_paths.dedup();
+        if matching_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let table = self.table.read().await;
+        let mut deleted = 0usize;
+        for batch in matching_paths.chunks(256) {
+            let list = batch
+                .iter()
+                .map(|p| format!("'{}'", p.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let del = table
+                .delete(&format!(
+                    "chunk_id = '{}' AND file_path IN ({list})",
+                    escaped_id
+                ))
+                .await
+                .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
+            deleted = deleted.saturating_add(del.num_deleted_rows as usize);
+        }
+        Ok(deleted)
     }
 }
 
@@ -530,4 +890,3 @@ mod tests {
         }
     }
 }
-

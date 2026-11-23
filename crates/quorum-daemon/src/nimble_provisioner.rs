@@ -10,11 +10,11 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use quorum_coordinator::{AutoFusionRouter, HardwareTelemetry, ModelProvisionPlan};
 use quorum_coordinator::nimble_client::{
-    CANONICAL_NIMBLE_GGUF, DEFAULT_NIMBLE_ENDPOINT, DEFAULT_NIMBLE_MODEL,
-    MIN_FREE_RAM_GB, MIN_FREE_VRAM_MB, PROBE_TIMEOUT,
+    CANONICAL_NIMBLE_GGUF, DEFAULT_NIMBLE_ENDPOINT, DEFAULT_NIMBLE_MODEL, MIN_FREE_RAM_GB,
+    MIN_FREE_VRAM_MB, PROBE_TIMEOUT,
 };
+use quorum_coordinator::{AutoFusionRouter, HardwareTelemetry, ModelProvisionPlan};
 
 /// Public status response format returned by `GET /api/models/nimble/status` and `POST /api/models/nimble/provision`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,9 +185,7 @@ impl NimbleProvisioner {
 
             for pf_var in ["ProgramFiles", "ProgramFiles(x86)"] {
                 if let Ok(pf) = std::env::var(pf_var) {
-                    let p = PathBuf::from(pf)
-                        .join("Ollama")
-                        .join("ollama.exe");
+                    let p = PathBuf::from(pf).join("Ollama").join("ollama.exe");
                     if p.is_file() {
                         return Some(p);
                     }
@@ -217,7 +215,11 @@ impl NimbleProvisioner {
         // 3. Unix standard locations
         #[cfg(not(windows))]
         {
-            for p_str in ["/usr/local/bin/ollama", "/opt/homebrew/bin/ollama", "/usr/bin/ollama"] {
+            for p_str in [
+                "/usr/local/bin/ollama",
+                "/opt/homebrew/bin/ollama",
+                "/usr/bin/ollama",
+            ] {
                 let p = PathBuf::from(p_str);
                 if p.is_file() {
                     return Some(p);
@@ -338,7 +340,11 @@ impl NimbleProvisioner {
             .and_then(|m| m.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(|s| s.trim().to_string()))
+                    .filter_map(|m| {
+                        m.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.trim().to_string())
+                    })
                     .filter(|s| !s.is_empty())
                     .collect()
             })
@@ -349,7 +355,9 @@ impl NimbleProvisioner {
     /// Helper to verify if the model tag or canonical tag is present in `/api/tags`.
     pub async fn is_model_installed(&self) -> bool {
         if let Some(names) = self.probe_installed_models().await {
-            return names.iter().any(|n| n == &self.model_tag || n == &self.canonical_tag);
+            return names
+                .iter()
+                .any(|n| n == &self.model_tag || n == &self.canonical_tag);
         }
         false
     }
@@ -387,7 +395,14 @@ impl NimbleProvisioner {
         let pulling_flag = Arc::clone(&self.is_pulling_fallback);
 
         tokio::spawn(async move {
-            Self::execute_fallback_pull_task(endpoint, clean_tag, http_client, fb_state, pulling_flag).await;
+            Self::execute_fallback_pull_task(
+                endpoint,
+                clean_tag,
+                http_client,
+                fb_state,
+                pulling_flag,
+            )
+            .await;
         });
         true
     }
@@ -409,7 +424,12 @@ impl NimbleProvisioner {
 
         let tags_url = format!("{}/api/tags", endpoint);
         let mut reachable = false;
-        if let Ok(resp) = http_client.get(&tags_url).timeout(PROBE_TIMEOUT).send().await {
+        if let Ok(resp) = http_client
+            .get(&tags_url)
+            .timeout(PROBE_TIMEOUT)
+            .send()
+            .await
+        {
             if resp.status().is_success() {
                 reachable = true;
                 if let Ok(val) = resp.json::<serde_json::Value>().await {
@@ -418,7 +438,11 @@ impl NimbleProvisioner {
                         .and_then(|m| m.as_array())
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(|s| s.trim().to_string()))
+                                .filter_map(|m| {
+                                    m.get("name")
+                                        .and_then(|n| n.as_str())
+                                        .map(|s| s.trim().to_string())
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -461,12 +485,19 @@ impl NimbleProvisioner {
         let resp = match pull_res {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                warn!("Fallback /api/pull for '{}' returned HTTP {}", fallback_tag, r.status());
+                warn!(
+                    "Fallback /api/pull for '{}' returned HTTP {}",
+                    fallback_tag,
+                    r.status()
+                );
                 *fb_state.write().await = NimbleProvisionState::NotInstalled;
                 return;
             }
             Err(e) => {
-                warn!("Fallback /api/pull request failed for '{}': {}", fallback_tag, e);
+                warn!(
+                    "Fallback /api/pull request failed for '{}': {}",
+                    fallback_tag, e
+                );
                 *fb_state.write().await = NimbleProvisionState::Offline;
                 return;
             }
@@ -511,7 +542,8 @@ impl NimbleProvisioner {
                                 }
                             }
                             let pct = if total_bytes > 0 {
-                                ((completed_bytes as f64) / (total_bytes as f64) * 100.0).clamp(0.0, 100.0)
+                                ((completed_bytes as f64) / (total_bytes as f64) * 100.0)
+                                    .clamp(0.0, 100.0)
                             } else {
                                 0.0
                             };
@@ -534,7 +566,10 @@ impl NimbleProvisioner {
         }
 
         if !stream_err && (succeeded || (total_bytes > 0 && completed_bytes >= total_bytes)) {
-            info!("Memory-fitted fallback model '{}' provisioned and ready", fallback_tag);
+            info!(
+                "Memory-fitted fallback model '{}' provisioned and ready",
+                fallback_tag
+            );
             *fb_state.write().await = NimbleProvisionState::Ready;
         } else {
             *fb_state.write().await = NimbleProvisionState::NotInstalled;
@@ -544,15 +579,18 @@ impl NimbleProvisioner {
     /// Probes the local Ollama `/api/tags` endpoint (400ms timeout) and returns the current `NimbleStatusResponse`.
     pub async fn probe_status(&self) -> NimbleStatusResponse {
         let (free_ram_gb, free_vram_mb, memory_sufficient) = Self::check_memory_law();
-        let fallback_model_tag = Self::select_memory_fitted_fallback_model(free_ram_gb, free_vram_mb).to_string();
+        let fallback_model_tag =
+            Self::select_memory_fitted_fallback_model(free_ram_gb, free_vram_mb).to_string();
 
         // 1. If active background pull is in-flight, return downloading status immediately
         if self.is_pulling.load(Ordering::SeqCst) {
             let current_state = self.state.read().await.clone();
             let (pct, comp, tot) = match current_state {
-                NimbleProvisionState::Downloading { progress_pct, completed_bytes, total_bytes } => {
-                    (progress_pct, completed_bytes, total_bytes)
-                }
+                NimbleProvisionState::Downloading {
+                    progress_pct,
+                    completed_bytes,
+                    total_bytes,
+                } => (progress_pct, completed_bytes, total_bytes),
                 _ => (0.0, 0, 0),
             };
             return NimbleStatusResponse {
@@ -595,7 +633,9 @@ impl NimbleProvisioner {
                 if Self::tag_in_installed_list(&fallback_model_tag, models) {
                     *self.fallback_state.write().await = NimbleProvisionState::Ready;
                     ("ready".to_string(), 100.0)
-                } else if !Self::is_autoinstall_disabled() && self.spawn_fallback_pull(&fallback_model_tag) {
+                } else if !Self::is_autoinstall_disabled()
+                    && self.spawn_fallback_pull(&fallback_model_tag)
+                {
                     ("downloading".to_string(), 0.0)
                 } else {
                     ("not_installed".to_string(), 0.0)
@@ -697,7 +737,8 @@ impl NimbleProvisioner {
     /// Returns the immediate status response (`"downloading"` if started, or current status if already running/skipped).
     pub fn trigger_provision(self: &Arc<Self>) -> NimbleStatusResponse {
         let (free_ram_gb, free_vram_mb, memory_sufficient) = Self::check_memory_law();
-        let fallback_model_tag = Self::select_memory_fitted_fallback_model(free_ram_gb, free_vram_mb).to_string();
+        let fallback_model_tag =
+            Self::select_memory_fitted_fallback_model(free_ram_gb, free_vram_mb).to_string();
 
         if !memory_sufficient {
             let started_fb = if !Self::is_autoinstall_disabled() {
@@ -705,30 +746,33 @@ impl NimbleProvisioner {
             } else {
                 false
             };
-            let (fb_state, fb_pct) = if started_fb || self.is_pulling_fallback.load(Ordering::SeqCst) {
-                let pct = self
-                    .fallback_state
-                    .try_read()
-                    .ok()
-                    .and_then(|g| match &*g {
-                        NimbleProvisionState::Downloading { progress_pct, .. } => Some(progress_pct.clamp(0.0, 100.0)),
-                        _ => None,
-                    })
-                    .unwrap_or(0.0);
-                ("downloading".to_string(), pct)
-            } else {
-                let ready = self
-                    .fallback_state
-                    .try_read()
-                    .ok()
-                    .map(|g| *g == NimbleProvisionState::Ready)
-                    .unwrap_or(false);
-                if ready {
-                    ("ready".to_string(), 100.0)
+            let (fb_state, fb_pct) =
+                if started_fb || self.is_pulling_fallback.load(Ordering::SeqCst) {
+                    let pct = self
+                        .fallback_state
+                        .try_read()
+                        .ok()
+                        .and_then(|g| match &*g {
+                            NimbleProvisionState::Downloading { progress_pct, .. } => {
+                                Some(progress_pct.clamp(0.0, 100.0))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0.0);
+                    ("downloading".to_string(), pct)
                 } else {
-                    ("not_installed".to_string(), 0.0)
-                }
-            };
+                    let ready = self
+                        .fallback_state
+                        .try_read()
+                        .ok()
+                        .map(|g| *g == NimbleProvisionState::Ready)
+                        .unwrap_or(false);
+                    if ready {
+                        ("ready".to_string(), 100.0)
+                    } else {
+                        ("not_installed".to_string(), 0.0)
+                    }
+                };
             return NimbleStatusResponse {
                 state: "skipped_low_memory".to_string(),
                 progress_pct: 0.0,
@@ -747,7 +791,11 @@ impl NimbleProvisioner {
         }
 
         // Single-flight atomic exchange guard
-        if self.is_pulling.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        if self
+            .is_pulling
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             let this = Arc::clone(self);
             tokio::spawn(async move {
                 this.execute_background_pull().await;
@@ -772,9 +820,11 @@ impl NimbleProvisioner {
             // Already pulling in background
             let current = match self.state.try_read() {
                 Ok(guard) => match &*guard {
-                    NimbleProvisionState::Downloading { progress_pct, completed_bytes, total_bytes } => {
-                        (*progress_pct, *completed_bytes, *total_bytes)
-                    }
+                    NimbleProvisionState::Downloading {
+                        progress_pct,
+                        completed_bytes,
+                        total_bytes,
+                    } => (*progress_pct, *completed_bytes, *total_bytes),
                     _ => (0.0, 0, 5340000000),
                 },
                 Err(_) => (0.0, 0, 5340000000),
@@ -916,7 +966,8 @@ impl NimbleProvisioner {
                                 }
                             }
                             let pct = if total_bytes > 0 {
-                                ((completed_bytes as f64) / (total_bytes as f64) * 100.0).clamp(0.0, 100.0)
+                                ((completed_bytes as f64) / (total_bytes as f64) * 100.0)
+                                    .clamp(0.0, 100.0)
                             } else {
                                 0.0
                             };
@@ -941,7 +992,9 @@ impl NimbleProvisioner {
             }
         }
 
-        if !stream_error && (download_succeeded || (total_bytes > 0 && completed_bytes >= total_bytes)) {
+        if !stream_error
+            && (download_succeeded || (total_bytes > 0 && completed_bytes >= total_bytes))
+        {
             download_succeeded = true;
         }
 
@@ -966,7 +1019,10 @@ impl NimbleProvisioner {
 
         match copy_res {
             Ok(r) if r.status().is_success() => {
-                info!("Successfully aliased {} to {}", self.canonical_tag, self.model_tag);
+                info!(
+                    "Successfully aliased {} to {}",
+                    self.canonical_tag, self.model_tag
+                );
                 let mut w = self.state.write().await;
                 *w = NimbleProvisionState::Ready;
             }
@@ -981,7 +1037,10 @@ impl NimbleProvisioner {
                 }
             }
             Err(e) => {
-                warn!("Failed to alias model via /api/copy: {}. Checking if model is installed.", e);
+                warn!(
+                    "Failed to alias model via /api/copy: {}. Checking if model is installed.",
+                    e
+                );
                 let is_ready = self.is_model_installed().await;
                 let mut w = self.state.write().await;
                 if is_ready {
@@ -1016,7 +1075,8 @@ mod tests {
             installed_models: vec!["qwen2.5:7b".to_string()],
         };
         let json = serde_json::to_string(&resp).expect("must serialize");
-        let deserialized: NimbleStatusResponse = serde_json::from_str(&json).expect("must deserialize");
+        let deserialized: NimbleStatusResponse =
+            serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(resp, deserialized);
         assert_eq!(deserialized.state, "downloading");
         assert_eq!(deserialized.progress_pct, 42.5);
@@ -1136,7 +1196,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_low_memory_fallback_auto_install_wire_mock() {
-        use axum::{routing::{get, post}, Json, Router};
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
         use std::sync::Mutex;
 
         let installed = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1193,8 +1256,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        assert!(pull_calls.load(Ordering::SeqCst), "Fallback model pull must be invoked automatically");
-        assert_eq!(*prov.fallback_state.read().await, NimbleProvisionState::Ready);
+        assert!(
+            pull_calls.load(Ordering::SeqCst),
+            "Fallback model pull must be invoked automatically"
+        );
+        assert_eq!(
+            *prov.fallback_state.read().await,
+            NimbleProvisionState::Ready
+        );
         srv.abort();
     }
 
@@ -1202,19 +1271,38 @@ mod tests {
     fn test_single_flight_atomic_bool_exclusion() {
         let provisioner = NimbleProvisioner::default();
         assert!(!provisioner.is_pulling.load(Ordering::SeqCst));
-        let first = provisioner.is_pulling.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        let second = provisioner.is_pulling.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        let first = provisioner.is_pulling.compare_exchange(
+            false,
+            true,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        let second = provisioner.is_pulling.compare_exchange(
+            false,
+            true,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         assert!(first.is_ok());
         assert!(second.is_err());
         provisioner.is_pulling.store(false, Ordering::SeqCst);
-        let third = provisioner.is_pulling.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        let third = provisioner.is_pulling.compare_exchange(
+            false,
+            true,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         assert!(third.is_ok());
     }
 
     #[test]
     fn test_initial_state_not_installed() {
         let provisioner = NimbleProvisioner::default();
-        let initial_state = provisioner.state.try_read().expect("must acquire read lock").clone();
+        let initial_state = provisioner
+            .state
+            .try_read()
+            .expect("must acquire read lock")
+            .clone();
         assert_eq!(initial_state, NimbleProvisionState::NotInstalled);
     }
 

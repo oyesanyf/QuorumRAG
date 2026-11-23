@@ -135,7 +135,13 @@ impl AtlasKvStore {
             } else {
                 // Fast exact scan for small graphs below `min_triples_for_hierarchy`
                 (0..st.total_rows)
-                    .filter_map(|id| if st.leaf_active[id] == 1 { Some(id as u32) } else { None })
+                    .filter_map(|id| {
+                        if st.leaf_active[id] == 1 {
+                            Some(id as u32)
+                        } else {
+                            None
+                        }
+                    })
                     .collect()
             };
 
@@ -293,8 +299,12 @@ fn is_path_inside_allowed_folders(file_path: &str, allowed_norm_folders: &[Strin
         if norm_file == *folder {
             return true;
         }
-        if let Some(rest) = norm_file.strip_prefix(folder.as_str()) {
-            if rest.starts_with('/') {
+        if folder.ends_with('/') || folder.ends_with('\\') {
+            if norm_file.starts_with(folder.as_str()) {
+                return true;
+            }
+        } else if let Some(rest) = norm_file.strip_prefix(folder.as_str()) {
+            if rest.starts_with('/') || rest.starts_with('\\') {
                 return true;
             }
         }
