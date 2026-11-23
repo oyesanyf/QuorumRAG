@@ -1057,15 +1057,15 @@ fn test_dlp_content_gate_base64_bearer_and_extended_db_uri_schemes() {
         ),
     ];
 
-    for (name, input, forbidden) in cases {
+    for (name, input, forbidden) in &cases {
         let scrubbed = ctrl
-            .inspect_ingest_text(r"C:\Users\Alice\OneDrive\secrets.txt", &input, 3)
+            .inspect_ingest_text(r"C:\Users\Alice\OneDrive\secrets.txt", input.as_str(), 3)
             .unwrap_or_else(|e| panic!("Redact mode failed for {name}: {e}"));
         assert!(
             scrubbed.contains("[REDACTED:CROWN_JEWEL_SECRET]"),
             "Expected CROWN_JEWEL_SECRET redaction for {name}, got: {scrubbed}"
         );
-        for tok in forbidden {
+        for tok in *forbidden {
             assert!(
                 !scrubbed.contains(tok),
                 "Remainder '{tok}' leaked after Redact for {name}: {scrubbed}"
@@ -1077,8 +1077,8 @@ fn test_dlp_content_gate_base64_bearer_and_extended_db_uri_schemes() {
         let mut g = ctrl.settings.write().unwrap();
         g.dlp.mode = DlpEnforcementMode::Block;
     }
-    for (name, input, _) in cases {
-        let res = ctrl.inspect_ingest_text(r"C:\Users\Alice\OneDrive\secrets.txt", input, 3);
+    for (name, input, _) in &cases {
+        let res = ctrl.inspect_ingest_text(r"C:\Users\Alice\OneDrive\secrets.txt", input.as_str(), 3);
         assert!(res.is_err(), "Block mode must reject {name}, got: {res:?}");
     }
 }
