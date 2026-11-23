@@ -6495,7 +6495,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-atlaskv"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "blake3",
  "half",
@@ -6513,7 +6513,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-classifier"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6523,7 +6523,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-contract"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "blake3",
  "candle-core",
@@ -6543,7 +6543,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-coordinator"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -6604,7 +6604,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-ingest"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "blake3",
  "cfb",
@@ -6636,7 +6636,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-network"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6658,7 +6658,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-storage"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -6683,7 +6683,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-types"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "blake3",
  "chrono",
