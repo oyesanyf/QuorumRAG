@@ -5,7 +5,10 @@ use axum::routing::{get, post};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::handlers::{artemis, atlaskv, cache, chat, drift, export, health, history, langextract, marketplace, media, mesh, reindex, settings};
+use crate::handlers::{
+    artemis, atlaskv, cache, chat, cloud_drives, drift, export, health, history, langextract,
+    marketplace, media, mesh, reindex, settings,
+};
 use crate::state::DaemonState;
 
 /// Constructs the complete Axum 0.7 web server Router.
@@ -15,13 +18,15 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
         .route("/", get(serve_index))
         .route("/assets/*path", get(serve_asset))
         .route("/favicon.ico", get(serve_favicon))
-
         // Chat & Query Endpoints (SSE streaming, JSON & SQLite History)
         .route("/api/chat", post(chat::chat_sse_handler))
         .route("/api/chat/stream", get(chat_stream_compat_handler))
         .route("/api/chat/cancel", post(chat::cancel_chat_handler))
         .route("/api/chat/active", get(chat::active_chat_tasks_handler))
-        .route("/api/chat/attach/:session_id", get(chat::chat_sse_attach_handler))
+        .route(
+            "/api/chat/attach/:session_id",
+            get(chat::chat_sse_attach_handler),
+        )
         .route("/api/chat/spellcheck", post(chat::spellcheck_handler))
         .route("/api/query", post(chat::query_handler))
         .route(
@@ -35,105 +40,260 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
             get(history::get_history_session_handler)
                 .delete(history::delete_history_session_handler),
         )
-
         // Multimodal media streaming, system viewer launch, and PDF/DOCX export
         .route("/api/media", get(media::serve_media_handler))
         .route("/api/open-file", post(media::open_file_handler))
         .route("/api/export", post(export::export_handler))
-
         // ChatGPT Settings, OshoosiClaw P2P Mesh, Shared Folders & HIPAA PHI DLP Endpoints
-        .route("/api/settings", get(settings::get_settings_handler).post(settings::update_settings_handler))
-        .route("/api/preferences", get(settings::get_settings_handler).post(settings::update_settings_handler))
+        .route(
+            "/api/settings",
+            get(settings::get_settings_handler).post(settings::update_settings_handler),
+        )
+        .route(
+            "/api/preferences",
+            get(settings::get_settings_handler).post(settings::update_settings_handler),
+        )
         .route("/api/mesh/status", get(settings::mesh_status_handler))
-        .route("/api/mesh/config", post(settings::update_mesh_config_handler))
-        .route("/api/mesh/shared-folders", post(settings::manage_shared_folders_handler))
-        .route("/api/mesh/browse-folders", get(settings::browse_folders_handler))
-        .route("/api/fs/browse-folders", get(settings::browse_folders_handler))
-        .route("/api/fs/pick-folder", post(settings::pick_folder_dialog_handler))
-        .route("/api/dialog/pick-folder", post(settings::pick_folder_dialog_handler))
+        .route(
+            "/api/mesh/config",
+            post(settings::update_mesh_config_handler),
+        )
+        .route(
+            "/api/mesh/shared-folders",
+            post(settings::manage_shared_folders_handler),
+        )
+        .route(
+            "/api/mesh/browse-folders",
+            get(settings::browse_folders_handler),
+        )
+        .route(
+            "/api/fs/browse-folders",
+            get(settings::browse_folders_handler),
+        )
+        .route(
+            "/api/fs/pick-folder",
+            post(settings::pick_folder_dialog_handler),
+        )
+        .route(
+            "/api/dialog/pick-folder",
+            post(settings::pick_folder_dialog_handler),
+        )
+        .route(
+            "/api/cloud-drives",
+            get(cloud_drives::get_cloud_drives_handler),
+        )
+        .route(
+            "/api/cloud-drives/config",
+            post(cloud_drives::update_cloud_drives_config_handler),
+        )
+        .route(
+            "/api/cloud-drives/reindex",
+            post(cloud_drives::reindex_cloud_drive_handler),
+        )
+        .route(
+            "/api/cloud-drives/relay/register",
+            post(cloud_drives::register_relay_handler),
+        )
         .route("/api/dlp/status", get(settings::dlp_status_handler))
         .route("/api/dlp/policy", post(settings::update_dlp_policy_handler))
         .route("/api/dlp/test", post(settings::test_dlp_inspection_handler))
-        .route("/api/endpoints/probe", post(settings::probe_endpoint_handler))
-
+        .route(
+            "/api/endpoints/probe",
+            post(settings::probe_endpoint_handler),
+        )
         // OshoosiClaw Mesh Network & TPM 2.0 Hardware RoT Endpoints
         .route("/api/mesh/tpm/status", get(mesh::get_tpm_status_handler))
-        .route("/api/mesh/watcher", get(crate::p2p_watcher::get_p2p_watcher_status_handler))
-        .route("/api/mesh/watcher/probe", post(crate::p2p_watcher::post_p2p_watcher_probe_handler))
-        .route("/api/mesh/watcher/heal", post(crate::p2p_watcher::post_p2p_watcher_heal_handler))
+        .route(
+            "/api/mesh/watcher",
+            get(crate::p2p_watcher::get_p2p_watcher_status_handler),
+        )
+        .route(
+            "/api/mesh/watcher/probe",
+            post(crate::p2p_watcher::post_p2p_watcher_probe_handler),
+        )
+        .route(
+            "/api/mesh/watcher/heal",
+            post(crate::p2p_watcher::post_p2p_watcher_heal_handler),
+        )
         .route("/api/tpm/status", get(mesh::get_tpm_status_handler))
         .route("/api/mesh/topology", get(mesh::get_mesh_topology_handler))
         .route("/api/topology", get(mesh::get_mesh_topology_handler))
         .route("/api/peers", get(mesh::get_mesh_topology_handler))
         .route("/api/mesh/peers", get(mesh::get_mesh_topology_handler))
-        .route("/api/mesh/bootstrap-peers", get(mesh::get_bootstrap_peers_handler).post(mesh::post_bootstrap_peers_handler))
-        .route("/mesh/bootstrap-peers", get(mesh::get_bootstrap_peers_handler).post(mesh::post_bootstrap_peers_handler))
-        .route("/api/mesh/pending-joins", get(mesh::get_pending_joins_handler))
+        .route(
+            "/api/mesh/bootstrap-peers",
+            get(mesh::get_bootstrap_peers_handler).post(mesh::post_bootstrap_peers_handler),
+        )
+        .route(
+            "/mesh/bootstrap-peers",
+            get(mesh::get_bootstrap_peers_handler).post(mesh::post_bootstrap_peers_handler),
+        )
+        .route(
+            "/api/mesh/pending-joins",
+            get(mesh::get_pending_joins_handler),
+        )
         .route("/api/pending-joins", get(mesh::get_pending_joins_handler))
-        .route("/api/mesh/pending-joins/clear", post(mesh::clear_pending_joins_handler))
-        .route("/api/pending-joins/clear", post(mesh::clear_pending_joins_handler))
-        .route("/api/mesh/pending-joins/:peer_id/allow", post(mesh::allow_pending_join_handler))
-        .route("/api/pending-joins/:peer_id/allow", post(mesh::allow_pending_join_handler))
-        .route("/api/mesh/pending-joins/:peer_id/deny", post(mesh::deny_pending_join_handler))
-        .route("/api/pending-joins/:peer_id/deny", post(mesh::deny_pending_join_handler))
-        .route("/api/mesh/quarantined-peers", get(mesh::get_quarantined_peers_handler))
-        .route("/api/quarantined-peers", get(mesh::get_quarantined_peers_handler))
-        .route("/api/mesh/quarantined-peers/:peer_id/release", post(mesh::release_quarantined_peer_handler))
-        .route("/api/quarantined-peers/:peer_id/release", post(mesh::release_quarantined_peer_handler))
-
+        .route(
+            "/api/mesh/pending-joins/clear",
+            post(mesh::clear_pending_joins_handler),
+        )
+        .route(
+            "/api/pending-joins/clear",
+            post(mesh::clear_pending_joins_handler),
+        )
+        .route(
+            "/api/mesh/pending-joins/:peer_id/allow",
+            post(mesh::allow_pending_join_handler),
+        )
+        .route(
+            "/api/pending-joins/:peer_id/allow",
+            post(mesh::allow_pending_join_handler),
+        )
+        .route(
+            "/api/mesh/pending-joins/:peer_id/deny",
+            post(mesh::deny_pending_join_handler),
+        )
+        .route(
+            "/api/pending-joins/:peer_id/deny",
+            post(mesh::deny_pending_join_handler),
+        )
+        .route(
+            "/api/mesh/quarantined-peers",
+            get(mesh::get_quarantined_peers_handler),
+        )
+        .route(
+            "/api/quarantined-peers",
+            get(mesh::get_quarantined_peers_handler),
+        )
+        .route(
+            "/api/mesh/quarantined-peers/:peer_id/release",
+            post(mesh::release_quarantined_peer_handler),
+        )
+        .route(
+            "/api/quarantined-peers/:peer_id/release",
+            post(mesh::release_quarantined_peer_handler),
+        )
         // Cache Management Endpoints
         .route("/api/cache/recache", post(cache::recache_handler))
         .route("/api/cache/stats", get(cache::cache_stats_handler))
-
         // Reindex Worker & Add New Documents Endpoints
         .route("/api/reindex", post(reindex::start_reindex_handler))
         .route("/api/reindex/status", get(reindex::reindex_status_handler))
         .route("/api/index/status", get(reindex::reindex_status_handler))
         .route("/api/reindex/cancel", post(reindex::cancel_reindex_handler))
         .route("/api/documents/add", post(reindex::add_documents_handler))
-
         // Drift Healing Endpoints
         .route("/api/drift/fix", post(drift::fix_drift_handler))
         .route("/api/drift/status", get(drift::drift_status_handler))
-
         // Google LangExtract Endpoints
         .route("/api/langextract", post(langextract::extract_handler))
-        .route("/api/langextract/visualize", post(langextract::visualize_handler))
-
+        .route(
+            "/api/langextract/visualize",
+            post(langextract::visualize_handler),
+        )
         // AtlasKV Pure-Rust Knowledge Graph & HiKVP Endpoints
-        .route("/api/v1/atlaskv/status", get(atlaskv::atlaskv_status_handler))
+        .route(
+            "/api/v1/atlaskv/status",
+            get(atlaskv::atlaskv_status_handler),
+        )
         .route(
             "/api/v1/atlaskv/config",
             get(atlaskv::atlaskv_get_config_handler).post(atlaskv::atlaskv_update_config_handler),
         )
-        .route("/api/v1/atlaskv/build", post(atlaskv::atlaskv_build_handler))
-        .route("/api/v1/atlaskv/query", post(atlaskv::atlaskv_query_handler))
-        .route("/api/v1/atlaskv/export", post(atlaskv::atlaskv_export_handler))
-        .route("/api/v1/atlaskv/import", post(atlaskv::atlaskv_import_handler))
-        .route("/api/v1/atlaskv/import-json", post(atlaskv::atlaskv_import_json_handler))
-
+        .route(
+            "/api/v1/atlaskv/build",
+            post(atlaskv::atlaskv_build_handler),
+        )
+        .route(
+            "/api/v1/atlaskv/query",
+            post(atlaskv::atlaskv_query_handler),
+        )
+        .route(
+            "/api/v1/atlaskv/export",
+            post(atlaskv::atlaskv_export_handler),
+        )
+        .route(
+            "/api/v1/atlaskv/import",
+            post(atlaskv::atlaskv_import_handler),
+        )
+        .route(
+            "/api/v1/atlaskv/import-json",
+            post(atlaskv::atlaskv_import_json_handler),
+        )
         // Opt-In Sovereign AI Training Data Marketplace Endpoints (Disabled by Default)
-        .route("/api/v1/marketplace/status", get(marketplace::marketplace_status_handler))
-        .route("/api/v1/marketplace/opt-in", post(marketplace::marketplace_opt_in_handler))
-        .route("/api/v1/marketplace/harvest", post(marketplace::marketplace_harvest_handler))
-        .route("/api/v1/marketplace/approve-batch", post(marketplace::marketplace_approve_batch_handler))
-        .route("/api/v1/marketplace/preview", get(marketplace::marketplace_preview_handler).post(marketplace::marketplace_preview_handler))
-        .route("/api/v1/marketplace/unlock", post(marketplace::marketplace_unlock_handler))
-        .route("/api/v1/marketplace/issue-receipt", post(marketplace::marketplace_unlock_handler))
-        .route("/api/v1/marketplace/download", get(marketplace::marketplace_download_handler).post(marketplace::marketplace_download_handler))
-        .route("/api/v1/marketplace/pool-merge", post(marketplace::marketplace_pool_merge_handler))
-        .route("/api/v1/marketplace/ledger", get(marketplace::marketplace_ledger_handler))
-        .route("/api/v1/marketplace/bounties", get(marketplace::marketplace_bounties_handler))
-        .route("/api/v1/marketplace/bounties/submit", post(marketplace::marketplace_bounty_submit_handler))
-        .route("/api/v1/marketplace/test/issue-cert", post(marketplace::marketplace_test_issue_cert_handler))
-        .route("/api/v1/marketplace/issue-cert", post(marketplace::marketplace_test_issue_cert_handler))
-        .route("/api/v1/marketplace/test/execute-transaction", post(marketplace::marketplace_test_execute_transaction_handler))
-        .route("/api/v1/marketplace/issue-nonce", post(marketplace::marketplace_issue_nonce_handler))
- 
+        .route(
+            "/api/v1/marketplace/status",
+            get(marketplace::marketplace_status_handler),
+        )
+        .route(
+            "/api/v1/marketplace/opt-in",
+            post(marketplace::marketplace_opt_in_handler),
+        )
+        .route(
+            "/api/v1/marketplace/harvest",
+            post(marketplace::marketplace_harvest_handler),
+        )
+        .route(
+            "/api/v1/marketplace/approve-batch",
+            post(marketplace::marketplace_approve_batch_handler),
+        )
+        .route(
+            "/api/v1/marketplace/preview",
+            get(marketplace::marketplace_preview_handler)
+                .post(marketplace::marketplace_preview_handler),
+        )
+        .route(
+            "/api/v1/marketplace/unlock",
+            post(marketplace::marketplace_unlock_handler),
+        )
+        .route(
+            "/api/v1/marketplace/issue-receipt",
+            post(marketplace::marketplace_unlock_handler),
+        )
+        .route(
+            "/api/v1/marketplace/download",
+            get(marketplace::marketplace_download_handler)
+                .post(marketplace::marketplace_download_handler),
+        )
+        .route(
+            "/api/v1/marketplace/pool-merge",
+            post(marketplace::marketplace_pool_merge_handler),
+        )
+        .route(
+            "/api/v1/marketplace/ledger",
+            get(marketplace::marketplace_ledger_handler),
+        )
+        .route(
+            "/api/v1/marketplace/bounties",
+            get(marketplace::marketplace_bounties_handler),
+        )
+        .route(
+            "/api/v1/marketplace/bounties/submit",
+            post(marketplace::marketplace_bounty_submit_handler),
+        )
+        .route(
+            "/api/v1/marketplace/test/issue-cert",
+            post(marketplace::marketplace_test_issue_cert_handler),
+        )
+        .route(
+            "/api/v1/marketplace/issue-cert",
+            post(marketplace::marketplace_test_issue_cert_handler),
+        )
+        .route(
+            "/api/v1/marketplace/test/execute-transaction",
+            post(marketplace::marketplace_test_execute_transaction_handler),
+        )
+        .route(
+            "/api/v1/marketplace/issue-nonce",
+            post(marketplace::marketplace_issue_nonce_handler),
+        )
         // Artemis DFIR & Forensics Local-Only Endpoints (Disabled by Default; middleware gates before Json<T> extraction)
         .merge(
             axum::Router::new()
-                .route("/api/v1/artemis/status", get(artemis::artemis_status_handler))
+                .route(
+                    "/api/v1/artemis/status",
+                    get(artemis::artemis_status_handler),
+                )
                 .route("/api/artemis/status", get(artemis::artemis_status_handler))
                 .route(
                     "/api/v1/artemis/config",
@@ -147,33 +307,59 @@ pub fn build_router(state: Arc<DaemonState>) -> axum::Router {
                         .post(artemis::artemis_update_config_handler)
                         .put(artemis::artemis_update_config_handler),
                 )
-                .route("/api/v1/artemis/collect", post(artemis::artemis_collect_handler))
-                .route("/api/artemis/collect", post(artemis::artemis_collect_handler))
-                .route("/api/v1/artemis/preview-normalizer", post(artemis::artemis_preview_normalizer_handler))
-                .route("/api/artemis/preview-normalizer", post(artemis::artemis_preview_normalizer_handler))
-                .route("/api/v1/artemis/evaluate", post(artemis::artemis_evaluate_handler))
-                .route("/api/artemis/evaluate", post(artemis::artemis_evaluate_handler))
-                .route("/api/v1/artemis/summary-table", post(artemis::artemis_summary_table_handler))
-                .route("/api/artemis/summary-table", post(artemis::artemis_summary_table_handler))
+                .route(
+                    "/api/v1/artemis/collect",
+                    post(artemis::artemis_collect_handler),
+                )
+                .route(
+                    "/api/artemis/collect",
+                    post(artemis::artemis_collect_handler),
+                )
+                .route(
+                    "/api/v1/artemis/preview-normalizer",
+                    post(artemis::artemis_preview_normalizer_handler),
+                )
+                .route(
+                    "/api/artemis/preview-normalizer",
+                    post(artemis::artemis_preview_normalizer_handler),
+                )
+                .route(
+                    "/api/v1/artemis/evaluate",
+                    post(artemis::artemis_evaluate_handler),
+                )
+                .route(
+                    "/api/artemis/evaluate",
+                    post(artemis::artemis_evaluate_handler),
+                )
+                .route(
+                    "/api/v1/artemis/summary-table",
+                    post(artemis::artemis_summary_table_handler),
+                )
+                .route(
+                    "/api/artemis/summary-table",
+                    post(artemis::artemis_summary_table_handler),
+                )
                 .route_layer(axum::middleware::from_fn(
                     artemis::require_forensics_enabled_middleware,
                 )),
         )
-
         // Health & Models Telemetry
         .route("/api/health", get(health::health_handler))
         .route("/api/models", get(health::models_handler))
         .route("/api/models/pull", post(health::pull_model_handler))
-        .route("/api/models/nimble/status", get(health::nimble_status_handler))
-        .route("/api/models/nimble/provision", post(health::nimble_provision_handler))
+        .route(
+            "/api/models/nimble/status",
+            get(health::nimble_status_handler),
+        )
+        .route(
+            "/api/models/nimble/provision",
+            post(health::nimble_provision_handler),
+        )
         .route("/api/ollama/install", post(health::install_ollama_handler))
-
         // Graceful Shutdown Endpoint
         .route("/api/shutdown", post(shutdown_handler))
-
         // SPA Fallback & Direct Static Asset Resolution
         .fallback(quorum_ui::static_handler)
-
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

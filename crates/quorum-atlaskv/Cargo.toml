@@ -7,6 +7,7 @@ license.workspace = true
 description = "Pure-Rust AtlasKV KG2KV extractor, 3-level hierarchical centroid index (Root -> Inter1 -> Leaf), sublinear HiKVP pruner, and native .npy/c2id interop for QuorumRAG"
 
 [dependencies]
+quorum-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }

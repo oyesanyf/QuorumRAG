@@ -894,12 +894,14 @@ fn test_adversarial_unicode_and_spaces_user_profiles() {
     }
 }
 
-/// 8. Adversarial Challenge 3: OneDrive Sync Folders and Directory Reparse Point Support
-/// - User "CloudUser" with genuine `OneDrive\Desktop`.
-/// - Reparse point support: `OneDrive\Documents` is created as an NTFS directory junction
-///   pointing to `CloudDocsStorage` -> MUST be discovered!
-/// - Reparse point rejection: `OneDrive\Pictures` is created as an NTFS directory junction
-///   pointing back to `CloudUser` (profile root) -> MUST be rejected!
+/// 8. Adversarial Challenge 3: OneDrive Decoupling and Directory Reparse Point Support
+/// - User "CloudUser" with `OneDrive\{Documents, Desktop, Pictures}` -> MUST NOT be auto-shared
+///   via `discover_user_document_roots()` (OneDrive is opt-in via `discover_cloud_drives()`).
+/// - User "JunctionUser" with standard profile folders:
+///   - Reparse point support: `JunctionUser\Documents` is an NTFS directory junction pointing to
+///     `CloudDocsStorage` -> MUST be discovered!
+///   - Reparse point rejection: `JunctionUser\Pictures` is an NTFS directory junction pointing
+///     back to `JunctionUser` (profile root) -> MUST be rejected!
 /// - Standard profile rejection: User "LoopUser" with `Documents` as an NTFS directory junction
 ///   pointing back to `LoopUser` (profile root) -> MUST be rejected!
 ///   `LoopUser\Desktop` is a regular directory -> MUST be discovered!
@@ -922,12 +924,17 @@ fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
     std::fs::create_dir_all(&target_docs).expect("create target docs");
     std::fs::create_dir_all(&onedrive).expect("create onedrive dir");
     std::fs::create_dir_all(&onedrive_desktop).expect("create onedrive desktop");
-
-    // Create OneDrive\Documents as an NTFS junction pointing to real storage (MUST be accepted)
     create_junction(&onedrive_docs, &target_docs).expect("create onedrive docs junction");
-
-    // Create OneDrive\Pictures as a recursive cyclic junction pointing back to cloud_user (MUST be rejected)
     create_junction(&onedrive_pictures, &cloud_user).expect("create onedrive cyclic junction loop");
+
+    let junction_user = users_dir.join("JunctionUser");
+    let junction_docs = junction_user.join("Documents");
+    let junction_desktop = junction_user.join("Desktop");
+    let junction_pictures = junction_user.join("Pictures");
+    std::fs::create_dir_all(&junction_user).expect("create junction_user dir");
+    std::fs::create_dir_all(&junction_desktop).expect("create junction_user desktop");
+    create_junction(&junction_docs, &target_docs).expect("create valid external junction");
+    create_junction(&junction_pictures, &junction_user).expect("create cyclic profile junction");
 
     // Create User "LoopUser" with cyclic standard document folder
     let loop_user = users_dir.join("LoopUser");
@@ -948,20 +955,55 @@ fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
         .filter(|p| p.starts_with(&users_dir))
         .collect();
 
+    // Verify OneDrive discovery via opt-in cloud_drives module (disabled & Tier 3 by default)
+    let cloud_user_str = cloud_user.to_str().expect("cloud_user to str");
+    let _cloud_env_guard = EnvGuard::set("QUORUM_CLOUD_TEST_PROFILE_DIR", cloud_user_str);
+    let cloud_discovered = quorum_ingest::discover_cloud_drives();
+    let cloud_settings = quorum_ingest::build_default_cloud_drives_settings(&cloud_discovered);
+    let od_entry = cloud_settings
+        .drives
+        .iter()
+        .find(|d| d.id == "onedrive_personal")
+        .expect("onedrive_personal entry");
+    assert!(
+        !od_entry.enabled,
+        "OneDrive must default to disabled (opt-in)"
+    );
+    assert_eq!(
+        od_entry.access_tier, 3,
+        "OneDrive must default to local-only Tier 3"
+    );
+    assert!(
+        cloud_discovered
+            .iter()
+            .any(|d| d.id == "onedrive_personal" && d.detected && d.mounted),
+        "OneDrive must be discovered via cloud_drives module"
+    );
+
     // Clean up junctions
     let _ = std::fs::remove_dir(&onedrive_docs);
     let _ = std::fs::remove_dir(&onedrive_pictures);
+    let _ = std::fs::remove_dir(&junction_docs);
+    let _ = std::fs::remove_dir(&junction_pictures);
     let _ = std::fs::remove_dir(&loop_docs);
 
+    // OneDrive decoupling: discover_user_document_roots() must NOT auto-include OneDrive* folders
+    assert!(
+        !synthetic_roots.contains(&onedrive_docs)
+            && !synthetic_roots.contains(&onedrive_desktop)
+            && !synthetic_roots.contains(&onedrive_pictures),
+        "OneDrive folders must be decoupled from discover_user_document_roots(): {:?}",
+        synthetic_roots
+    );
     // M25 Invariant 1: Valid directory reparse point pointing to external storage MUST be accepted
     assert!(
-        synthetic_roots.contains(&onedrive_docs),
-        "Must contain CloudUser/OneDrive/Documents even when it is an NTFS directory reparse point"
+        synthetic_roots.contains(&junction_docs),
+        "Must contain JunctionUser/Documents even when it is an NTFS directory reparse point"
     );
     // M25 Invariant 2: Normal directory MUST be accepted
     assert!(
-        synthetic_roots.contains(&onedrive_desktop),
-        "Must contain CloudUser/OneDrive/Desktop"
+        synthetic_roots.contains(&junction_desktop),
+        "Must contain JunctionUser/Desktop"
     );
     assert!(
         synthetic_roots.contains(&loop_desktop),
@@ -969,8 +1011,8 @@ fn test_adversarial_onedrive_discovery_and_reparse_point_rejection() {
     );
     // M25 Invariant 3: Reparse points pointing to profile root or ancestor MUST be rejected
     assert!(
-        !synthetic_roots.contains(&onedrive_pictures),
-        "Must NOT contain CloudUser/OneDrive/Pictures because it is a cyclic junction pointing to profile root"
+        !synthetic_roots.contains(&junction_pictures),
+        "Must NOT contain JunctionUser/Pictures because it is a cyclic junction pointing to profile root"
     );
     assert!(
         !synthetic_roots.contains(&loop_docs),

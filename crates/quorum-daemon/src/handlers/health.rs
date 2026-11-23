@@ -8,15 +8,17 @@ use crate::state::DaemonState;
 use quorum_coordinator::HardwareTelemetry;
 
 /// Health & Telemetry endpoint: `GET /api/health`.
-pub async fn health_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+pub async fn health_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let hw = HardwareTelemetry::probe();
     let total_chunks = state.storage.count().await.unwrap_or(0);
 
     let (connected_peers, listen_addrs) = if let Some(ref swarm) = state.swarm_handle {
         let peers = swarm.connected_peers().await.map(|p| p.len()).unwrap_or(0);
-        let addrs = swarm.listen_addresses().await.map(|a| a.iter().map(|m| m.to_string()).collect()).unwrap_or_default();
+        let addrs = swarm
+            .listen_addresses()
+            .await
+            .map(|a| a.iter().map(|m| m.to_string()).collect())
+            .unwrap_or_default();
         (peers, addrs)
     } else {
         (0, Vec::new())
@@ -41,13 +43,29 @@ pub async fn health_handler(
 
     let cache_stats = state.coordinator.cache_stats();
     let watcher_rt = state.p2p_watcher();
-    let watcher_pid_raw = watcher_rt.watcher_pid.load(std::sync::atomic::Ordering::Acquire);
-    let watcher_pid_opt = if watcher_pid_raw > 0 { Some(watcher_pid_raw) } else { None };
-    let watcher_active = watcher_rt.enabled.load(std::sync::atomic::Ordering::Acquire);
-    let watcher_restarts = watcher_rt.watcher_restarts.load(std::sync::atomic::Ordering::Relaxed);
-    let watcher_probe_runs = watcher_rt.probe_runs.load(std::sync::atomic::Ordering::Relaxed);
-    let watcher_heal_runs = watcher_rt.heal_runs.load(std::sync::atomic::Ordering::Relaxed);
-    let watcher_zombies_evicted = watcher_rt.zombies_evicted.load(std::sync::atomic::Ordering::Relaxed);
+    let watcher_pid_raw = watcher_rt
+        .watcher_pid
+        .load(std::sync::atomic::Ordering::Acquire);
+    let watcher_pid_opt = if watcher_pid_raw > 0 {
+        Some(watcher_pid_raw)
+    } else {
+        None
+    };
+    let watcher_active = watcher_rt
+        .enabled
+        .load(std::sync::atomic::Ordering::Acquire);
+    let watcher_restarts = watcher_rt
+        .watcher_restarts
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let watcher_probe_runs = watcher_rt
+        .probe_runs
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let watcher_heal_runs = watcher_rt
+        .heal_runs
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let watcher_zombies_evicted = watcher_rt
+        .zombies_evicted
+        .load(std::sync::atomic::Ordering::Relaxed);
     let watcher_last_probe_at = watcher_rt.last_probe_at.read().ok().and_then(|g| g.clone());
     let watcher_last_heal_at = watcher_rt.last_heal_at.read().ok().and_then(|g| g.clone());
 
@@ -103,7 +121,10 @@ pub struct PullModelRequest {
 /// Triggers background `ollama pull <model>` ONLY AFTER calculating live host resources
 /// (`HardwareTelemetry::probe_fresh()` + `AutoFusionRouter::calculate_provision_plan_with_hw`) (`POST /api/models/pull`).
 pub async fn pull_model_handler(Json(payload): Json<PullModelRequest>) -> impl IntoResponse {
-    let model = quorum_coordinator::DeterministicOfflineSynthesisEngine::normalize_requested_model_tag(&payload.model);
+    let model =
+        quorum_coordinator::DeterministicOfflineSynthesisEngine::normalize_requested_model_tag(
+            &payload.model,
+        );
     if model.is_empty()
         || model.len() > 96
         || !model
@@ -182,7 +203,8 @@ pub async fn pull_model_handler(Json(payload): Json<PullModelRequest>) -> impl I
 
 /// Triggers automated Ollama host installation: `POST /api/ollama/install`.
 pub async fn install_ollama_handler() -> impl IntoResponse {
-    let installed_binary = quorum_coordinator::DeterministicOfflineSynthesisEngine::detect_ollama_binary();
+    let installed_binary =
+        quorum_coordinator::DeterministicOfflineSynthesisEngine::detect_ollama_binary();
     if let Some(path) = installed_binary {
         return Json(serde_json::json!({
             "status": "already_installed",
@@ -279,9 +301,7 @@ pub async fn install_ollama_handler() -> impl IntoResponse {
 }
 
 /// Model family and hardware telemetry recommendation endpoint: `GET /api/models`.
-pub async fn models_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+pub async fn models_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let hw = HardwareTelemetry::probe();
     let qwen_tag = quorum_coordinator::AutoFusionRouter::size_qwen_by_hardware(&hw);
     let gemma_tag = quorum_coordinator::AutoFusionRouter::size_gemma_by_hardware(&hw);
@@ -291,20 +311,23 @@ pub async fn models_handler(
     )
     .await
     .unwrap_or_default();
-    let gemma4_installed = installed
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case("gemma4:26b") || m.to_ascii_lowercase().starts_with("gemma4:26b"));
+    let gemma4_installed = installed.iter().any(|m| {
+        m.eq_ignore_ascii_case("gemma4:26b") || m.to_ascii_lowercase().starts_with("gemma4:26b")
+    });
 
-    let ollama_binary = quorum_coordinator::DeterministicOfflineSynthesisEngine::detect_ollama_binary();
+    let ollama_binary =
+        quorum_coordinator::DeterministicOfflineSynthesisEngine::detect_ollama_binary();
     let ollama_installed = ollama_binary.is_some() || !installed.is_empty();
 
     let calibrated_target = if gemma4_installed && gemma4_eligible {
         "gemma4:26b".to_string()
-    } else if let Some(matched) = quorum_coordinator::AutoFusionRouter::find_best_installed_chat_model(
-        Some(&qwen_tag),
-        &hw,
-        &installed,
-    ) {
+    } else if let Some(matched) =
+        quorum_coordinator::AutoFusionRouter::find_best_installed_chat_model(
+            Some(&qwen_tag),
+            &hw,
+            &installed,
+        )
+    {
         matched
     } else {
         qwen_tag.clone()
@@ -407,9 +430,7 @@ pub async fn models_handler(
 }
 
 /// Returns Nimble-9B model provisioning status: `GET /api/models/nimble/status`.
-pub async fn nimble_status_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+pub async fn nimble_status_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let provisioner = state.nimble_provisioner();
     let status = provisioner.probe_status().await;
     (
@@ -438,4 +459,3 @@ pub async fn nimble_provision_handler(
         Json(status),
     )
 }
-

@@ -339,26 +339,13 @@ impl RetrieveMeshNode {
             None
         };
 
-        let local_access_tier = {
-            let is_forensic_q = forensic_intent.is_some()
-                || q_low.contains("artemis")
-                || q_low.contains("antivirus")
-                || q_low.contains("defender")
-                || q_low.contains("codeintegrity")
-                || q_low.contains("malware")
-                || q_low.contains("trojan")
-                || (q_low.contains("process") && (q_low.contains("block") || q_low.contains("blocked")));
-            let ctrl = crate::dlp_mesh::global_mesh_dlp_controller();
-            let s = ctrl
-                .settings
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if s.artemis.enabled && (s.artemis.local_collection_enabled || is_forensic_q) {
-                access_tier.max(quorum_types::AccessTier::Tier3Restricted.as_u8())
-            } else {
-                access_tier
-            }
-        };
+        let settings_snapshot = crate::dlp_mesh::global_mesh_dlp_controller().get_settings();
+        let local_policy = crate::artemis_airgap::resolve_local_retrieval_policy(
+            &settings_snapshot,
+            access_tier,
+            &[&state.original_prompt, &state.current_query, &search_query],
+        );
+        let local_access_tier = local_policy.local_access_tier;
 
         // Dispatch primary query + supplemental queries concurrently via tokio::join!
         // Send the unbloated query (`state.current_query`) to remote P2P peers so 1.5M+ chunk remote corpora
@@ -394,7 +381,7 @@ impl RetrieveMeshNode {
             }
         };
         let forensic_fut = async {
-            if crate::artemis_airgap::is_forensics_enabled() {
+            if local_policy.allow_artemis_local {
                 if let Some(fi) = forensic_intent {
                     engine
                         .local_storage
@@ -487,6 +474,9 @@ impl RetrieveMeshNode {
                 .collect();
 
             for (idx, mut hit) in forensic_hits.into_iter().enumerate() {
+                if !local_policy.permits_local_scored_chunk(&hit) {
+                    continue;
+                }
                 hit.score = 1.0 / (50.0 + idx as f32);
                 if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                     chunks.push(hit);
@@ -497,6 +487,9 @@ impl RetrieveMeshNode {
                 let max_supp = 96;
                 let supp_denom = if peer_count > 0 { 120.0 } else { 60.0 };
                 for (idx, mut hit) in entity_hits.into_iter().take(max_supp).enumerate() {
+                    if !local_policy.permits_local_scored_chunk(&hit) {
+                        continue;
+                    }
                     // Harmonized supplemental score scale prevents local text from skewing
                     // candidate ranks over remote peers when connected to mesh, without dropping local entity hits.
                     hit.score = 1.0 / (supp_denom + idx as f32);
@@ -507,6 +500,9 @@ impl RetrieveMeshNode {
 
                 let max_prompt = 64;
                 for (idx, mut hit) in prompt_hits.into_iter().take(max_prompt).enumerate() {
+                    if !local_policy.permits_local_scored_chunk(&hit) {
+                        continue;
+                    }
                     hit.score = 1.0 / (supp_denom + idx as f32);
                     if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                         chunks.push(hit);
@@ -515,6 +511,9 @@ impl RetrieveMeshNode {
 
                 let max_cue = 48;
                 for (idx, mut hit) in cue_hits.into_iter().take(max_cue).enumerate() {
+                    if !local_policy.permits_local_scored_chunk(&hit) {
+                        continue;
+                    }
                     hit.score = 1.0 / (supp_denom + idx as f32);
                     if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
                         chunks.push(hit);
@@ -523,12 +522,7 @@ impl RetrieveMeshNode {
             }
         }
 
-        if !crate::artemis_airgap::is_forensics_enabled() {
-            chunks.retain(|c| {
-                !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
-                    && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
-            });
-        }
+        chunks.retain(|c| local_policy.permits_local_scored_chunk(c));
 
         if let Some(ref filters) = state.query_metadata_filters {
             if let Some(ext) = filters.get("filetype") {
@@ -666,9 +660,12 @@ impl RetrieveMeshNode {
         for ext in &state.extracted_entities {
             if ext.extraction_class == "named_entity" || ext.extraction_class == "technical_term" {
                 let lower_term = ext.extraction_text.to_ascii_lowercase();
-                for sub in lower_term.split(|c: char| !c.is_alphanumeric()) {
+                for sub in lower_term.split(|c: char| !c.is_alphanumeric() && c != '_') {
                     let s = sub.trim();
-                    if s.len() >= 3 && !entity_terms.iter().any(|e| e == s) {
+                    if s.len() >= 3
+                        && query_terms.iter().any(|qt| qt == s)
+                        && !entity_terms.iter().any(|e| e == s)
+                    {
                         entity_terms.push(s.to_string());
                     }
                 }
@@ -795,7 +792,9 @@ impl RetrieveMeshNode {
 
                 let doc_tokens: std::collections::HashSet<&str> = text_l
                     .split(|ch: char| !ch.is_alphanumeric())
+                    .chain(text_l.split(|ch: char| !ch.is_alphanumeric() && ch != '_'))
                     .chain(file_name_l.split(|ch: char| !ch.is_alphanumeric()))
+                    .chain(file_name_l.split(|ch: char| !ch.is_alphanumeric() && ch != '_'))
                     .filter(|w| !w.is_empty())
                     .collect();
 
@@ -895,6 +894,7 @@ impl RetrieveMeshNode {
                 // Boost chunks whose filename directly matches query terms (e.g. "African Churches and Gang Violence.docx")
                 let file_tokens: std::collections::HashSet<&str> = file_name_l
                     .split(|ch: char| !ch.is_alphanumeric())
+                    .chain(file_name_l.split(|ch: char| !ch.is_alphanumeric() && ch != '_'))
                     .filter(|w| !w.is_empty())
                     .collect();
                 let file_term_hits = query_term_info
@@ -1091,11 +1091,18 @@ impl RetrieveMeshNode {
                 // When 2 specific entity terms are present (e.g. "cover letter", "universal mineral"), require both.
                 // When only 1 entity term is paired with a generic attribute term (e.g. "cigna policy"),
                 // require the entity term and rank higher if the attribute term also matches.
-                let required_entity_hits = if entity_terms.len() == 2 {
+                let addressable_entity_terms = query_term_info
+                    .iter()
+                    .filter(|qt| qt.is_entity)
+                    .count()
+                    .min(entity_terms.len());
+                let required_entity_hits = if addressable_entity_terms == 2 {
                     2
-                } else if entity_terms.len() > 2 {
-                    ((entity_terms.len() + 1) / 2).max(2).min(entity_terms.len())
-                } else if entity_terms.len() == 1 {
+                } else if addressable_entity_terms > 2 {
+                    ((addressable_entity_terms + 1) / 2)
+                        .max(2)
+                        .min(addressable_entity_terms)
+                } else if addressable_entity_terms == 1 {
                     1
                 } else {
                     0
@@ -1248,6 +1255,30 @@ impl RetrieveMeshNode {
             chunks = paired.into_iter().map(|(c, _)| c).collect();
         }
 
+        // Phase 2 (#18 Adaptive RAG + #8 Query Decomposition + #4 Stage-2a/2b Reranking):
+        // Re-score non-forensic candidates against the clean primary subject and decomposed
+        // sub-questions (Stage-2a CrossSignalReranker), then optionally fuse local Stage-2b
+        // neural reranking (`/v1/rerank`, Ollama `Qwen3-Reranker`/`bge-reranker`, or `/api/embed`).
+        if forensic_intent.is_none() && chunks.len() > 2 {
+            let adaptive_plan = crate::adaptive_rag::plan_adaptive_query(&state.original_prompt, false);
+            if adaptive_plan.primary_subject.is_some() || adaptive_plan.sub_questions.len() >= 2 {
+                let stage2a = crate::reranker::CrossSignalReranker::rerank(
+                    &state.original_prompt,
+                    adaptive_plan.primary_subject.as_deref(),
+                    &adaptive_plan.sub_questions,
+                    chunks,
+                    candidate_k,
+                    crate::reranker::RerankerConfig::default(),
+                );
+                let stage2b = crate::reranker::NeuralReranker::maybe_neural_rerank_live(
+                    &state.original_prompt,
+                    stage2a,
+                )
+                .await;
+                chunks = stage2b.into_iter().map(|r| r.chunk).collect();
+            }
+        }
+
         let has_local_artemis_for_forensic = if let Some(fi) = forensic_intent {
             let has_cat = chunks.iter().any(|c| {
                 let pl = c.chunk.file_path.to_ascii_lowercase();
@@ -1333,6 +1364,9 @@ impl RetrieveMeshNode {
                         .get_chunks_by_ids(&sibling_ids, local_access_tier)
                         .await;
                     for extra in extras {
+                        if !local_policy.permits_local_chunk(&extra) {
+                            continue;
+                        }
                         if !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_corrupt_or_binary_chunk(
                             &extra.text_content,
                         ) && seen_local_ids.insert(extra.chunk_id.clone())

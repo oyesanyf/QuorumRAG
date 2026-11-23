@@ -36,4 +36,7 @@ pub enum AtlasKvError {
 
     #[error("Corrupted AtlasKV hierarchy file: {0}")]
     CorruptedHierarchy(String),
+
+    #[error("Domain type error: {0}")]
+    Type(#[from] quorum_types::TypeError),
 }

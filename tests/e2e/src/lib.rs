@@ -1,6 +1,8 @@
 //! Test infrastructure, mathematical oracles, domain contracts, and test fixtures
 //! for the QuorumRAG 4-tier opaque-box E2E test suite.
 
+pub mod cloud_drives_harness;
+
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use quorum_types::{CandidateChunkDto, DocumentChunk, ScoredChunk, VolatileRemoteChunk};

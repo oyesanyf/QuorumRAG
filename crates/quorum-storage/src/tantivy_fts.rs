@@ -3,20 +3,22 @@
 //! # Invariant: Absolute Arrow Isolation
 //! All types and internal Tantivy dependencies are strictly `pub(crate)`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::create_dir_all;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
 use quorum_types::{DocumentChunk, ScoredChunk};
+use serde::{Deserialize, Serialize};
 use tantivy::collector::{Count, TopDocs};
-use tantivy::merge_policy::NoMergePolicy;
-use tantivy::query::{BooleanQuery, Query, QueryParser, RangeQuery, TermQuery};
-use tantivy::schema::*;
 use tantivy::index::SegmentId;
+use tantivy::merge_policy::NoMergePolicy;
+use tantivy::query::{
+    BooleanQuery, BoostQuery, FuzzyTermQuery, Query, QueryParser, RangeQuery, TermQuery,
+};
+use tantivy::schema::*;
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::error::StorageError;
@@ -31,8 +33,13 @@ enum SyncCheck<'a> {
     DocPresent { chunk_id: &'a str },
     /// Verifies that a specific chunk_id has been purged / marked deleted.
     DocAbsent { chunk_id: &'a str },
-    /// Verifies that all documents with the specified file_path have been purged.
-    FilePathAbsent { file_path: &'a str },
+    /// Verifies that a specific `(chunk_id, file_path)` pair has been purged / marked deleted.
+    ChunkAtPathAbsent {
+        chunk_id: &'a str,
+        file_path: &'a str,
+    },
+    /// Verifies that all documents across any of the specified file_paths have been purged.
+    FilePathsAbsent { file_paths: &'a [String] },
     /// Verifies that all documents have been cleared (`num_docs == 0`).
     AllCleared,
 }
@@ -99,7 +106,8 @@ impl TantivyFtsIndex {
                     attempts += 1;
                     if attempts >= 25 {
                         return Err(StorageError::Tantivy(format!(
-                            "Failed to create Tantivy writer after {} attempts: {}", attempts, e
+                            "Failed to create Tantivy writer after {} attempts: {}",
+                            attempts, e
                         )));
                     }
                     std::thread::yield_now();
@@ -117,9 +125,9 @@ impl TantivyFtsIndex {
         if guard.is_none() {
             *guard = Some(Self::create_writer_inner(index)?);
         }
-        guard
-            .as_mut()
-            .ok_or_else(|| StorageError::Tantivy("index writer unavailable after initialization".into()))
+        guard.as_mut().ok_or_else(|| {
+            StorageError::Tantivy("index writer unavailable after initialization".into())
+        })
     }
 
     /// Drops any existing IndexWriter to release `.tantivy-writer.lock` before creating a fresh writer.
@@ -171,7 +179,9 @@ impl TantivyFtsIndex {
             .reader_builder()
             .reload_policy(tantivy::ReloadPolicy::Manual)
             .try_into()
-            .map_err(|e| StorageError::Tantivy(format!("Failed to create Tantivy reader: {}", e)))?;
+            .map_err(|e| {
+                StorageError::Tantivy(format!("Failed to create Tantivy reader: {}", e))
+            })?;
 
         let (initial_opstamp, initial_seq) = match index.load_metas() {
             Ok(m) => {
@@ -226,7 +236,8 @@ impl TantivyFtsIndex {
         doc.add_text(self.field_metadata_json, &c.metadata_json);
 
         if let Some(f) = self.field_doc_title {
-            let title = crate::document_catalog::extract_title_from_chunk(&c.text_content, &c.file_path);
+            let title =
+                crate::document_catalog::extract_title_from_chunk(&c.text_content, &c.file_path);
             doc.add_text(f, &title);
         }
         if let Some(f) = self.field_doc_authors {
@@ -332,7 +343,9 @@ impl TantivyFtsIndex {
 
         // Verify that the first chunk is discoverable before returning
         let first_chunk_id = &chunks[0].chunk_id;
-        self.reload_with_retry(SyncCheck::DocPresent { chunk_id: first_chunk_id })?;
+        self.reload_with_retry(SyncCheck::DocPresent {
+            chunk_id: first_chunk_id,
+        })?;
 
         Ok(chunks.len())
     }
@@ -363,10 +376,7 @@ impl TantivyFtsIndex {
         if let Some(f) = self.field_doc_authors {
             search_fields.push(f);
         }
-        let mut query_parser = QueryParser::for_index(
-            &self.index,
-            search_fields,
-        );
+        let mut query_parser = QueryParser::for_index(&self.index, search_fields);
         query_parser.set_field_boost(self.field_text_content, 1.5);
         query_parser.set_field_boost(self.field_file_path_text, 0.75);
         if let Some(f) = self.field_doc_title {
@@ -381,47 +391,55 @@ impl TantivyFtsIndex {
             || trimmed.contains('+')
             || trimmed.contains('*');
 
-        let effective_query_str: String = if !has_explicit_syntax {
+        let (effective_query_str, fuzzy_terms): (String, Vec<String>) = if !has_explicit_syntax {
             const QUESTION_STOPWORDS: &[&str] = &[
-                "what", "does", "do", "did", "where", "when", "who", "how", "why",
-                "is", "are", "was", "were", "the", "a", "an", "to", "for", "of",
-                "in", "on", "at", "with", "from", "about", "go", "fo", "went",
-                "attend", "attended", "tell", "me", "can", "you", "please", "his", "her", "their",
+                "what", "does", "do", "did", "where", "when", "who", "how", "why", "is", "are",
+                "was", "were", "the", "a", "an", "to", "for", "of", "in", "on", "at", "with",
+                "from", "about", "go", "fo", "went", "attend", "attended", "tell", "me", "can",
+                "you", "please", "his", "her", "their",
             ];
             // Remove conversational framing ("show me the file that contains a ...",
             // "are there pictures taken in ...") so only the subject drives BM25.
             let subject = crate::query_framing::strip_conversational_framing(trimmed);
-            let subject_src: &str = if subject.is_empty() { trimmed } else { subject.as_str() };
+            let subject_src: &str = if subject.is_empty() {
+                trimmed
+            } else {
+                subject.as_str()
+            };
             let sanitized: String = subject_src
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        ' '
+                    }
+                })
                 .collect();
             let mut content_terms: Vec<&str> = sanitized
                 .split_whitespace()
                 .filter(|w| !QUESTION_STOPWORDS.contains(&w.to_ascii_lowercase().as_str()))
                 .collect();
             let lower_q = trimmed.to_ascii_lowercase();
-            if lower_q.contains("school") || lower_q.contains("college") || lower_q.contains("education") {
+            if lower_q.contains("school")
+                || lower_q.contains("college")
+                || lower_q.contains("education")
+            {
                 content_terms.push("university");
                 content_terms.push("transcript");
             }
             if content_terms.is_empty() {
-                trimmed.to_string()
+                (trimmed.to_string(), Vec::new())
             } else {
-                let formatted_terms: Vec<String> = content_terms
+                let fuzzy: Vec<String> = content_terms
                     .iter()
-                    .map(|t| {
-                        if t.len() >= 5 && t.chars().all(|c| c.is_ascii_alphanumeric()) {
-                            format!("({} OR {}~1)", t, t)
-                        } else {
-                            t.to_string()
-                        }
-                    })
+                    .filter(|t| t.len() >= 5 && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .map(|t| t.to_ascii_lowercase())
                     .collect();
-                formatted_terms.join(" ")
+                (content_terms.join(" "), fuzzy)
             }
         } else {
-            trimmed.to_string()
+            (trimmed.to_string(), Vec::new())
         };
 
         // Parse query with fallback if query has syntax chars
@@ -438,14 +456,38 @@ impl TantivyFtsIndex {
             }
         });
 
-        let text_query = match parsed_query {
-            Ok(q) => q,
+        let text_query: Box<dyn Query> = match parsed_query {
+            Ok(q) => {
+                if fuzzy_terms.is_empty() {
+                    q
+                } else {
+                    let mut clauses: Vec<Box<dyn Query>> = vec![q];
+                    let mut fuzzy_fields = vec![self.field_text_content, self.field_file_path_text];
+                    if let Some(f) = self.field_doc_title {
+                        fuzzy_fields.push(f);
+                    }
+                    if let Some(f) = self.field_doc_authors {
+                        fuzzy_fields.push(f);
+                    }
+                    for ft in &fuzzy_terms {
+                        for &field in &fuzzy_fields {
+                            let fuzzy_q =
+                                FuzzyTermQuery::new(Term::from_field_text(field, ft), 1, true);
+                            clauses.push(Box::new(BoostQuery::new(Box::new(fuzzy_q), 0.5)));
+                        }
+                    }
+                    Box::new(BooleanQuery::union(clauses))
+                }
+            }
             Err(_) => return Ok(Vec::new()),
         };
 
         let tier_range = RangeQuery::new(
             Bound::Included(Term::from_field_u64(self.field_access_tier, 0)),
-            Bound::Included(Term::from_field_u64(self.field_access_tier, max_tier as u64)),
+            Bound::Included(Term::from_field_u64(
+                self.field_access_tier,
+                max_tier as u64,
+            )),
         );
 
         let combined = BooleanQuery::intersection(vec![text_query, Box::new(tier_range)]);
@@ -453,20 +495,27 @@ impl TantivyFtsIndex {
         // Over-fetch when the index is large so monolithic dumps (chat.html, conversations-*.json)
         // or source code files never crowd out real PDF/DOCX documents before top_k truncation.
         let fetch_limit = if num_docs > 500 {
-            top_k.saturating_mul(3).max(96).min(180).min(num_docs.max(1))
+            top_k
+                .saturating_mul(3)
+                .max(96)
+                .min(180)
+                .min(num_docs.max(1))
         } else {
             top_k.min(num_docs.max(1))
         };
         let top_docs = searcher
-            .search(&combined, &TopDocs::with_limit(fetch_limit).order_by_score())
+            .search(
+                &combined,
+                &TopDocs::with_limit(fetch_limit).order_by_score(),
+            )
             .map_err(|e| StorageError::Tantivy(format!("Search execution failed: {}", e)))?;
 
         let mut primary_chunks = Vec::with_capacity(top_k.min(top_docs.len()));
         let mut fallback_chunks = Vec::new();
         for (score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher
-                .doc(doc_address)
-                .map_err(|e| StorageError::Tantivy(format!("Failed to retrieve document: {}", e)))?;
+            let doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| {
+                StorageError::Tantivy(format!("Failed to retrieve document: {}", e))
+            })?;
 
             let chunk = self.doc_to_chunk_fast(&doc);
             let path_l = chunk.file_path.to_ascii_lowercase();
@@ -486,9 +535,18 @@ impl TantivyFtsIndex {
 
             // Indexed media and user office/PDF documents are user content even inside a repo tree
             // such as D:\harfile\music, so only code/config files under the repo root are demoted.
-            let is_media_chunk = chunk.text_content.trim_start().starts_with("[Audio Document:")
-                || chunk.text_content.trim_start().starts_with("[Image Document:")
-                || chunk.text_content.trim_start().starts_with("[Video Document:");
+            let is_media_chunk = chunk
+                .text_content
+                .trim_start()
+                .starts_with("[Audio Document:")
+                || chunk
+                    .text_content
+                    .trim_start()
+                    .starts_with("[Image Document:")
+                || chunk
+                    .text_content
+                    .trim_start()
+                    .starts_with("[Video Document:");
             let is_user_doc = file_l.ends_with(".pdf")
                 || file_l.ends_with(".docx")
                 || file_l.ends_with(".doc")
@@ -538,16 +596,61 @@ impl TantivyFtsIndex {
         Ok(scored_chunks)
     }
 
-    /// Returns the lowest `access_tier` among chunks whose stored `file_path` equals `file_path`
-    /// exactly, or `None` when the path is not part of the index.
-    pub(crate) fn indexed_path_min_tier(&self, file_path: &str) -> Result<Option<u8>, StorageError> {
+    fn resolve_matching_file_paths(
+        searcher: &tantivy::Searcher,
+        field_file_path: Field,
+        file_path: &str,
+    ) -> Vec<String> {
+        let target_key = crate::file_path_compare_key(file_path);
+        let mut matched = HashSet::new();
+        for seg_reader in searcher.segment_readers() {
+            if let Ok(inv_idx) = seg_reader.inverted_index(field_file_path) {
+                if let Ok(mut stream) = inv_idx.terms().stream() {
+                    while stream.advance() {
+                        if let Ok(path_str) = std::str::from_utf8(stream.key()) {
+                            if crate::file_path_compare_key(path_str) == target_key {
+                                matched.insert(path_str.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = matched.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    /// Returns the lowest `access_tier` among chunks whose stored `file_path` matches `file_path`
+    /// (exact or normalized Windows slash/case variant), or `None` when not part of the index.
+    pub(crate) fn indexed_path_min_tier(
+        &self,
+        file_path: &str,
+    ) -> Result<Option<u8>, StorageError> {
         self.reload_with_retry(SyncCheck::None)?;
         let searcher = self.reader.searcher();
         let term = Term::from_field_text(self.field_file_path, file_path);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
-        let hits = searcher
+        let mut hits = searcher
             .search(&query, &TopDocs::with_limit(64).order_by_score())
             .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+        if hits.is_empty() {
+            let matching =
+                Self::resolve_matching_file_paths(&searcher, self.field_file_path, file_path);
+            if !matching.is_empty() {
+                let queries: Vec<Box<dyn Query>> = matching
+                    .iter()
+                    .map(|p| {
+                        let t = Term::from_field_text(self.field_file_path, p);
+                        Box::new(TermQuery::new(t, IndexRecordOption::Basic)) as Box<dyn Query>
+                    })
+                    .collect();
+                let union_q = BooleanQuery::union(queries);
+                hits = searcher
+                    .search(&union_q, &TopDocs::with_limit(64).order_by_score())
+                    .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+            }
+        }
         let mut min_tier: Option<u8> = None;
         for (_score, addr) in hits {
             let doc: TantivyDocument = searcher
@@ -557,6 +660,48 @@ impl TantivyFtsIndex {
             min_tier = Some(min_tier.map_or(chunk.access_tier, |t: u8| t.min(chunk.access_tier)));
         }
         Ok(min_tier)
+    }
+
+    /// Returns the highest (most restricted) `access_tier` among chunks whose stored
+    /// `file_path` matches `file_path` (exact or normalized), or `None` when no chunks exist.
+    pub(crate) fn indexed_path_max_tier(
+        &self,
+        file_path: &str,
+    ) -> Result<Option<u8>, StorageError> {
+        self.reload_with_retry(SyncCheck::None)?;
+        let searcher = self.reader.searcher();
+        let limit = (searcher.num_docs() as usize).max(1);
+        let term = Term::from_field_text(self.field_file_path, file_path);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let mut hits = searcher
+            .search(&query, &TopDocs::with_limit(limit).order_by_score())
+            .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+        if hits.is_empty() {
+            let matching =
+                Self::resolve_matching_file_paths(&searcher, self.field_file_path, file_path);
+            if !matching.is_empty() {
+                let queries: Vec<Box<dyn Query>> = matching
+                    .iter()
+                    .map(|p| {
+                        let t = Term::from_field_text(self.field_file_path, p);
+                        Box::new(TermQuery::new(t, IndexRecordOption::Basic)) as Box<dyn Query>
+                    })
+                    .collect();
+                let union_q = BooleanQuery::union(queries);
+                hits = searcher
+                    .search(&union_q, &TopDocs::with_limit(limit).order_by_score())
+                    .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+            }
+        }
+        let mut max_tier: Option<u8> = None;
+        for (_score, addr) in hits {
+            let doc: TantivyDocument = searcher
+                .doc(addr)
+                .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+            let chunk = self.doc_to_chunk_fast(&doc);
+            max_tier = Some(max_tier.map_or(chunk.access_tier, |t: u8| t.max(chunk.access_tier)));
+        }
+        Ok(max_tier)
     }
 
     /// Checks if a chunk hash already exists in the Tantivy index.
@@ -581,6 +726,125 @@ impl TantivyFtsIndex {
             .search(&query, &TopDocs::with_limit(1).order_by_score())
             .map_err(|e| StorageError::Tantivy(e.to_string()))?;
         Ok(!hits.is_empty())
+    }
+
+    /// Checks if `(chunk_id, file_path)` already exists together in the Tantivy index,
+    /// allowing identical file copies at distinct paths to each be indexed.
+    pub(crate) fn has_chunk_id_for_file_path(
+        &self,
+        chunk_id: &str,
+        file_path: &str,
+    ) -> Result<bool, StorageError> {
+        self.reload_with_retry(SyncCheck::None)?;
+        let searcher = self.reader.searcher();
+        let q_id = TermQuery::new(
+            Term::from_field_text(self.field_chunk_id, chunk_id),
+            IndexRecordOption::Basic,
+        );
+        let q_path = TermQuery::new(
+            Term::from_field_text(self.field_file_path, file_path),
+            IndexRecordOption::Basic,
+        );
+        let combined = BooleanQuery::intersection(vec![Box::new(q_id.clone()), Box::new(q_path)]);
+        let hits = searcher
+            .search(&combined, &TopDocs::with_limit(1).order_by_score())
+            .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+        if !hits.is_empty() {
+            return Ok(true);
+        }
+        let target_key = crate::file_path_compare_key(file_path);
+        let id_hits = searcher
+            .search(&q_id, &TopDocs::with_limit(64).order_by_score())
+            .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+        for (_, doc_address) in id_hits {
+            let doc: TantivyDocument = searcher
+                .doc(doc_address)
+                .map_err(|e| StorageError::Tantivy(e.to_string()))?;
+            if let Some(fp) = doc.get_first(self.field_file_path).and_then(|v| v.as_str()) {
+                if crate::file_path_compare_key(fp) == target_key {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Retrieves a single chunk matching both `(chunk_id, file_path)` (normalizing Windows slash/case variants).
+    pub(crate) fn get_chunk_by_id_and_file_path(
+        &self,
+        chunk_id: &str,
+        file_path: &str,
+        include_vector: bool,
+    ) -> Result<Option<DocumentChunk>, StorageError> {
+        self.reload_with_retry(SyncCheck::None)?;
+        let searcher = self.reader.searcher();
+        if searcher.num_docs() == 0 {
+            return Ok(None);
+        }
+        let q_id = TermQuery::new(
+            Term::from_field_text(self.field_chunk_id, chunk_id),
+            IndexRecordOption::Basic,
+        );
+        let q_path = TermQuery::new(
+            Term::from_field_text(self.field_file_path, file_path),
+            IndexRecordOption::Basic,
+        );
+        let combined = BooleanQuery::intersection(vec![Box::new(q_id.clone()), Box::new(q_path)]);
+        let hits = searcher
+            .search(&combined, &TopDocs::with_limit(1).order_by_score())
+            .map_err(|e| StorageError::Tantivy(format!("Point lookup failed: {}", e)))?;
+        if let Some((_, doc_address)) = hits.into_iter().next() {
+            let doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| {
+                StorageError::Tantivy(format!("Failed to retrieve document: {}", e))
+            })?;
+            return Ok(Some(self.doc_to_chunk_internal(&doc, include_vector)));
+        }
+
+        let target_key = crate::file_path_compare_key(file_path);
+        let id_hits = searcher
+            .search(&q_id, &TopDocs::with_limit(64).order_by_score())
+            .map_err(|e| StorageError::Tantivy(format!("Point lookup failed: {}", e)))?;
+        for (_, doc_address) in id_hits {
+            let doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| {
+                StorageError::Tantivy(format!("Failed to retrieve document: {}", e))
+            })?;
+            if let Some(fp) = doc.get_first(self.field_file_path).and_then(|v| v.as_str()) {
+                if crate::file_path_compare_key(fp) == target_key {
+                    return Ok(Some(self.doc_to_chunk_internal(&doc, include_vector)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Retrieves all copies matching `chunk_id` across distinct `file_path`s.
+    pub(crate) fn get_chunks_for_id(
+        &self,
+        chunk_id: &str,
+        include_vector: bool,
+    ) -> Result<Vec<DocumentChunk>, StorageError> {
+        self.reload_with_retry(SyncCheck::None)?;
+        let searcher = self.reader.searcher();
+        let num_docs = searcher.num_docs();
+        if num_docs == 0 {
+            return Ok(Vec::new());
+        }
+        let term = Term::from_field_text(self.field_chunk_id, chunk_id);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let top_docs = searcher
+            .search(
+                &query,
+                &TopDocs::with_limit(num_docs.max(1) as usize).order_by_score(),
+            )
+            .map_err(|e| StorageError::Tantivy(format!("Point lookup failed: {}", e)))?;
+        let mut chunks = Vec::with_capacity(top_docs.len());
+        for (_score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| {
+                StorageError::Tantivy(format!("Failed to retrieve document: {}", e))
+            })?;
+            chunks.push(self.doc_to_chunk_internal(&doc, include_vector));
+        }
+        Ok(chunks)
     }
 
     /// Retrieves specific chunks by their chunk IDs via O(K) inverted-index point lookups.
@@ -609,29 +873,48 @@ impl TantivyFtsIndex {
 
         let union_query = BooleanQuery::union(queries);
         let top_docs = searcher
-            .search(&union_query, &TopDocs::with_limit(chunk_ids.len()).order_by_score())
+            .search(
+                &union_query,
+                &TopDocs::with_limit(chunk_ids.len()).order_by_score(),
+            )
             .map_err(|e| StorageError::Tantivy(format!("Point lookup failed: {}", e)))?;
 
         let mut chunks = Vec::with_capacity(top_docs.len());
         for (_score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher
-                .doc(doc_address)
-                .map_err(|e| StorageError::Tantivy(format!("Failed to retrieve document: {}", e)))?;
+            let doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| {
+                StorageError::Tantivy(format!("Failed to retrieve document: {}", e))
+            })?;
             chunks.push(self.doc_to_chunk_internal(&doc, include_vector));
         }
 
         Ok(chunks)
     }
 
-    /// Deletes all indexed documents matching the specified `file_path`.
+    /// Deletes all indexed documents matching the specified `file_path`
+    /// (normalizing Windows slash/case variants across FST terms).
     pub(crate) fn delete_by_file_path(&self, file_path: &str) -> Result<usize, StorageError> {
         self.reload_with_retry(SyncCheck::None)?;
-        let term = Term::from_field_text(self.field_file_path, file_path);
-        let query = TermQuery::new(term.clone(), IndexRecordOption::Basic);
         let searcher = self.reader.searcher();
-        let count = searcher
-            .search(&query, &Count)
-            .map_err(|e| StorageError::Tantivy(format!("Count matching documents failed: {}", e)))?;
+        let matching_paths =
+            Self::resolve_matching_file_paths(&searcher, self.field_file_path, file_path);
+        if matching_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let mut count = 0usize;
+        for batch in matching_paths.chunks(256) {
+            let queries: Vec<Box<dyn Query>> = batch
+                .iter()
+                .map(|p| {
+                    let term = Term::from_field_text(self.field_file_path, p);
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>
+                })
+                .collect();
+            let union_q = BooleanQuery::union(queries);
+            count = count.saturating_add(searcher.search(&union_q, &Count).map_err(|e| {
+                StorageError::Tantivy(format!("Count matching documents failed: {}", e))
+            })?);
+        }
 
         if count == 0 {
             return Ok(0);
@@ -648,7 +931,10 @@ impl TantivyFtsIndex {
             let next_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
             let delete_res = {
                 let writer = Self::get_or_recreate_writer(&self.index, &mut writer_guard)?;
-                let _ = writer.delete_term(term.clone());
+                for p in &matching_paths {
+                    let term = Term::from_field_text(self.field_file_path, p);
+                    let _ = writer.delete_term(term);
+                }
                 commit_single(writer, Some(&format!("seq:{}", next_seq)))
             };
 
@@ -679,17 +965,303 @@ impl TantivyFtsIndex {
         }
 
         drop(writer_guard);
-        self.reload_with_retry(SyncCheck::FilePathAbsent { file_path })?;
+        self.reload_with_retry(SyncCheck::FilePathsAbsent {
+            file_paths: &matching_paths,
+        })?;
 
         Ok(count)
     }
 
-    /// O(1) inverted-index check for whether any live chunk exists for `file_path`.
+    /// Deletes all live Tantivy documents whose raw `file_path` matches `prefix` on strict
+    /// component boundaries, scanning the untokenized `field_file_path` FST dictionary.
+    pub(crate) fn delete_by_path_prefix(&self, prefix: &str) -> Result<usize, StorageError> {
+        let norm_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+        self.reload_with_retry(SyncCheck::None)?;
+
+        let matching_paths: Vec<String> = {
+            let searcher = self.reader.searcher();
+            let mut matched = HashSet::new();
+            for seg_reader in searcher.segment_readers() {
+                if let Ok(inv_idx) = seg_reader.inverted_index(self.field_file_path) {
+                    if let Ok(mut stream) = inv_idx.terms().stream() {
+                        while stream.advance() {
+                            if let Ok(path_str) = std::str::from_utf8(stream.key()) {
+                                if quorum_types::path_matches_prefix(path_str, &norm_prefix)
+                                    .unwrap_or(false)
+                                {
+                                    matched.insert(path_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut out: Vec<String> = matched.into_iter().collect();
+            out.sort();
+            out
+        };
+
+        if matching_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let live_count = {
+            let searcher = self.reader.searcher();
+            let mut total = 0usize;
+            for batch in matching_paths.chunks(256) {
+                let queries: Vec<Box<dyn Query>> = batch
+                    .iter()
+                    .map(|p| {
+                        let term = Term::from_field_text(self.field_file_path, p);
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>
+                    })
+                    .collect();
+                let union_q = BooleanQuery::union(queries);
+                let count = searcher.search(&union_q, &Count).map_err(|e| {
+                    StorageError::Tantivy(format!("Prefix count matching documents failed: {}", e))
+                })?;
+                total = total.saturating_add(count);
+            }
+            total
+        };
+
+        if live_count == 0 {
+            return Ok(0);
+        }
+
+        let mut writer_guard = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Tantivy("Tantivy writer mutex poisoned".into()))?;
+
+        let mut recovery_attempts = 0;
+        const MAX_RECOVERIES: usize = 10;
+        'delete_attempt: loop {
+            let next_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
+            let delete_res = {
+                let writer = Self::get_or_recreate_writer(&self.index, &mut writer_guard)?;
+                for p in &matching_paths {
+                    let term = Term::from_field_text(self.field_file_path, p);
+                    let _ = writer.delete_term(term);
+                }
+                commit_single(writer, Some(&format!("seq:{}", next_seq)))
+            };
+
+            match delete_res {
+                Ok(op) => {
+                    self.last_commit_opstamp.store(op, Ordering::Release);
+                    self.last_commit_seq.store(next_seq, Ordering::Release);
+                    break 'delete_attempt;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Tantivy delete_by_path_prefix failed during commit (attempt {} of {}); recreating writer: {}",
+                        recovery_attempts + 1,
+                        MAX_RECOVERIES,
+                        e
+                    );
+                    recovery_attempts += 1;
+                    if recovery_attempts > MAX_RECOVERIES {
+                        return Err(StorageError::Tantivy(format!(
+                            "Exceeded maximum writer recoveries ({}) during prefix delete: {}",
+                            MAX_RECOVERIES, e
+                        )));
+                    }
+                    Self::recreate_writer(&self.index, &mut writer_guard)?;
+                    continue 'delete_attempt;
+                }
+            }
+        }
+
+        drop(writer_guard);
+        self.reload_with_retry(SyncCheck::FilePathsAbsent {
+            file_paths: &matching_paths,
+        })?;
+
+        Ok(live_count)
+    }
+
+    /// Updates `access_tier` across all live Tantivy documents whose raw `file_path` matches
+    /// `prefix` on strict component boundaries, preserving `vector_bytes` and all metadata.
+    pub(crate) fn update_access_tier_by_path_prefix(
+        &self,
+        prefix: &str,
+        new_tier: u8,
+    ) -> Result<usize, StorageError> {
+        quorum_types::AccessTier::from_u8(new_tier)?;
+        let norm_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+        self.reload_with_retry(SyncCheck::None)?;
+
+        let (paths_to_replace, chunks_to_reinsert, updated_count) = {
+            let searcher = self.reader.searcher();
+            let mut matched = HashSet::new();
+            for seg_reader in searcher.segment_readers() {
+                if let Ok(inv_idx) = seg_reader.inverted_index(self.field_file_path) {
+                    if let Ok(mut stream) = inv_idx.terms().stream() {
+                        while stream.advance() {
+                            if let Ok(path_str) = std::str::from_utf8(stream.key()) {
+                                if quorum_types::path_matches_prefix(path_str, &norm_prefix)
+                                    .unwrap_or(false)
+                                {
+                                    matched.insert(path_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if matched.is_empty() {
+                return Ok(0);
+            }
+            let mut matching_paths: Vec<String> = matched.into_iter().collect();
+            matching_paths.sort();
+
+            let doc_limit = (searcher.num_docs() as usize).max(1);
+            let mut by_file: HashMap<String, Vec<DocumentChunk>> = HashMap::new();
+            for batch in matching_paths.chunks(128) {
+                let queries: Vec<Box<dyn Query>> = batch
+                    .iter()
+                    .map(|p| {
+                        let term = Term::from_field_text(self.field_file_path, p);
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>
+                    })
+                    .collect();
+                let union_q = BooleanQuery::union(queries);
+                let top_docs = searcher
+                    .search(&union_q, &TopDocs::with_limit(doc_limit).order_by_score())
+                    .map_err(|e| {
+                        StorageError::Tantivy(format!("Prefix tier fetch failed: {}", e))
+                    })?;
+                for (_score, addr) in top_docs {
+                    let doc: TantivyDocument = searcher.doc(addr).map_err(|e| {
+                        StorageError::Tantivy(format!("Failed to retrieve document: {}", e))
+                    })?;
+                    let chunk = self.doc_to_chunk(&doc);
+                    by_file
+                        .entry(chunk.file_path.clone())
+                        .or_default()
+                        .push(chunk);
+                }
+            }
+
+            let mut paths = Vec::new();
+            let mut reinsert = Vec::new();
+            let mut updated = 0usize;
+            for (fp, mut file_chunks) in by_file {
+                let changed_in_file = file_chunks
+                    .iter()
+                    .filter(|c| c.access_tier != new_tier)
+                    .count();
+                if changed_in_file == 0 {
+                    continue;
+                }
+                updated += changed_in_file;
+                paths.push(fp);
+                for c in &mut file_chunks {
+                    c.access_tier = new_tier;
+                }
+                reinsert.extend(file_chunks);
+            }
+            (paths, reinsert, updated)
+        };
+
+        if updated_count == 0 {
+            return Ok(0);
+        }
+
+        let mut writer_guard = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Tantivy("Tantivy writer mutex poisoned".into()))?;
+
+        let mut recovery_attempts = 0;
+        const MAX_RECOVERIES: usize = 10;
+        'update_attempt: loop {
+            let next_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
+            let res = {
+                let writer = Self::get_or_recreate_writer(&self.index, &mut writer_guard)?;
+                for fp in &paths_to_replace {
+                    let term = Term::from_field_text(self.field_file_path, fp);
+                    let _ = writer.delete_term(term);
+                }
+                let mut add_err = None;
+                for c in &chunks_to_reinsert {
+                    let doc = self.chunk_to_doc(c);
+                    if let Err(e) = writer.add_document(doc) {
+                        add_err = Some(StorageError::Tantivy(format!(
+                            "Tantivy prefix tier add_document failed: {}",
+                            e
+                        )));
+                        break;
+                    }
+                }
+                if let Some(e) = add_err {
+                    Err(e)
+                } else {
+                    commit_single(writer, Some(&format!("seq:{}", next_seq)))
+                }
+            };
+
+            match res {
+                Ok(op) => {
+                    self.last_commit_opstamp.store(op, Ordering::Release);
+                    self.last_commit_seq.store(next_seq, Ordering::Release);
+                    break 'update_attempt;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Tantivy update_access_tier_by_path_prefix failed during commit (attempt {} of {}); recreating writer: {}",
+                        recovery_attempts + 1,
+                        MAX_RECOVERIES,
+                        e
+                    );
+                    recovery_attempts += 1;
+                    if recovery_attempts > MAX_RECOVERIES {
+                        return Err(StorageError::Tantivy(format!(
+                            "Exceeded maximum writer recoveries ({}) during prefix tier update: {}",
+                            MAX_RECOVERIES, e
+                        )));
+                    }
+                    Self::recreate_writer(&self.index, &mut writer_guard)?;
+                    continue 'update_attempt;
+                }
+            }
+        }
+
+        drop(writer_guard);
+        self.reload_with_retry(SyncCheck::None)?;
+
+        Ok(updated_count)
+    }
+
+    /// O(1) inverted-index check for whether any live chunk exists for `file_path`
+    /// (normalizing Windows slash/case variants via `file_path_compare_key`).
     pub fn has_file_path(&self, file_path: &str) -> bool {
         let term = Term::from_field_text(self.field_file_path, file_path);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
         let searcher = self.reader.searcher();
-        searcher.search(&query, &Count).unwrap_or(0) > 0
+        if searcher.search(&query, &Count).unwrap_or(0) > 0 {
+            return true;
+        }
+        let matching =
+            Self::resolve_matching_file_paths(&searcher, self.field_file_path, file_path);
+        if matching.is_empty() {
+            return false;
+        }
+        for batch in matching.chunks(256) {
+            let queries: Vec<Box<dyn Query>> = batch
+                .iter()
+                .map(|p| {
+                    let t = Term::from_field_text(self.field_file_path, p);
+                    Box::new(TermQuery::new(t, IndexRecordOption::Basic)) as Box<dyn Query>
+                })
+                .collect();
+            let union_q = BooleanQuery::union(queries);
+            if searcher.search(&union_q, &Count).unwrap_or(0) > 0 {
+                return true;
+            }
+        }
+        false
     }
 
     /// Fast FST term-dictionary scan of all unique `file_path` values present in Tantivy.
@@ -727,17 +1299,19 @@ impl TantivyFtsIndex {
                     self.last_commit_seq.store(pre_seq, Ordering::Release);
                 }
                 Err(e) => {
-                    tracing::warn!("Tantivy writer error during compact pre-commit; recreating: {}", e);
+                    tracing::warn!(
+                        "Tantivy writer error during compact pre-commit; recreating: {}",
+                        e
+                    );
                     let _ = Self::recreate_writer(&self.index, &mut writer_guard);
                 }
             }
         }
 
         // 2. Enumerate all active segment IDs currently in the committed index metadata
-        let segment_ids = self
-            .index
-            .searchable_segment_ids()
-            .map_err(|e| StorageError::Tantivy(format!("Failed to list searchable segment IDs: {}", e)))?;
+        let segment_ids = self.index.searchable_segment_ids().map_err(|e| {
+            StorageError::Tantivy(format!("Failed to list searchable segment IDs: {}", e))
+        })?;
 
         // 3. Consolidate segments if multiple segments exist
         if segment_ids.len() >= 2 {
@@ -757,7 +1331,8 @@ impl TantivyFtsIndex {
                 match writer.merge(&segment_ids).wait() {
                     Ok(_merged) => {
                         let post_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
-                        if let Ok(w) = Self::get_or_recreate_writer(&self.index, &mut writer_guard) {
+                        if let Ok(w) = Self::get_or_recreate_writer(&self.index, &mut writer_guard)
+                        {
                             match commit_single(w, Some(&format!("seq:{}", post_seq))) {
                                 Ok(op) => {
                                     self.last_commit_opstamp.store(op, Ordering::Release);
@@ -773,13 +1348,19 @@ impl TantivyFtsIndex {
                     }
                     Err(e) => {
                         merge_attempts += 1;
-                        tracing::warn!(attempt = merge_attempts, "Retrying segment merge after error: {}", e);
+                        tracing::warn!(
+                            attempt = merge_attempts,
+                            "Retrying segment merge after error: {}",
+                            e
+                        );
                         let _ = Self::recreate_writer(&self.index, &mut writer_guard);
                         if merge_attempts >= 5 {
                             break;
                         }
                         std::thread::yield_now();
-                        std::thread::sleep(std::time::Duration::from_millis(20 * merge_attempts as u64));
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            20 * merge_attempts as u64,
+                        ));
                     }
                 }
             }
@@ -849,7 +1430,10 @@ impl TantivyFtsIndex {
             .to_string();
 
         let vector = if include_vector {
-            if let Some(bytes) = doc.get_first(self.field_vector_bytes).and_then(|v| v.as_bytes()) {
+            if let Some(bytes) = doc
+                .get_first(self.field_vector_bytes)
+                .and_then(|v| v.as_bytes())
+            {
                 bytes
                     .as_chunks::<4>()
                     .0
@@ -888,19 +1472,29 @@ impl TantivyFtsIndex {
         let mut work_clusters: HashMap<String, DistinctWorkHit> = HashMap::new();
 
         for scored in candidate_chunks {
-            let cluster_id = crate::document_catalog::derive_work_cluster_id(&scored.chunk.file_path);
-            let entry = work_clusters.entry(cluster_id.clone()).or_insert_with(|| {
-                DistinctWorkHit {
-                    work_cluster_id: cluster_id,
-                    canonical_file_path: scored.chunk.file_path.clone(),
-                    document_id: scored.chunk.document_id.clone(),
-                    doc_title: crate::document_catalog::extract_title_from_chunk(&scored.chunk.text_content, &scored.chunk.file_path),
-                    doc_authors: crate::document_catalog::extract_author_from_chunk(&scored.chunk.text_content),
-                    doc_kind: crate::document_catalog::extract_kind_from_chunk(&scored.chunk.text_content, &scored.chunk.file_path),
-                    max_score: scored.score,
-                    matching_chunks_count: 0,
-                }
-            });
+            let cluster_id =
+                crate::document_catalog::derive_work_cluster_id(&scored.chunk.file_path);
+            let entry =
+                work_clusters
+                    .entry(cluster_id.clone())
+                    .or_insert_with(|| DistinctWorkHit {
+                        work_cluster_id: cluster_id,
+                        canonical_file_path: scored.chunk.file_path.clone(),
+                        document_id: scored.chunk.document_id.clone(),
+                        doc_title: crate::document_catalog::extract_title_from_chunk(
+                            &scored.chunk.text_content,
+                            &scored.chunk.file_path,
+                        ),
+                        doc_authors: crate::document_catalog::extract_author_from_chunk(
+                            &scored.chunk.text_content,
+                        ),
+                        doc_kind: crate::document_catalog::extract_kind_from_chunk(
+                            &scored.chunk.text_content,
+                            &scored.chunk.file_path,
+                        ),
+                        max_score: scored.score,
+                        matching_chunks_count: 0,
+                    });
             entry.matching_chunks_count += 1;
             if scored.score > entry.max_score {
                 entry.max_score = scored.score;
@@ -908,7 +1502,11 @@ impl TantivyFtsIndex {
         }
 
         let mut distinct: Vec<DistinctWorkHit> = work_clusters.into_values().collect();
-        distinct.sort_by(|a, b| b.max_score.partial_cmp(&a.max_score).unwrap_or(std::cmp::Ordering::Equal));
+        distinct.sort_by(|a, b| {
+            b.max_score
+                .partial_cmp(&a.max_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(distinct)
     }
 
@@ -928,9 +1526,9 @@ impl TantivyFtsIndex {
 
         let mut chunks = Vec::with_capacity(top_docs.len());
         for (_score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher
-                .doc(doc_address)
-                .map_err(|e| StorageError::Tantivy(format!("Failed to retrieve document: {}", e)))?;
+            let doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| {
+                StorageError::Tantivy(format!("Failed to retrieve document: {}", e))
+            })?;
             chunks.push(self.doc_to_chunk_fast(&doc));
         }
         Ok(chunks)
@@ -952,9 +1550,9 @@ impl TantivyFtsIndex {
 
         let mut chunks = Vec::with_capacity(top_docs.len());
         for (_score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher
-                .doc(doc_address)
-                .map_err(|e| StorageError::Tantivy(format!("Failed to retrieve document: {}", e)))?;
+            let doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| {
+                StorageError::Tantivy(format!("Failed to retrieve document: {}", e))
+            })?;
             chunks.push(self.doc_to_chunk(&doc));
         }
         Ok(chunks)
@@ -966,9 +1564,9 @@ impl TantivyFtsIndex {
         let term = Term::from_field_text(self.field_chunk_id, chunk_id);
         let query = TermQuery::new(term.clone(), IndexRecordOption::Basic);
         let searcher = self.reader.searcher();
-        let count = searcher
-            .search(&query, &Count)
-            .map_err(|e| StorageError::Tantivy(format!("Count matching documents failed: {}", e)))?;
+        let count = searcher.search(&query, &Count).map_err(|e| {
+            StorageError::Tantivy(format!("Count matching documents failed: {}", e))
+        })?;
 
         if count == 0 {
             return Ok(0);
@@ -1017,6 +1615,116 @@ impl TantivyFtsIndex {
 
         drop(writer_guard);
         self.reload_with_retry(SyncCheck::DocAbsent { chunk_id })?;
+
+        Ok(count)
+    }
+
+    /// Deletes a specific chunk matching `(chunk_id, file_path)` (normalizing Windows slash/case
+    /// variants via `file_path_compare_key`), preserving sibling copies at other paths.
+    pub(crate) fn delete_by_chunk_id_and_file_path(
+        &self,
+        chunk_id: &str,
+        file_path: &str,
+    ) -> Result<usize, StorageError> {
+        self.reload_with_retry(SyncCheck::None)?;
+        let q_id = TermQuery::new(
+            Term::from_field_text(self.field_chunk_id, chunk_id),
+            IndexRecordOption::Basic,
+        );
+        let searcher = self.reader.searcher();
+        let id_count = searcher.search(&q_id, &Count).map_err(|e| {
+            StorageError::Tantivy(format!("Count matching documents failed: {}", e))
+        })?;
+        if id_count == 0 {
+            return Ok(0);
+        }
+
+        let target_key = crate::file_path_compare_key(file_path);
+        let id_hits = searcher
+            .search(
+                &q_id,
+                &TopDocs::with_limit(id_count.max(1)).order_by_score(),
+            )
+            .map_err(|e| StorageError::Tantivy(format!("Chunk path scan failed: {}", e)))?;
+
+        let mut matching_paths = HashSet::new();
+        let mut count = 0usize;
+        for (_, doc_address) in id_hits {
+            let doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| {
+                StorageError::Tantivy(format!("Failed to retrieve document: {}", e))
+            })?;
+            if let Some(fp) = doc.get_first(self.field_file_path).and_then(|v| v.as_str()) {
+                if crate::file_path_compare_key(fp) == target_key {
+                    matching_paths.insert(fp.to_string());
+                    count += 1;
+                }
+            }
+        }
+
+        if count == 0 || matching_paths.is_empty() {
+            return Ok(0);
+        }
+        let mut sorted_paths: Vec<String> = matching_paths.into_iter().collect();
+        sorted_paths.sort();
+
+        let mut writer_guard = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Tantivy("Tantivy writer mutex poisoned".into()))?;
+
+        let mut recovery_attempts = 0;
+        const MAX_RECOVERIES: usize = 10;
+        'delete_attempt: loop {
+            let next_seq = self.last_commit_seq.load(Ordering::Acquire) + 1;
+            let delete_res = {
+                let writer = Self::get_or_recreate_writer(&self.index, &mut writer_guard)?;
+                for p in &sorted_paths {
+                    let del_q_id = TermQuery::new(
+                        Term::from_field_text(self.field_chunk_id, chunk_id),
+                        IndexRecordOption::Basic,
+                    );
+                    let del_q_path = TermQuery::new(
+                        Term::from_field_text(self.field_file_path, p),
+                        IndexRecordOption::Basic,
+                    );
+                    let del_query =
+                        BooleanQuery::intersection(vec![Box::new(del_q_id), Box::new(del_q_path)]);
+                    let _ = writer.delete_query(Box::new(del_query));
+                }
+                commit_single(writer, Some(&format!("seq:{}", next_seq)))
+            };
+
+            match delete_res {
+                Ok(op) => {
+                    self.last_commit_opstamp.store(op, Ordering::Release);
+                    self.last_commit_seq.store(next_seq, Ordering::Release);
+                    break 'delete_attempt;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Tantivy delete_by_chunk_id_and_file_path failed during commit (attempt {} of {}); recreating writer: {}",
+                        recovery_attempts + 1,
+                        MAX_RECOVERIES,
+                        e
+                    );
+                    recovery_attempts += 1;
+                    if recovery_attempts > MAX_RECOVERIES {
+                        return Err(StorageError::Tantivy(format!(
+                            "Exceeded maximum writer recoveries ({}) during delete: {}",
+                            MAX_RECOVERIES, e
+                        )));
+                    }
+                    Self::recreate_writer(&self.index, &mut writer_guard)?;
+                    continue 'delete_attempt;
+                }
+            }
+        }
+
+        drop(writer_guard);
+        self.reload_with_retry(SyncCheck::ChunkAtPathAbsent {
+            chunk_id,
+            file_path,
+        })?;
 
         Ok(count)
     }
@@ -1080,8 +1788,7 @@ impl TantivyFtsIndex {
 
         // Fast path: if reader is already synchronized to at least target_seq, no reload needed!
         // But only if no specific semantic verification (e.g. DocPresent/DocAbsent) is required.
-        if self.synced_seq.load(Ordering::Acquire) >= target_seq
-            && matches!(check, SyncCheck::None)
+        if self.synced_seq.load(Ordering::Acquire) >= target_seq && matches!(check, SyncCheck::None)
         {
             return Ok(());
         }
@@ -1115,7 +1822,13 @@ impl TantivyFtsIndex {
                 );
                 std::thread::yield_now();
                 if attempt > 5 {
-                    let backoff = if attempt <= 20 { 100 } else if attempt <= 50 { 250 } else { 500 };
+                    let backoff = if attempt <= 20 {
+                        100
+                    } else if attempt <= 50 {
+                        250
+                    } else {
+                        500
+                    };
                     std::thread::sleep(std::time::Duration::from_micros(backoff));
                 }
                 continue;
@@ -1174,10 +1887,17 @@ impl TantivyFtsIndex {
                     let query = TermQuery::new(term, IndexRecordOption::Basic);
                     let count = searcher.search(&query, &Count).unwrap_or(0);
                     if count == 0 {
-                        last_err = format!("DocPresent verification failed for chunk_id {}", chunk_id);
+                        last_err =
+                            format!("DocPresent verification failed for chunk_id {}", chunk_id);
                         std::thread::yield_now();
                         if attempt > 5 {
-                            let backoff = if attempt <= 20 { 100 } else if attempt <= 50 { 250 } else { 500 };
+                            let backoff = if attempt <= 20 {
+                                100
+                            } else if attempt <= 50 {
+                                250
+                            } else {
+                                500
+                            };
                             std::thread::sleep(std::time::Duration::from_micros(backoff));
                         }
                         continue;
@@ -1188,24 +1908,108 @@ impl TantivyFtsIndex {
                     let query = TermQuery::new(term, IndexRecordOption::Basic);
                     let count = searcher.search(&query, &Count).unwrap_or(0);
                     if count > 0 {
-                        last_err = format!("DocAbsent verification failed for chunk_id {} (count={})", chunk_id, count);
+                        last_err = format!(
+                            "DocAbsent verification failed for chunk_id {} (count={})",
+                            chunk_id, count
+                        );
                         std::thread::yield_now();
                         if attempt > 5 {
-                            let backoff = if attempt <= 20 { 100 } else if attempt <= 50 { 250 } else { 500 };
+                            let backoff = if attempt <= 20 {
+                                100
+                            } else if attempt <= 50 {
+                                250
+                            } else {
+                                500
+                            };
                             std::thread::sleep(std::time::Duration::from_micros(backoff));
                         }
                         continue;
                     }
                 }
-                SyncCheck::FilePathAbsent { file_path } => {
-                    let term = Term::from_field_text(self.field_file_path, file_path);
-                    let query = TermQuery::new(term, IndexRecordOption::Basic);
-                    let count = searcher.search(&query, &Count).unwrap_or(0);
+                SyncCheck::ChunkAtPathAbsent {
+                    chunk_id,
+                    file_path,
+                } => {
+                    let q_id = TermQuery::new(
+                        Term::from_field_text(self.field_chunk_id, chunk_id),
+                        IndexRecordOption::Basic,
+                    );
+                    let target_key = crate::file_path_compare_key(file_path);
+                    let limit = (searcher.num_docs() as usize).max(1);
+                    let count = searcher
+                        .search(&q_id, &TopDocs::with_limit(limit).order_by_score())
+                        .map(|hits| {
+                            hits.into_iter()
+                                .filter(|(_, addr)| {
+                                    searcher
+                                        .doc::<TantivyDocument>(*addr)
+                                        .ok()
+                                        .and_then(|d| {
+                                            d.get_first(self.field_file_path)
+                                                .and_then(|v| v.as_str())
+                                                .map(|fp| {
+                                                    crate::file_path_compare_key(fp) == target_key
+                                                })
+                                        })
+                                        .unwrap_or(false)
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
                     if count > 0 {
-                        last_err = format!("FilePathAbsent verification failed for file_path {} (count={})", file_path, count);
+                        last_err = format!(
+                            "ChunkAtPathAbsent verification failed for ({}, {}) (count={})",
+                            chunk_id, file_path, count
+                        );
                         std::thread::yield_now();
                         if attempt > 5 {
-                            let backoff = if attempt <= 20 { 100 } else if attempt <= 50 { 250 } else { 500 };
+                            let backoff = if attempt <= 20 {
+                                100
+                            } else if attempt <= 50 {
+                                250
+                            } else {
+                                500
+                            };
+                            std::thread::sleep(std::time::Duration::from_micros(backoff));
+                        }
+                        continue;
+                    }
+                }
+                SyncCheck::FilePathsAbsent { file_paths } => {
+                    let mut remaining = 0usize;
+                    for batch in file_paths.chunks(256) {
+                        if batch.is_empty() {
+                            continue;
+                        }
+                        let queries: Vec<Box<dyn Query>> = batch
+                            .iter()
+                            .map(|p| {
+                                let term = Term::from_field_text(self.field_file_path, p);
+                                Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                                    as Box<dyn Query>
+                            })
+                            .collect();
+                        let union_q = BooleanQuery::union(queries);
+                        remaining = remaining
+                            .saturating_add(searcher.search(&union_q, &Count).unwrap_or(0));
+                        if remaining > 0 {
+                            break;
+                        }
+                    }
+                    if remaining > 0 {
+                        last_err = format!(
+                            "FilePathsAbsent verification failed (remaining={})",
+                            remaining
+                        );
+                        std::thread::yield_now();
+                        if attempt > 5 {
+                            let backoff = if attempt <= 20 {
+                                100
+                            } else if attempt <= 50 {
+                                250
+                            } else {
+                                500
+                            };
                             std::thread::sleep(std::time::Duration::from_micros(backoff));
                         }
                         continue;
@@ -1213,10 +2017,19 @@ impl TantivyFtsIndex {
                 }
                 SyncCheck::AllCleared => {
                     if searcher.num_docs() > 0 {
-                        last_err = format!("AllCleared verification failed: num_docs={}", searcher.num_docs());
+                        last_err = format!(
+                            "AllCleared verification failed: num_docs={}",
+                            searcher.num_docs()
+                        );
                         std::thread::yield_now();
                         if attempt > 5 {
-                            let backoff = if attempt <= 20 { 100 } else if attempt <= 50 { 250 } else { 500 };
+                            let backoff = if attempt <= 20 {
+                                100
+                            } else if attempt <= 50 {
+                                250
+                            } else {
+                                500
+                            };
                             std::thread::sleep(std::time::Duration::from_micros(backoff));
                         }
                         continue;
@@ -1266,7 +2079,9 @@ impl TantivyFtsIndex {
 
         let top_docs = searcher
             .search(&query, &TopDocs::with_limit(4096).order_by_score())
-            .map_err(|e| StorageError::Tantivy(format!("Parent reconstruction lookup failed: {}", e)))?;
+            .map_err(|e| {
+                StorageError::Tantivy(format!("Parent reconstruction lookup failed: {}", e))
+            })?;
 
         if top_docs.is_empty() {
             return Ok(None);
@@ -1308,8 +2123,10 @@ impl TantivyFtsIndex {
 
         let primary_doc_id = chunks[0].document_id.clone();
         let min_tier = chunks.iter().map(|c| c.access_tier).max().unwrap_or(0);
-        let title_guess =
-            crate::document_catalog::extract_title_from_chunk(&chunks[0].text_content, &target_path);
+        let title_guess = crate::document_catalog::extract_title_from_chunk(
+            &chunks[0].text_content,
+            &target_path,
+        );
         let author_guess =
             crate::document_catalog::extract_author_from_chunk(&chunks[0].text_content);
 
@@ -1334,7 +2151,11 @@ impl TantivyFtsIndex {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let format = if chunks[0].text_content.trim_start().starts_with("[Image Document:") {
+        let format = if chunks[0]
+            .text_content
+            .trim_start()
+            .starts_with("[Image Document:")
+        {
             quorum_types::DocumentFormat::ImageFile
         } else {
             quorum_types::DocumentFormat::from_extension(&ext)
@@ -1343,7 +2164,10 @@ impl TantivyFtsIndex {
         let blake3_hash = blake3::hash(assembled.as_bytes()).to_hex().to_string();
         let byte_len = assembled.len() as u64;
         let mut metadata = HashMap::new();
-        metadata.insert("reconstructed_from_chunks".to_string(), chunks.len().to_string());
+        metadata.insert(
+            "reconstructed_from_chunks".to_string(),
+            chunks.len().to_string(),
+        );
 
         let parent = quorum_types::IngestedParentDocument {
             doc_id: primary_doc_id,
@@ -1351,7 +2175,11 @@ impl TantivyFtsIndex {
             source_path: target_path,
             os_platform: std::env::consts::OS.to_string(),
             format,
-            title: if title_guess.is_empty() { None } else { Some(title_guess) },
+            title: if title_guess.is_empty() {
+                None
+            } else {
+                Some(title_guess)
+            },
             author: if author_guess.is_empty() || author_guess.eq_ignore_ascii_case("unknown") {
                 None
             } else {

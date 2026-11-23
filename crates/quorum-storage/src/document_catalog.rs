@@ -94,7 +94,10 @@ pub fn parse_contextual_header(text: &str) -> Option<(String, String, String, St
         return None;
     }
 
-    let title = parts[0].strip_prefix("Document: ")?.trim_matches('"').to_string();
+    let title = parts[0]
+        .strip_prefix("Document: ")?
+        .trim_matches('"')
+        .to_string();
     let author = parts[1].strip_prefix("Author: ")?.to_string();
     let kind = parts[2].strip_prefix("Kind: ")?.to_string();
     let file = parts[3].strip_prefix("File: ")?.to_string();
@@ -302,9 +305,10 @@ impl DocumentCatalog {
         Ok(())
     }
 
-    /// Deletes a document entry and its cached parent document by file path.
+    /// Deletes a document entry and its cached parent document by file path
+    /// (normalizing Windows slash/case variants when exact match finds 0 rows).
     pub fn delete_by_file_path(&self, file_path: &str) -> Result<bool, StorageError> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let rows = conn.execute(
             "DELETE FROM document_catalog WHERE file_path = ?1",
             params![file_path],
@@ -313,7 +317,241 @@ impl DocumentCatalog {
             "DELETE FROM parent_documents WHERE file_path = ?1",
             params![file_path],
         )?;
-        Ok((rows + parent_rows) > 0)
+        if rows > 0 && parent_rows > 0 {
+            return Ok(true);
+        }
+
+        let target_key = crate::file_path_compare_key(file_path);
+        let tx = conn.transaction()?;
+        let mut extra_deleted = 0usize;
+
+        if rows == 0 {
+            let cat_matches: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT file_path FROM document_catalog")?;
+                let mut matched = Vec::new();
+                for r in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                    let fp = r?;
+                    if crate::file_path_compare_key(&fp) == target_key {
+                        matched.push(fp);
+                    }
+                }
+                matched
+            };
+            for fp in &cat_matches {
+                extra_deleted += tx.execute(
+                    "DELETE FROM document_catalog WHERE file_path = ?1",
+                    params![fp],
+                )?;
+            }
+        }
+
+        if parent_rows == 0 {
+            let par_matches: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT file_path FROM parent_documents")?;
+                let mut matched = Vec::new();
+                for r in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                    let fp = r?;
+                    if crate::file_path_compare_key(&fp) == target_key {
+                        matched.push(fp);
+                    }
+                }
+                matched
+            };
+            for fp in &par_matches {
+                extra_deleted += tx.execute(
+                    "DELETE FROM parent_documents WHERE file_path = ?1",
+                    params![fp],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok((rows + parent_rows + extra_deleted) > 0)
+    }
+
+    /// Deletes all catalog entries (and via trigger `document_catalog_fts`) plus `parent_documents`
+    /// rows whose `file_path` matches `prefix` on strict component boundaries.
+    pub fn delete_by_path_prefix(&self, prefix: &str) -> Result<(usize, usize), StorageError> {
+        let norm_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+
+        let catalog_paths: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT file_path FROM document_catalog")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut matched = Vec::new();
+            for r in rows {
+                let fp = r?;
+                if quorum_types::path_matches_prefix(&fp, &norm_prefix).unwrap_or(false) {
+                    matched.push(fp);
+                }
+            }
+            matched
+        };
+
+        let parent_paths: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT file_path FROM parent_documents")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut matched = Vec::new();
+            for r in rows {
+                let fp = r?;
+                if quorum_types::path_matches_prefix(&fp, &norm_prefix).unwrap_or(false) {
+                    matched.push(fp);
+                }
+            }
+            matched
+        };
+
+        let mut catalog_deleted = 0usize;
+        if !catalog_paths.is_empty() {
+            let mut del_cat =
+                tx.prepare_cached("DELETE FROM document_catalog WHERE file_path = ?1")?;
+            for fp in &catalog_paths {
+                catalog_deleted = catalog_deleted.saturating_add(del_cat.execute(params![fp])?);
+            }
+        }
+
+        let mut parent_deleted = 0usize;
+        if !parent_paths.is_empty() {
+            let mut del_par =
+                tx.prepare_cached("DELETE FROM parent_documents WHERE file_path = ?1")?;
+            for fp in &parent_paths {
+                parent_deleted = parent_deleted.saturating_add(del_par.execute(params![fp])?);
+            }
+        }
+
+        tx.commit()?;
+        Ok((catalog_deleted, parent_deleted))
+    }
+
+    /// Updates `access_tier` in both `document_catalog` and `parent_documents` for `file_path`
+    /// (falling back to normalized Windows slash/case matching if exact row differs in casing/slashes).
+    pub fn update_file_access_tier(
+        &self,
+        file_path: &str,
+        new_tier: u8,
+    ) -> Result<usize, StorageError> {
+        quorum_types::AccessTier::from_u8(new_tier)?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut cat = tx.execute(
+            "UPDATE document_catalog SET access_tier = ?1 WHERE file_path = ?2 AND access_tier != ?1",
+            params![new_tier as i64, file_path],
+        )?;
+        let mut par = tx.execute(
+            "UPDATE parent_documents SET access_tier = ?1 WHERE file_path = ?2 AND access_tier != ?1",
+            params![new_tier as i64, file_path],
+        )?;
+        if cat == 0 {
+            let target_key = crate::file_path_compare_key(file_path);
+            let cat_matches: Vec<String> = {
+                let mut stmt =
+                    tx.prepare("SELECT file_path FROM document_catalog WHERE access_tier != ?1")?;
+                let mut matched = Vec::new();
+                for r in stmt.query_map(params![new_tier as i64], |row| row.get::<_, String>(0))? {
+                    let fp = r?;
+                    if crate::file_path_compare_key(&fp) == target_key {
+                        matched.push(fp);
+                    }
+                }
+                matched
+            };
+            for fp in &cat_matches {
+                cat += tx.execute(
+                    "UPDATE document_catalog SET access_tier = ?1 WHERE file_path = ?2 AND access_tier != ?1",
+                    params![new_tier as i64, fp],
+                )?;
+            }
+        }
+        if par == 0 {
+            let target_key = crate::file_path_compare_key(file_path);
+            let par_matches: Vec<String> = {
+                let mut stmt =
+                    tx.prepare("SELECT file_path FROM parent_documents WHERE access_tier != ?1")?;
+                let mut matched = Vec::new();
+                for r in stmt.query_map(params![new_tier as i64], |row| row.get::<_, String>(0))? {
+                    let fp = r?;
+                    if crate::file_path_compare_key(&fp) == target_key {
+                        matched.push(fp);
+                    }
+                }
+                matched
+            };
+            for fp in &par_matches {
+                par += tx.execute(
+                    "UPDATE parent_documents SET access_tier = ?1 WHERE file_path = ?2 AND access_tier != ?1",
+                    params![new_tier as i64, fp],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(cat + par)
+    }
+
+    /// Updates `access_tier` across both `document_catalog` (firing FTS update trigger) and
+    /// `parent_documents` for all rows matching `prefix` on strict component boundaries.
+    pub fn update_access_tier_by_path_prefix(
+        &self,
+        prefix: &str,
+        new_tier: u8,
+    ) -> Result<(usize, usize), StorageError> {
+        quorum_types::AccessTier::from_u8(new_tier)?;
+        let norm_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+
+        let catalog_paths: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT file_path FROM document_catalog WHERE access_tier != ?1")?;
+            let rows = stmt.query_map(params![new_tier as i64], |row| row.get::<_, String>(0))?;
+            let mut matched = Vec::new();
+            for r in rows {
+                let fp = r?;
+                if quorum_types::path_matches_prefix(&fp, &norm_prefix).unwrap_or(false) {
+                    matched.push(fp);
+                }
+            }
+            matched
+        };
+
+        let parent_paths: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT file_path FROM parent_documents WHERE access_tier != ?1")?;
+            let rows = stmt.query_map(params![new_tier as i64], |row| row.get::<_, String>(0))?;
+            let mut matched = Vec::new();
+            for r in rows {
+                let fp = r?;
+                if quorum_types::path_matches_prefix(&fp, &norm_prefix).unwrap_or(false) {
+                    matched.push(fp);
+                }
+            }
+            matched
+        };
+
+        let mut catalog_updated = 0usize;
+        if !catalog_paths.is_empty() {
+            let mut upd_cat = tx.prepare_cached(
+                "UPDATE document_catalog SET access_tier = ?1 WHERE file_path = ?2",
+            )?;
+            for fp in &catalog_paths {
+                catalog_updated =
+                    catalog_updated.saturating_add(upd_cat.execute(params![new_tier as i64, fp])?);
+            }
+        }
+
+        let mut parent_updated = 0usize;
+        if !parent_paths.is_empty() {
+            let mut upd_par = tx.prepare_cached(
+                "UPDATE parent_documents SET access_tier = ?1 WHERE file_path = ?2",
+            )?;
+            for fp in &parent_paths {
+                parent_updated =
+                    parent_updated.saturating_add(upd_par.execute(params![new_tier as i64, fp])?);
+            }
+        }
+
+        tx.commit()?;
+        Ok((catalog_updated, parent_updated))
     }
 
     /// Inserts or replaces a full unchunked parent document record for RLM byte-slice & regex inspection.
@@ -369,23 +607,14 @@ impl DocumentCatalog {
         Ok(())
     }
 
-    /// Retrieves a stored full parent document by either `file_path` or `document_id`, along with its `access_tier`.
+    /// Retrieves a stored full parent document by either `file_path` (exact or normalized
+    /// slash/case/`\\?\` variant) or `document_id`, along with its `access_tier`.
     pub fn get_parent_document(
         &self,
         doc_id_or_path: &str,
     ) -> Result<Option<(quorum_types::IngestedParentDocument, u8)>, StorageError> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT file_path, document_id, blake3_hash, os_platform, format,
-                    title, author, created_unix_secs, modified_unix_secs, byte_len,
-                    access_tier, full_text, metadata_json
-             FROM parent_documents
-             WHERE file_path = ?1 OR document_id = ?1
-             ORDER BY modified_unix_secs DESC
-             LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![doc_id_or_path])?;
-        if let Some(row) = rows.next()? {
+        let row_to_parent = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(quorum_types::IngestedParentDocument, u8)> {
             let source_path: String = row.get(0)?;
             let doc_id: String = row.get(1)?;
             let blake3_hash: String = row.get(2)?;
@@ -402,7 +631,7 @@ impl DocumentCatalog {
             let metadata: HashMap<String, String> =
                 serde_json::from_str(&metadata_json).unwrap_or_default();
 
-            Ok(Some((
+            Ok((
                 quorum_types::IngestedParentDocument {
                     doc_id,
                     blake3_hash,
@@ -418,21 +647,76 @@ impl DocumentCatalog {
                     metadata,
                 },
                 access_tier,
-            )))
-        } else {
-            Ok(None)
+            ))
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT file_path, document_id, blake3_hash, os_platform, format,
+                    title, author, created_unix_secs, modified_unix_secs, byte_len,
+                    access_tier, full_text, metadata_json
+             FROM parent_documents
+             WHERE file_path = ?1 OR document_id = ?1
+             ORDER BY modified_unix_secs DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![doc_id_or_path])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(row_to_parent(row)?));
         }
+        drop(rows);
+        drop(stmt);
+
+        let target_key = crate::file_path_compare_key(doc_id_or_path);
+        if target_key.is_empty() {
+            return Ok(None);
+        }
+        let matched_file_path: Option<String> = {
+            let mut scan = conn.prepare(
+                "SELECT file_path FROM parent_documents ORDER BY modified_unix_secs DESC",
+            )?;
+            let paths = scan.query_map([], |r| r.get::<_, String>(0))?;
+            let mut found = None;
+            for p_res in paths {
+                let fp = p_res?;
+                if crate::file_path_compare_key(&fp) == target_key {
+                    found = Some(fp);
+                    break;
+                }
+            }
+            found
+        };
+
+        if let Some(exact_fp) = matched_file_path {
+            let mut by_fp = conn.prepare(
+                "SELECT file_path, document_id, blake3_hash, os_platform, format,
+                        title, author, created_unix_secs, modified_unix_secs, byte_len,
+                        access_tier, full_text, metadata_json
+                 FROM parent_documents
+                 WHERE file_path = ?1
+                 LIMIT 1",
+            )?;
+            let mut fp_rows = by_fp.query(params![exact_fp])?;
+            if let Some(row) = fp_rows.next()? {
+                return Ok(Some(row_to_parent(row)?));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Returns total number of full parent documents stored in SQLite.
     pub fn count_parent_documents(&self) -> Result<usize, StorageError> {
         let conn = self.conn.lock();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM parent_documents", [], |r| r.get(0))?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM parent_documents", [], |r| r.get(0))?;
         Ok(count.max(0) as usize)
     }
 
     /// Retrieves an entry by its exact file path.
-    pub fn get_by_file_path(&self, file_path: &str) -> Result<Option<DocumentCatalogEntry>, StorageError> {
+    pub fn get_by_file_path(
+        &self,
+        file_path: &str,
+    ) -> Result<Option<DocumentCatalogEntry>, StorageError> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT file_path, document_id, work_cluster_id, doc_title, doc_authors, doc_kind,
@@ -452,16 +736,17 @@ impl DocumentCatalog {
     /// Returns the total number of documents in the catalog.
     pub fn count_documents(&self) -> Result<usize, StorageError> {
         let conn = self.conn.lock();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM document_catalog",
-            [],
-            |r| r.get(0),
-        )?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM document_catalog", [], |r| r.get(0))?;
         Ok(count as usize)
     }
 
     /// Enumerates distinct matching documents across title, author, filename, or summary, collapsed by `work_cluster_id`.
-    pub fn catalog_find_documents(&self, query: &str, limit: usize) -> Result<Vec<DocumentCatalogEntry>, StorageError> {
+    pub fn catalog_find_documents(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<DocumentCatalogEntry>, StorageError> {
         self.catalog_find_documents_extended(query, None, 3, limit)
     }
 
@@ -487,7 +772,11 @@ impl DocumentCatalog {
             );
             if let Some(kinds) = doc_kinds {
                 if !kinds.is_empty() {
-                    let kind_list = kinds.iter().map(|k| format!("'{}'", k.replace('\'', "''"))).collect::<Vec<_>>().join(",");
+                    let kind_list = kinds
+                        .iter()
+                        .map(|k| format!("'{}'", k.replace('\'', "''")))
+                        .collect::<Vec<_>>()
+                        .join(",");
                     sql.push_str(&format!(" AND doc_kind IN ({})", kind_list));
                 }
             }
@@ -515,14 +804,23 @@ impl DocumentCatalog {
             );
             if let Some(kinds) = doc_kinds {
                 if !kinds.is_empty() {
-                    let kind_list = kinds.iter().map(|k| format!("'{}'", k.replace('\'', "''"))).collect::<Vec<_>>().join(",");
+                    let kind_list = kinds
+                        .iter()
+                        .map(|k| format!("'{}'", k.replace('\'', "''")))
+                        .collect::<Vec<_>>()
+                        .join(",");
                     sql.push_str(&format!(" AND c.doc_kind IN ({})", kind_list));
                 }
             }
-            sql.push_str(" GROUP BY c.work_cluster_id ORDER BY fts.rank ASC, c.mtime_secs DESC LIMIT ?3;");
+            sql.push_str(
+                " GROUP BY c.work_cluster_id ORDER BY fts.rank ASC, c.mtime_secs DESC LIMIT ?3;",
+            );
 
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![fts_query, max_tier, limit as i64], Self::row_to_entry)?;
+            let rows = stmt.query_map(
+                params![fts_query, max_tier, limit as i64],
+                Self::row_to_entry,
+            )?;
             let mut entries = Vec::new();
             for r in rows {
                 entries.push(r?);
@@ -551,14 +849,21 @@ impl DocumentCatalog {
         );
         if let Some(kinds) = doc_kinds {
             if !kinds.is_empty() {
-                let kind_list = kinds.iter().map(|k| format!("'{}'", k.replace('\'', "''"))).collect::<Vec<_>>().join(",");
+                let kind_list = kinds
+                    .iter()
+                    .map(|k| format!("'{}'", k.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(",");
                 sql.push_str(&format!(" AND doc_kind IN ({})", kind_list));
             }
         }
         sql.push_str(" GROUP BY work_cluster_id ORDER BY mtime_secs DESC LIMIT ?3;");
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![like_pattern, max_tier, limit as i64], Self::row_to_entry)?;
+        let rows = stmt.query_map(
+            params![like_pattern, max_tier, limit as i64],
+            Self::row_to_entry,
+        )?;
         let mut entries = Vec::new();
         for r in rows {
             entries.push(r?);
@@ -601,7 +906,10 @@ impl DocumentCatalog {
     }
 
     /// Hydrates the document catalog from an existing slice of chunks in a single batched transaction.
-    pub fn hydrate_from_chunks(&self, chunks: &[quorum_types::DocumentChunk]) -> Result<usize, StorageError> {
+    pub fn hydrate_from_chunks(
+        &self,
+        chunks: &[quorum_types::DocumentChunk],
+    ) -> Result<usize, StorageError> {
         if chunks.is_empty() {
             return Ok(0);
         }
@@ -612,7 +920,10 @@ impl DocumentCatalog {
         // Group chunks by file_path
         let mut doc_map: HashMap<String, Vec<&quorum_types::DocumentChunk>> = HashMap::new();
         for chunk in chunks {
-            doc_map.entry(chunk.file_path.clone()).or_default().push(chunk);
+            doc_map
+                .entry(chunk.file_path.clone())
+                .or_default()
+                .push(chunk);
         }
 
         let mut count = 0;
@@ -625,9 +936,21 @@ impl DocumentCatalog {
                 .unwrap_or(file_chunks[0]);
 
             let path_obj = Path::new(&file_path);
-            let file_name = path_obj.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
-            let file_ext = path_obj.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
-            let folder = path_obj.parent().and_then(|p| p.to_str()).unwrap_or("").to_string();
+            let file_name = path_obj
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
+            let file_ext = path_obj
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+            let folder = path_obj
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .to_string();
             let normalized_stem = derive_work_cluster_id(&file_name);
             let work_cluster_id = normalized_stem.clone();
 
@@ -684,7 +1007,10 @@ impl DocumentCatalog {
     }
 
     /// Hydrates the document catalog from the storage engine's stored Tantivy chunks if currently empty.
-    pub fn hydrate_document_catalog_if_needed(&self, storage: &crate::engine::StorageEngine) -> Result<usize, StorageError> {
+    pub fn hydrate_document_catalog_if_needed(
+        &self,
+        storage: &crate::engine::StorageEngine,
+    ) -> Result<usize, StorageError> {
         if self.count_documents()? > 0 {
             return Ok(0);
         }
@@ -741,10 +1067,16 @@ mod tests {
     #[test]
     fn test_derive_work_cluster_id_collapses_revisions() {
         assert_eq!(derive_work_cluster_id("RedactX_v3_final.pdf"), "redactx");
-        assert_eq!(derive_work_cluster_id("RedactX_v3_typesetting.pdf"), "redactx");
+        assert_eq!(
+            derive_work_cluster_id("RedactX_v3_typesetting.pdf"),
+            "redactx"
+        );
         assert_eq!(derive_work_cluster_id("ACDSO_v2_draft.pdf"), "acdso");
         assert_eq!(derive_work_cluster_id("paper_v1 (1).pdf"), "paper");
-        assert_eq!(derive_work_cluster_id("Femi_Oyesanya_CV_2026.pdf"), "femi oyesanya cv 2026");
+        assert_eq!(
+            derive_work_cluster_id("Femi_Oyesanya_CV_2026.pdf"),
+            "femi oyesanya cv 2026"
+        );
     }
 
     #[test]
@@ -821,7 +1153,12 @@ mod tests {
 
         // Find by author "Femi Oyesanya" -> collapses 2 revisions of RedactX into 1 work cluster
         let femi_docs = catalog.catalog_find_documents("Femi Oyesanya", 10).unwrap();
-        assert_eq!(femi_docs.len(), 1, "Expected 1 collapsed work cluster for RedactX, got: {:?}", femi_docs);
+        assert_eq!(
+            femi_docs.len(),
+            1,
+            "Expected 1 collapsed work cluster for RedactX, got: {:?}",
+            femi_docs
+        );
         assert_eq!(femi_docs[0].work_cluster_id, "redactx");
 
         // Find by topic "QuorumRAG"
@@ -830,12 +1167,22 @@ mod tests {
         assert_eq!(quorum_docs[0].work_cluster_id, "quorumrag arch");
 
         // Delete entry1
-        catalog.delete_by_file_path("D:/docs/RedactX_v1.pdf").unwrap();
+        catalog
+            .delete_by_file_path("D:/docs/RedactX_v1.pdf")
+            .unwrap();
         assert_eq!(catalog.count_documents().unwrap(), 2);
 
         let identities = catalog.list_all_file_identities().unwrap();
         assert_eq!(identities.len(), 2);
-        assert!(identities.iter().any(|id| id.file_path == "D:/docs/RedactX_v2_final.pdf" && id.size_bytes == 52000 && id.chunk_count == 6));
-        assert!(identities.iter().any(|id| id.file_path == "D:/docs/QuorumRAG_Arch.pdf" && id.size_bytes == 40000 && id.chunk_count == 4));
+        assert!(identities
+            .iter()
+            .any(|id| id.file_path == "D:/docs/RedactX_v2_final.pdf"
+                && id.size_bytes == 52000
+                && id.chunk_count == 6));
+        assert!(identities
+            .iter()
+            .any(|id| id.file_path == "D:/docs/QuorumRAG_Arch.pdf"
+                && id.size_bytes == 40000
+                && id.chunk_count == 4));
     }
 }

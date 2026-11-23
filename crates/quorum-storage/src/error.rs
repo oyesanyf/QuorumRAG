@@ -48,6 +48,9 @@ pub enum StorageError {
 
     #[error("Chunk not found: {0}")]
     NotFound(String),
+
+    #[error("AtlasKV error: {0}")]
+    AtlasKv(#[from] quorum_atlaskv::AtlasKvError),
 }
 
 impl From<serde_json::Error> for StorageError {

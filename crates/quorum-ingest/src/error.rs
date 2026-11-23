@@ -41,6 +41,12 @@ pub enum IngestError {
     #[error("Type error: {0}")]
     TypeError(#[from] quorum_types::TypeError),
 
+    #[error("Blocked by DLP policy at '{path}': {reason}")]
+    DlpBlocked {
+        path: PathBuf,
+        reason: String,
+    },
+
     #[error("Ingestion channel closed or consumer dropped")]
     ChannelClosed,
 

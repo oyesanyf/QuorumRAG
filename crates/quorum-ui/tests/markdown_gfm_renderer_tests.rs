@@ -70,6 +70,8 @@ fn test_gfm_markdown_css_rules_present_for_all_themes() {
         ".qr-md-table-wrap",
         ".qr-md-table",
         ".qr-md-table thead",
+        ".qr-md-table td:first-child",
+        ".qr-md-table td:nth-child(3)",
         ".qr-md-quote",
         ".qr-md-pre",
         ".qr-md-details",
@@ -83,4 +85,23 @@ fn test_gfm_markdown_css_rules_present_for_all_themes() {
             "styles.css must define {selector} for GFM markdown elements"
         );
     }
+
+    // Top nav must flex-wrap with min-height instead of rigid 56px height so dropdowns never overlap telemetry-bar
+    let top_nav_idx = css.find(".top-nav {").expect(".top-nav rule must exist");
+    let top_nav_block = &css[top_nav_idx..(top_nav_idx + 400).min(css.len())];
+    assert!(
+        top_nav_block.contains("min-height: 56px;") && top_nav_block.contains("flex-wrap: wrap;"),
+        ".top-nav must use min-height: 56px and flex-wrap: wrap to prevent header overlap"
+    );
+
+    let (js_bytes, _) = get_asset("app.js").expect("app.js must be embedded");
+    let js = String::from_utf8_lossy(&js_bytes);
+    assert!(
+        js.contains("✓ Complete — "),
+        "markTelemetryComplete must clear stale Synthesizing status to Complete"
+    );
+    assert!(
+        js.contains(r"\bHYPERLINK\s+"),
+        "renderMarkdownHtml must clean legacy saved HYPERLINK field codes on display"
+    );
 }

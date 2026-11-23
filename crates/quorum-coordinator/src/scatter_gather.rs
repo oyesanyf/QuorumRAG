@@ -585,34 +585,29 @@ impl ScatterGatherEngine {
         };
 
         // 2. Execute Local Storage Search concurrently while remote_handle runs on the Tokio pool.
-        // Local Artemis DFIR telemetry chunks are indexed at Tier3Restricted (3) so they never cross the P2P mesh,
-        // but local queries on this host may retrieve them when Artemis local collection is enabled or queried.
-        let local_access_tier = {
-            let ql = query_text.to_ascii_lowercase();
-            let is_forensic_q = crate::offline_engine::ForensicQueryIntent::detect(query_text).is_some()
-                || crate::offline_engine::ForensicQueryIntent::detect(effective_p2p_query).is_some()
-                || ql.contains("artemis")
-                || ql.contains("antivirus")
-                || ql.contains("defender")
-                || ql.contains("codeintegrity")
-                || ql.contains("eventlog")
-                || ql.contains("systemeventlog");
-            let s = controller.settings.read().unwrap_or_else(|e| e.into_inner());
-            if s.artemis.enabled && (s.artemis.local_collection_enabled || is_forensic_q) {
-                access_tier.max(quorum_types::AccessTier::Tier3Restricted.as_u8())
-            } else {
-                access_tier
-            }
+        // Local Artemis DFIR telemetry and local-only Cloud Drives are retrieved up to `local_access_tier`
+        // while outbound P2P `FederatedQueryRequest` signing and remote chunk clamping remain at `access_tier`.
+        let settings_snapshot = controller.get_settings();
+        let local_policy = crate::artemis_airgap::resolve_local_retrieval_policy(
+            &settings_snapshot,
+            access_tier,
+            &[query_text, effective_p2p_query],
+        );
+        let local_access_tier = local_policy.local_access_tier;
+        let local_candidate_limit = if !local_policy.allow_artemis_local && local_access_tier >= 3 {
+            candidate_limit.max(96)
+        } else {
+            candidate_limit
         };
 
         let (mut local_results, mut new_cached_vector) = if let Some(cached) = cached_vector {
             if !cached.is_empty() {
                 let text_hits = self
                     .local_storage
-                    .search_text(query_text, local_access_tier, candidate_limit)
+                    .search_text(query_text, local_access_tier, local_candidate_limit)
                     .await;
                 let mut rrf_map: std::collections::HashMap<
-                    String,
+                    (String, String),
                     (f32, quorum_types::DocumentChunk),
                 > = std::collections::HashMap::new();
 
@@ -622,7 +617,10 @@ impl ScatterGatherEngine {
                     }
                     let rrf = 1.0 / (60.0 + (i + 1) as f32);
                     let entry = rrf_map
-                        .entry(scored.chunk.chunk_id.clone())
+                        .entry((
+                            scored.chunk.chunk_id.clone(),
+                            scored.chunk.file_path.clone(),
+                        ))
                         .or_insert_with(|| (0.0, scored.chunk.clone()));
                     entry.0 += rrf;
                 }
@@ -633,27 +631,36 @@ impl ScatterGatherEngine {
                     }
                     let rrf = 1.0 / (60.0 + (i + 1) as f32);
                     let entry = rrf_map
-                        .entry(scored.chunk.chunk_id.clone())
+                        .entry((
+                            scored.chunk.chunk_id.clone(),
+                            scored.chunk.file_path.clone(),
+                        ))
                         .or_insert_with(|| (0.0, scored.chunk.clone()));
                     entry.0 += rrf;
                 }
 
                 let mut fused_local: Vec<ScoredChunk> = rrf_map
                     .into_iter()
-                    .map(|(_id, (score, chunk))| ScoredChunk::new(chunk, score, "local", false))
+                    .map(|(_key, (score, chunk))| ScoredChunk::new(chunk, score, "local", false))
                     .collect();
                 fused_local.sort_by(|a, b| {
                     b.score
                         .partial_cmp(&a.score)
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
+                        .then_with(|| a.chunk.file_path.cmp(&b.chunk.file_path))
                         .then_with(|| a.chunk.blake3_hash.cmp(&b.chunk.blake3_hash))
                 });
                 (fused_local, cached.to_vec())
             } else {
                 let results = if exclude_chunk_ids.is_empty() {
                     self.local_storage
-                        .search_hybrid(query_text, query_vec, local_access_tier, candidate_limit)
+                        .search_hybrid(
+                            query_text,
+                            query_vec,
+                            local_access_tier,
+                            local_candidate_limit,
+                        )
                         .await
                 } else {
                     self.local_storage
@@ -661,7 +668,7 @@ impl ScatterGatherEngine {
                             query_text,
                             query_vec,
                             local_access_tier,
-                            candidate_limit,
+                            local_candidate_limit,
                             exclude_chunk_ids,
                         )
                         .await
@@ -671,7 +678,12 @@ impl ScatterGatherEngine {
         } else {
             let results = if exclude_chunk_ids.is_empty() {
                 self.local_storage
-                    .search_hybrid(query_text, query_vec, local_access_tier, candidate_limit)
+                    .search_hybrid(
+                        query_text,
+                        query_vec,
+                        local_access_tier,
+                        local_candidate_limit,
+                    )
                     .await
             } else {
                 self.local_storage
@@ -679,7 +691,7 @@ impl ScatterGatherEngine {
                         query_text,
                         query_vec,
                         local_access_tier,
-                        candidate_limit,
+                        local_candidate_limit,
                         exclude_chunk_ids,
                     )
                         .await
@@ -687,16 +699,8 @@ impl ScatterGatherEngine {
             (results.clone(), results)
         };
 
-        if !crate::artemis_airgap::is_forensics_enabled() {
-            local_results.retain(|c| {
-                !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
-                    && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
-            });
-            new_cached_vector.retain(|c| {
-                !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
-                    && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
-            });
-        }
+        local_results.retain(|c| local_policy.permits_local_scored_chunk(c));
+        new_cached_vector.retain(|c| local_policy.permits_local_scored_chunk(c));
 
         let (remote_responses, mut diagnostics) = match remote_handle {
             Some(jh) => jh
@@ -1010,10 +1014,24 @@ impl ScatterGatherEngine {
             None
         };
 
+        let settings_snapshot = controller.get_settings();
+        let local_policy = crate::artemis_airgap::resolve_local_retrieval_policy(
+            &settings_snapshot,
+            access_tier,
+            &[query_text],
+        );
+        let local_limit = if !local_policy.allow_artemis_local && local_policy.local_access_tier >= 3
+        {
+            top_k.max(96)
+        } else {
+            top_k
+        };
         let mut results = self
             .local_storage
-            .search_text(query_text, access_tier, top_k)
+            .search_text(query_text, local_policy.local_access_tier, local_limit)
             .await;
+        results.retain(|c| local_policy.permits_local_scored_chunk(c));
+        results.truncate(top_k);
         let peer_responses_opt = match peer_handle {
             Some(jh) => jh.await.ok().flatten(),
             None => None,

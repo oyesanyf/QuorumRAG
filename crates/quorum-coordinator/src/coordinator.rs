@@ -75,38 +75,45 @@ impl QueryCoordinator {
     pub async fn query(&self, prompt: &str, top_k: usize) -> Result<QueryResult, CoordinatorError> {
         let start = std::time::Instant::now();
         let epoch = self.engine.local_storage.index_epoch();
-        let access_tier = self.config.default_peer_access_tier;
+        let peer_access_tier = self.config.default_peer_access_tier;
+        let settings = crate::dlp_mesh::global_mesh_dlp_controller().get_settings();
+        let policy = crate::artemis_airgap::resolve_local_retrieval_policy(
+            &settings,
+            peer_access_tier,
+            &[prompt],
+        );
 
         // Check QueryCache (bypass local-only cached entry when active P2P mesh peers are connected)
-        let p2p_active = crate::dlp_mesh::global_mesh_dlp_controller()
-            .settings
-            .read()
-            .map(|s| s.mesh.p2p_enabled)
-            .unwrap_or(true)
-            && self.engine.mesh_dispatcher.peer_count() > 0;
-        let forensics_enabled = crate::artemis_airgap::is_forensics_enabled();
-        let query_targets_forensics = crate::offline_engine::ForensicQueryIntent::detect(prompt).is_some()
-            || crate::artemis_airgap::contains_artemis_query(prompt);
+        let p2p_active = settings.mesh.p2p_enabled && self.engine.mesh_dispatcher.peer_count() > 0;
+        let query_targets_forensics = crate::artemis_airgap::is_forensic_query_text(prompt);
         if let Some(cached) = self.cache_manager.query_cache.get_with_mesh_requirement(
             prompt,
             SearchMode::Hybrid,
             SynthesisModelFamily::AutoFusion,
-            access_tier,
+            policy.local_access_tier,
             epoch,
             p2p_active,
         ) {
-            let cache_clean_for_forensics = if forensics_enabled {
+            let cache_clean_for_forensics = if policy.allow_artemis_local {
                 !cached
                     .synthesis_prompt
                     .contains("forensics subsystem is currently disabled")
+                    && cached
+                        .chunks
+                        .iter()
+                        .all(|c| policy.permits_local_scored_chunk(c))
             } else {
                 cached.chunks.iter().all(|c| {
-                    !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
-                        && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
-                }) && (!query_targets_forensics
-                    || cached
-                        .synthesis_prompt
-                        .contains("forensics subsystem is currently disabled"))
+                    !crate::artemis_airgap::is_artemis_dfir_chunk(&c.chunk)
+                        && policy.permits_local_scored_chunk(c)
+                }) && !cached
+                    .synthesis_prompt
+                    .to_ascii_lowercase()
+                    .contains("artemis://")
+                    && (!query_targets_forensics
+                        || cached
+                            .synthesis_prompt
+                            .contains("forensics subsystem is currently disabled"))
             };
             if cache_clean_for_forensics {
                 let execution_time_ms = start.elapsed().as_millis() as u64;
@@ -137,38 +144,27 @@ impl QueryCoordinator {
             .execute_query(
                 prompt,
                 &vector,
-                access_tier,
+                peer_access_tier,
                 top_k,
             )
             .await;
 
-        if !forensics_enabled {
-            chunks.retain(|c| {
-                !crate::artemis_airgap::is_artemis_uri(&c.chunk.file_path)
-                    && !c.chunk.metadata_json.contains("\"artemis_dfir\":true")
-            });
-        }
+        chunks.retain(|c| policy.permits_local_scored_chunk(c));
 
         let mut synthesis_prompt =
             DeterministicOfflineSynthesisEngine::build_synthesis_prompt(prompt, &chunks);
-        let atlaskv_settings = crate::dlp_mesh::global_mesh_dlp_controller()
-            .settings
-            .read()
-            .map(|s| s.atlaskv.clone())
-            .unwrap_or_default();
+        let atlaskv_settings = settings.atlaskv.clone();
         if atlaskv_settings.enabled {
             if let Some(store) = self.engine.local_storage.atlaskv() {
                 let qv = vector.clone();
-                let max_tier = access_tier;
+                let max_tier = policy.local_access_tier;
                 let leaf_k = atlaskv_settings.leaf_top_k_kb.max(1);
                 if let Ok(Ok((mut triples, _trace))) = tokio::task::spawn_blocking(move || {
                     store.hikvp_search(&qv, max_tier, leaf_k, None)
                 })
                 .await
                 {
-                    if !forensics_enabled {
-                        triples.retain(|t| !crate::artemis_airgap::is_artemis_uri(&t.triple.file_path));
-                    }
+                    triples.retain(|t| policy.permits_local_triple(&t.triple));
                     if !triples.is_empty() {
                         let kg_ctx = quorum_atlaskv::format_grounded_kg_context(&triples);
                         if !kg_ctx.trim().is_empty() {
@@ -179,7 +175,7 @@ impl QueryCoordinator {
                 }
             }
         }
-        if !forensics_enabled && query_targets_forensics {
+        if !policy.allow_artemis_local && query_targets_forensics {
             synthesis_prompt.push_str("\n\n> **Notice**: The forensics subsystem is currently disabled. Forensic sources and `artemis://` telemetry were skipped during retrieval.");
         }
         let sources_cited: Vec<Citation> = chunks.iter().map(|c| c.to_citation()).collect();
@@ -190,7 +186,7 @@ impl QueryCoordinator {
             prompt,
             SearchMode::Hybrid,
             SynthesisModelFamily::AutoFusion,
-            access_tier,
+            policy.local_access_tier,
             epoch,
             chunks.clone(),
             synthesis_prompt.clone(),
@@ -251,13 +247,9 @@ impl QueryCoordinator {
         let epoch = self.engine.local_storage.index_epoch();
         let hits_before = self.cache_manager.telemetry(false).hits;
 
-        let effective_tier = if crate::artemis_airgap::is_forensics_enabled()
-            && crate::offline_engine::ForensicQueryIntent::detect(prompt).is_some()
-        {
-            3
-        } else {
-            self.config.default_peer_access_tier
-        };
+        // Keep outbound peer_access_tier at default_peer_access_tier; LocalRetrievalPolicy handles
+        // Artemis DFIR and enabled Cloud Drives local elevation without elevating P2P signing tier.
+        let effective_tier = self.config.default_peer_access_tier;
 
         let final_state = self
             .agentic_runner

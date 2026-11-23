@@ -759,7 +759,7 @@ impl RlmOrchestrator {
             {
                 continue;
             }
-            if scored.chunk.file_path.to_ascii_lowercase().starts_with("artemis://") {
+            if crate::artemis_airgap::is_artemis_dfir_chunk(&scored.chunk) {
                 continue;
             }
             let head = scored.chunk.text_content.trim_start();
@@ -1359,7 +1359,7 @@ impl RlmOrchestrator {
             {
                 continue;
             }
-            if scored.chunk.file_path.to_ascii_lowercase().starts_with("artemis://") {
+            if crate::artemis_airgap::is_artemis_dfir_chunk(&scored.chunk) {
                 continue;
             }
             let head = scored.chunk.text_content.trim_start();

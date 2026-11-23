@@ -539,6 +539,54 @@ pub struct PersistedDaemonSettings {
     pub artemis: crate::artemis_airgap::ArtemisDfirSettings,
     #[serde(default)]
     pub atlaskv: quorum_atlaskv::AtlasKvSettings,
+    #[serde(default)]
+    pub cloud_drives: quorum_types::CloudDrivesSettings,
+}
+
+fn sanitize_cloud_drives_settings(cfg: &mut quorum_types::CloudDrivesSettings) -> bool {
+    let mut dirty = false;
+    if cfg.placeholder_policy().is_err() {
+        cfg.placeholder_mode = quorum_types::CloudPlaceholderMode::LocallySyncedOnly;
+        cfg.hydration_max_file_size_mb = quorum_types::DEFAULT_HYDRATION_MAX_FILE_SIZE_MB;
+        dirty = true;
+    }
+
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut sanitized_drives = Vec::with_capacity(cfg.drives.len());
+    for mut entry in std::mem::take(&mut cfg.drives) {
+        if entry.id.trim().is_empty() || entry.label.trim().is_empty() {
+            dirty = true;
+            continue;
+        }
+        let id_key = entry.id.trim().to_ascii_lowercase();
+        if !seen_ids.insert(id_key) {
+            dirty = true;
+            continue;
+        }
+        if quorum_types::AccessTier::from_u8(entry.access_tier).is_err() {
+            entry.enabled = false;
+            entry.access_tier = quorum_types::AccessTier::Tier3Restricted.as_u8();
+            dirty = true;
+        }
+        if let Some(ref root) = entry.root_path {
+            if quorum_types::validate_cloud_drive_path(root).is_err() {
+                entry.root_path = None;
+                entry.enabled = false;
+                dirty = true;
+            }
+        }
+        let before_len = entry.custom_paths.len();
+        entry
+            .custom_paths
+            .retain(|p| quorum_types::validate_cloud_drive_path(p).is_ok());
+        if entry.custom_paths.len() != before_len {
+            entry.enabled = false;
+            dirty = true;
+        }
+        sanitized_drives.push(entry);
+    }
+    cfg.drives = sanitized_drives;
+    dirty
 }
 
 /// Live runtime telemetry for the DLP & Mesh Governance controller.
@@ -606,11 +654,12 @@ impl OsoosiMeshDlpController {
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 if let Ok(mut parsed) = serde_json::from_str::<PersistedDaemonSettings>(&raw) {
                     let cleaned = parsed.ui.sanitize_mock_artifacts();
+                    let cleaned_cloud = sanitize_cloud_drives_settings(&mut parsed.cloud_drives);
                     {
                         let mut guard = self.settings.write().unwrap_or_else(|e| e.into_inner());
                         *guard = parsed;
                     }
-                    if cleaned {
+                    if cleaned || cleaned_cloud {
                         self.save_to_disk();
                     }
                     let _ = self.auto_provision_presidio_and_gliner(data_dir);
@@ -787,6 +836,125 @@ impl OsoosiMeshDlpController {
         *guard = new_settings;
     }
 
+    /// Returns a clone of the current Cloud Drives configuration.
+    pub fn get_cloud_drives_settings(&self) -> quorum_types::CloudDrivesSettings {
+        self.settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .cloud_drives
+            .clone()
+    }
+
+    /// Validates `new_settings` fail-closed (tiers, paths, hydration cap, duplicate ids),
+    /// updates persisted settings, and writes `settings.json` to disk.
+    pub fn update_cloud_drives_settings(
+        &self,
+        new_settings: quorum_types::CloudDrivesSettings,
+    ) -> Result<(), quorum_types::TypeError> {
+        new_settings.validate()?;
+        let mut seen_ids = std::collections::HashSet::with_capacity(new_settings.drives.len());
+        for d in &new_settings.drives {
+            let key = d.id.trim().to_ascii_lowercase();
+            if !seen_ids.insert(key) {
+                return Err(quorum_types::TypeError::InvalidCloudDriveConfig(format!(
+                    "Duplicate cloud drive id '{}'",
+                    d.id
+                )));
+            }
+        }
+        {
+            let mut guard = self.settings.write().unwrap_or_else(|e| e.into_inner());
+            guard.cloud_drives = new_settings;
+        }
+        self.save_to_disk();
+        Ok(())
+    }
+
+    /// Returns the maximum valid `access_tier` across enabled cloud drives (failing closed to `3`
+    /// if an enabled entry carries an invalid tier, or `0` if no cloud drives are enabled).
+    pub fn max_enabled_cloud_drive_local_tier(&self) -> u8 {
+        let guard = self.settings.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .cloud_drives
+            .drives
+            .iter()
+            .filter(|d| d.enabled)
+            .map(|d| {
+                quorum_types::AccessTier::from_u8(d.access_tier)
+                    .map(|t| t.as_u8())
+                    .unwrap_or(quorum_types::AccessTier::Tier3Restricted.as_u8())
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Returns normalized `(prefix_path, access_tier)` rules for all configured cloud drives'
+    /// `root_path` and `custom_paths`, keeping disabled cloud roots mapped to Tier 3 (`Tier3Restricted`)
+    /// so no concurrent write can ever fall back to Tier 0 (failing closed to Tier 3 on invalid tiers).
+    pub fn cloud_drive_access_tier_rules(&self) -> Vec<(PathBuf, u8)> {
+        let guard = self.settings.read().unwrap_or_else(|e| e.into_inner());
+        let mut rules = Vec::new();
+        let tier3 = quorum_types::AccessTier::Tier3Restricted.as_u8();
+        for drive in guard.cloud_drives.drives.iter().filter(|d| d.enabled) {
+            let tier = quorum_types::AccessTier::from_u8(drive.access_tier)
+                .map(|t| t.as_u8())
+                .unwrap_or(tier3);
+            for raw_path in drive.root_path.iter().chain(drive.custom_paths.iter()) {
+                if let Ok(norm) = quorum_types::normalize_prefix_for_match(raw_path) {
+                    rules.push((PathBuf::from(norm), tier));
+                }
+            }
+        }
+        for drive in guard.cloud_drives.drives.iter().filter(|d| !d.enabled) {
+            for raw_path in drive.root_path.iter().chain(drive.custom_paths.iter()) {
+                if let Ok(norm) = quorum_types::normalize_prefix_for_match(raw_path) {
+                    rules.push((PathBuf::from(norm), tier3));
+                }
+            }
+        }
+        rules
+    }
+
+    /// Returns true if `file_path` falls under any configured cloud drive root (enabled or
+    /// disabled) or matches a standard OS cloud-sync root marker.
+    pub fn is_cloud_drive_path(&self, file_path: &str) -> bool {
+        self.effective_cloud_drive_tier_for_path(file_path).is_some()
+    }
+
+    /// Returns `Some(effective_tier)` if `file_path` falls inside a configured cloud drive
+    /// (enabled or disabled; failing closed to `3` if invalid tier or disabled) or a standard OS cloud root
+    /// marker (`Some(3)`), or `None` for non-cloud paths.
+    pub fn effective_cloud_drive_tier_for_path(&self, file_path: &str) -> Option<u8> {
+        let norm_file = Self::normalize_folder_path(file_path)?;
+        let guard = self.settings.read().unwrap_or_else(|e| e.into_inner());
+        let tier3 = quorum_types::AccessTier::Tier3Restricted.as_u8();
+        let mut max_tier: Option<u8> = None;
+        for drive in &guard.cloud_drives.drives {
+            let tier = if !drive.enabled {
+                tier3
+            } else {
+                quorum_types::AccessTier::from_u8(drive.access_tier)
+                    .map(|t| t.as_u8())
+                    .unwrap_or(tier3)
+            };
+            for raw_root in drive.root_path.iter().chain(drive.custom_paths.iter()) {
+                if let Some(norm_root) = Self::normalize_folder_path(raw_root) {
+                    if Self::normalized_path_within(&norm_file, &norm_root) {
+                        max_tier = Some(max_tier.unwrap_or(0).max(tier));
+                    }
+                }
+            }
+        }
+        if max_tier.is_some() {
+            return max_tier;
+        }
+        if Self::is_standard_cloud_root_marker(&norm_file) {
+            Some(tier3)
+        } else {
+            None
+        }
+    }
+
     /// Computes OshoosiClaw-compatible keyed BLAKE3/MAC generation epoch signature over `(peer_id, epoch, role)`.
     pub fn sign_epoch_token(&self, peer_id: &str, epoch: u64, role: &str) -> String {
         let canonical = format!(
@@ -833,40 +1001,224 @@ impl OsoosiMeshDlpController {
         next
     }
 
-    /// Normalizes a filesystem path for safe, case-insensitive prefix comparison on Windows/Unix.
+    /// Normalizes a filesystem path for safe, case-insensitive, fail-closed prefix comparison.
     pub fn normalize_folder_path(raw: &str) -> Option<String> {
-        let mut trimmed = raw.trim().replace('/', "\\");
-        if let Some(rest) = trimmed.strip_prefix("\\\\?\\") {
-            if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("unc\\") {
-                return None;
+        fn has_forbidden_patterns(s: &str) -> bool {
+            if s.len() > 4096 || s.trim().is_empty() || s != s.trim() {
+                return true;
             }
-            trimmed = rest.to_string();
+            if s.chars().any(|c| c == '\0' || c.is_control()) {
+                return true;
+            }
+            if s.chars().any(|c| {
+                matches!(
+                    c,
+                    '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+                )
+            }) {
+                return true;
+            }
+            let lower = s.to_ascii_lowercase();
+            if lower.contains("%2e")
+                || lower.contains("%2f")
+                || lower.contains("%5c")
+                || lower.contains("%00")
+                || lower.contains("%25")
+            {
+                return true;
+            }
+            if s.contains("..") {
+                return true;
+            }
+            if lower.starts_with(r"\\?\unc\") || lower.starts_with("//?/unc/") {
+                return true;
+            }
+            let without_verbatim = if let Some(rest) = s.strip_prefix(r"\\?\") {
+                let b = rest.as_bytes();
+                let is_win = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+                if !is_win {
+                    return true;
+                }
+                rest
+            } else {
+                s
+            };
+            if without_verbatim.starts_with(r"\\") || without_verbatim.starts_with("//") {
+                return true;
+            }
+            for seg in without_verbatim.split(['/', '\\']) {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                if seg != seg.trim() || seg.ends_with('.') || seg.ends_with(' ') {
+                    return true;
+                }
+            }
+            let bytes = without_verbatim.as_bytes();
+            let is_win_drive = bytes.len() >= 2
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/');
+            for (idx, &b) in bytes.iter().enumerate() {
+                if b == b':' && !(idx == 1 && is_win_drive) {
+                    return true;
+                }
+            }
+            false
         }
-        if trimmed.is_empty()
-            || trimmed.contains("..")
-            || trimmed.contains("%2e")
-            || trimmed.contains("%2E")
-            || trimmed.starts_with("\\\\")
-        {
+
+        if has_forbidden_patterns(raw) {
             return None;
         }
-        let path = Path::new(&trimmed);
-        for comp in path.components() {
+
+        let decoded = crate::artemis_airgap::percent_decode_ascii_lossy(raw);
+        if decoded != raw && has_forbidden_patterns(&decoded) {
+            return None;
+        }
+
+        let without_verbatim = decoded.strip_prefix(r"\\?\").unwrap_or(&decoded);
+        for comp in Path::new(without_verbatim).components() {
             if matches!(comp, Component::ParentDir) {
                 return None;
             }
         }
-        let clean = trimmed.trim_end_matches('\\').to_ascii_lowercase();
-        if clean.is_empty() {
-            None
+
+        let replaced = without_verbatim.replace('/', "\\");
+        let bytes = replaced.as_bytes();
+        let is_win_drive = bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/');
+
+        if is_win_drive {
+            let drive = (bytes[0] as char).to_ascii_lowercase();
+            let rest = &replaced[2..];
+            let mut parts: Vec<String> = Vec::new();
+            for seg in rest.split('\\') {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                parts.push(seg.to_ascii_lowercase());
+            }
+            if parts.is_empty() {
+                Some(format!("{drive}:"))
+            } else {
+                Some(format!("{drive}:\\{}", parts.join("\\")))
+            }
+        } else if replaced.starts_with('\\') {
+            let mut parts: Vec<String> = Vec::new();
+            for seg in replaced.split('\\') {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                parts.push(seg.to_string());
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(format!("\\{}", parts.join("\\")))
+            }
         } else {
-            Some(clean)
+            None
         }
     }
 
-    /// Checks whether a local file path is inside one of the user's explicitly enabled `shared_folders`.
-    /// Returns the matching `SharedFolderEntry` if sharing is permitted, or `None` if local-only.
+    #[inline]
+    fn normalized_path_within(norm_candidate: &str, norm_root: &str) -> bool {
+        norm_candidate == norm_root || norm_candidate.starts_with(&format!("{}\\", norm_root))
+    }
+
+    /// Returns true if any segment of a normalized path matches standard sync-root
+    /// markers for Google Drive, OneDrive, Dropbox, iCloud Drive, Box, Nextcloud, Proton Drive,
+    /// or pCloud across Windows, macOS, and Linux.
+    pub fn is_standard_cloud_root_marker(norm_path: &str) -> bool {
+        let lower_path = norm_path.to_ascii_lowercase();
+        let segments: Vec<&str> = lower_path.split(['\\', '/']).collect();
+        for (idx, &seg) in segments.iter().enumerate() {
+            if seg.is_empty() {
+                continue;
+            }
+            let prev = idx.checked_sub(1).and_then(|i| segments.get(i).copied());
+            let prev2 = idx.checked_sub(2).and_then(|i| segments.get(i).copied());
+
+            // Google Drive
+            if seg == "google drive"
+                || seg == "googledrive"
+                || seg == "google-drive"
+                || seg.starts_with("googledrive-")
+                || seg == "my drive"
+                || seg == "shared drives"
+            {
+                return true;
+            }
+            // Microsoft OneDrive (Personal & Business)
+            if seg == "onedrive" || seg.starts_with("onedrive -") || seg.starts_with("onedrive-") {
+                return true;
+            }
+            // Dropbox (Personal & Org)
+            if seg == "dropbox" || seg.starts_with("dropbox (") || seg.starts_with("dropbox-") {
+                return true;
+            }
+            // iCloud Drive
+            if seg == "iclouddrive"
+                || seg == "icloud drive"
+                || seg.starts_with("iclouddrive")
+                || seg == "com~apple~clouddocs"
+            {
+                return true;
+            }
+            // macOS CloudStorage container
+            if seg == "cloudstorage" && prev == Some("library") {
+                return true;
+            }
+            // Box
+            if seg == "box sync"
+                || seg == "box-box"
+                || ((seg == "box" || seg.starts_with("box-"))
+                    && (prev == Some("cloudstorage")
+                        || matches!(prev2, Some("users") | Some("home"))
+                        || prev.is_some_and(|p| p.len() == 2 && p.ends_with(':'))))
+            {
+                return true;
+            }
+            // Nextcloud
+            if seg == "nextcloud" || seg.starts_with("nextcloud") {
+                return true;
+            }
+            // Proton Drive
+            if seg == "proton drive"
+                || seg == "protondrive"
+                || seg.starts_with("protondrive")
+                || seg.starts_with("proton drive")
+            {
+                return true;
+            }
+            // pCloud
+            if seg == "pcloud drive"
+                || seg == "pclouddrive"
+                || seg == "pcloud"
+                || seg.starts_with("pcloud")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Checks whether a local file path is permitted for P2P mesh sharing, failing closed on
+    /// `artemis://`, malformed paths, and all Cloud Drives (unless explicitly opted into
+    /// `mesh.shared_folders` inside the cloud root with effective `access_tier < 3`).
     pub fn check_file_shared_with_mesh(&self, file_path: &str) -> Option<SharedFolderEntry> {
+        self.check_file_shared_with_mesh_with_hint(file_path, false)
+    }
+
+    /// Variant of `check_file_shared_with_mesh` allowing callers that inspected chunk metadata
+    /// (e.g. `"cloud_drive"` tag) to enforce strict cloud-drive isolation even for custom paths.
+    pub fn check_file_shared_with_mesh_with_hint(
+        &self,
+        file_path: &str,
+        force_cloud_drive: bool,
+    ) -> Option<SharedFolderEntry> {
         // Immediate fail-closed airgap rejection:
         if crate::artemis_airgap::is_artemis_uri(file_path) {
             return None;
@@ -877,16 +1229,90 @@ impl OsoosiMeshDlpController {
         }
         let norm_file = Self::normalize_folder_path(file_path)?;
 
+        let tier3 = quorum_types::AccessTier::Tier3Restricted.as_u8();
+        let mut matched_cloud_roots: Vec<String> = Vec::new();
+        let mut configured_drive_max_tier: Option<u8> = None;
+        let mut matched_disabled_drive = false;
+        for drive in &guard.cloud_drives.drives {
+            let drive_tier = if !drive.enabled {
+                tier3
+            } else {
+                quorum_types::AccessTier::from_u8(drive.access_tier)
+                    .map(|t| t.as_u8())
+                    .unwrap_or(tier3)
+            };
+            for raw_root in drive.root_path.iter().chain(drive.custom_paths.iter()) {
+                if let Some(norm_root) = Self::normalize_folder_path(raw_root) {
+                    if Self::normalized_path_within(&norm_file, &norm_root) {
+                        if !drive.enabled {
+                            matched_disabled_drive = true;
+                        }
+                        configured_drive_max_tier =
+                            Some(configured_drive_max_tier.unwrap_or(0).max(drive_tier));
+                        matched_cloud_roots.push(norm_root);
+                    }
+                }
+            }
+        }
+        if matched_disabled_drive {
+            return None;
+        }
+
+        let is_cloud_drive = force_cloud_drive
+            || configured_drive_max_tier.is_some()
+            || Self::is_standard_cloud_root_marker(&norm_file);
+
+        // Fail closed: any file residing in a cloud drive (standard marker or cloud metadata)
+        // that does NOT match an explicitly enabled `CloudDriveConfigEntry` with tier < 3
+        // must NEVER be shared over the mesh, even if added to `mesh.shared_folders` before
+        // discovery reconciliation ran.
+        if is_cloud_drive
+            && configured_drive_max_tier
+                .map(|t| t >= tier3)
+                .unwrap_or(true)
+        {
+            return None;
+        }
+
         for folder in &guard.mesh.shared_folders {
             if !folder.enabled {
                 continue;
             }
+            if folder.path.trim() == "*" {
+                continue;
+            }
             if let Some(norm_folder) = Self::normalize_folder_path(&folder.path) {
-                if norm_file == norm_folder || norm_file.starts_with(&format!("{}\\", norm_folder))
-                {
-                    return Some(folder.clone());
+                if Self::normalized_path_within(&norm_file, &norm_folder) {
+                    if is_cloud_drive {
+                        // Prevent parent-folder share leakage (e.g. sharing C:\Users\Alice must
+                        // NEVER expose C:\Users\Alice\OneDrive unless the shared folder itself is
+                        // at or inside the cloud drive root).
+                        let folder_is_at_or_inside_cloud =
+                            Self::is_standard_cloud_root_marker(&norm_folder)
+                                || matched_cloud_roots.iter().any(|r| {
+                                    Self::normalized_path_within(&norm_folder, r)
+                                });
+                        if !folder_is_at_or_inside_cloud {
+                            continue;
+                        }
+                    }
+
+                    let effective_tier = folder
+                        .access_tier
+                        .max(configured_drive_max_tier.unwrap_or(0));
+                    if effective_tier >= quorum_types::AccessTier::Tier3Restricted.as_u8() {
+                        continue;
+                    }
+
+                    let mut effective_entry = folder.clone();
+                    effective_entry.access_tier = effective_tier;
+                    return Some(effective_entry);
                 }
             }
+        }
+
+        if is_cloud_drive {
+            return None;
         }
 
         if !guard.mesh.require_explicit_folder_share {
@@ -905,7 +1331,7 @@ impl OsoosiMeshDlpController {
 
     /// Filters and scrubs/blocks candidate chunks before returning them to a remote Mesh peer.
     /// Enforces BOTH:
-    /// 1. User Shared Folders allowlist (`shared_folders`)
+    /// 1. User Shared Folders allowlist (`shared_folders`) & Cloud Drive isolation
     /// 2. HIPAA PHI / PII Data Loss Prevention (`Redact` or `Block`)
     pub fn filter_and_enforce_outbound_mesh_chunks(
         &self,
@@ -922,7 +1348,17 @@ impl OsoosiMeshDlpController {
             }
 
             let shared_entry = match self.check_file_shared_with_mesh(&chunk.file_path) {
-                Some(entry) => entry,
+                Some(entry)
+                    if entry.access_tier
+                        < quorum_types::AccessTier::Tier3Restricted.as_u8() =>
+                {
+                    entry
+                }
+                Some(_) => {
+                    let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
+                    stats.total_blocked_chunks += 1;
+                    continue;
+                }
                 None => {
                     let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
                     stats.total_blocked_unshared_folder_chunks += 1;
@@ -1278,7 +1714,16 @@ impl OsoosiMeshDlpController {
                 text,
                 &mut spans,
                 &mut categories,
-                r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b|\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b|\bsk-(?:proj-|live-)?[A-Za-z0-9_\-]{16,}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----",
+                r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----|-----BEGIN [A-Z ]*PRIVATE KEY-----",
+                "CROWN_JEWEL_SECRET",
+                "[REDACTED:CROWN_JEWEL_SECRET]",
+                0.99,
+            );
+            add_matches(
+                text,
+                &mut spans,
+                &mut categories,
+                r"(?i)\bbearer\s+[A-Za-z0-9_\-\.\+/~][A-Za-z0-9_\-\.\+/~=]{15,}|(?i)\b(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|rediss?|mssql|amqp|couchdb)://[^:\s]*:[^@\s]+@[^\s]+|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b|\bsk-(?:ant-|proj-|live-)?[A-Za-z0-9_\-]{16,}\b|\bxox[baprs]-[0-9a-zA-Z-]{10,}\b|\bAIza[0-9A-Za-z\-_]{35,}\b",
                 "CROWN_JEWEL_SECRET",
                 "[REDACTED:CROWN_JEWEL_SECRET]",
                 0.99,
@@ -1502,6 +1947,40 @@ impl OsoosiMeshDlpController {
             alt = !alt;
         }
         sum % 10 == 0
+    }
+}
+
+impl quorum_types::DlpContentGate for OsoosiMeshDlpController {
+    fn inspect_ingest_text(
+        &self,
+        file_path: &str,
+        text: &str,
+        access_tier: u8,
+    ) -> Result<String, String> {
+        quorum_types::AccessTier::from_u8(access_tier)
+            .map_err(|e| format!("Invalid access tier {access_tier}: {e}"))?;
+        let res = self.inspect_and_enforce_text(
+            text,
+            file_path,
+            "local_ingest",
+            "LocalIngest",
+            None,
+            true,
+        );
+        if res.allowed_to_share {
+            Ok(res.scrubbed_text)
+        } else {
+            Err(format!(
+                "DLP blocked ingest for '{}' (tier {}): {}",
+                file_path,
+                access_tier,
+                if res.detected_categories.is_empty() {
+                    "policy_block".to_string()
+                } else {
+                    res.detected_categories.join(", ")
+                }
+            ))
+        }
     }
 }
 

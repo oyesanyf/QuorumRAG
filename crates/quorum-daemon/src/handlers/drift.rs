@@ -23,13 +23,19 @@ pub async fn fix_drift_handler(
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<DriftFixRequest>,
 ) -> impl IntoResponse {
+    state.sync_drift_healer_watch_paths().await;
+
     let mut targets = Vec::new();
     if let Some(ref list) = payload.target_drifts {
         for item in list {
             match item.to_lowercase().as_str() {
                 "merkle_state" | "merkle" | "fs" => targets.push(DriftType::MerkleState),
-                "hybrid_index_desync" | "hybrid" | "desync" => targets.push(DriftType::HybridIndexDesync),
-                "vector_contract" | "contract" | "vector" => targets.push(DriftType::VectorContract),
+                "hybrid_index_desync" | "hybrid" | "desync" => {
+                    targets.push(DriftType::HybridIndexDesync)
+                }
+                "vector_contract" | "contract" | "vector" => {
+                    targets.push(DriftType::VectorContract)
+                }
                 "acl_policy" | "acl" => targets.push(DriftType::AclPolicy),
                 "storage_compaction" | "compaction" => targets.push(DriftType::StorageCompaction),
                 _ => {}
@@ -37,10 +43,11 @@ pub async fn fix_drift_handler(
         }
     }
 
+    let access_tier_rules = state.drift_healer.config_snapshot().await.access_tier_rules;
     let options = DriftFixOptions {
         target_drifts: targets,
         dry_run: payload.dry_run.unwrap_or(false),
-        access_tier_rules: state.ingest_config.access_tier_rules.clone(),
+        access_tier_rules,
     };
 
     info!(
@@ -51,6 +58,14 @@ pub async fn fix_drift_handler(
 
     match state.drift_healer.fix_all_drifts(options).await {
         Ok(report) => Json(report).into_response(),
+        Err(quorum_ingest::IngestError::Cancelled) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "cancelled",
+                "message": "Drift remediation cancelled due to concurrent cloud-drive disable or purge"
+            })),
+        )
+            .into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -63,17 +78,26 @@ pub async fn fix_drift_handler(
 }
 
 /// Retrieve current drift status (runs a fast dry-run inspection): `GET /api/drift/status`.
-pub async fn drift_status_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+pub async fn drift_status_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    state.sync_drift_healer_watch_paths().await;
+
+    let access_tier_rules = state.drift_healer.config_snapshot().await.access_tier_rules;
     let options = DriftFixOptions {
         target_drifts: Vec::new(), // Check all 5
         dry_run: true,             // Do not mutate database
-        access_tier_rules: state.ingest_config.access_tier_rules.clone(),
+        access_tier_rules,
     };
 
     match state.drift_healer.fix_all_drifts(options).await {
         Ok(report) => Json(report).into_response(),
+        Err(quorum_ingest::IngestError::Cancelled) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "cancelled",
+                "message": "Drift inspection cancelled due to concurrent cloud-drive disable or purge"
+            })),
+        )
+            .into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({

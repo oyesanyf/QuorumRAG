@@ -155,10 +155,12 @@ pub struct QuarantinedPeerDto {
 }
 
 /// Thread-safe in-memory store for pending joins
-static PENDING_JOINS: LazyLock<RwLock<Vec<PendingJoinDto>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+static PENDING_JOINS: LazyLock<RwLock<Vec<PendingJoinDto>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Thread-safe in-memory metadata for quarantined peers
-static QUARANTINE_METADATA: LazyLock<RwLock<HashMap<String, QuarantinedPeerDto>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static QUARANTINE_METADATA: LazyLock<RwLock<HashMap<String, QuarantinedPeerDto>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// 1. GET /api/mesh/tpm/status
 pub async fn get_tpm_status_handler() -> impl IntoResponse {
@@ -196,9 +198,7 @@ pub async fn get_tpm_status_handler() -> impl IntoResponse {
 }
 
 /// 2. GET /api/mesh/topology (and aliases /api/topology, /api/peers)
-pub async fn get_mesh_topology_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+pub async fn get_mesh_topology_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let controller = global_mesh_dlp_controller();
     let mesh_settings = controller
         .settings
@@ -286,7 +286,11 @@ pub async fn get_mesh_topology_handler(
         let tier_val = authorized_tier.as_u8();
 
         let (att_state, rot_b, is_hw) = if tier_val >= 2 {
-            ("TPM 2.0 Hardware RoT Verified", "TPM 2.0 Hardware RoT Verified", true)
+            (
+                "TPM 2.0 Hardware RoT Verified",
+                "TPM 2.0 Hardware RoT Verified",
+                true,
+            )
         } else if tier_val == 1 {
             ("Simulated TPM Tier 1", "Simulated TPM Tier 1", false)
         } else {
@@ -550,10 +554,8 @@ pub async fn allow_pending_join_handler(
 
         let now = chrono::Utc::now();
         let expires = now + chrono::Duration::hours(24);
-        let vendor = quorum_coordinator::TpmOemVendor::from_manufacturer_id_or_str(
-            0,
-            &approved.tpm_badge,
-        );
+        let vendor =
+            quorum_coordinator::TpmOemVendor::from_manufacturer_id_or_str(0, &approved.tpm_badge);
         acl_guard.record_peer_attestation(quorum_coordinator::PeerAttestationRecord {
             peer_id: approved.peer_id.clone(),
             pubkey: None,
@@ -602,9 +604,7 @@ pub async fn allow_pending_join_handler(
     }
 }
 
-pub async fn deny_pending_join_handler(
-    Path(peer_id): Path<String>,
-) -> impl IntoResponse {
+pub async fn deny_pending_join_handler(Path(peer_id): Path<String>) -> impl IntoResponse {
     let mut guard = PENDING_JOINS.write().unwrap_or_else(|e| e.into_inner());
     let initial_len = guard.len();
     guard.retain(|p| !p.peer_id.eq_ignore_ascii_case(&peer_id));
@@ -638,7 +638,9 @@ pub async fn get_quarantined_peers_handler() -> impl IntoResponse {
         .unwrap_or_else(|e| e.into_inner())
         .mesh
         .clone();
-    let meta_guard = QUARANTINE_METADATA.read().unwrap_or_else(|e| e.into_inner());
+    let meta_guard = QUARANTINE_METADATA
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
 
     let mut list = Vec::new();
     for qp in &mesh.quarantined_peers {
@@ -659,9 +661,7 @@ pub async fn get_quarantined_peers_handler() -> impl IntoResponse {
     Json(list)
 }
 
-pub async fn release_quarantined_peer_handler(
-    Path(peer_id): Path<String>,
-) -> impl IntoResponse {
+pub async fn release_quarantined_peer_handler(Path(peer_id): Path<String>) -> impl IntoResponse {
     let controller = global_mesh_dlp_controller();
     let mut found = false;
 
@@ -683,7 +683,9 @@ pub async fn release_quarantined_peer_handler(
 
     if found {
         controller.save_to_disk();
-        let mut meta_guard = QUARANTINE_METADATA.write().unwrap_or_else(|e| e.into_inner());
+        let mut meta_guard = QUARANTINE_METADATA
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = meta_guard.get_mut(&peer_id) {
             entry.active = false;
             entry.released_at = Some(Utc::now().to_rfc3339());

@@ -221,7 +221,7 @@ impl AtlasKvStore {
         })?;
 
         let db_path = dir.join("triples_meta.sqlite");
-        let conn = Connection::open(&db_path)?;
+        let mut conn = Connection::open(&db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -250,6 +250,36 @@ impl AtlasKvStore {
              CREATE INDEX IF NOT EXISTS idx_triples_tier_active ON triples(deleted, access_tier);",
         )?;
 
+        // Backfill any legacy `file_path_norm` rows (Unix mixed-case, Windows roots, UNC,
+        // `\\?\` / `//?/`) whose stored key diverges from `normalize_path_key(&file_path)`.
+        {
+            let tx = conn.transaction()?;
+            let updates: Vec<(i64, String)> = {
+                let mut stmt =
+                    tx.prepare("SELECT triple_id, file_path, file_path_norm FROM triples")?;
+                let mut rows = stmt.query([])?;
+                let mut pending = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let tid: i64 = row.get(0)?;
+                    let fp: String = row.get(1)?;
+                    let existing_norm: String = row.get(2)?;
+                    let expected_norm = normalize_path_key(&fp);
+                    if existing_norm != expected_norm {
+                        pending.push((tid, expected_norm));
+                    }
+                }
+                pending
+            };
+            if !updates.is_empty() {
+                let mut upd =
+                    tx.prepare("UPDATE triples SET file_path_norm = ?1 WHERE triple_id = ?2")?;
+                for (tid, norm) in updates {
+                    upd.execute(params![norm, tid])?;
+                }
+            }
+            tx.commit()?;
+        }
+
         let mut index_state = StoreIndexState::default();
         let hier_path = dir.join("hierarchy_index.bin");
         let keys_path = dir.join("keys_leaf.f16");
@@ -263,9 +293,11 @@ impl AtlasKvStore {
 
         // Reconcile side arrays with SQLite if hierarchy_index.bin did not exist yet
         let db_max_rows: usize = conn
-            .query_row("SELECT COALESCE(MAX(triple_id) + 1, 0) FROM triples", [], |r| {
-                r.get::<_, i64>(0)
-            })?
+            .query_row(
+                "SELECT COALESCE(MAX(triple_id) + 1, 0) FROM triples",
+                [],
+                |r| r.get::<_, i64>(0),
+            )?
             .max(0) as usize;
 
         if index_state.total_rows != db_max_rows {
@@ -397,9 +429,7 @@ impl AtlasKvStore {
                 if !seen_batch.insert(hash.clone()) {
                     continue;
                 }
-                let already_exists = exists_stmt
-                    .query_row(params![&hash], |_| Ok(()))
-                    .is_ok();
+                let already_exists = exists_stmt.query_row(params![&hash], |_| Ok(())).is_ok();
                 if already_exists {
                     continue;
                 }
@@ -502,7 +532,10 @@ impl AtlasKvStore {
                 let mut best_inter_sim = f32::NEG_INFINITY;
                 for &inter_id_u32 in candidate_inters {
                     let inter_id = inter_id_u32 as usize;
-                    let s = dot_f32(kn, &st.inter_centroids[inter_id * dim..(inter_id + 1) * dim]);
+                    let s = dot_f32(
+                        kn,
+                        &st.inter_centroids[inter_id * dim..(inter_id + 1) * dim],
+                    );
                     if s > best_inter_sim {
                         best_inter_sim = s;
                         best_inter = inter_id;
@@ -527,8 +560,15 @@ impl AtlasKvStore {
     /// - $k_{\text{inter1}} = \lceil N^{2/3} \rceil$ (clamped)
     /// - $k_{\text{root}} = \lceil N^{1/3} \rceil$ (clamped)
     pub fn rebuild_hierarchy(&self) -> Result<AtlasKvStoreStats, AtlasKvError> {
-        let dim = self.config.embedding_dim;
         let mut st = self.state.write();
+        self.rebuild_hierarchy_locked(&mut st)
+    }
+
+    fn rebuild_hierarchy_locked(
+        &self,
+        st: &mut StoreIndexState,
+    ) -> Result<AtlasKvStoreStats, AtlasKvError> {
+        let dim = self.config.embedding_dim;
 
         let active_ids: Vec<u32> = st
             .leaf_active
@@ -545,8 +585,8 @@ impl AtlasKvStore {
             st.root_c2id = CsrAdjacency::default();
             st.inter_c2id = CsrAdjacency::default();
             st.incremental_since_rebuild = 0;
-            save_hierarchy_bin(&self.hierarchy_path(), dim, &st)?;
-            return Ok(self.compute_stats_locked(&st));
+            save_hierarchy_bin(&self.hierarchy_path(), dim, st)?;
+            return Ok(self.compute_stats_locked(st));
         }
 
         let keys_mmap = st.keys_mmap.as_ref().ok_or_else(|| {
@@ -556,9 +596,7 @@ impl AtlasKvStore {
 
         // Compute AtlasKV 3-level cluster counts: k_inter1 = ceil(N^(2/3)), k_root = ceil(N^(1/3))
         let k_inter_raw = (n as f64).powf(2.0 / 3.0).ceil() as usize;
-        let k_inter = k_inter_raw
-            .clamp(2, self.config.max_inter_clusters)
-            .min(n);
+        let k_inter = k_inter_raw.clamp(2, self.config.max_inter_clusters).min(n);
         let k_root_raw = (n as f64).powf(1.0 / 3.0).ceil() as usize;
         let k_root = k_root_raw
             .clamp(1, self.config.max_root_clusters)
@@ -593,8 +631,8 @@ impl AtlasKvStore {
         st.hierarchy_built = true;
         st.incremental_since_rebuild = 0;
 
-        save_hierarchy_bin(&self.hierarchy_path(), dim, &st)?;
-        Ok(self.compute_stats_locked(&st))
+        save_hierarchy_bin(&self.hierarchy_path(), dim, st)?;
+        Ok(self.compute_stats_locked(st))
     }
 
     /// Marks all KG triples originating from `file_path` as deleted so they immediately vanish
@@ -604,9 +642,8 @@ impl AtlasKvStore {
         let db = self.db.lock();
         let mut st = self.state.write();
 
-        let mut stmt = db.prepare(
-            "SELECT triple_id FROM triples WHERE file_path_norm = ?1 AND deleted = 0",
-        )?;
+        let mut stmt =
+            db.prepare("SELECT triple_id FROM triples WHERE file_path_norm = ?1 AND deleted = 0")?;
         let tids: Vec<usize> = stmt
             .query_map(params![&norm], |row| Ok(row.get::<_, i64>(0)? as usize))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -630,11 +667,241 @@ impl AtlasKvStore {
         }
         st.active_rows = st.active_rows.saturating_sub(removed);
 
-        if st.hierarchy_built {
+        if removed > 0 && (st.hierarchy_built || self.hierarchy_path().exists()) {
             save_hierarchy_bin(&self.hierarchy_path(), self.config.embedding_dim, &st)?;
         }
 
         Ok(removed)
+    }
+
+    /// Marks all KG triples whose raw `file_path` falls under `prefix` (validated and matched
+    /// fail-closed on component boundaries via `quorum_types::path_matches_prefix`) as deleted,
+    /// keeps the HiKVP hierarchy consistent, and persists `hierarchy_index.bin`.
+    pub fn delete_by_path_prefix(&self, prefix: &str) -> Result<usize, AtlasKvError> {
+        let norm_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+        let mut db = self.db.lock();
+        let mut st = self.state.write();
+
+        let tids: Vec<usize> = {
+            let mut stmt =
+                db.prepare("SELECT triple_id, file_path FROM triples WHERE deleted = 0")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)? as usize, row.get::<_, String>(1)?))
+            })?;
+            let mut matched = Vec::new();
+            for item in rows {
+                let (tid, fp) = item?;
+                if quorum_types::path_matches_prefix(&fp, &norm_prefix).unwrap_or(false) {
+                    matched.push(tid);
+                }
+            }
+            matched
+        };
+
+        if tids.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = db.transaction()?;
+        {
+            let mut upd = tx.prepare_cached(
+                "UPDATE triples SET deleted = 1 WHERE triple_id = ?1 AND deleted = 0",
+            )?;
+            for &tid in &tids {
+                upd.execute(params![tid as i64])?;
+            }
+        }
+        tx.commit()?;
+
+        let mut removed = 0usize;
+        for tid in tids {
+            if tid < st.leaf_active.len() && st.leaf_active[tid] == 1 {
+                st.leaf_active[tid] = 0;
+                removed += 1;
+            }
+        }
+        st.active_rows = st.leaf_active.iter().filter(|&&b| b == 1).count();
+
+        let mut saved_hier = false;
+        if st.hierarchy_built {
+            if st.active_rows < 4 || st.keys_mmap.is_none() {
+                st.hierarchy_built = false;
+                st.root_centroids.clear();
+                st.inter_centroids.clear();
+                st.root_c2id = CsrAdjacency::default();
+                st.inter_c2id = CsrAdjacency::default();
+                st.incremental_since_rebuild = 0;
+            } else {
+                let _ = self.rebuild_hierarchy_locked(&mut st)?;
+                saved_hier = true;
+            }
+        }
+
+        if removed > 0 && !saved_hier {
+            save_hierarchy_bin(&self.hierarchy_path(), self.config.embedding_dim, &st)?;
+        }
+
+        Ok(removed)
+    }
+
+    /// Updates `access_tier` across SQLite `triples`, in-memory `leaf_access_tier`, and
+    /// `hierarchy_index.bin` for all active triples originating from `chunk_id`.
+    pub fn update_chunk_access_tier(
+        &self,
+        chunk_id: &str,
+        new_tier: u8,
+    ) -> Result<usize, AtlasKvError> {
+        validate_access_tier(new_tier)?;
+        let mut db = self.db.lock();
+        let mut st = self.state.write();
+
+        let tids: Vec<usize> = {
+            let mut stmt = db.prepare(
+                "SELECT triple_id FROM triples WHERE chunk_id = ?1 AND deleted = 0 AND access_tier != ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![chunk_id, new_tier as i64], |row| {
+                    Ok(row.get::<_, i64>(0)? as usize)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        if tids.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = db.transaction()?;
+        tx.execute(
+            "UPDATE triples SET access_tier = ?1 WHERE chunk_id = ?2 AND deleted = 0 AND access_tier != ?1",
+            params![new_tier as i64, chunk_id],
+        )?;
+        tx.commit()?;
+
+        let mut updated = 0usize;
+        for tid in tids {
+            if tid < st.leaf_access_tier.len() {
+                st.leaf_access_tier[tid] = new_tier;
+                updated += 1;
+            }
+        }
+
+        if updated > 0 && (st.hierarchy_built || self.hierarchy_path().exists()) {
+            save_hierarchy_bin(&self.hierarchy_path(), self.config.embedding_dim, &st)?;
+        }
+
+        Ok(updated)
+    }
+
+    /// Updates `access_tier` across SQLite `triples`, in-memory `leaf_access_tier`, and
+    /// `hierarchy_index.bin` for active triples matching `(chunk_id, file_path_norm)`,
+    /// preserving sibling copies at other paths.
+    pub fn update_chunk_access_tier_for_file(
+        &self,
+        chunk_id: &str,
+        file_path: &str,
+        new_tier: u8,
+    ) -> Result<usize, AtlasKvError> {
+        validate_access_tier(new_tier)?;
+        let norm = normalize_path_key(file_path);
+        let mut db = self.db.lock();
+        let mut st = self.state.write();
+
+        let tids: Vec<usize> = {
+            let mut stmt = db.prepare(
+                "SELECT triple_id FROM triples WHERE chunk_id = ?1 AND file_path_norm = ?2 AND deleted = 0 AND access_tier != ?3",
+            )?;
+            let rows = stmt
+                .query_map(params![chunk_id, &norm, new_tier as i64], |row| {
+                    Ok(row.get::<_, i64>(0)? as usize)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        if tids.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = db.transaction()?;
+        tx.execute(
+            "UPDATE triples SET access_tier = ?1 WHERE chunk_id = ?2 AND file_path_norm = ?3 AND deleted = 0 AND access_tier != ?1",
+            params![new_tier as i64, chunk_id, &norm],
+        )?;
+        tx.commit()?;
+
+        let mut updated = 0usize;
+        for tid in tids {
+            if tid < st.leaf_access_tier.len() {
+                st.leaf_access_tier[tid] = new_tier;
+                updated += 1;
+            }
+        }
+
+        if updated > 0 && (st.hierarchy_built || self.hierarchy_path().exists()) {
+            save_hierarchy_bin(&self.hierarchy_path(), self.config.embedding_dim, &st)?;
+        }
+
+        Ok(updated)
+    }
+
+    /// Updates `access_tier` across SQLite `triples`, in-memory `leaf_access_tier`, and
+    /// `hierarchy_index.bin` for all active triples matching `prefix` on component boundaries.
+    pub fn update_access_tier_by_path_prefix(
+        &self,
+        prefix: &str,
+        new_tier: u8,
+    ) -> Result<usize, AtlasKvError> {
+        validate_access_tier(new_tier)?;
+        let norm_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+        let mut db = self.db.lock();
+        let mut st = self.state.write();
+
+        let tids: Vec<usize> = {
+            let mut stmt = db.prepare(
+                "SELECT triple_id, file_path FROM triples WHERE deleted = 0 AND access_tier != ?1",
+            )?;
+            let rows = stmt.query_map(params![new_tier as i64], |row| {
+                Ok((row.get::<_, i64>(0)? as usize, row.get::<_, String>(1)?))
+            })?;
+            let mut matched = Vec::new();
+            for item in rows {
+                let (tid, fp) = item?;
+                if quorum_types::path_matches_prefix(&fp, &norm_prefix).unwrap_or(false) {
+                    matched.push(tid);
+                }
+            }
+            matched
+        };
+
+        if tids.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = db.transaction()?;
+        {
+            let mut upd = tx.prepare_cached(
+                "UPDATE triples SET access_tier = ?1 WHERE triple_id = ?2 AND deleted = 0",
+            )?;
+            for &tid in &tids {
+                upd.execute(params![new_tier as i64, tid as i64])?;
+            }
+        }
+        tx.commit()?;
+
+        let mut updated = 0usize;
+        for tid in tids {
+            if tid < st.leaf_access_tier.len() {
+                st.leaf_access_tier[tid] = new_tier;
+                updated += 1;
+            }
+        }
+
+        if updated > 0 && (st.hierarchy_built || self.hierarchy_path().exists()) {
+            save_hierarchy_bin(&self.hierarchy_path(), self.config.embedding_dim, &st)?;
+        }
+
+        Ok(updated)
     }
 
     /// Removes all triples, shards, and hierarchy state cleanly (safely releasing Windows mmaps first).
@@ -957,8 +1224,7 @@ fn spherical_kmeans_f16_leaves(
             }
         });
 
-    let (trained_centroids, _) =
-        spherical_kmeans_f32_rows(&sample_mat, m, dim, k, max_iters, seed);
+    let (trained_centroids, _) = spherical_kmeans_f32_rows(&sample_mat, m, dim, k, max_iters, seed);
     drop(sample_mat);
 
     let trained_k = trained_centroids.len() / dim;
@@ -1027,16 +1293,13 @@ fn spherical_kmeans_f32_rows(
     let mut min_dist = vec![f32::INFINITY; n];
     for c_idx in 1..k {
         let prev_c = &centroids[(c_idx - 1) * dim..c_idx * dim];
-        min_dist
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, d)| {
-                let sim = dot_f32(&data[i * dim..(i + 1) * dim], prev_c);
-                let dist = (1.0 - sim).max(0.0);
-                if dist < *d {
-                    *d = dist;
-                }
-            });
+        min_dist.par_iter_mut().enumerate().for_each(|(i, d)| {
+            let sim = dot_f32(&data[i * dim..(i + 1) * dim], prev_c);
+            let dist = (1.0 - sim).max(0.0);
+            if dist < *d {
+                *d = dist;
+            }
+        });
 
         let total_weight: f64 = min_dist.iter().map(|&d| (d as f64) * (d as f64)).sum();
         let chosen = if total_weight <= 1e-12 {
@@ -1130,11 +1393,7 @@ fn spherical_kmeans_f32_rows(
 }
 
 /// Atomically persists the 3-level hierarchy & branchless side-arrays to `hierarchy_index.bin`.
-fn save_hierarchy_bin(
-    path: &Path,
-    dim: usize,
-    st: &StoreIndexState,
-) -> Result<(), AtlasKvError> {
+fn save_hierarchy_bin(path: &Path, dim: usize, st: &StoreIndexState) -> Result<(), AtlasKvError> {
     let tmp = path.with_extension("bin.tmp");
     let mut buf = Vec::with_capacity(
         64 + (st.root_centroids.len() + st.inter_centroids.len()) * 4
@@ -1317,4 +1576,173 @@ fn read_u8_vec(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>, AtlasKvError> {
     let count = read_u64(bytes, pos)? as usize;
     let s = read_slice(bytes, pos, count)?;
     Ok(s.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::l2_normalize_in_place;
+    use tempfile::TempDir;
+
+    fn unit_vec(dim: usize, seed: usize) -> Vec<f32> {
+        let mut v = vec![0.05f32; dim];
+        v[seed % dim] = 1.0;
+        l2_normalize_in_place(&mut v);
+        v
+    }
+
+    #[test]
+    fn t5_atlaskv_open_backfills_legacy_unix_root_and_unc_file_path_norm() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = AtlasKvTreeConfig {
+            embedding_dim: 16,
+            min_triples_for_hierarchy: 4,
+            ..Default::default()
+        };
+        let q = unit_vec(16, 5);
+
+        let unix_path = "/home/alice/Nextcloud/SecretReport.txt";
+        let win_root_path = r"C:\";
+        let unc_path = r"\\fileserver\ConfidentialShare\Plan.txt";
+        let verb_path = r"\\?\C:\Users\Alice\OneDrive\Legacy.txt";
+
+        {
+            let store = AtlasKvStore::open(tmp.path(), cfg.clone()).unwrap();
+            let records = vec![
+                KgTripleRecord::new(
+                    "UnixEnt",
+                    "clearance",
+                    "unix_secret",
+                    "d_unix",
+                    "c_unix",
+                    unix_path,
+                    1,
+                    5,
+                    "d_unix",
+                    0,
+                    "local",
+                )
+                .unwrap(),
+                KgTripleRecord::new(
+                    "RootEnt",
+                    "clearance",
+                    "root_secret",
+                    "d_root",
+                    "c_root",
+                    win_root_path,
+                    1,
+                    5,
+                    "d_root",
+                    0,
+                    "local",
+                )
+                .unwrap(),
+                KgTripleRecord::new(
+                    "UncEnt",
+                    "clearance",
+                    "unc_secret",
+                    "d_unc",
+                    "c_unc",
+                    unc_path,
+                    1,
+                    5,
+                    "d_unc",
+                    0,
+                    "local",
+                )
+                .unwrap(),
+                KgTripleRecord::new(
+                    "VerbEnt",
+                    "clearance",
+                    "verb_secret",
+                    "d_verb",
+                    "c_verb",
+                    verb_path,
+                    1,
+                    5,
+                    "d_verb",
+                    0,
+                    "local",
+                )
+                .unwrap(),
+            ];
+            store
+                .insert_triples(&records, &vec![q.clone(); 4], &vec![q.clone(); 4])
+                .unwrap();
+            store.rebuild_hierarchy().unwrap();
+
+            // Seed legacy pre-Iteration-3 file_path_norm values directly in SQLite
+            let db = store.db.lock();
+            db.execute(
+                "UPDATE triples SET file_path_norm = ?1 WHERE chunk_id = 'c_unix'",
+                params!["/home/alice/nextcloud/secretreport.txt"],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE triples SET file_path_norm = ?1 WHERE chunk_id = 'c_root'",
+                params!["c:"],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE triples SET file_path_norm = ?1 WHERE chunk_id = 'c_unc'",
+                params!["//fileserver/confidentialshare/plan.txt"],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE triples SET file_path_norm = ?1 WHERE chunk_id = 'c_verb'",
+                params!["//?/c:/users/alice/onedrive/legacy.txt"],
+            )
+            .unwrap();
+        }
+
+        // Reopen must backfill every legacy row so tier updates & deletes match
+        let reopened = AtlasKvStore::open(tmp.path(), cfg).unwrap();
+
+        assert_eq!(
+            reopened
+                .update_chunk_access_tier_for_file("c_unix", unix_path, 3)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .update_chunk_access_tier_for_file("c_root", win_root_path, 3)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .update_chunk_access_tier_for_file("c_unc", unc_path, 3)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .update_chunk_access_tier_for_file(
+                    "c_verb",
+                    r"C:\Users\Alice\OneDrive\Legacy.txt",
+                    3
+                )
+                .unwrap(),
+            1
+        );
+
+        let (t0_hits, _) = reopened.hikvp_search(&q, 0, 10, None).unwrap();
+        assert_eq!(
+            t0_hits.len(),
+            0,
+            "No legacy row may leak at Tier 0 after reopen + tier upgrade: {t0_hits:?}"
+        );
+
+        assert_eq!(reopened.delete_by_file_path(unix_path).unwrap(), 1);
+        assert_eq!(reopened.delete_by_file_path(win_root_path).unwrap(), 1);
+        assert_eq!(reopened.delete_by_file_path(unc_path).unwrap(), 1);
+        assert_eq!(
+            reopened
+                .delete_by_file_path(r"C:\Users\Alice\OneDrive\Legacy.txt")
+                .unwrap(),
+            1
+        );
+        assert_eq!(reopened.stats().active_triples, 0);
+    }
 }

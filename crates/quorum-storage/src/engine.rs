@@ -105,6 +105,53 @@ pub struct CompactionStats {
     pub tantivy_segments_merged: bool,
 }
 
+/// Summary of a boundary-safe path-prefix purge across all four storage backends.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixPurgeReport {
+    pub normalized_prefix: String,
+    pub lance_chunks_deleted: usize,
+    pub tantivy_chunks_deleted: usize,
+    pub catalog_docs_deleted: usize,
+    pub parent_docs_deleted: usize,
+    pub atlaskv_triples_deleted: usize,
+    pub new_index_epoch: u64,
+}
+
+impl PrefixPurgeReport {
+    /// Returns `true` if at least one record was purged from any store.
+    pub fn any_deleted(&self) -> bool {
+        self.lance_chunks_deleted > 0
+            || self.tantivy_chunks_deleted > 0
+            || self.catalog_docs_deleted > 0
+            || self.parent_docs_deleted > 0
+            || self.atlaskv_triples_deleted > 0
+    }
+}
+
+/// Summary of a boundary-safe path-prefix access-tier update across all four storage backends.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixTierUpdateReport {
+    pub normalized_prefix: String,
+    pub new_access_tier: u8,
+    pub lance_chunks_updated: usize,
+    pub tantivy_chunks_updated: usize,
+    pub catalog_docs_updated: usize,
+    pub parent_docs_updated: usize,
+    pub atlaskv_triples_updated: usize,
+    pub new_index_epoch: u64,
+}
+
+impl PrefixTierUpdateReport {
+    /// Returns `true` if at least one record was updated in any store.
+    pub fn any_updated(&self) -> bool {
+        self.lance_chunks_updated > 0
+            || self.tantivy_chunks_updated > 0
+            || self.catalog_docs_updated > 0
+            || self.parent_docs_updated > 0
+            || self.atlaskv_triples_updated > 0
+    }
+}
+
 /// Persistent storage metadata for cache coherence and index synchronization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageMetadata {
@@ -154,9 +201,7 @@ impl StorageEngine {
             ..Default::default()
         };
         let atlaskv = Arc::new(
-            quorum_atlaskv::AtlasKvStore::open(cfg.atlaskv_path(), atlaskv_cfg).map_err(|e| {
-                StorageError::Lance(format!("Failed to open AtlasKV store: {e}"))
-            })?,
+            quorum_atlaskv::AtlasKvStore::open(cfg.atlaskv_path(), atlaskv_cfg)?,
         );
 
         // Load or initialize metadata
@@ -275,23 +320,28 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Inserts document chunks with automatic per-document chunk_id deduplication.
+    /// Inserts document chunks with automatic per-`(chunk_id, file_path)` deduplication.
     pub async fn insert_chunks(&self, chunks: &[DocumentChunk]) -> Result<usize, StorageError> {
         if chunks.is_empty() {
             return Ok(0);
         }
 
         let mut unique_chunks: Vec<DocumentChunk> = Vec::with_capacity(chunks.len());
-        let mut seen_chunk_ids: HashSet<String> = HashSet::with_capacity(chunks.len());
+        let mut seen_chunk_keys: HashSet<(String, String)> = HashSet::with_capacity(chunks.len());
 
         for chunk in chunks {
-            if seen_chunk_ids.contains(&chunk.chunk_id) {
+            let key = (chunk.chunk_id.clone(), chunk.file_path.clone());
+            if seen_chunk_keys.contains(&key) {
                 continue;
             }
-            if self.fts_index.has_chunk_id(&chunk.chunk_id).unwrap_or(false) {
+            if self
+                .fts_index
+                .has_chunk_id_for_file_path(&chunk.chunk_id, &chunk.file_path)
+                .unwrap_or(false)
+            {
                 continue;
             }
-            seen_chunk_ids.insert(chunk.chunk_id.clone());
+            seen_chunk_keys.insert(key);
             unique_chunks.push(chunk.clone());
         }
 
@@ -412,7 +462,7 @@ impl StorageEngine {
             (self.search_text(text, max_tier, candidate_limit).await?, Vec::new())
         };
 
-        let mut rrf_map: HashMap<String, (f32, DocumentChunk)> = HashMap::new();
+        let mut rrf_map: HashMap<(String, String), (f32, DocumentChunk)> = HashMap::new();
 
         // Only include vector hits that have positive cosine similarity and are not excluded
         let relevant_vector_hits: Vec<ScoredChunk> = vector_hits
@@ -433,7 +483,7 @@ impl StorageEngine {
             }
             let rrf = vector_weight / (60.0 + current_rank as f32);
             let entry = rrf_map
-                .entry(scored.chunk.chunk_id.clone())
+                .entry((scored.chunk.chunk_id.clone(), scored.chunk.file_path.clone()))
                 .or_insert((0.0, scored.chunk.clone()));
             entry.0 += rrf;
         }
@@ -451,7 +501,7 @@ impl StorageEngine {
             }
             let rrf = text_weight / (60.0 + current_rank as f32);
             let entry = rrf_map
-                .entry(scored.chunk.chunk_id.clone())
+                .entry((scored.chunk.chunk_id.clone(), scored.chunk.file_path.clone()))
                 .or_insert((0.0, scored.chunk.clone()));
             entry.0 += rrf;
         }
@@ -486,7 +536,7 @@ impl StorageEngine {
         top_k: usize,
     ) -> Vec<ScoredChunk> {
         let exclude_set: HashSet<&str> = exclude_chunk_ids.iter().map(|s| s.as_str()).collect();
-        let mut rrf_map: HashMap<String, (f32, DocumentChunk)> = HashMap::new();
+        let mut rrf_map: HashMap<(String, String), (f32, DocumentChunk)> = HashMap::new();
 
         let mut current_rank = 1;
         for (i, scored) in vector_hits.iter().enumerate() {
@@ -498,7 +548,7 @@ impl StorageEngine {
             }
             let rrf = dense_weight / (k + current_rank as f32);
             let entry = rrf_map
-                .entry(scored.chunk.chunk_id.clone())
+                .entry((scored.chunk.chunk_id.clone(), scored.chunk.file_path.clone()))
                 .or_insert_with(|| (0.0, scored.chunk.clone()));
             entry.0 += rrf;
         }
@@ -513,7 +563,7 @@ impl StorageEngine {
             }
             let rrf = sparse_weight / (k + current_rank as f32);
             let entry = rrf_map
-                .entry(scored.chunk.chunk_id.clone())
+                .entry((scored.chunk.chunk_id.clone(), scored.chunk.file_path.clone()))
                 .or_insert_with(|| (0.0, scored.chunk.clone()));
             entry.0 += rrf;
         }
@@ -622,6 +672,60 @@ impl StorageEngine {
         Ok(lance_deleted.max(tantivy_deleted))
     }
 
+    /// Purges all chunks, catalog/parent documents, and AtlasKV triples whose `file_path`
+    /// matches `prefix` on strict component boundaries, then bumps `index_epoch` if any
+    /// store was modified. Fails closed on invalid/relative/traversal prefixes.
+    pub async fn delete_by_path_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<PrefixPurgeReport, StorageError> {
+        let normalized_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+
+        let lance_chunks_deleted = self
+            .vector_store
+            .delete_by_path_prefix(&normalized_prefix)
+            .await?;
+
+        let fts = Arc::clone(&self.fts_index);
+        let norm_fts = normalized_prefix.clone();
+        let tantivy_chunks_deleted =
+            tokio::task::spawn_blocking(move || fts.delete_by_path_prefix(&norm_fts))
+                .await
+                .map_err(|e| {
+                    StorageError::Tantivy(format!("Tantivy prefix delete task failed: {e}"))
+                })??;
+
+        let (catalog_docs_deleted, parent_docs_deleted) =
+            self.catalog.delete_by_path_prefix(&normalized_prefix)?;
+
+        let kv = Arc::clone(&self.atlaskv);
+        let norm_kv = normalized_prefix.clone();
+        let atlaskv_triples_deleted =
+            tokio::task::spawn_blocking(move || kv.delete_by_path_prefix(&norm_kv))
+                .await
+                .map_err(|e| {
+                    StorageError::GenericIo(std::io::Error::other(format!(
+                        "AtlasKV prefix delete task failed: {e}"
+                    )))
+                })??;
+
+        let mut report = PrefixPurgeReport {
+            normalized_prefix,
+            lance_chunks_deleted,
+            tantivy_chunks_deleted,
+            catalog_docs_deleted,
+            parent_docs_deleted,
+            atlaskv_triples_deleted,
+            new_index_epoch: self.index_epoch(),
+        };
+
+        if report.any_deleted() {
+            report.new_index_epoch = self.bump_index_epoch("path_prefix_purged")?;
+        }
+
+        Ok(report)
+    }
+
     /// Removes existing chunks for several files at once (used before re-inserting re-indexed files,
     /// so a reindex replaces stale chunks instead of duplicating them).
     pub async fn delete_by_file_paths(&self, file_paths: &[String]) -> Result<(), StorageError> {
@@ -648,6 +752,13 @@ impl StorageEngine {
     /// O(1) check whether `chunk_id` is already indexed in Tantivy.
     pub fn has_chunk_id_in_fts(&self, chunk_id: &str) -> bool {
         self.fts_index.has_chunk_id(chunk_id).unwrap_or(false)
+    }
+
+    /// O(1) check whether `(chunk_id, file_path)` is already indexed in Tantivy.
+    pub fn has_chunk_id_for_file_in_fts(&self, chunk_id: &str, file_path: &str) -> bool {
+        self.fts_index
+            .has_chunk_id_for_file_path(chunk_id, file_path)
+            .unwrap_or(false)
     }
 
     /// Fast FST dictionary scan of all unique `file_path` strings currently indexed in Tantivy.
@@ -777,23 +888,196 @@ impl StorageEngine {
         self.fts_index.index_chunks(chunks)
     }
 
-    /// Updates or replaces a single chunk record across both LanceDB and Tantivy.
+    /// Updates or replaces a single chunk record scoped by `(chunk_id, file_path)` across both
+    /// LanceDB and Tantivy, preserving identical-content sibling copies at other paths.
     pub async fn update_chunk_record(&self, chunk: &DocumentChunk) -> Result<(), StorageError> {
-        let _ = self.vector_store.delete_by_chunk_id(&chunk.chunk_id).await?;
-        let _ = self.fts_index.delete_by_chunk_id(&chunk.chunk_id)?;
+        let _ = self
+            .vector_store
+            .delete_by_chunk_id_and_file_path(&chunk.chunk_id, &chunk.file_path)
+            .await?;
+        let _ = self
+            .fts_index
+            .delete_by_chunk_id_and_file_path(&chunk.chunk_id, &chunk.file_path)?;
         self.vector_store.insert_chunks(std::slice::from_ref(chunk)).await?;
         self.fts_index.index_chunks(std::slice::from_ref(chunk))?;
         Ok(())
     }
 
-    /// Updates the access_tier of an existing chunk atomically across both stores.
-    pub async fn update_chunk_access_tier(&self, chunk_id: &str, new_tier: u8) -> Result<(), StorageError> {
-        let chunks = self.get_chunks_by_ids(&[chunk_id.to_string()]).await?;
-        if let Some(mut chunk) = chunks.into_iter().next() {
+    /// Retrieves a specific chunk matching `(chunk_id, file_path)` via Tantivy fast path with
+    /// LanceDB fallback.
+    pub async fn get_chunk_by_id_and_file_path(
+        &self,
+        chunk_id: &str,
+        file_path: &str,
+    ) -> Result<Option<DocumentChunk>, StorageError> {
+        let fts = Arc::clone(&self.fts_index);
+        let cid = chunk_id.to_string();
+        let fp = file_path.to_string();
+        let fts_hit = tokio::task::spawn_blocking(move || {
+            fts.get_chunk_by_id_and_file_path(&cid, &fp, true)
+        })
+        .await
+        .map_err(|e| {
+            StorageError::Tantivy(format!(
+                "Tantivy (chunk_id, file_path) lookup blocking task failed: {e}"
+            ))
+        })??;
+        if fts_hit.is_some() {
+            return Ok(fts_hit);
+        }
+        self.vector_store
+            .get_chunk_by_id_and_file_path(chunk_id, file_path)
+            .await
+    }
+
+    /// Updates the `access_tier` of a specific `(chunk_id, file_path)` copy atomically across
+    /// LanceDB, Tantivy, DocumentCatalog (`document_catalog` + `parent_documents`), and AtlasKV,
+    /// preserving any identical-content sibling copies at other `file_path`s.
+    pub async fn update_chunk_access_tier_for_file(
+        &self,
+        chunk_id: &str,
+        file_path: &str,
+        new_tier: u8,
+    ) -> Result<(), StorageError> {
+        quorum_types::AccessTier::from_u8(new_tier)?;
+        if let Some(mut chunk) = self.get_chunk_by_id_and_file_path(chunk_id, file_path).await? {
+            let canonical_fp = chunk.file_path.clone();
             chunk.access_tier = new_tier;
             self.update_chunk_record(&chunk).await?;
+
+            let file_tier = self
+                .fts_index
+                .indexed_path_max_tier(&canonical_fp)?
+                .unwrap_or(new_tier);
+            let _ = self.catalog.update_file_access_tier(&canonical_fp, file_tier)?;
+
+            let kv = Arc::clone(&self.atlaskv);
+            let cid = chunk_id.to_string();
+            let fp = canonical_fp;
+            let _ = tokio::task::spawn_blocking(move || {
+                kv.update_chunk_access_tier_for_file(&cid, &fp, new_tier)
+            })
+            .await
+            .map_err(|e| {
+                StorageError::GenericIo(std::io::Error::other(format!(
+                    "AtlasKV chunk tier update task failed: {e}"
+                )))
+            })??;
+            self.bump_index_epoch("chunk_access_tier_updated")?;
         }
         Ok(())
+    }
+
+    /// Updates the access_tier of all copies matching `chunk_id` atomically across LanceDB,
+    /// Tantivy, DocumentCatalog (`document_catalog` + `parent_documents`), and AtlasKV.
+    pub async fn update_chunk_access_tier(&self, chunk_id: &str, new_tier: u8) -> Result<(), StorageError> {
+        quorum_types::AccessTier::from_u8(new_tier)?;
+        let fts = Arc::clone(&self.fts_index);
+        let cid_fts = chunk_id.to_string();
+        let mut chunks = tokio::task::spawn_blocking(move || fts.get_chunks_for_id(&cid_fts, true))
+            .await
+            .map_err(|e| {
+                StorageError::Tantivy(format!("Tantivy multi-copy lookup blocking task failed: {e}"))
+            })??;
+        let mut seen_paths: HashSet<String> =
+            chunks.iter().map(|c| c.file_path.clone()).collect();
+        let lance_chunks = self.vector_store.get_chunks_for_id(chunk_id).await?;
+        for lc in lance_chunks {
+            if seen_paths.insert(lc.file_path.clone()) {
+                chunks.push(lc);
+            }
+        }
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        let mut updated_paths = HashSet::new();
+        for mut chunk in chunks {
+            let file_path = chunk.file_path.clone();
+            chunk.access_tier = new_tier;
+            self.update_chunk_record(&chunk).await?;
+            updated_paths.insert(file_path);
+        }
+
+        for file_path in updated_paths {
+            let file_tier = self
+                .fts_index
+                .indexed_path_max_tier(&file_path)?
+                .unwrap_or(new_tier);
+            let _ = self.catalog.update_file_access_tier(&file_path, file_tier)?;
+        }
+
+        let kv = Arc::clone(&self.atlaskv);
+        let cid = chunk_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || kv.update_chunk_access_tier(&cid, new_tier))
+            .await
+            .map_err(|e| {
+                StorageError::GenericIo(std::io::Error::other(format!(
+                    "AtlasKV chunk tier update task failed: {e}"
+                )))
+            })??;
+        self.bump_index_epoch("chunk_access_tier_updated")?;
+        Ok(())
+    }
+
+    /// Updates `access_tier` across LanceDB, Tantivy, DocumentCatalog (`document_catalog` +
+    /// `parent_documents`), and AtlasKV for all records matching `prefix` on component boundaries,
+    /// then bumps `index_epoch` if any store was modified.
+    pub async fn update_path_prefix_access_tier(
+        &self,
+        prefix: &str,
+        new_tier: u8,
+    ) -> Result<PrefixTierUpdateReport, StorageError> {
+        quorum_types::AccessTier::from_u8(new_tier)?;
+        let normalized_prefix = quorum_types::normalize_prefix_for_match(prefix)?;
+
+        let lance_chunks_updated = self
+            .vector_store
+            .update_access_tier_by_path_prefix(&normalized_prefix, new_tier)
+            .await?;
+
+        let fts = Arc::clone(&self.fts_index);
+        let norm_fts = normalized_prefix.clone();
+        let tantivy_chunks_updated = tokio::task::spawn_blocking(move || {
+            fts.update_access_tier_by_path_prefix(&norm_fts, new_tier)
+        })
+        .await
+        .map_err(|e| {
+            StorageError::Tantivy(format!("Tantivy prefix tier update task failed: {e}"))
+        })??;
+
+        let (catalog_docs_updated, parent_docs_updated) = self
+            .catalog
+            .update_access_tier_by_path_prefix(&normalized_prefix, new_tier)?;
+
+        let kv = Arc::clone(&self.atlaskv);
+        let norm_kv = normalized_prefix.clone();
+        let atlaskv_triples_updated = tokio::task::spawn_blocking(move || {
+            kv.update_access_tier_by_path_prefix(&norm_kv, new_tier)
+        })
+        .await
+        .map_err(|e| {
+            StorageError::GenericIo(std::io::Error::other(format!(
+                "AtlasKV prefix tier update task failed: {e}"
+            )))
+        })??;
+
+        let mut report = PrefixTierUpdateReport {
+            normalized_prefix,
+            new_access_tier: new_tier,
+            lance_chunks_updated,
+            tantivy_chunks_updated,
+            catalog_docs_updated,
+            parent_docs_updated,
+            atlaskv_triples_updated,
+            new_index_epoch: self.index_epoch(),
+        };
+
+        if report.any_updated() {
+            report.new_index_epoch = self.bump_index_epoch("path_prefix_access_tier_updated")?;
+        }
+
+        Ok(report)
     }
 
     /// Enriches a chunk's metadata_json with entity clustering information (`entity_cluster` and `nimble_confidence`),

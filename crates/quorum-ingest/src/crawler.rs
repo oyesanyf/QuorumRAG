@@ -40,6 +40,8 @@ pub struct CrawlerStats {
     pub files_skipped_binary: usize,
     pub files_skipped_hidden: usize,
     pub files_skipped_io: usize,
+    #[serde(default)]
+    pub files_skipped_placeholder: usize,
     pub elapsed_millis: u64,
 }
 
@@ -53,6 +55,7 @@ struct AtomicCrawlerStats {
     files_skipped_binary: AtomicUsize,
     files_skipped_hidden: AtomicUsize,
     files_skipped_io: AtomicUsize,
+    files_skipped_placeholder: AtomicUsize,
 }
 
 impl AtomicCrawlerStats {
@@ -67,6 +70,7 @@ impl AtomicCrawlerStats {
             files_skipped_binary: AtomicUsize::new(0),
             files_skipped_hidden: AtomicUsize::new(0),
             files_skipped_io: AtomicUsize::new(0),
+            files_skipped_placeholder: AtomicUsize::new(0),
         }
     }
 
@@ -81,6 +85,7 @@ impl AtomicCrawlerStats {
             files_skipped_binary: self.files_skipped_binary.load(Ordering::Relaxed),
             files_skipped_hidden: self.files_skipped_hidden.load(Ordering::Relaxed),
             files_skipped_io: self.files_skipped_io.load(Ordering::Relaxed),
+            files_skipped_placeholder: self.files_skipped_placeholder.load(Ordering::Relaxed),
             elapsed_millis,
         }
     }
@@ -573,6 +578,10 @@ impl FilesystemCrawler {
             }
             FilterDecision::SkipHidden | FilterDecision::SkipSymlink => {
                 stats.files_skipped_hidden.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            FilterDecision::SkipCloudPlaceholder => {
+                stats.files_skipped_placeholder.fetch_add(1, Ordering::Relaxed);
                 None
             }
             FilterDecision::SkipIoError { .. } => {

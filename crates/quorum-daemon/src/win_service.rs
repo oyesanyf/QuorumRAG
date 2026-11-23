@@ -14,10 +14,11 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows_sys::Win32::System::Services::{
-    RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW, SERVICE_ACCEPT_SHUTDOWN,
-    SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
-    SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOPPED, SERVICE_STOP_PENDING,
-    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
+    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE,
+    SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING,
+    SERVICE_STATUS, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
+    SERVICE_WIN32_OWN_PROCESS,
 };
 
 use crate::cli::Cli;
@@ -123,19 +124,27 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     // SAFETY: `name` is a NUL-terminated UTF-16 string valid for the duration of the call.
     let handle = RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(control_handler), null());
     if handle.is_null() {
-        tracing::error!("RegisterServiceCtrlHandlerExW failed: {}", std::io::Error::last_os_error());
+        tracing::error!(
+            "RegisterServiceCtrlHandlerExW failed: {}",
+            std::io::Error::last_os_error()
+        );
         return;
     }
     STATUS_HANDLE.store(handle, Ordering::SeqCst);
     report(SERVICE_START_PENDING, 0, 1, 60_000, NO_ERROR);
 
-    let cli = CLI_SLOT.get().and_then(|slot| slot.lock().ok().and_then(|mut g| g.take()));
+    let cli = CLI_SLOT
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|mut g| g.take()));
     let Some(cli) = cli else {
         report_stopped(ERROR_EXCEPTION_IN_SERVICE);
         return;
     };
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!("Failed to start Tokio runtime for service: {e}");
@@ -144,8 +153,20 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
         }
     };
 
-    report(SERVICE_RUNNING, SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN, 0, 0, NO_ERROR);
-    tracing::info!("QuorumRAG is running as Windows service '{SERVICE_NAME}'");
+    report(
+        SERVICE_RUNNING,
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+        0,
+        0,
+        NO_ERROR,
+    );
+    let local_system = crate::win_native::is_running_as_local_system();
+    let session_id = crate::win_native::current_session_id();
+    tracing::info!(
+        running_as_local_system = local_system,
+        session_id = ?session_id,
+        "QuorumRAG is running as Windows service '{SERVICE_NAME}'"
+    );
 
     let result = runtime.block_on(crate::run_daemon_and_ui(cli));
     let exit_code = match &result {
@@ -165,8 +186,14 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     CLI_SLOT.get_or_init(|| Mutex::new(Some(cli)));
     let mut name = wide(SERVICE_NAME);
     let table = [
-        SERVICE_TABLE_ENTRYW { lpServiceName: name.as_mut_ptr(), lpServiceProc: Some(service_main) },
-        SERVICE_TABLE_ENTRYW { lpServiceName: null_mut(), lpServiceProc: None },
+        SERVICE_TABLE_ENTRYW {
+            lpServiceName: name.as_mut_ptr(),
+            lpServiceProc: Some(service_main),
+        },
+        SERVICE_TABLE_ENTRYW {
+            lpServiceName: null_mut(),
+            lpServiceProc: None,
+        },
     ];
     // SAFETY: the table is NUL-entry terminated and outlives the blocking dispatcher call.
     let ok = unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) };

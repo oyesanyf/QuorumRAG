@@ -171,8 +171,13 @@ impl DocumentExtractor {
     }
 
     /// Public entry point for PDF extraction with scanned OCR fallback,
-    /// matching the interface contract in `SCOPE.md`.
+    /// failing closed on cloud placeholders under `LocallySyncedOnly`.
     pub fn extract_pdf_with_ocr_fallback(path: &Path) -> Result<String, IngestError> {
+        crate::cloud_drives::ensure_open_allowed_for_placeholder(
+            path,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+        .map_err(IngestError::Io)?;
         Self::extract_pdf_text(path).map_err(IngestError::Io)
     }
 
@@ -283,8 +288,24 @@ impl DocumentExtractor {
     /// Extracts all searchable UTF-8 text from any file discovered by Magika,
     /// falling back to the user-space OS Search index (Windows Search OLE DB / macOS Spotlight)
     /// when a document is exclusively locked by another application.
+    /// Fails closed on cloud placeholders under `CloudPlaceholderPolicy::LocallySyncedOnly`.
     pub fn extract_text(path: &Path, identity: &FileIdentity) -> io::Result<String> {
-        let res = Self::extract_text_inner(path, identity);
+        Self::extract_text_with_policy(
+            path,
+            identity,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Extracts all searchable UTF-8 text after enforcing `policy` on OS cloud-placeholder
+    /// attributes before opening the file.
+    pub fn extract_text_with_policy(
+        path: &Path,
+        identity: &FileIdentity,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> io::Result<String> {
+        crate::cloud_drives::ensure_open_allowed_for_placeholder(path, policy)?;
+        let res = Self::extract_text_inner(path, identity, policy);
         match res {
             Ok(text) => Ok(text),
             Err(e) if Self::is_lock_or_permission_error(&e) => {
@@ -299,7 +320,11 @@ impl DocumentExtractor {
         }
     }
 
-    fn extract_text_inner(path: &Path, identity: &FileIdentity) -> io::Result<String> {
+    fn extract_text_inner(
+        path: &Path,
+        identity: &FileIdentity,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> io::Result<String> {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -331,7 +356,7 @@ impl DocumentExtractor {
 
         // Sniff OLE2 Compound Document: \xD0\xCF\x11\xE0 (e.g. legacy binary .doc misnamed as .pdf)
         if magic_header.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
-            if let Ok(text) = Self::extract_ole2_doc_text(path) {
+            if let Ok(text) = Self::extract_ole2_doc_text_with_policy(path, policy) {
                 if !text.trim().is_empty() {
                     return Ok(text);
                 }
@@ -340,7 +365,7 @@ impl DocumentExtractor {
 
         // Sniff JPEG: \xFF\xD8\xFF misnamed as other formats (e.g. .pdf)
         if magic_header.starts_with(&[0xFF, 0xD8, 0xFF]) {
-            if let Some(ocr_text) = ImageIndexer::run_ocr_on_file(path) {
+            if let Some(ocr_text) = ImageIndexer::run_ocr_on_file_with_policy(path, policy) {
                 if !ocr_text.trim().is_empty() {
                     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
                     return Ok(format!("[Image OCR — {}]\n{}", file_name, ocr_text));
@@ -362,7 +387,7 @@ impl DocumentExtractor {
             || magic_header.starts_with(b"<html")
             || magic_header.starts_with(b"<HTML")
         {
-            return Self::extract_html_prose(path);
+            return Self::extract_html_prose_with_policy(path, policy);
         }
 
         // 3. Word OpenXML & Legacy Word / OpenDocument Text (.docx, .doc, .odt)
@@ -370,7 +395,7 @@ impl DocumentExtractor {
             || mime.contains("wordprocessingml")
             || matches!(ext.as_str(), "docx" | "doc" | "odt")
         {
-            return Self::extract_word_or_odt_text(path, &ext);
+            return Self::extract_word_or_odt_text(path, &ext, policy);
         }
 
         // 4. Excel Spreadsheets (.xlsx, .xls, .ods)
@@ -569,15 +594,174 @@ impl DocumentExtractor {
         entries
     }
 
-    /// Extracts clean document prose, tables, `<w:sdt>` content controls, `<w:txbxContent>` timeline boxes,
-    /// and `<a:t>` DrawingML shapes from OpenXML Word (`.docx`) or OpenDocument (`.odt`) XML strings.
-    fn extract_word_xml_runs(xml: &str, is_odt: bool) -> String {
+    /// Strips raw Word/ODT field codes (`HYPERLINK "..."`, `MERGEFORMAT`, `PAGEREF`, `REF _Ref...`),
+    /// decorative underscore signature rules (`________`), and OCR/legacy split years/ordinals
+    /// (`201 9` -> `2019`, `1 st` -> `1st`) at ingestion time before text ever reaches index chunks.
+    pub fn sanitize_extracted_markdown_artifacts(input: &str) -> String {
+        static HYPERLINK_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static FIELD_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static UNDERSCORE_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static SPLIT_YEAR_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static SPLIT_ORD_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+        let hyperlink_re = HYPERLINK_RE.get_or_init(|| {
+            regex::Regex::new(r#"(?i)\bHYPERLINK\s+"[^"]*"(?:\s+\\[a-z]\s+"[^"]*")*\s*"#)
+                .expect("valid hyperlink regex")
+        });
+        let field_re = FIELD_RE.get_or_init(|| {
+            regex::Regex::new(r#"(?i)\b(?:MERGEFORMAT|PAGEREF\s+\S+|REF\s+_Ref\S+|TOC\s+\\[a-z]\s+"[^"]*")\b"#)
+                .expect("valid field regex")
+        });
+        let underscore_re = UNDERSCORE_RE
+            .get_or_init(|| regex::Regex::new(r"_{4,}").expect("valid underscore regex"));
+        let split_year_re = SPLIT_YEAR_RE
+            .get_or_init(|| regex::Regex::new(r"\b(19|20)(\d)\s+(\d)\b").expect("valid split year regex"));
+        let split_ord_re = SPLIT_ORD_RE
+            .get_or_init(|| regex::Regex::new(r"\b(\d+)\s+(st|nd|rd|th)\b").expect("valid split ordinal regex"));
+
+        let s1 = hyperlink_re.replace_all(input, "");
+        let s2 = field_re.replace_all(&s1, "");
+        let s3 = underscore_re.replace_all(&s2, " ");
+        let s4 = split_year_re.replace_all(&s3, "$1$2$3");
+        let s5 = split_ord_re.replace_all(&s4, "$1$2");
+        s5.into_owned()
+    }
+
+    fn extract_xml_attr<'a>(tag_raw: &'a str, attr_name: &str) -> Option<&'a str> {
+        let needle = format!("{attr_name}=");
+        let pos = tag_raw.find(&needle)?;
+        let rest = &tag_raw[pos + needle.len()..];
+        let quote = rest.as_bytes().first().copied()?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        let inner = &rest[1..];
+        let end = inner.find(quote as char)?;
+        Some(&inner[..end])
+    }
+
+    fn parse_docx_heading_level(style_val: &str) -> Option<usize> {
+        let low = style_val.trim().to_ascii_lowercase();
+        if low == "title" {
+            return Some(1);
+        }
+        if low == "subtitle" {
+            return Some(2);
+        }
+        if let Some(rest) = low.strip_prefix("heading") {
+            let digits = rest.trim_start_matches(|c: char| !c.is_ascii_digit());
+            if let Ok(n) = digits.parse::<usize>() {
+                if (1..=6).contains(&n) {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
+    /// Extracts clean GFM-normalized Markdown prose, headings (`#..######`), bullet lists (`- `),
+    /// multi-column GFM tables (`| ... |` + `|---|`), `<w:sdt>` content controls, `<w:txbxContent>`
+    /// timeline boxes, and `<a:t>` DrawingML shapes from OpenXML Word (`.docx`) or OpenDocument
+    /// (`.odt`) XML strings while stripping `<w:instrText>`, `<w:fldData>`, `<w:delText>`, and raw
+    /// `HYPERLINK` field codes at ingestion time (Kreuzberg / Docling Markdown-normalization parity).
+    pub fn extract_word_xml_runs(xml: &str, is_odt: bool) -> String {
         let mut out = String::with_capacity(xml.len() / 3);
         let bytes = xml.as_bytes();
         let mut i = 0usize;
         let mut capture_depth = 0usize;
         let mut skip_depth = 0usize;
+        let mut table_depth = 0usize;
         let mut table_cell_depth = 0usize;
+        let mut in_odt_list_item = false;
+
+        // Current paragraph formatting state (non-table paragraphs)
+        let mut cur_heading_level: Option<usize> = None;
+        let mut cur_is_list_item = false;
+        let mut cur_para = String::new();
+
+        // Current table accumulator (flushed as GFM table when >= 2 columns & >= 2 rows)
+        let mut cur_table_rows: Vec<Vec<String>> = Vec::new();
+        let mut cur_row_cells: Vec<String> = Vec::new();
+        let mut cur_cell = String::new();
+
+        let flush_paragraph = |out: &mut String,
+                               cur_para: &mut String,
+                               cur_heading_level: &mut Option<usize>,
+                               cur_is_list_item: &mut bool| {
+            let text = cur_para.split_whitespace().collect::<Vec<_>>().join(" ");
+            cur_para.clear();
+            let h_lvl = cur_heading_level.take();
+            let is_li = *cur_is_list_item;
+            *cur_is_list_item = false;
+            if text.is_empty() {
+                return;
+            }
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if let Some(lvl) = h_lvl {
+                let hashes = "#".repeat(lvl.clamp(1, 6));
+                out.push_str(&format!("{hashes} {text}\n"));
+            } else if is_li && !text.starts_with("- ") && !text.starts_with("* ") {
+                out.push_str(&format!("- {text}\n"));
+            } else {
+                out.push_str(&text);
+                out.push('\n');
+            }
+        };
+
+        let flush_table = |out: &mut String, rows: &mut Vec<Vec<String>>| {
+            let non_empty: Vec<Vec<String>> = rows
+                .drain(..)
+                .filter(|r| r.iter().any(|c| !c.trim().is_empty()))
+                .collect();
+            if non_empty.is_empty() {
+                return;
+            }
+            let max_cols = non_empty.iter().map(|r| r.len()).max().unwrap_or(0);
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if max_cols >= 2 && non_empty.len() >= 2 {
+                let fmt_row = |cells: &[String]| -> String {
+                    let mut padded = Vec::with_capacity(max_cols);
+                    for idx in 0..max_cols {
+                        let cell = cells
+                            .get(idx)
+                            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+                            .unwrap_or_default()
+                            .replace('|', "\\|");
+                        padded.push(cell);
+                    }
+                    format!("| {} |", padded.join(" | "))
+                };
+                out.push_str(&fmt_row(&non_empty[0]));
+                out.push('\n');
+                out.push('|');
+                for _ in 0..max_cols {
+                    out.push_str("---|");
+                }
+                out.push('\n');
+                for row in &non_empty[1..] {
+                    out.push_str(&fmt_row(row));
+                    out.push('\n');
+                }
+            } else {
+                // Single-column layout table (common in resumes/invoices): emit clean lines
+                for row in non_empty {
+                    let line = row
+                        .into_iter()
+                        .map(|c| c.split_whitespace().collect::<Vec<_>>().join(" "))
+                        .filter(|c| !c.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    if !line.is_empty() {
+                        out.push_str(&line);
+                        out.push('\n');
+                    }
+                }
+            }
+        };
 
         while i < bytes.len() {
             if bytes[i] == b'<' {
@@ -597,11 +781,16 @@ impl DocumentExtractor {
                         .unwrap_or("");
 
                     // Skip Word AlternateContent VML fallbacks (`mc:Fallback`), deleted revisions (`w:delText`),
-                    // and raw field instruction syntax (`w:instrText`) so timeline textboxes are never duplicated
-                    // or polluted with raw `HYPERLINK` field codes.
+                    // field data (`w:fldData`), and raw field instruction syntax (`w:instrText`) so timeline
+                    // textboxes are never duplicated or polluted with raw `HYPERLINK` field codes.
                     let is_skip_tag = matches!(
                         tag_name,
-                        "mc:Fallback" | "w:delText" | "w:instrText" | "office:binary-data" | "svg:desc"
+                        "mc:Fallback"
+                            | "w:delText"
+                            | "w:instrText"
+                            | "w:fldData"
+                            | "office:binary-data"
+                            | "svg:desc"
                     );
                     if is_skip_tag {
                         if is_closing {
@@ -615,6 +804,31 @@ impl DocumentExtractor {
                         continue;
                     }
 
+                    // Heading & list style detection
+                    if !is_closing {
+                        if tag_name == "w:pStyle" {
+                            if let Some(val) = Self::extract_xml_attr(clean_tag, "w:val") {
+                                if let Some(lvl) = Self::parse_docx_heading_level(val) {
+                                    cur_heading_level = Some(lvl);
+                                } else if val.to_ascii_lowercase().contains("list") {
+                                    cur_is_list_item = true;
+                                }
+                            }
+                        } else if tag_name == "w:numPr" {
+                            cur_is_list_item = true;
+                        } else if tag_name == "text:h" {
+                            let lvl = Self::extract_xml_attr(clean_tag, "text:outline-level")
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(2)
+                                .clamp(1, 6);
+                            cur_heading_level = Some(lvl);
+                        } else if tag_name == "text:list-item" && !is_self_closing {
+                            in_odt_list_item = true;
+                        }
+                    } else if tag_name == "text:list-item" {
+                        in_odt_list_item = false;
+                    }
+
                     let is_text_run = if is_odt {
                         matches!(tag_name, "text:p" | "text:h" | "text:span" | "text:a")
                     } else {
@@ -625,52 +839,85 @@ impl DocumentExtractor {
                         if is_closing {
                             capture_depth = capture_depth.saturating_sub(1);
                         } else if !is_self_closing {
+                            if is_odt && tag_name == "text:p" && in_odt_list_item {
+                                cur_is_list_item = true;
+                            }
                             capture_depth += 1;
                         }
-                    } else if !is_closing {
-                        if matches!(tag_name, "w:tc" | "a:tc" | "table:table-cell") && !is_self_closing {
+                    }
+
+                    // Table & block structural transitions
+                    if !is_closing {
+                        if matches!(tag_name, "w:tbl" | "table:table") && !is_self_closing {
+                            if table_depth == 0 {
+                                flush_paragraph(
+                                    &mut out,
+                                    &mut cur_para,
+                                    &mut cur_heading_level,
+                                    &mut cur_is_list_item,
+                                );
+                            }
+                            table_depth += 1;
+                        } else if matches!(tag_name, "w:tr" | "a:tr" | "table:table-row") && !is_self_closing {
+                            cur_row_cells.clear();
+                        } else if matches!(tag_name, "w:tc" | "a:tc" | "table:table-cell") && !is_self_closing {
                             table_cell_depth += 1;
+                            if table_cell_depth == 1 {
+                                cur_cell.clear();
+                            }
                         } else if matches!(tag_name, "w:tab" | "a:tab" | "text:tab") {
-                            out.push('\t');
+                            if table_cell_depth > 0 {
+                                cur_cell.push(' ');
+                            } else {
+                                cur_para.push('\t');
+                            }
                         } else if matches!(tag_name, "w:br" | "w:cr" | "a:br" | "text:line-break") {
                             if table_cell_depth > 0 {
-                                if !out.ends_with(' ') && !out.ends_with(" | ") && !out.ends_with('\n') {
-                                    out.push(' ');
+                                if !cur_cell.ends_with(' ') {
+                                    cur_cell.push(' ');
                                 }
                             } else {
-                                out.push('\n');
+                                flush_paragraph(
+                                    &mut out,
+                                    &mut cur_para,
+                                    &mut cur_heading_level,
+                                    &mut cur_is_list_item,
+                                );
                             }
                         }
                     } else {
                         match tag_name {
                             "w:tc" | "a:tc" | "table:table-cell" => {
                                 table_cell_depth = table_cell_depth.saturating_sub(1);
-                                while out.ends_with(' ') && !out.ends_with(" | ") {
-                                    out.pop();
-                                }
-                                if !out.is_empty() && !out.ends_with(" | ") && !out.ends_with('\n') {
-                                    out.push_str(" | ");
+                                if table_cell_depth == 0 {
+                                    cur_row_cells.push(std::mem::take(&mut cur_cell));
                                 }
                             }
                             "w:tr" | "a:tr" | "table:table-row" => {
-                                if out.ends_with(" | ") {
-                                    out.truncate(out.len() - 3);
+                                if !cur_row_cells.is_empty() {
+                                    cur_table_rows.push(std::mem::take(&mut cur_row_cells));
                                 }
-                                if !out.ends_with('\n') {
-                                    out.push('\n');
+                            }
+                            "w:tbl" | "table:table" => {
+                                table_depth = table_depth.saturating_sub(1);
+                                if table_depth == 0 {
+                                    flush_table(&mut out, &mut cur_table_rows);
                                 }
                             }
                             "w:p" | "a:p" | "text:p" | "text:h" => {
                                 if table_cell_depth > 0 {
-                                    if !out.is_empty()
-                                        && !out.ends_with(' ')
-                                        && !out.ends_with(" | ")
-                                        && !out.ends_with('\n')
-                                    {
-                                        out.push(' ');
+                                    if !cur_cell.is_empty() && !cur_cell.ends_with(' ') {
+                                        cur_cell.push(' ');
                                     }
-                                } else if !out.ends_with('\n') {
-                                    out.push('\n');
+                                    cur_heading_level = None;
+                                    cur_is_list_item = false;
+                                } else {
+                                    flush_paragraph(
+                                        &mut out,
+                                        &mut cur_para,
+                                        &mut cur_heading_level,
+                                        &mut cur_is_list_item,
+                                    );
                                 }
                             }
                             _ => {}
@@ -683,14 +930,32 @@ impl DocumentExtractor {
             let next_tag = xml[i..].find('<').map(|off| i + off).unwrap_or(bytes.len());
             if capture_depth > 0 && skip_depth == 0 && next_tag > i {
                 let raw_text = &xml[i..next_tag];
-                out.push_str(&Self::decode_html_entities(raw_text));
+                let decoded = Self::decode_html_entities(raw_text);
+                if table_cell_depth > 0 {
+                    cur_cell.push_str(&decoded);
+                } else {
+                    cur_para.push_str(&decoded);
+                }
             }
             i = next_tag;
         }
 
+        if !cur_para.trim().is_empty() {
+            flush_paragraph(
+                &mut out,
+                &mut cur_para,
+                &mut cur_heading_level,
+                &mut cur_is_list_item,
+            );
+        }
+        if !cur_table_rows.is_empty() {
+            flush_table(&mut out, &mut cur_table_rows);
+        }
+
+        let sanitized = Self::sanitize_extracted_markdown_artifacts(&out);
         let mut cleaned_lines: Vec<String> = Vec::new();
-        for line in out.lines() {
-            let trimmed = line.trim().trim_matches('|').trim();
+        for line in sanitized.lines() {
+            let trimmed = line.trim();
             if !trimmed.is_empty() {
                 cleaned_lines.push(trimmed.to_string());
             }
@@ -1738,9 +2003,13 @@ impl DocumentExtractor {
 
     /// Extracts all paragraphs, tables, timeline textboxes, content controls, headers, and footers
     /// from `.docx`, `.doc`, or `.odt` using pure-Rust OpenXML/OLE2 parsing first.
-    fn extract_word_or_odt_text(path: &Path, ext: &str) -> io::Result<String> {
+    fn extract_word_or_odt_text(
+        path: &Path,
+        ext: &str,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> io::Result<String> {
         if ext == "doc" {
-            if let Ok(text) = Self::extract_ole2_doc_text(path) {
+            if let Ok(text) = Self::extract_ole2_doc_text_with_policy(path, policy) {
                 if !text.trim().is_empty() {
                     return Ok(text);
                 }
@@ -1814,8 +2083,21 @@ impl DocumentExtractor {
     }
 
     /// Pure-Rust OLE2 parser using `cfb` for legacy binary `.doc` files (Word 97-2003).
-    /// Extracts text from the `WordDocument` stream without 256KB truncation.
+    /// Extracts text from the `WordDocument` stream without 256KB truncation
+    /// (defaults fail-closed to `CloudPlaceholderPolicy::LocallySyncedOnly`).
     pub fn extract_ole2_doc_text(path: &Path) -> io::Result<String> {
+        Self::extract_ole2_doc_text_with_policy(
+            path,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Pure-Rust OLE2 parser using `cfb` for legacy binary `.doc` files while enforcing `policy`.
+    pub fn extract_ole2_doc_text_with_policy(
+        path: &Path,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> io::Result<String> {
+        crate::cloud_drives::ensure_open_allowed_for_placeholder(path, policy)?;
         let file = std::fs::File::open(path)?;
         let mut comp = cfb::CompoundFile::open(file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -2089,48 +2371,77 @@ impl DocumentExtractor {
         out
     }
 
-    /// Extracts clean prose from HTML files, stripping `<script>` and `<style>` blocks and decoding entities.
+    /// Extracts clean prose from HTML files, stripping `<script>` and `<style>` blocks and decoding entities
+    /// (defaults fail-closed to `CloudPlaceholderPolicy::LocallySyncedOnly`).
     pub fn extract_html_prose(path: &Path) -> io::Result<String> {
+        Self::extract_html_prose_with_policy(
+            path,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Extracts clean prose from HTML files while enforcing `policy` before reading.
+    pub fn extract_html_prose_with_policy(
+        path: &Path,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> io::Result<String> {
+        crate::cloud_drives::ensure_open_allowed_for_placeholder(path, policy)?;
         let raw = Self::read_any_text_encoding(path)?;
         Ok(Self::clean_html_prose(&raw))
     }
 
-    /// Strips `<script>` and `<style>` blocks, removes HTML tags, and decodes HTML entities into clean prose.
+    /// Strips `<script>`, `<style>`, `<noscript>`, and `<svg>` blocks, normalizes structural HTML
+    /// (`<h1>..<h6>`, `<li>`, `<blockquote>`, `<table>` cells) into clean GFM Markdown, and decodes
+    /// HTML entities (Kreuzberg / Docling HTML-to-Markdown normalization).
     pub fn clean_html_prose(html: &str) -> String {
-        let without_script = if let Ok(re) = regex::RegexBuilder::new(r"(?is)<script\b[^>]*>.*?</script>")
-            .build()
-        {
-            re.replace_all(html, " ").to_string()
-        } else {
-            html.to_string()
-        };
+        static RE_STRIP_BLOCKS: OnceLock<regex::Regex> = OnceLock::new();
+        static RE_H1: OnceLock<regex::Regex> = OnceLock::new();
+        static RE_H2: OnceLock<regex::Regex> = OnceLock::new();
+        static RE_H3: OnceLock<regex::Regex> = OnceLock::new();
+        static RE_LI_OPEN: OnceLock<regex::Regex> = OnceLock::new();
+        static RE_BQ_OPEN: OnceLock<regex::Regex> = OnceLock::new();
+        static RE_CELL_CLOSE: OnceLock<regex::Regex> = OnceLock::new();
+        static RE_BLOCK_CLOSE: OnceLock<regex::Regex> = OnceLock::new();
+        static RE_ANY_TAG: OnceLock<regex::Regex> = OnceLock::new();
 
-        let without_style = if let Ok(re) = regex::RegexBuilder::new(r"(?is)<style\b[^>]*>.*?</style>")
-            .build()
-        {
-            re.replace_all(&without_script, " ").to_string()
-        } else {
-            without_script
-        };
+        let re_strip = RE_STRIP_BLOCKS.get_or_init(|| {
+            regex::RegexBuilder::new(r"(?is)<(?:script|style|noscript|svg)\b[^>]*>.*?</(?:script|style|noscript|svg)>")
+                .build()
+                .expect("strip blocks regex")
+        });
+        let re_h1 = RE_H1.get_or_init(|| regex::Regex::new(r"(?i)<h1\b[^>]*>").expect("h1 regex"));
+        let re_h2 = RE_H2.get_or_init(|| regex::Regex::new(r"(?i)<h2\b[^>]*>").expect("h2 regex"));
+        let re_h3 = RE_H3.get_or_init(|| regex::Regex::new(r"(?i)<h[3-6]\b[^>]*>").expect("h3 regex"));
+        let re_li = RE_LI_OPEN.get_or_init(|| regex::Regex::new(r"(?i)<li\b[^>]*>").expect("li regex"));
+        let re_bq = RE_BQ_OPEN.get_or_init(|| regex::Regex::new(r"(?i)<blockquote\b[^>]*>").expect("bq regex"));
+        let re_cell_close = RE_CELL_CLOSE.get_or_init(|| regex::Regex::new(r"(?i)</t[dh]>").expect("td close regex"));
+        let re_block_close = RE_BLOCK_CLOSE.get_or_init(|| {
+            regex::Regex::new(r"(?i)(?:<br\s*/?>|</(?:p|div|h[1-6]|li|tr|blockquote|section|article|table)>)")
+                .expect("block close regex")
+        });
+        let re_any_tag = RE_ANY_TAG.get_or_init(|| regex::Regex::new(r"<[^>]+>").expect("tag regex"));
 
-        let block_spaced = if let Ok(re) = regex::RegexBuilder::new(r"(?i)</(?:p|div|h[1-6]|li|tr|blockquote|section|article)>")
-            .build()
-        {
-            re.replace_all(&without_style, "\n").to_string()
-        } else {
-            without_style
-        };
-
-        let tag_regex = regex::Regex::new(r"<[^>]+>").unwrap();
-        let stripped = tag_regex.replace_all(&block_spaced, " ");
-
+        let s0 = re_strip.replace_all(html, " ");
+        let s1 = re_h1.replace_all(&s0, "\n# ");
+        let s2 = re_h2.replace_all(&s1, "\n## ");
+        let s3 = re_h3.replace_all(&s2, "\n### ");
+        let s4 = re_li.replace_all(&s3, "\n- ");
+        let s5 = re_bq.replace_all(&s4, "\n> ");
+        let s6 = re_cell_close.replace_all(&s5, " | ");
+        let s7 = re_block_close.replace_all(&s6, "\n");
+        let stripped = re_any_tag.replace_all(&s7, " ");
         let decoded = Self::decode_html_entities(&stripped);
+        let sanitized = Self::sanitize_extracted_markdown_artifacts(&decoded);
 
         let mut lines = Vec::new();
-        for line in decoded.lines() {
-            let trimmed = line.trim();
+        for line in sanitized.lines() {
+            let trimmed = line
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let trimmed = trimmed.trim_end_matches('|').trim();
             if !trimmed.is_empty() {
-                lines.push(trimmed);
+                lines.push(trimmed.to_string());
             }
         }
         lines.join("\n\n")
@@ -2690,6 +3001,7 @@ try {
 
     /// Builds a canonical `IngestedParentDocument` record containing the unchunked full text
     /// and internal OpenXML / PDF / OS Search metadata (`doc_title`, `doc_author`, `doc_revision`).
+    /// Fails closed on cloud placeholders under `CloudPlaceholderPolicy::LocallySyncedOnly`.
     pub fn build_ingested_parent_document(
         path: &Path,
         doc_id: &str,
@@ -2698,6 +3010,31 @@ try {
         mtime_secs: i64,
         size_bytes: u64,
         override_format: Option<quorum_types::DocumentFormat>,
+    ) -> quorum_types::IngestedParentDocument {
+        Self::build_ingested_parent_document_with_policy(
+            path,
+            doc_id,
+            blake3_hash,
+            full_text,
+            mtime_secs,
+            size_bytes,
+            override_format,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Builds a canonical `IngestedParentDocument` record while enforcing `policy` before
+    /// reading OpenXML/ODF core properties from `path`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_ingested_parent_document_with_policy(
+        path: &Path,
+        doc_id: &str,
+        blake3_hash: &str,
+        full_text: &str,
+        mtime_secs: i64,
+        size_bytes: u64,
+        override_format: Option<quorum_types::DocumentFormat>,
+        policy: quorum_types::CloudPlaceholderPolicy,
     ) -> quorum_types::IngestedParentDocument {
         let ext = path
             .extension()
@@ -2720,10 +3057,14 @@ try {
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert("file_size_bytes".to_string(), size_bytes.to_string());
 
-        if matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp") {
+        if matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp")
+            && crate::cloud_drives::ensure_open_allowed_for_placeholder(path, policy).is_ok()
+        {
             if let Ok(bytes) = std::fs::read(path) {
                 for (k, v) in Self::extract_openxml_core_props(&bytes) {
-                    metadata.insert(k, v);
+                    let scrubbed_v =
+                        crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(&v);
+                    metadata.insert(k, scrubbed_v);
                 }
             }
         }
@@ -3282,5 +3623,51 @@ mod tests {
         let classifier = FileTypeClassifier::new();
         let identity = classifier.classify_file(&fake_pdf).expect("classify");
         let _ = DocumentExtractor::extract_text(&fake_pdf, &identity);
+    }
+
+    #[test]
+    fn test_kreuzberg_grade_docx_odt_and_html_markdown_normalization() {
+        let docx_xml = r#"
+        <w:document>
+          <w:body>
+            <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Lease Terms Overview</w:t></w:r></w:p>
+            <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr><w:r><w:t>Contact Angela Davis at HYPERLINK "mailto:firldeal@gmail.com" firldeal@gmail.com.</w:t></w:r></w:p>
+            <w:p><w:r><w:instrText> HYPERLINK "mailto:hidden@example.com" \o "Hidden" </w:instrText><w:t>Effective 1 st October 201 9</w:t></w:r></w:p>
+            <w:tbl>
+              <w:tr><w:tc><w:p><w:r><w:t>Field</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Amount</w:t></w:r></w:p></w:tc></w:tr>
+              <w:tr><w:tc><w:p><w:r><w:t>Monthly Rent</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>$850.00</w:t></w:r></w:p></w:tc></w:tr>
+            </w:tbl>
+          </w:body>
+        </w:document>"#;
+
+        let md_docx = DocumentExtractor::extract_word_xml_runs(docx_xml, false);
+        assert!(md_docx.contains("# Lease Terms Overview"), "Must emit Markdown heading:\n{md_docx}");
+        assert!(md_docx.contains("- Contact Angela Davis at firldeal@gmail.com."), "Must emit bullet & strip HYPERLINK:\n{md_docx}");
+        assert!(!md_docx.contains("HYPERLINK"), "Must strip all HYPERLINK codes:\n{md_docx}");
+        assert!(md_docx.contains("1st October 2019"), "Must repair split ordinal and year:\n{md_docx}");
+        assert!(md_docx.contains("| Field | Amount |\n|---|---|\n| Monthly Rent | $850.00 |"), "Must emit real GFM table:\n{md_docx}");
+
+        let odt_xml = r#"
+        <office:body><office:text>
+          <text:h text:outline-level="2">Academic Research</text:h>
+          <text:list><text:list-item><text:p>Women, Race &amp; Class (1981)</text:p></text:list-item></text:list>
+          <table:table>
+            <table:table-row><table:table-cell><text:p>Theme</text:p></table:table-cell><table:table-cell><text:p>Focus</text:p></table:table-cell></table:table-row>
+            <table:table-row><table:table-cell><text:p>Abolition</text:p></table:table-cell><table:table-cell><text:p>Sojourner Truth</text:p></table:table-cell></table:table-row>
+          </table:table>
+        </office:text></office:body>"#;
+
+        let md_odt = DocumentExtractor::extract_word_xml_runs(odt_xml, true);
+        assert!(md_odt.contains("## Academic Research"), "ODT heading:\n{md_odt}");
+        assert!(md_odt.contains("- Women, Race & Class (1981)"), "ODT bullet:\n{md_odt}");
+        assert!(md_odt.contains("| Theme | Focus |\n|---|---|\n| Abolition | Sojourner Truth |"), "ODT GFM table:\n{md_odt}");
+
+        let md_html = DocumentExtractor::clean_html_prose(
+            "<html><body><script>evil()</script><h1>Title</h1><ul><li>Point One</li></ul><blockquote>Quote text</blockquote></body></html>"
+        );
+        assert!(md_html.contains("# Title"), "HTML heading:\n{md_html}");
+        assert!(md_html.contains("- Point One"), "HTML bullet:\n{md_html}");
+        assert!(md_html.contains("> Quote text"), "HTML quote:\n{md_html}");
+        assert!(!md_html.contains("evil()"));
     }
 }

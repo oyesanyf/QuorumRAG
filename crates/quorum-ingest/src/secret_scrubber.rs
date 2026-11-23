@@ -270,37 +270,74 @@ pub fn is_high_entropy_secret(token: &str) -> bool {
     shannon_entropy_bits(clean) > 4.20
 }
 
+/// Scrubs a single whitespace-delimited token or `key=value` field while preserving key names.
+fn scrub_single_word_or_kv(word: &str) -> String {
+    if let Some(eq_idx) = word.find('=') {
+        let key_part = &word[..eq_idx];
+        let val_part = &word[eq_idx + 1..];
+        let valid_key = !key_part.is_empty()
+            && key_part.len() <= 32
+            && key_part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if valid_key && !val_part.is_empty() {
+            if is_high_entropy_secret(val_part) {
+                return format!("{key_part}=[REDACTED_HIGH_ENTROPY_SECRET]");
+            } else {
+                return word.to_string();
+            }
+        }
+    }
+    if is_high_entropy_secret(word) {
+        "[REDACTED_HIGH_ENTROPY_SECRET]".to_string()
+    } else {
+        word.to_string()
+    }
+}
+
 /// Scrubs high-entropy secret tokens from text, replacing them with
 /// `[REDACTED_HIGH_ENTROPY_SECRET]` while preserving structured `key=value` telemetry field names
 /// (e.g., `query_name='api.github.com'`) and valid DNS FQDNs.
 pub fn scrub_high_entropy_tokens(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for word in text.split_whitespace() {
-        // Preserve structured telemetry/log `key=value` field names so only the value is inspected
-        if let Some(eq_idx) = word.find('=') {
-            let key_part = &word[..eq_idx];
-            let val_part = &word[eq_idx + 1..];
-            let valid_key = !key_part.is_empty()
-                && key_part.len() <= 32
-                && key_part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-            if valid_key && !val_part.is_empty() {
-                if is_high_entropy_secret(val_part) {
-                    out.push(format!("{key_part}=[REDACTED_HIGH_ENTROPY_SECRET]"));
-                } else {
-                    out.push(word.to_string());
-                }
-                continue;
-            }
-        }
-        if is_high_entropy_secret(word) {
-            out.push("[REDACTED_HIGH_ENTROPY_SECRET]".to_string());
-        } else {
-            out.push(word.to_string());
-        }
+        out.push(scrub_single_word_or_kv(word));
     }
     out.join(" ")
+}
+
+/// Scrubs high-entropy secret tokens while preserving exact whitespace, newlines (`\n`, `\r\n`),
+/// tabs, and indentation so `TextChunker` line numbers and heading hierarchies remain intact.
+pub fn scrub_high_entropy_tokens_preserving_layout(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut iter = text.char_indices().peekable();
+    while let Some(&(start, ch)) = iter.peek() {
+        if ch.is_whitespace() {
+            let mut end = start + ch.len_utf8();
+            iter.next();
+            while let Some(&(idx, next_ch)) = iter.peek() {
+                if !next_ch.is_whitespace() {
+                    break;
+                }
+                end = idx + next_ch.len_utf8();
+                iter.next();
+            }
+            out.push_str(&text[start..end]);
+        } else {
+            let mut end = start + ch.len_utf8();
+            iter.next();
+            while let Some(&(idx, next_ch)) = iter.peek() {
+                if next_ch.is_whitespace() {
+                    break;
+                }
+                end = idx + next_ch.len_utf8();
+                iter.next();
+            }
+            let word = &text[start..end];
+            out.push_str(&scrub_single_word_or_kv(word));
+        }
+    }
+    out
 }
 
 /// Scrubs known credential patterns from text using regular expressions.
@@ -405,6 +442,109 @@ pub fn scrub_text(input: &str) -> String {
     SecretScrubber::scrub_text(input)
 }
 
+/// Combined entry point that preserves all whitespace, newlines, and indentation.
+pub fn scrub_text_preserving_layout(input: &str) -> String {
+    SecretScrubber::scrub_text_preserving_layout(input)
+}
+
+/// Sanitizes extracted text with layout-preserving `SecretScrubber`, then enforces an optional
+/// fail-closed `DlpContentGate`. Any `Err(reason)` blocks ingestion before chunking or storage.
+pub fn sanitize_and_gate_text(
+    file_path: &str,
+    text: &str,
+    access_tier: u8,
+    dlp_gate: Option<&dyn quorum_types::DlpContentGate>,
+) -> Result<String, String> {
+    let scrubbed = SecretScrubber::scrub_text_preserving_layout(text);
+    if let Some(gate) = dlp_gate {
+        gate.inspect_ingest_text(file_path, &scrubbed, access_tier)
+    } else {
+        Ok(scrubbed)
+    }
+}
+
+fn sanitize_json_value_with_gate(
+    file_path: &str,
+    val: &mut serde_json::Value,
+    access_tier: u8,
+    dlp_gate: Option<&dyn quorum_types::DlpContentGate>,
+) -> Result<(), String> {
+    match val {
+        serde_json::Value::String(s) => {
+            if !s.is_empty() {
+                *s = sanitize_and_gate_text(file_path, s, access_tier, dlp_gate)?;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                sanitize_json_value_with_gate(file_path, item, access_tier, dlp_gate)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                sanitize_json_value_with_gate(file_path, v, access_tier, dlp_gate)?;
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+/// Sanitizes and DLP-gates every string value inside a JSON metadata payload (`metadata_json`),
+/// failing closed on invalid JSON or any `DlpContentGate` rejection, and guaranteeing valid JSON output.
+pub fn sanitize_and_gate_metadata_json(
+    file_path: &str,
+    metadata_json: &str,
+    access_tier: u8,
+    dlp_gate: Option<&dyn quorum_types::DlpContentGate>,
+) -> Result<String, String> {
+    let trimmed = metadata_json.trim();
+    if trimmed.is_empty() {
+        return Ok("{}".to_string());
+    }
+    let mut val: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("Invalid metadata_json payload: {e}"))?;
+    sanitize_json_value_with_gate(file_path, &mut val, access_tier, dlp_gate)?;
+    serde_json::to_string(&val).map_err(|e| format!("Failed to serialize metadata_json: {e}"))
+}
+
+/// Sanitizes and DLP-gates resolved document metadata (`title`, `author`, `revision`)
+/// before formatting chunk headers or persisting chunk/parent metadata.
+pub fn sanitize_and_gate_resolved_metadata(
+    file_path: &str,
+    meta: &mut crate::chunker::ResolvedDocumentMetadata,
+    access_tier: u8,
+    dlp_gate: Option<&dyn quorum_types::DlpContentGate>,
+) -> Result<(), String> {
+    meta.title = sanitize_and_gate_text(file_path, &meta.title, access_tier, dlp_gate)?;
+    meta.author = sanitize_and_gate_text(file_path, &meta.author, access_tier, dlp_gate)?;
+    if let Some(ref mut rev) = meta.revision {
+        *rev = sanitize_and_gate_text(file_path, rev, access_tier, dlp_gate)?;
+    }
+    Ok(())
+}
+
+/// Sanitizes and DLP-gates `IngestedParentDocument` metadata fields (`title`, `author`, and
+/// all `metadata` map values such as OpenXML `docProps/core.xml` properties), failing closed
+/// on any `DlpContentGate` rejection.
+pub fn sanitize_and_gate_parent_document(
+    parent_doc: &mut quorum_types::IngestedParentDocument,
+    access_tier: u8,
+    dlp_gate: Option<&dyn quorum_types::DlpContentGate>,
+) -> Result<(), String> {
+    let source_path = parent_doc.source_path.clone();
+    if let Some(ref mut title) = parent_doc.title {
+        *title = sanitize_and_gate_text(&source_path, title, access_tier, dlp_gate)?;
+    }
+    if let Some(ref mut author) = parent_doc.author {
+        *author = sanitize_and_gate_text(&source_path, author, access_tier, dlp_gate)?;
+    }
+    for (_, val) in parent_doc.metadata.iter_mut() {
+        *val = sanitize_and_gate_text(&source_path, val, access_tier, dlp_gate)?;
+    }
+    Ok(())
+}
+
 /// Unified pre-index secret scrubber combining regex and Shannon entropy detection.
 pub struct SecretScrubber;
 
@@ -413,6 +553,18 @@ impl SecretScrubber {
     pub fn scrub_text(input: &str) -> String {
         let regex_scrubbed = scrub_regex_secrets(input);
         scrub_high_entropy_tokens(&regex_scrubbed)
+    }
+
+    /// Layout-preserving entry point for document ingestion: scrubs regex patterns and
+    /// high-entropy tokens while preserving newlines, indentation, and heading boundaries.
+    pub fn scrub_text_preserving_layout(input: &str) -> String {
+        let regex_scrubbed = scrub_regex_secrets(input);
+        scrub_high_entropy_tokens_preserving_layout(&regex_scrubbed)
+    }
+
+    /// Scrubs high-entropy tokens while preserving whitespace and newlines.
+    pub fn scrub_high_entropy_tokens_preserving_layout(text: &str) -> String {
+        scrub_high_entropy_tokens_preserving_layout(text)
     }
 
     /// Scrubs regex credential patterns.
@@ -722,6 +874,51 @@ mod tests {
         let scrubbed_secret = SecretScrubber::scrub_text(&real_secret);
         assert!(scrubbed_secret.contains("REDACTED"));
         assert!(!scrubbed_secret.contains(&synthetic_value[..14]));
+    }
+
+    #[test]
+    fn test_sanitize_and_gate_metadata_json_scrubs_masks_and_fails_closed() {
+        struct TestGate;
+        impl quorum_types::DlpContentGate for TestGate {
+            fn inspect_ingest_text(
+                &self,
+                _file_path: &str,
+                text: &str,
+                _access_tier: u8,
+            ) -> Result<String, String> {
+                if text.contains("FORBIDDEN_META") {
+                    Err("Blocked metadata".to_string())
+                } else {
+                    Ok(text.replace("SANITIZE_ME", "[DLP_MASKED]"))
+                }
+            }
+        }
+
+        let synthetic_api_key = concat!("sk-", "1234567890abcdefghijklmnop");
+        let raw_json = serde_json::json!({
+            "mime_type": "image/png",
+            "width": 100,
+            "ocr_text": format!("token={synthetic_api_key}\nSANITIZE_ME"),
+            "keywords": ["alpha", "SANITIZE_ME"],
+            "user_comment": null
+        })
+        .to_string();
+
+        let sanitized = sanitize_and_gate_metadata_json("img.png", &raw_json, 3, Some(&TestGate))
+            .expect("sanitization must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).expect("valid JSON");
+        assert_eq!(parsed["mime_type"], "image/png");
+        assert_eq!(parsed["width"], 100);
+        let ocr = parsed["ocr_text"].as_str().unwrap();
+        assert!(!ocr.contains(synthetic_api_key));
+        assert!(!ocr.contains("SANITIZE_ME"));
+        assert!(ocr.contains("[REDACTED_API_KEY]"));
+        assert!(ocr.contains("[DLP_MASKED]"));
+        assert_eq!(parsed["keywords"][1], "[DLP_MASKED]");
+
+        let blocked_json = serde_json::json!({ "ocr_text": "FORBIDDEN_META" }).to_string();
+        assert!(sanitize_and_gate_metadata_json("img.png", &blocked_json, 3, Some(&TestGate)).is_err());
+        assert!(sanitize_and_gate_metadata_json("img.png", "{not-json", 3, Some(&TestGate)).is_err());
     }
 }
 

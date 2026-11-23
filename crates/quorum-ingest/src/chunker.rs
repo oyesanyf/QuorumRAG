@@ -370,14 +370,20 @@ impl TextChunker {
                 if content[end_idx..].trim().is_empty() {
                     end_idx = total_len;
                 } else {
+                    let semantic_min = start_idx + (self.config.target_chunk_size / 2);
                     let mut snap_window_start = end_idx.saturating_sub(self.config.target_chunk_size / 4).max(start_idx);
                     while !content.is_char_boundary(snap_window_start) && snap_window_start < end_idx {
                         snap_window_start += 1;
                     }
                     let window = &content[snap_window_start..end_idx];
 
-                    // Check for paragraph break (\n\n)
-                    if let Some(pos) = window.rfind("\n\n") {
+                    // 0. Semantic topic-shift boundary (#2 Semantic Chunking) inside the trailing half of the chunk
+                    if let Some(sem_pos) = find_semantic_topic_breakpoint(content, semantic_min, end_idx) {
+                        if sem_pos > start_idx && sem_pos < end_idx && content.is_char_boundary(sem_pos) {
+                            end_idx = sem_pos;
+                        }
+                    } else if let Some(pos) = window.rfind("\n\n") {
+                        // 1. Paragraph break (\n\n)
                         let snapped = snap_window_start + pos + 2;
                         if content.is_char_boundary(snapped) {
                             end_idx = snapped;
@@ -718,8 +724,22 @@ pub struct ResolvedDocumentMetadata {
 
 /// Deterministically resolves parent-document metadata (`title`, `author`, `revision`, `kind`)
 /// from document headers, `[PDF Metadata]` / `[Document Metadata]` banners, OpenXML core properties,
-/// and filename fallbacks.
+/// and filename fallbacks (defaults fail-closed to `CloudPlaceholderPolicy::LocallySyncedOnly`).
 pub fn resolve_document_metadata(path: &Path, content: &str) -> ResolvedDocumentMetadata {
+    resolve_document_metadata_with_policy(
+        path,
+        content,
+        quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+    )
+}
+
+/// Deterministically resolves parent-document metadata while enforcing `policy` before
+/// reading OpenXML/ODF core properties from `path`.
+pub fn resolve_document_metadata_with_policy(
+    path: &Path,
+    content: &str,
+    policy: quorum_types::CloudPlaceholderPolicy,
+) -> ResolvedDocumentMetadata {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -736,8 +756,11 @@ pub fn resolve_document_metadata(path: &Path, content: &str) -> ResolvedDocument
     let mut doc_authors = String::new();
     let mut doc_revision: Option<String> = None;
 
-    // 0. If this is an OpenXML / ODF document on disk, inspect core properties first
-    if matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp") && path.exists() {
+    // 0. If this is an OpenXML / ODF document on disk, inspect core properties first (gated by placeholder policy)
+    if matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp")
+        && path.exists()
+        && crate::cloud_drives::ensure_open_allowed_for_placeholder(path, policy).is_ok()
+    {
         if let Ok(bytes) = std::fs::read(path) {
             let props = crate::document_extractor::DocumentExtractor::extract_openxml_core_props(&bytes);
             if let Some(t) = props.get("doc_title").filter(|s| !s.trim().is_empty()) {
@@ -865,7 +888,25 @@ pub fn resolve_document_metadata(path: &Path, content: &str) -> ResolvedDocument
 /// `[Document: "{doc_title}" | Author: {doc_authors} | Kind: {doc_kind} | File: {file_name}]`
 /// (with `| Rev: {revision}` included when a revision is present).
 pub fn build_contextual_header(path: &Path, content: &str) -> String {
-    let meta = resolve_document_metadata(path, content);
+    build_contextual_header_with_policy(
+        path,
+        content,
+        quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+    )
+}
+
+/// Derives document metadata and builds the contextual header while enforcing `policy`.
+pub fn build_contextual_header_with_policy(
+    path: &Path,
+    content: &str,
+    policy: quorum_types::CloudPlaceholderPolicy,
+) -> String {
+    let meta = resolve_document_metadata_with_policy(path, content, policy);
+    format_contextual_header_from_meta(&meta)
+}
+
+/// Formats the contextual header from an already-resolved (and sanitized) `ResolvedDocumentMetadata`.
+pub fn format_contextual_header_from_meta(meta: &ResolvedDocumentMetadata) -> String {
     if let Some(ref rev) = meta.revision {
         format!(
             "[Document: \"{}\" | Author: {} | Rev: {} | Kind: {} | File: {}]",
@@ -896,5 +937,182 @@ pub fn prepend_contextual_header_with_section(header: &str, section_path: &str, 
         format!("{}\n[Section: {}]\n\n{}", header, section_path, raw_slice)
     } else {
         format!("{}\n\n{}", header, raw_slice)
+    }
+}
+
+/// Extracts top discriminative document topic keywords (deterministic, zero LLM latency)
+/// for Anthropic-style Extractive Contextual Retrieval (#12) so isolated chunks retain document topic context.
+pub fn extract_document_topic_keywords(content: &str, max_terms: usize) -> Vec<String> {
+    use std::collections::HashMap;
+    const STOP: &[&str] = &[
+        "about", "after", "again", "against", "because", "before", "being", "between", "could",
+        "doing", "during", "every", "first", "found", "great", "having", "herein", "into", "might",
+        "never", "other", "shall", "should", "since", "still", "their", "there", "these", "thing",
+        "think", "those", "through", "under", "until", "using", "where", "which", "while", "whose",
+        "would", "document", "section", "paragraph", "agreement", "page", "lines",
+    ];
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for raw in content.split(|c: char| !c.is_alphanumeric()) {
+        if raw.len() < 5 || raw.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let low = raw.to_ascii_lowercase();
+        if STOP.contains(&low.as_str()) {
+            continue;
+        }
+        // Boost capitalized proper-noun / domain terms
+        let weight = if raw.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+            2
+        } else {
+            1
+        };
+        *freq.entry(low).or_insert(0) += weight;
+    }
+    let mut pairs: Vec<(String, usize)> = freq.into_iter().filter(|(_, c)| *c >= 2).collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs.into_iter().take(max_terms).map(|(k, _)| k).collect()
+}
+
+/// Prepends the `[Document: ...]` banner enriched with extractive document topics (#12 Contextual Retrieval)
+/// inside the existing bracketed banner format so display strippers automatically hide it from user prose.
+pub fn prepend_contextual_header_with_topics(
+    header: &str,
+    section_path: &str,
+    full_doc_content: &str,
+    raw_slice: &str,
+) -> String {
+    let topics = extract_document_topic_keywords(full_doc_content, 6);
+    let enriched_header = if !topics.is_empty() && header.starts_with("[Document:") && header.ends_with(']') {
+        format!("{} | Topics: {}]", &header[..header.len() - 1], topics.join(", "))
+    } else {
+        header.to_string()
+    };
+    prepend_contextual_header_with_section(&enriched_header, section_path, raw_slice)
+}
+
+/// Detects a semantic topic-shift split point (#2 Semantic Chunking) within `[min_bound..max_bound]`
+/// by scoring cosine similarity of bag-of-words vectors across adjacent sentence/paragraph blocks.
+/// Returns `Some(byte_offset)` at the sharpest topic shift (`cosine < 0.14`) so distinct discussions
+/// or pasted chat threads do not bleed into a single chunk.
+pub fn find_semantic_topic_breakpoint(
+    content: &str,
+    min_bound: usize,
+    max_bound: usize,
+) -> Option<usize> {
+    use std::collections::HashMap;
+    let total = content.len();
+    let mut s_min = min_bound.min(total);
+    while s_min < total && !content.is_char_boundary(s_min) {
+        s_min += 1;
+    }
+    let mut s_max = max_bound.min(total);
+    while s_max > s_min && !content.is_char_boundary(s_max) {
+        s_max -= 1;
+    }
+    if s_max.saturating_sub(s_min) < 120 {
+        return None;
+    }
+
+    let window = &content[s_min..s_max];
+    let mut candidate_breaks: Vec<usize> = Vec::new();
+    for (idx, _) in window.match_indices("\n\n") {
+        let abs = s_min + idx + 2;
+        if abs > s_min + 40 && abs + 40 < s_max && content.is_char_boundary(abs) {
+            candidate_breaks.push(abs);
+        }
+    }
+    if candidate_breaks.is_empty() {
+        for (idx, _) in window.match_indices(". ") {
+            let abs = s_min + idx + 2;
+            if abs > s_min + 60 && abs + 60 < s_max && content.is_char_boundary(abs) {
+                candidate_breaks.push(abs);
+            }
+        }
+    }
+    if candidate_breaks.is_empty() {
+        return None;
+    }
+
+    let bow = |slice: &str| -> HashMap<String, f32> {
+        let mut m = HashMap::new();
+        for tok in slice.split(|c: char| !c.is_alphanumeric()) {
+            if tok.len() >= 4 {
+                *m.entry(tok.to_ascii_lowercase()).or_insert(0.0f32) += 1.0;
+            }
+        }
+        m
+    };
+    let cosine = |a: &HashMap<String, f32>, b: &HashMap<String, f32>| -> f32 {
+        if a.is_empty() || b.is_empty() {
+            return 1.0;
+        }
+        let mut dot = 0.0f32;
+        let mut na = 0.0f32;
+        let mut nb = 0.0f32;
+        for (k, &va) in a {
+            na += va * va;
+            if let Some(&vb) = b.get(k) {
+                dot += va * vb;
+            }
+        }
+        for &vb in b.values() {
+            nb += vb * vb;
+        }
+        if na <= 0.0 || nb <= 0.0 {
+            1.0
+        } else {
+            dot / (na.sqrt() * nb.sqrt())
+        }
+    };
+
+    let mut best: Option<(usize, f32)> = None;
+    for abs in candidate_breaks {
+        let mut left_start = abs.saturating_sub(260).max(s_min);
+        while left_start < abs && !content.is_char_boundary(left_start) {
+            left_start += 1;
+        }
+        let mut right_end = (abs + 260).min(s_max);
+        while right_end > abs && !content.is_char_boundary(right_end) {
+            right_end -= 1;
+        }
+        let left_v = bow(&content[left_start..abs]);
+        let right_v = bow(&content[abs..right_end]);
+        if left_v.len() < 4 || right_v.len() < 4 {
+            continue;
+        }
+        let sim = cosine(&left_v, &right_v);
+        if sim < 0.14 && best.map_or(true, |(_, b_sim)| sim < b_sim) {
+            best = Some((abs, sim));
+        }
+    }
+    best.map(|(pos, _)| pos)
+}
+
+#[cfg(test)]
+mod semantic_and_contextual_tests {
+    use super::*;
+
+    #[test]
+    fn test_semantic_topic_breakpoint_splits_unrelated_discussions() {
+        let doc = "Women, Race and Class by Angela Davis examines slavery, abolition, suffrage, labor unions, and reproductive rights across American history.\n\n\
+                   Residential property lease agreement for 2913 Castiglione Street specifies monthly rent, security deposit, plumbing repairs, and late penalty fees.";
+        let split = find_semantic_topic_breakpoint(doc, 0, doc.len())
+            .expect("Must detect sharp semantic topic shift between unrelated paragraphs");
+        assert!(
+            doc[split..].starts_with("Residential property lease"),
+            "Split must land right at the topic transition, got: {}",
+            &doc[split..]
+        );
+    }
+
+    #[test]
+    fn test_extractive_contextual_retrieval_enriches_document_banner() {
+        let content = "Angela Davis authored Women, Race & Class in 1981. Angela Davis analyzes intersectional labor movements, abolition, and suffrage.";
+        let banner = "[Document: \"Women Race Class\" | Author: Unknown | Kind: article | File: Women Race Class.docx]";
+        let enriched = prepend_contextual_header_with_topics(banner, "Overview", content, "First paragraph.");
+        assert!(enriched.starts_with("[Document: \"Women Race Class\""));
+        assert!(enriched.contains("| Topics: "));
+        assert!(enriched.contains("angela") && enriched.contains("davis"));
+        assert!(enriched.contains("[Section: Overview]"));
     }
 }

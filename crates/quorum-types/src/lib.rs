@@ -12,6 +12,9 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+pub mod cloud_drives;
+pub use cloud_drives::*;
+
 /// Error types for `quorum-types` domain logic.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TypeError {
@@ -33,6 +36,12 @@ pub enum TypeError {
         query_time: i64,
         drift_seconds: i64,
     },
+
+    #[error("Invalid cloud drive path '{path}': {reason}")]
+    InvalidCloudDrivePath { path: String, reason: String },
+
+    #[error("Invalid cloud drive configuration: {0}")]
+    InvalidCloudDriveConfig(String),
 }
 
 /// Access tiers for document and chunk level authorization.

@@ -340,11 +340,37 @@ impl ResponseFormatterWatchdog {
                 formatting_repaired = true;
             }
         }
+        if let Ok(re_dangling_in) =
+            Regex::new(r"(?i)\b(as detailed|as documented|as noted|as shown|outlined|described)\s+in\s*,")
+        {
+            if re_dangling_in.is_match(&prose) {
+                prose = re_dangling_in
+                    .replace_all(&prose, "$1 in the retrieved records,")
+                    .to_string();
+                formatting_repaired = true;
+            }
+        }
         if let Ok(re_space_punct) = Regex::new(r" +([.,;:])") {
             if re_space_punct.is_match(&prose) {
                 prose = re_space_punct.replace_all(&prose, "$1").to_string();
                 formatting_repaired = true;
             }
+        }
+        // Apply unified structured markdown hygiene: balance * and **, expand inline bullet runs,
+        // demote conversational headings / orphan quotes, remove mid-word truncation stubs, and
+        // sanitize non-allowlisted raw angle-bracket HTML tags via pulldown-cmark AST inspection.
+        let polished_prose = crate::structured_output::sanitize_raw_markdown_html_tags(
+            &crate::structured_output::clean_truncated_word_stubs(
+                &crate::structured_output::demote_retrieved_headings_and_orphan_quotes(
+                    &crate::structured_output::expand_inline_bullet_runs(
+                        &crate::structured_output::balance_markdown_emphasis(&prose),
+                    ),
+                ),
+            ),
+        );
+        if polished_prose != prose {
+            prose = polished_prose;
+            formatting_repaired = true;
         }
 
         // 1b. Strip standalone / orphan citation stubs (e.g. standalone "[1].", "[5].", "[1].\n[5].", or " **[1]**.")
@@ -502,11 +528,37 @@ impl ResponseFormatterWatchdog {
                 formatting_repaired = true;
             }
         }
+        if let Ok(re_dangling_in) =
+            Regex::new(r"(?i)\b(as detailed|as documented|as noted|as shown|outlined|described)\s+in\s*,")
+        {
+            if re_dangling_in.is_match(&prose) {
+                prose = re_dangling_in
+                    .replace_all(&prose, "$1 in the retrieved records,")
+                    .to_string();
+                formatting_repaired = true;
+            }
+        }
         if let Ok(re_space_punct) = Regex::new(r" +([.,;:])") {
             if re_space_punct.is_match(&prose) {
                 prose = re_space_punct.replace_all(&prose, "$1").to_string();
                 formatting_repaired = true;
             }
+        }
+        // Apply unified structured markdown hygiene: balance * and **, expand inline bullet runs,
+        // demote conversational headings / orphan quotes, remove mid-word truncation stubs, and
+        // sanitize non-allowlisted raw angle-bracket HTML tags via pulldown-cmark AST inspection.
+        let polished_prose = crate::structured_output::sanitize_raw_markdown_html_tags(
+            &crate::structured_output::clean_truncated_word_stubs(
+                &crate::structured_output::demote_retrieved_headings_and_orphan_quotes(
+                    &crate::structured_output::expand_inline_bullet_runs(
+                        &crate::structured_output::balance_markdown_emphasis(&prose),
+                    ),
+                ),
+            ),
+        );
+        if polished_prose != prose {
+            prose = polished_prose;
+            formatting_repaired = true;
         }
         if let Ok(re_orphan) = Regex::new(r"(?im)^\s*(?:\*{1,2})?\[\d+\](?:\*{1,2})?\.?\s*$") {
             if re_orphan.is_match(&prose) {

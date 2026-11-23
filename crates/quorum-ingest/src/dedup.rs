@@ -57,8 +57,11 @@ pub enum DedupAction {
 pub struct Level1DedupCatalog {
     /// Primary index: file_blake3 -> FileCatalogEntry
     entries: HashMap<String, FileCatalogEntry>,
-    /// Secondary index: file_path -> file_blake3
+    /// Secondary index: file_path -> file_blake3 (preserves original path casing)
     path_to_hash: HashMap<PathBuf, String>,
+    /// Normalized lookup index: normalized_key -> original path in `path_to_hash`
+    #[serde(skip)]
+    norm_to_raw: HashMap<PathBuf, PathBuf>,
 }
 
 /// Atomically persists a serialized JSON byte payload to disk using a unique temporary file
@@ -96,18 +99,116 @@ fn atomic_write_json_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn normalize_dedup_path_key(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Ok(norm) = quorum_types::normalize_prefix_for_match(&raw) {
+        return PathBuf::from(norm);
+    }
+    let trimmed = raw.trim();
+    if cfg!(windows)
+        || (trimmed.len() >= 2
+            && trimmed.as_bytes()[0].is_ascii_alphabetic()
+            && trimmed.as_bytes()[1] == b':')
+    {
+        let replaced = trimmed.replace('/', "\\");
+        let stripped = replaced.strip_prefix(r"\\?\").unwrap_or(&replaced);
+        let mut out = String::with_capacity(stripped.len());
+        let mut prev_sep = false;
+        for ch in stripped.chars() {
+            if ch == '\\' {
+                if !prev_sep {
+                    out.push('\\');
+                }
+                prev_sep = true;
+            } else {
+                out.push(ch.to_ascii_lowercase());
+                prev_sep = false;
+            }
+        }
+        if out.len() > 3 && out.ends_with('\\') {
+            out.pop();
+        }
+        PathBuf::from(out)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 impl Level1DedupCatalog {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Load catalog from a JSON file on disk.
+    /// Load catalog from a JSON file on disk, indexing normalized lookup keys.
     pub fn load_from_file(path: impl AsRef<Path>) -> io::Result<Self> {
         let f = File::open(path)?;
         let reader = BufReader::new(f);
-        let catalog = serde_json::from_reader(reader)
+        let mut catalog: Self = serde_json::from_reader(reader)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        catalog.rebuild_norm_index();
         Ok(catalog)
+    }
+
+    fn rebuild_norm_index(&mut self) {
+        self.norm_to_raw.clear();
+        self.norm_to_raw.reserve(self.path_to_hash.len());
+        for raw in self.path_to_hash.keys() {
+            self.norm_to_raw
+                .insert(normalize_dedup_path_key(raw), raw.clone());
+        }
+    }
+
+    fn lookup_hash_and_raw(&self, path: &Path) -> Option<(&PathBuf, &String)> {
+        if let Some((k, v)) = self.path_to_hash.get_key_value(path) {
+            return Some((k, v));
+        }
+        let key = normalize_dedup_path_key(path);
+        if let Some(raw) = self.norm_to_raw.get(&key) {
+            if let Some((k, v)) = self.path_to_hash.get_key_value(raw) {
+                return Some((k, v));
+            }
+        }
+        if self.norm_to_raw.is_empty() && !self.path_to_hash.is_empty() {
+            return self
+                .path_to_hash
+                .iter()
+                .find(|(k, _)| normalize_dedup_path_key(k) == key);
+        }
+        None
+    }
+
+    fn insert_path_mapping(&mut self, raw_path: PathBuf, hash: String) {
+        let key = normalize_dedup_path_key(&raw_path);
+        if let Some(prev_raw) = self.norm_to_raw.insert(key, raw_path.clone()) {
+            if prev_raw != raw_path {
+                self.path_to_hash.remove(&prev_raw);
+            }
+        }
+        self.path_to_hash.insert(raw_path, hash);
+    }
+
+    fn remove_path_mapping(&mut self, path: &Path) -> Option<String> {
+        let key = normalize_dedup_path_key(path);
+        if let Some(hash) = self.path_to_hash.remove(path) {
+            if self.norm_to_raw.get(&key).map(|p| p.as_path()) == Some(path) {
+                self.norm_to_raw.remove(&key);
+            }
+            return Some(hash);
+        }
+        if let Some(raw) = self.norm_to_raw.remove(&key) {
+            return self.path_to_hash.remove(&raw);
+        }
+        if self.norm_to_raw.is_empty() && !self.path_to_hash.is_empty() {
+            if let Some(found) = self
+                .path_to_hash
+                .keys()
+                .find(|k| normalize_dedup_path_key(k) == key)
+                .cloned()
+            {
+                return self.path_to_hash.remove(&found);
+            }
+        }
+        None
     }
 
     /// Persist catalog atomically to a JSON file on disk using in-memory serialization
@@ -124,7 +225,7 @@ impl Level1DedupCatalog {
         current_mtime: i64,
         current_size: u64,
     ) -> Option<DedupAction> {
-        let existing_hash = self.path_to_hash.get(path)?;
+        let (_, existing_hash) = self.lookup_hash_and_raw(path)?;
         let entry = self.entries.get(existing_hash)?;
         if entry.mtime_secs == current_mtime && entry.size_bytes == current_size {
             Some(DedupAction::Unchanged {
@@ -144,15 +245,36 @@ impl Level1DedupCatalog {
         current_size: u64,
         file_b3: String,
     ) -> DedupAction {
+        let key = normalize_dedup_path_key(path);
+        let existing_match = self
+            .lookup_hash_and_raw(path)
+            .map(|(_, h)| h == &file_b3)
+            .unwrap_or(false);
+        let known_path = self.lookup_hash_and_raw(path).is_some();
+
         if let Some(entry) = self.entries.get_mut(&file_b3) {
-            if entry.file_path != path {
+            if normalize_dedup_path_key(&entry.file_path) == key {
+                entry.mtime_secs = current_mtime;
+                entry.size_bytes = current_size;
+                let chunk_hashes = entry.chunk_hashes.clone();
+                self.insert_path_mapping(path.to_path_buf(), file_b3.clone());
+                return DedupAction::Unchanged {
+                    file_blake3: file_b3,
+                    chunk_hashes,
+                };
+            } else if existing_match {
+                return DedupAction::Unchanged {
+                    file_blake3: file_b3,
+                    chunk_hashes: entry.chunk_hashes.clone(),
+                };
+            } else if !entry.file_path.exists() {
                 let old_path = entry.file_path.clone();
                 let chunk_hashes = entry.chunk_hashes.clone();
-                self.path_to_hash.remove(&old_path);
-                self.path_to_hash.insert(path.to_path_buf(), file_b3.clone());
                 entry.file_path = path.to_path_buf();
                 entry.mtime_secs = current_mtime;
                 entry.size_bytes = current_size;
+                self.remove_path_mapping(&old_path);
+                self.insert_path_mapping(path.to_path_buf(), file_b3.clone());
                 return DedupAction::MovedOrRenamed {
                     old_path,
                     new_path: path.to_path_buf(),
@@ -160,24 +282,36 @@ impl Level1DedupCatalog {
                     chunk_hashes,
                 };
             } else {
-                entry.mtime_secs = current_mtime;
-                entry.size_bytes = current_size;
-                return DedupAction::Unchanged {
+                return DedupAction::ModifiedOrNew {
                     file_blake3: file_b3,
-                    chunk_hashes: entry.chunk_hashes.clone(),
+                    is_new: !known_path,
                 };
             }
         }
-        let is_new = !self.path_to_hash.contains_key(path);
         DedupAction::ModifiedOrNew {
             file_blake3: file_b3,
-            is_new,
+            is_new: !known_path,
         }
     }
 
-    /// Compute 64-char lowercase hex BLAKE3 hash of a file via streaming reader.
+    /// Compute 64-char lowercase hex BLAKE3 hash of a file via streaming reader,
+    /// failing closed under `CloudPlaceholderPolicy::LocallySyncedOnly`.
     pub fn hash_file_stream(path: impl AsRef<Path>) -> io::Result<String> {
-        let f = quorum_classifier::FileTypeClassifier::open_file_with_retry(path.as_ref())?;
+        Self::hash_file_stream_with_policy(
+            path,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Compute 64-char lowercase hex BLAKE3 hash of a file after enforcing `policy` on
+    /// OS cloud-placeholder attributes before opening the file.
+    pub fn hash_file_stream_with_policy(
+        path: impl AsRef<Path>,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> io::Result<String> {
+        let p = path.as_ref();
+        crate::cloud_drives::ensure_open_allowed_for_placeholder(p, policy)?;
+        let f = quorum_classifier::FileTypeClassifier::open_file_with_retry(p)?;
         let mut reader = BufReader::with_capacity(64 * 1024, f);
         let mut hasher = blake3::Hasher::new();
         let mut buffer = [0u8; 64 * 1024];
@@ -193,24 +327,42 @@ impl Level1DedupCatalog {
         Ok(hasher.finalize().to_hex().to_string())
     }
 
-    /// Check a file's status against the catalog before reading content.
-    ///
-    /// 1. Fast Path: If path, mtime, and size match existing entry -> Unchanged (0 disk read).
-    /// 2. Move/Rename Detection: If content hash exists under another path -> MovedOrRenamed.
-    /// 3. Otherwise -> ModifiedOrNew.
+    /// Check a file's status against the catalog before reading content (defaults fail-closed to `LocallySyncedOnly`).
     pub fn evaluate_file(
         &mut self,
         path: &Path,
         current_mtime: i64,
         current_size: u64,
     ) -> io::Result<DedupAction> {
+        self.evaluate_file_with_policy(
+            path,
+            current_mtime,
+            current_size,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Check a file's status against the catalog before reading content under `policy`.
+    ///
+    /// 1. Fast Path: If path, mtime, and size match existing entry -> Unchanged (0 disk read).
+    /// 2. Move/Rename Detection: If content hash exists under another path -> MovedOrRenamed.
+    /// 3. Otherwise -> ModifiedOrNew.
+    pub fn evaluate_file_with_policy(
+        &mut self,
+        path: &Path,
+        current_mtime: i64,
+        current_size: u64,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> io::Result<DedupAction> {
+        let key = normalize_dedup_path_key(path);
         // Step 1: Check if path exists in secondary index
-        if let Some(existing_hash) = self.path_to_hash.get(path) {
-            if let Some(entry) = self.entries.get(existing_hash) {
+        if let Some((_, existing_hash)) = self.lookup_hash_and_raw(path) {
+            let existing_hash = existing_hash.clone();
+            if let Some(entry) = self.entries.get(&existing_hash) {
                 if entry.mtime_secs == current_mtime && entry.size_bytes == current_size {
                     // FAST PATH: mtime and size unchanged, skip reading file!
                     return Ok(DedupAction::Unchanged {
-                        file_blake3: existing_hash.clone(),
+                        file_blake3: existing_hash,
                         chunk_hashes: entry.chunk_hashes.clone(),
                     });
                 }
@@ -218,21 +370,42 @@ impl Level1DedupCatalog {
         }
 
         // Step 2: Content may have changed or file is moved/new. Compute BLAKE3 hash.
-        let file_b3 = Self::hash_file_stream(path)?;
+        let file_b3 = Self::hash_file_stream_with_policy(path, policy)?;
+
+        let existing_match = self
+            .lookup_hash_and_raw(path)
+            .map(|(_, h)| h == &file_b3)
+            .unwrap_or(false);
+        let known_path = self.lookup_hash_and_raw(path).is_some();
 
         // Check if content hash already exists in catalog
         if let Some(entry) = self.entries.get_mut(&file_b3) {
-            if entry.file_path != path {
+            if normalize_dedup_path_key(&entry.file_path) == key {
+                // Content identical, but mtime or size metadata changed (e.g. touched)
+                entry.mtime_secs = current_mtime;
+                entry.size_bytes = current_size;
+                let chunk_hashes = entry.chunk_hashes.clone();
+                self.insert_path_mapping(path.to_path_buf(), file_b3.clone());
+                return Ok(DedupAction::Unchanged {
+                    file_blake3: file_b3,
+                    chunk_hashes,
+                });
+            } else if existing_match {
+                return Ok(DedupAction::Unchanged {
+                    file_blake3: file_b3,
+                    chunk_hashes: entry.chunk_hashes.clone(),
+                });
+            } else if !entry.file_path.exists() {
                 // RENAME OR MOVE DETECTED!
                 let old_path = entry.file_path.clone();
                 let chunk_hashes = entry.chunk_hashes.clone();
 
                 // Update indices
-                self.path_to_hash.remove(&old_path);
-                self.path_to_hash.insert(path.to_path_buf(), file_b3.clone());
                 entry.file_path = path.to_path_buf();
                 entry.mtime_secs = current_mtime;
                 entry.size_bytes = current_size;
+                self.remove_path_mapping(&old_path);
+                self.insert_path_mapping(path.to_path_buf(), file_b3.clone());
 
                 return Ok(DedupAction::MovedOrRenamed {
                     old_path,
@@ -241,44 +414,114 @@ impl Level1DedupCatalog {
                     chunk_hashes,
                 });
             } else {
-                // Content identical, but mtime or size metadata changed (e.g. touched)
-                entry.mtime_secs = current_mtime;
-                entry.size_bytes = current_size;
-                return Ok(DedupAction::Unchanged {
+                // Identical content exists at another live path on disk; index this copy too.
+                return Ok(DedupAction::ModifiedOrNew {
                     file_blake3: file_b3,
-                    chunk_hashes: entry.chunk_hashes.clone(),
+                    is_new: !known_path,
                 });
             }
         }
 
         // Step 3: Truly new or modified content
-        let is_new = !self.path_to_hash.contains_key(path);
         Ok(DedupAction::ModifiedOrNew {
             file_blake3: file_b3,
-            is_new,
+            is_new: !known_path,
         })
     }
 
     /// Register or update an entry in the catalog after chunking/indexing.
     pub fn register_entry(&mut self, entry: FileCatalogEntry) {
-        self.path_to_hash
-            .insert(entry.file_path.clone(), entry.file_blake3.clone());
+        self.insert_path_mapping(entry.file_path.clone(), entry.file_blake3.clone());
         self.entries.insert(entry.file_blake3.clone(), entry);
     }
 
     /// Remove a file from the catalog when deleted on disk.
     pub fn remove_file(&mut self, path: &Path) -> Option<FileCatalogEntry> {
-        if let Some(hash) = self.path_to_hash.remove(path) {
-            self.entries.remove(&hash)
-        } else {
+        let hash = self.remove_path_mapping(path)?;
+        let surviving_path = self
+            .path_to_hash
+            .iter()
+            .find_map(|(p, h)| if h == &hash { Some(p.clone()) } else { None });
+        if let Some(surviving) = surviving_path {
+            if let Some(entry) = self.entries.get_mut(&hash) {
+                let mut removed_copy = entry.clone();
+                removed_copy.file_path = path.to_path_buf();
+                if normalize_dedup_path_key(&entry.file_path) == normalize_dedup_path_key(path) {
+                    entry.file_path = surviving;
+                }
+                return Some(removed_copy);
+            }
             None
+        } else {
+            self.entries.remove(&hash)
         }
     }
 
+    /// Boundary-safe removal of all catalog entries whose `file_path` matches `prefix`
+    /// (normalized across slashes, `\\?\`, and Windows case).
+    pub fn remove_by_prefix(&mut self, prefix: &Path) -> Vec<FileCatalogEntry> {
+        let matching_paths: Vec<PathBuf> = self
+            .path_to_hash
+            .keys()
+            .filter(|p| crate::config::path_matches_prefix(p, prefix))
+            .cloned()
+            .collect();
+
+        let mut removed_hashes: Vec<(PathBuf, String)> = Vec::with_capacity(matching_paths.len());
+        for p in matching_paths {
+            self.norm_to_raw.remove(&normalize_dedup_path_key(&p));
+            if let Some(hash) = self.path_to_hash.remove(&p) {
+                removed_hashes.push((p, hash));
+            }
+        }
+
+        let mut removed = Vec::new();
+        for (p, hash) in removed_hashes {
+            let surviving_path = self
+                .path_to_hash
+                .iter()
+                .find_map(|(sp, sh)| if sh == &hash { Some(sp.clone()) } else { None });
+            if let Some(surviving) = surviving_path {
+                if let Some(entry) = self.entries.get_mut(&hash) {
+                    let mut removed_copy = entry.clone();
+                    removed_copy.file_path = p;
+                    if crate::config::path_matches_prefix(&entry.file_path, prefix) {
+                        entry.file_path = surviving;
+                    }
+                    removed.push(removed_copy);
+                }
+            } else if let Some(e) = self.entries.remove(&hash) {
+                removed.push(e);
+            }
+        }
+
+        let matching_hashes: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| crate::config::path_matches_prefix(&entry.file_path, prefix))
+            .map(|(h, _)| h.clone())
+            .collect();
+        for h in matching_hashes {
+            let surviving_path = self
+                .path_to_hash
+                .iter()
+                .find_map(|(sp, sh)| if sh == &h { Some(sp.clone()) } else { None });
+            if let Some(surviving) = surviving_path {
+                if let Some(entry) = self.entries.get_mut(&h) {
+                    entry.file_path = surviving;
+                }
+            } else if let Some(e) = self.entries.remove(&h) {
+                self.remove_path_mapping(&e.file_path);
+                removed.push(e);
+            }
+        }
+
+        removed
+    }
+
     pub fn get_file_entry(&self, path: &Path) -> Option<&FileCatalogEntry> {
-        self.path_to_hash
-            .get(path)
-            .and_then(|hash| self.entries.get(hash))
+        self.lookup_hash_and_raw(path)
+            .and_then(|(_, hash)| self.entries.get(hash))
     }
 
     pub fn get_all_tracked_files(&self) -> Vec<PathBuf> {
@@ -417,6 +660,26 @@ impl Level2ChunkCache {
         }
     }
 
+    /// Removes the specified chunk hashes from the Level-2 cache and eviction queue.
+    pub fn remove_hashes(&self, hashes: &std::collections::HashSet<String>) -> usize {
+        if hashes.is_empty() {
+            return 0;
+        }
+        let Ok(mut inner) = self.inner.write() else {
+            return 0;
+        };
+        let mut removed = 0usize;
+        for h in hashes {
+            if inner.map.remove(h).is_some() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            inner.order.retain(|k| !hashes.contains(k));
+        }
+        removed
+    }
+
     pub fn stats(&self) -> CacheStats {
         let inner = self.inner.read().unwrap();
         CacheStats {
@@ -469,17 +732,34 @@ impl TwoLevelDedupEngine {
         catalog.check_unchanged_fast(path, current_mtime, current_size)
     }
 
-    /// Evaluates a file against the Level-1 catalog without holding the catalog lock during BLAKE3 disk I/O.
+    /// Evaluates a file against the Level-1 catalog (defaults fail-closed to `LocallySyncedOnly`).
     pub fn evaluate_file(
         &self,
         path: &Path,
         current_mtime: i64,
         current_size: u64,
     ) -> io::Result<DedupAction> {
+        self.evaluate_file_with_policy(
+            path,
+            current_mtime,
+            current_size,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Evaluates a file against the Level-1 catalog without holding the catalog lock during BLAKE3 disk I/O,
+    /// enforcing `policy` before opening the file on fast-path misses.
+    pub fn evaluate_file_with_policy(
+        &self,
+        path: &Path,
+        current_mtime: i64,
+        current_size: u64,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> io::Result<DedupAction> {
         if let Some(unchanged) = self.check_unchanged_fast(path, current_mtime, current_size) {
             return Ok(unchanged);
         }
-        let file_b3 = Level1DedupCatalog::hash_file_stream(path)?;
+        let file_b3 = Level1DedupCatalog::hash_file_stream_with_policy(path, policy)?;
         let mut catalog = self.catalog.write().map_err(|_| {
             io::Error::other("Level 1 catalog lock poisoned")
         })?;
@@ -497,6 +777,47 @@ impl TwoLevelDedupEngine {
     pub fn remove_file(&self, path: &Path) -> Option<FileCatalogEntry> {
         let mut catalog = self.catalog.write().ok()?;
         catalog.remove_file(path)
+    }
+
+    /// Boundary-safe removal of all tracked files matching `prefix` from Level-1 catalog,
+    /// also evicting orphaned chunk hashes from `Level2ChunkCache`.
+    pub fn remove_by_prefix(&self, prefix: &Path) -> usize {
+        let (removed_count, orphan_hashes) = {
+            let Ok(mut catalog) = self.catalog.write() else {
+                return 0;
+            };
+            let removed_entries = catalog.remove_by_prefix(prefix);
+            if removed_entries.is_empty() {
+                return 0;
+            }
+            let mut candidate_hashes: std::collections::HashSet<String> = removed_entries
+                .iter()
+                .flat_map(|e| e.chunk_hashes.iter().cloned())
+                .collect();
+            for remaining in catalog.entries.values() {
+                for h in &remaining.chunk_hashes {
+                    candidate_hashes.remove(h);
+                }
+            }
+            (removed_entries.len(), candidate_hashes)
+        };
+        self.cache.remove_hashes(&orphan_hashes);
+        removed_count
+    }
+
+    /// Boundary-safe prefix removal followed by atomic persistence of `dedup_catalog.json` when mutated.
+    pub fn remove_by_prefix_and_save(
+        &self,
+        prefix: &Path,
+        catalog_path: Option<&Path>,
+    ) -> io::Result<usize> {
+        let removed = self.remove_by_prefix(prefix);
+        if removed > 0 {
+            if let Some(path) = catalog_path {
+                self.save_catalog_to_file(path)?;
+            }
+        }
+        Ok(removed)
     }
 
     pub fn get_file_entry(&self, path: &Path) -> Option<FileCatalogEntry> {

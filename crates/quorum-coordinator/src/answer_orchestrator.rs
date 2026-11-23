@@ -817,8 +817,16 @@ pub fn classify_entity_domain_cluster(path: &str, text: &str) -> &'static str {
         "Marine Engineering & Subsea Robotics"
     } else if tl.contains("cardiologist")
         || tl.contains("cardiology")
+        || tl.contains("cardiac")
+        || tl.contains("arrhythmia")
         || tl.contains("echocardiography")
         || tl.contains("heart failure")
+        || tl.contains("phi_medical_record")
+        || tl.contains("gliner_hospital_org")
+        || fl.contains("cardiology")
+        || fl.contains("clinical")
+        || fl.contains("hospital")
+        || fl.contains("medical")
         || (tl.contains("patient")
             && (tl.contains("diagnosis")
                 || tl.contains("clinical")
@@ -944,7 +952,16 @@ pub fn synthesize_grounded_document_analysis(
         .lines()
         .map(str::trim)
         .filter(|l| {
+            let ll = l.to_ascii_lowercase();
+            let is_raw_pipe_row = l.matches('|').count() >= 2 && !l.starts_with('|');
+            let is_raw_email_header = ll.contains("<[redacted:phi_email]>")
+                || (ll.contains("yahoo account") && (ll.contains(" pm") || ll.contains(" am")))
+                || ll.starts_with("from: ")
+                || ll.starts_with("sent: ")
+                || ll.starts_with("subject: ");
             !l.is_empty()
+                && !is_raw_pipe_row
+                && !is_raw_email_header
                 && !crate::offline_engine::DeterministicOfflineSynthesisEngine::is_contact_bar_or_header(l)
                 && !l.chars().all(|ch| ch == '_' || ch == '-' || ch == ' ')
         })
@@ -968,11 +985,25 @@ pub fn synthesize_grounded_document_analysis(
     let window_raw = crate::offline_engine::DeterministicOfflineSynthesisEngine::answer_focused_window(
         prompt,
         healed_joined.trim(),
-        3200,
+        680,
     );
-    let window = crate::structured_output::balance_markdown_emphasis(
-        &crate::structured_output::heal_leading_fragment(window_raw.trim()),
+    let window_cleaned = crate::structured_output::clean_truncated_word_stubs(
+        &crate::structured_output::demote_retrieved_headings_and_orphan_quotes(
+            &crate::structured_output::expand_inline_bullet_runs(
+                &crate::structured_output::balance_markdown_emphasis(
+                    &crate::structured_output::heal_leading_fragment(window_raw.trim()),
+                ),
+            ),
+        ),
     );
+    // Guarantee inline fallback summary ends cleanly on a complete sentence boundary
+    // (full verbatim text is always preserved in the collapsible <details> drawer).
+    let window = crate::offline_engine::DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(
+        window_cleaned.trim(),
+        680,
+    )
+    .trim()
+    .to_string();
     if window.trim().is_empty() {
         return String::new();
     }
@@ -1249,16 +1280,17 @@ pub fn render_homonym_cluster_summary_table(chunks: &[&ScoredChunk]) -> String {
         } else {
             non_contact_joined
         };
-        let stripped = crate::structured_output::balance_markdown_emphasis(
+        let stripped = crate::structured_output::sanitize_table_cell_text(
             &crate::structured_output::heal_leading_fragment(&strip_leading_title(
-                &crate::structured_output::strip_extraction_field_artifacts(&fallback_joined),
+                &fallback_joined,
             )),
         );
-        let brief = crate::offline_engine::DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(
-            stripped.trim(),
-            180,
-        )
-        .replace('|', "\\|");
+        let brief = crate::structured_output::sanitize_table_cell_text(
+            crate::offline_engine::DeterministicOfflineSynthesisEngine::truncate_to_sentence_boundary(
+                stripped.trim(),
+                180,
+            ),
+        );
         rows.push(format!(
             "| **[{}]** | `{}` | {} | *{}* — {} |",
             idx + 1,

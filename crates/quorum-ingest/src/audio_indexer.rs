@@ -94,6 +94,21 @@ impl AudioIndexer {
         bytes: &[u8],
         identity: &FileIdentity,
     ) -> AudioMetadata {
+        Self::extract_metadata_with_policy(
+            path,
+            bytes,
+            identity,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Extract audio metadata while enforcing `policy` before opening companion lyric/transcript files.
+    pub fn extract_metadata_with_policy(
+        path: &Path,
+        bytes: &[u8],
+        identity: &FileIdentity,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> AudioMetadata {
         let size_bytes = bytes.len() as u64;
         let path_tokens = Self::extract_path_tokens(path);
 
@@ -111,7 +126,7 @@ impl AudioIndexer {
 
         // 4. Companion lyrics and transcript discovery
         let (has_companion_lyrics, companion_source, companion_text) =
-            Self::find_companion_lyrics(path);
+            Self::find_companion_lyrics_with_policy(path, policy);
 
         let (has_lyrics, lyrics_source, lyrics_text) = if has_companion_lyrics {
             (true, companion_source, companion_text)
@@ -865,7 +880,20 @@ impl AudioIndexer {
 
     /// Searches file directory for companion lyrics and transcripts.
     /// Matches `<stem>.lrc`, `<stem>.txt`, `<stem>.srt`, `lyrics.txt`, `transcript.txt`.
+    /// Fails closed on cloud placeholders under `CloudPlaceholderPolicy::LocallySyncedOnly`.
     pub fn find_companion_lyrics(path: &Path) -> (bool, Option<String>, Option<String>) {
+        Self::find_companion_lyrics_with_policy(
+            path,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Searches file directory for companion lyrics/transcripts, enforcing `policy`
+    /// on each sibling candidate before opening.
+    pub fn find_companion_lyrics_with_policy(
+        path: &Path,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> (bool, Option<String>, Option<String>) {
         let parent = match path.parent() {
             Some(p) => p,
             None => return (false, None, None),
@@ -886,13 +914,10 @@ impl AudioIndexer {
         for name in &candidate_names {
             let candidate_path = parent.join(name);
             if candidate_path.is_file() {
-                // Read up to 512KB for performance and security
-                if let Ok(content) = std::fs::read_to_string(&candidate_path) {
-                    let trimmed = content.trim();
-                    if !trimmed.is_empty() {
-                        return (true, Some(name.clone()), Some(trimmed.to_string()));
-                    }
-                } else if let Ok(raw_bytes) = std::fs::read(&candidate_path) {
+                if crate::cloud_drives::ensure_open_allowed_for_placeholder(&candidate_path, policy).is_err() {
+                    continue;
+                }
+                if let Ok(raw_bytes) = std::fs::read(&candidate_path) {
                     let text = String::from_utf8_lossy(&raw_bytes).trim().to_string();
                     if !text.is_empty() {
                         return (true, Some(name.clone()), Some(text));
@@ -1042,7 +1067,8 @@ impl AudioIndexer {
         lines.join("\n")
     }
 
-    /// Index an audio file into a `DocumentChunk` ready for LanceDB and Tantivy.
+    /// Index an audio file into a `DocumentChunk` ready for LanceDB and Tantivy
+    /// (defaults fail-closed to `LocallySyncedOnly` for companion lyrics).
     pub fn index_audio(
         path: &Path,
         bytes: &[u8],
@@ -1050,7 +1076,50 @@ impl AudioIndexer {
         access_tier: u8,
         embedding_generator: &dyn EmbeddingGenerator,
     ) -> Result<DocumentChunk, TypeError> {
-        let metadata = Self::extract_metadata(path, bytes, identity);
+        Self::index_audio_with_policy(
+            path,
+            bytes,
+            identity,
+            access_tier,
+            embedding_generator,
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly,
+        )
+    }
+
+    /// Scrubs text-bearing audio metadata fields with `SecretScrubber::scrub_text_preserving_layout`
+    /// so neither `text_content` nor serialized `metadata_json` retains raw secrets.
+    pub fn sanitize_metadata(meta: &mut AudioMetadata) {
+        if let Some(ref mut title) = meta.title {
+            *title = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(title);
+        }
+        if let Some(ref mut artist) = meta.artist {
+            *artist = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(artist);
+        }
+        if let Some(ref mut album) = meta.album {
+            *album = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(album);
+        }
+        if let Some(ref mut genre) = meta.genre {
+            *genre = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(genre);
+        }
+        if let Some(ref mut src) = meta.lyrics_source {
+            *src = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(src);
+        }
+        if let Some(ref mut lyrics) = meta.lyrics_text {
+            *lyrics = crate::secret_scrubber::SecretScrubber::scrub_text_preserving_layout(lyrics);
+        }
+    }
+
+    /// Index an audio file into a `DocumentChunk` while enforcing `policy` on companion files.
+    pub fn index_audio_with_policy(
+        path: &Path,
+        bytes: &[u8],
+        identity: &FileIdentity,
+        access_tier: u8,
+        embedding_generator: &dyn EmbeddingGenerator,
+        policy: quorum_types::CloudPlaceholderPolicy,
+    ) -> Result<DocumentChunk, TypeError> {
+        let mut metadata = Self::extract_metadata_with_policy(path, bytes, identity, policy);
+        Self::sanitize_metadata(&mut metadata);
         let search_text = Self::build_search_text(&metadata, path);
         let file_b3 = blake3::hash(bytes).to_hex().to_string();
 

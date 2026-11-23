@@ -33,7 +33,8 @@ use std::sync::{OnceLock, RwLock};
 static TOTAL_ARTEMIS_COLLECTED_RECORDS: AtomicUsize = AtomicUsize::new(0);
 static LAST_ARTEMIS_COLLECTION_TIMESTAMP: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 static LAST_ARTEMIS_COLLECTION_INSTANT: OnceLock<RwLock<Option<Instant>>> = OnceLock::new();
-static ARTEMIS_RETAINED_CHUNKS: OnceLock<RwLock<Vec<quorum_types::DocumentChunk>>> = OnceLock::new();
+static ARTEMIS_RETAINED_CHUNKS: OnceLock<RwLock<Vec<quorum_types::DocumentChunk>>> =
+    OnceLock::new();
 
 fn last_collection_ts_lock() -> &'static RwLock<Option<String>> {
     LAST_ARTEMIS_COLLECTION_TIMESTAMP.get_or_init(|| RwLock::new(None))
@@ -219,9 +220,7 @@ pub async fn require_forensics_enabled_middleware(
 
 /// GET /api/v1/artemis/status and GET /api/artemis/status
 /// Returns current Artemis DFIR configuration, airgap enforcement, and category allowlists.
-pub async fn artemis_status_handler(
-    State(_state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+pub async fn artemis_status_handler(State(_state): State<Arc<DaemonState>>) -> impl IntoResponse {
     if !is_forensics_enabled() {
         return forensics_disabled_response().into_response();
     }
@@ -248,7 +247,8 @@ pub async fn artemis_status_handler(
         "normalize_for_harvest": settings.artemis.normalize_for_harvest,
         "total_collected_records": total_collected,
         "last_collection_timestamp": last_ts,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// GET /api/v1/artemis/config and GET /api/artemis/config
@@ -397,7 +397,11 @@ pub async fn artemis_collect_handler(
     }
 
     // Fail-fast validation: non-live collection requires target_path or folder_path
-    if !is_live_source && target_path_str.as_deref().map_or(true, |s| s.trim().is_empty()) {
+    if !is_live_source
+        && target_path_str
+            .as_deref()
+            .map_or(true, |s| s.trim().is_empty())
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -440,7 +444,9 @@ pub async fn artemis_collect_handler(
             }
         } else if path.is_dir() {
             let dir_clone = path.to_path_buf();
-            if let Ok(records) = tokio::task::spawn_blocking(move || collect_forensic_directory(&dir_clone)).await {
+            if let Ok(records) =
+                tokio::task::spawn_blocking(move || collect_forensic_directory(&dir_clone)).await
+            {
                 parsed_records.extend(records);
             }
             if parsed_records.is_empty() {
@@ -493,10 +499,8 @@ pub async fn artemis_collect_handler(
 
     // Optional category filtering
     if let Some(ref cats) = req.categories {
-        let normalized_cats: HashSet<String> = cats
-            .iter()
-            .map(|c| c.trim().to_ascii_lowercase())
-            .collect();
+        let normalized_cats: HashSet<String> =
+            cats.iter().map(|c| c.trim().to_ascii_lowercase()).collect();
         parsed_records.retain(|r| {
             let t_str = r.telemetry_type.as_str().to_ascii_lowercase();
             normalized_cats
@@ -601,9 +605,7 @@ pub async fn artemis_preview_normalizer_handler(
     if !is_forensics_enabled() {
         return forensics_disabled_response().into_response();
     }
-    let raw = req
-        .sample_text
-        .or(req.raw_telemetry);
+    let raw = req.sample_text.or(req.raw_telemetry);
 
     let text = match raw {
         Some(t) if !t.trim().is_empty() => t,
@@ -623,8 +625,7 @@ pub async fn artemis_preview_normalizer_handler(
         .as_deref()
         .unwrap_or("artemis-preview-salt");
 
-    let mut normalizer =
-        ForensicStructuralNormalizer::from_node_seed(&[0u8; 32], salt);
+    let mut normalizer = ForensicStructuralNormalizer::from_node_seed(&[0u8; 32], salt);
     let preview = normalizer.preview_normalization(&text);
 
     (
@@ -643,9 +644,7 @@ pub async fn artemis_preview_normalizer_handler(
 
 /// POST /api/v1/artemis/evaluate and POST /api/artemis/evaluate
 /// Evaluates host telemetry input across the 4-voter consensus panel.
-pub async fn artemis_evaluate_handler(
-    Json(input): Json<DfirTelemetryInput>,
-) -> impl IntoResponse {
+pub async fn artemis_evaluate_handler(Json(input): Json<DfirTelemetryInput>) -> impl IntoResponse {
     if !is_forensics_enabled() {
         return forensics_disabled_response().into_response();
     }
@@ -698,19 +697,24 @@ pub fn spawn_artemis_auto_collector(
             }
 
             let settings = global_mesh_dlp_controller().get_settings().artemis;
-            if !settings.enabled || !settings.local_collection_enabled || settings.auto_collection_interval_mins == 0 {
+            if !settings.enabled
+                || !settings.local_collection_enabled
+                || settings.auto_collection_interval_mins == 0
+            {
                 continue;
             }
 
-            let interval =
-                std::time::Duration::from_secs(u64::from(settings.auto_collection_interval_mins) * 60);
-            let due = last_collection_instant_lock()
-                .read()
-                .ok()
-                .map_or(true, |guard| match *guard {
-                    Some(last) => last.elapsed() >= interval,
-                    None => true,
-                });
+            let interval = std::time::Duration::from_secs(
+                u64::from(settings.auto_collection_interval_mins) * 60,
+            );
+            let due =
+                last_collection_instant_lock()
+                    .read()
+                    .ok()
+                    .map_or(true, |guard| match *guard {
+                        Some(last) => last.elapsed() >= interval,
+                        None => true,
+                    });
 
             if !due {
                 continue;
@@ -776,4 +780,3 @@ pub fn spawn_artemis_auto_collector(
         }
     });
 }
-

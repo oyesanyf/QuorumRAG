@@ -430,9 +430,78 @@ pub fn encode_f32_to_f16_le(vec: &[f32], out: &mut Vec<u8>) {
 }
 
 /// Cross-OS path normalization for consistent keys and allowed-folder prefix checks.
+///
+/// Aligns with `quorum_types::normalize_prefix_for_match` and `quorum_storage::file_path_compare_key`:
+/// strips Windows verbatim prefixes (`\\?\`, `//?/`) and `\\?\UNC\` / `//?/unc/` -> `\\`,
+/// normalizes separators and ASCII-lowercases Windows drive/UNC paths while preserving Unix case.
 pub fn normalize_path_key(path: &str) -> String {
-    path.trim()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let unc_rewritten: Option<String> = {
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with(r"\\?\unc\") || lower.starts_with("//?/unc/") {
+            Some(format!(r"\\{}", &trimmed[8..]))
+        } else if lower.starts_with(r"\\?\") || lower.starts_with("//?/") {
+            Some(trimmed[4..].to_string())
+        } else {
+            None
+        }
+    };
+    let effective = unc_rewritten.as_deref().unwrap_or(trimmed);
+
+    if let Ok(norm) = quorum_types::normalize_prefix_for_match(effective) {
+        return norm;
+    }
+
+    let bytes = effective.as_bytes();
+    let is_win_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let is_unc = effective.starts_with(r"\\") || effective.starts_with("//");
+    if cfg!(windows) || is_win_drive || is_unc {
+        let replaced = effective.replace('/', "\\");
+        let mut out = String::with_capacity(replaced.len());
+        let mut chars = replaced.chars().peekable();
+        if replaced.starts_with(r"\\") {
+            out.push_str(r"\\");
+            while matches!(chars.peek(), Some('\\')) {
+                chars.next();
+            }
+        }
+        let mut prev_sep = false;
+        for ch in chars {
+            if ch == '\\' {
+                if !prev_sep {
+                    out.push('\\');
+                }
+                prev_sep = true;
+            } else {
+                out.push(ch.to_ascii_lowercase());
+                prev_sep = false;
+            }
+        }
+        if out.len() > 3 && out.ends_with('\\') {
+            out.pop();
+        }
+        out
+    } else {
+        let mut out = String::with_capacity(effective.len());
+        let mut prev_sep = false;
+        for ch in effective.chars() {
+            if ch == '/' {
+                if !prev_sep {
+                    out.push('/');
+                }
+                prev_sep = true;
+            } else {
+                out.push(ch);
+                prev_sep = false;
+            }
+        }
+        if out.len() > 1 && out.ends_with('/') {
+            out.pop();
+        }
+        out
+    }
 }

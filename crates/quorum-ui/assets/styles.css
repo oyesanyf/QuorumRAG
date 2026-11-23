@@ -497,12 +497,17 @@ body {
 }
 
 .top-nav {
-  height: 56px;
+  min-height: 56px;
+  height: auto;
+  flex-shrink: 0;
   border-bottom: 1px solid var(--border-color);
   display: flex;
+  flex-wrap: wrap;
+  row-gap: 8px;
+  column-gap: 12px;
   align-items: safe center;
   justify-content: space-between;
-  padding: 0 16px;
+  padding: 8px 16px;
   background-color: var(--bg-canvas);
   z-index: 10;
   min-inline-size: 0;
@@ -2661,7 +2666,7 @@ body.theme-white .tpm-badge-red {
 .inline-cite-badge {
   display: inline;
   padding: 0 3px;
-  margin: 0 1px;
+  margin: 0 0 0 2px;
   border: none;
   border-radius: 4px;
   background: rgba(66, 133, 244, 0.15);
@@ -2671,6 +2676,7 @@ body.theme-white .tpm-badge-red {
   font-weight: 600;
   cursor: pointer;
   vertical-align: baseline;
+  white-space: nowrap;
 }
 .inline-cite-badge:hover { background: rgba(66, 133, 244, 0.3); }
 .qr-cite-pulse { box-shadow: 0 0 0 3px rgba(66, 133, 244, 0.55); }
@@ -2797,6 +2803,16 @@ audio.qr-lightbox-media { width: min(640px, 100%); }
   vertical-align: top;
   word-break: break-word;
 }
+.qr-md-table th:first-child,
+.qr-md-table td:first-child {
+  white-space: nowrap;
+  word-break: normal;
+  width: 1%;
+}
+.qr-md-table td:nth-child(3) {
+  white-space: nowrap;
+  word-break: normal;
+}
 .qr-md-table tbody tr:last-child td {
   border-bottom: none;
 }
@@ -2904,5 +2920,154 @@ body.theme-white .qr-md-pre {
     transition-duration: 0.22s;
     transition-timing-function: ease-in-out;
     transition-behavior: allow-discrete;
+  }
+}
+
+/* ==========================================================================
+   CLOUD DRIVES SETTINGS TAB (OPT-IN LOCAL SYNC & PLACEHOLDER PROTECTION)
+   ========================================================================== */
+
+.cloud-drive-banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border-color);
+  border-left: 4px solid var(--accent);
+  background: var(--accent-light);
+  margin-bottom: 16px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  box-sizing: border-box;
+}
+
+.cloud-drive-banner.warn {
+  border-left-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.cloud-drive-banner.error {
+  border-left-color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.cloud-drive-banner.info {
+  border-left-color: #10a37f;
+  background: rgba(16, 163, 127, 0.08);
+}
+
+.cloud-drive-card {
+  background-color: var(--bg-canvas);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: border-color 0.15s ease;
+}
+
+.cloud-drive-card:last-child {
+  margin-bottom: 0;
+}
+
+.cloud-drive-card.is-enabled {
+  border-color: rgba(16, 163, 127, 0.45);
+}
+
+.cloud-drive-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.cloud-drive-card-meta {
+  flex: 1 1 260px;
+  min-inline-size: 0;
+}
+
+.cloud-drive-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cloud-drive-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.cloud-drive-badge {
+  margin-left: 0;
+  white-space: nowrap;
+}
+
+.cloud-drive-path-line {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  word-break: break-all;
+}
+
+.cloud-drive-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.cloud-drive-size-input {
+  width: 84px;
+  text-align: right;
+  padding: 6px 8px;
+}
+
+.cloud-drive-custom-folders {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border-color);
+}
+
+body.theme-white .cloud-drive-banner.warn,
+body.theme-warm .cloud-drive-banner.warn {
+  background: rgba(217, 119, 6, 0.1);
+}
+
+body.theme-white .cloud-drive-banner.info,
+body.theme-warm .cloud-drive-banner.info {
+  background: rgba(16, 163, 127, 0.08);
+}
+
+body.theme-white .cloud-drive-card .dlp-badge-redact,
+body.theme-warm .cloud-drive-card .dlp-badge-redact,
+body.theme-white .cloud-drive-banner .dlp-badge-redact,
+body.theme-warm .cloud-drive-banner .dlp-badge-redact,
+body.theme-white .cloud-drive-hydration-card .dlp-badge-redact,
+body.theme-warm .cloud-drive-hydration-card .dlp-badge-redact {
+  color: #92400e;
+  background: rgba(245, 158, 11, 0.18);
+  border-color: rgba(180, 83, 9, 0.35);
+}
+
+@media (max-width: 640px) {
+  .chatgpt-settings-content {
+    padding: 24px 16px 80px 16px;
+  }
+
+  .cloud-drive-card-header,
+  .cloud-drive-card-actions {
+    width: 100%;
+    justify-content: flex-start;
   }
 }

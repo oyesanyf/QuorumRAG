@@ -121,8 +121,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             force_reembed,
             batch_size,
         }) => {
-            run_standalone_reindex(cli.clone(), path.clone(), *full, *force_reembed, *batch_size)
-                .await?;
+            run_standalone_reindex(
+                cli.clone(),
+                path.clone(),
+                *full,
+                *force_reembed,
+                *batch_size,
+            )
+            .await?;
         }
         Some(Commands::FixDrift {
             dry_run,
@@ -157,6 +163,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+use handlers::cloud_drives::{
+    collect_disabled_cloud_roots, collect_filtered_initial_watch_dirs,
+    collect_pass0_priority_user_roots, effective_ingest_max_file_size_bytes,
+    expand_physical_watch_paths, is_disabled_cloud_root, push_watch_root_excluding_disabled,
+};
 
 /// Starts the QuorumRAG Daemon and embedded Web UI.
 pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
@@ -239,10 +251,25 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    // 2. Ingest Config & Workers (defaults to discovered user roots + fixed physical drives when --watch-dir is omitted)
+    // Initialize OshoosiClaw Mesh, PHI/PII DLP & Cloud Drives persistence BEFORE constructing workers
+    let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
+    mesh_dlp_controller.init_persistence(&cli.data_dir);
+    let discovered_cloud_drives = quorum_ingest::discover_cloud_drives();
+    handlers::cloud_drives::reconcile_discovered_cloud_drives(
+        &mesh_dlp_controller,
+        &discovered_cloud_drives,
+    );
+
+    // 2. Ingest Config & Workers (defaults to discovered user roots + safe expanded drive slices when --watch-dir is omitted)
+    let cloud_drives_settings = mesh_dlp_controller.get_cloud_drives_settings();
     let mut ingest_config = quorum_ingest::IngestConfig::default();
     ingest_config.exclude_source_code = true;
-    ingest_config.max_file_size_bytes = 15 * 1024 * 1024;
+    ingest_config.max_file_size_bytes =
+        effective_ingest_max_file_size_bytes(&cloud_drives_settings);
+    ingest_config.access_tier_rules = mesh_dlp_controller.cloud_drive_access_tier_rules();
+    ingest_config.placeholder_policy = cloud_drives_settings
+        .placeholder_policy()
+        .unwrap_or_default();
     ingest_config.dedup_catalog_path = Some(cli.data_dir.join("dedup_catalog.json"));
     if !ingest_config
         .excluded_paths
@@ -251,85 +278,173 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     {
         ingest_config.excluded_paths.push(cli.data_dir.clone());
     }
+    let disabled_cloud_roots =
+        collect_disabled_cloud_roots(&mesh_dlp_controller, &discovered_cloud_drives);
+    let enabled_cloud_paths = handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+        &mesh_dlp_controller,
+        &disabled_cloud_roots,
+    );
+
     if let Some(ref watch_path) = cli.watch_dir {
-        ingest_config.watch_paths.push(watch_path.clone());
+        push_watch_root_excluding_disabled(
+            watch_path,
+            &disabled_cloud_roots,
+            &mut ingest_config.watch_paths,
+        );
+        for cp in &enabled_cloud_paths {
+            push_watch_root_excluding_disabled(
+                cp,
+                &disabled_cloud_roots,
+                &mut ingest_config.watch_paths,
+            );
+        }
     } else {
-        let user_roots = quorum_ingest::IngestConfig::discover_user_document_roots();
-        let physical_drives = quorum_ingest::IngestConfig::discover_physical_drives();
+        let isolated_watch_only = std::env::var("QUORUM_ISOLATED_WATCH_DIR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let user_roots = if isolated_watch_only {
+            Vec::new()
+        } else {
+            quorum_ingest::IngestConfig::discover_user_document_roots()
+        };
+        let physical_drives = if isolated_watch_only {
+            Vec::new()
+        } else {
+            quorum_ingest::IngestConfig::discover_physical_drives()
+        };
         info!(
             user_roots = ?user_roots,
             drives = ?physical_drives,
-            "No --watch-dir specified; defaulting to discovered user document roots + fixed physical drives"
+            "No --watch-dir specified; defaulting to discovered user document roots + expanded fixed drive slices"
         );
         let mut default_paths = Vec::new();
 
-        // 1. Data physical drives (D:\, E:\, etc. before C:\)
-        for d in &physical_drives {
-            let s = d.to_string_lossy().to_ascii_uppercase();
-            if !s.starts_with("C:") && !default_paths.contains(d) {
-                default_paths.push(d.clone());
+        // 1. Expanded non-C: data physical drive slices (skipping user profile roots & disabled cloud drives at any depth)
+        let data_drives: Vec<std::path::PathBuf> = physical_drives
+            .iter()
+            .filter(|d| !d.to_string_lossy().to_ascii_uppercase().starts_with("C:"))
+            .cloned()
+            .collect();
+        for slice in expand_physical_watch_paths(&data_drives, &disabled_cloud_roots) {
+            if !default_paths.contains(&slice) {
+                default_paths.push(slice);
             }
         }
 
         // 2. Documents, Desktop, Downloads
         for sub in ["documents", "desktop", "downloads"] {
             for root in &user_roots {
-                let name = root.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-                if name == sub && !default_paths.contains(root) {
-                    default_paths.push(root.clone());
+                let name = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if name == sub {
+                    push_watch_root_excluding_disabled(
+                        root,
+                        &disabled_cloud_roots,
+                        &mut default_paths,
+                    );
                 }
             }
         }
 
         // 3. User document roots other than Pictures
         for root in &user_roots {
-            let name = root.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            if name != "pictures" && !default_paths.contains(root) {
-                default_paths.push(root.clone());
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if name != "pictures" {
+                push_watch_root_excluding_disabled(root, &disabled_cloud_roots, &mut default_paths);
             }
         }
 
         // 4. Pictures roots
         for root in &user_roots {
-            let name = root.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            if name == "pictures" && !default_paths.contains(root) {
-                default_paths.push(root.clone());
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if name == "pictures" {
+                push_watch_root_excluding_disabled(root, &disabled_cloud_roots, &mut default_paths);
             }
         }
 
-        // 5. Remaining physical drives (C:\)
-        for d in physical_drives {
-            if !default_paths.contains(&d) {
-                default_paths.push(d);
+        // 5. Enabled opt-in Cloud Drives
+        for cp in &enabled_cloud_paths {
+            push_watch_root_excluding_disabled(cp, &disabled_cloud_roots, &mut default_paths);
+        }
+
+        // 6. Expanded remaining drive slices (C:\) excluding C:\Users\<user> profile roots & disabled cloud roots
+        let sys_drives: Vec<std::path::PathBuf> = physical_drives
+            .into_iter()
+            .filter(|d| d.to_string_lossy().to_ascii_uppercase().starts_with("C:"))
+            .collect();
+        for slice in expand_physical_watch_paths(&sys_drives, &disabled_cloud_roots) {
+            if !default_paths.contains(&slice) {
+                default_paths.push(slice);
             }
         }
 
         ingest_config.watch_paths = default_paths;
     }
 
-    let reindex_worker = Arc::new(quorum_ingest::ReindexWorker::new(
-        ingest_config.clone(),
-        Arc::clone(&storage),
-        Arc::clone(&classifier),
-        Arc::clone(&embedder),
-        Arc::clone(&dedup),
-    ));
+    let dlp_gate: Arc<dyn quorum_types::DlpContentGate> =
+        Arc::clone(&mesh_dlp_controller) as Arc<dyn quorum_types::DlpContentGate>;
+    let reindex_worker = Arc::new(
+        quorum_ingest::ReindexWorker::new(
+            ingest_config.clone(),
+            Arc::clone(&storage),
+            Arc::clone(&classifier),
+            Arc::clone(&embedder),
+            Arc::clone(&dedup),
+        )
+        .with_dlp_gate(Arc::clone(&dlp_gate)),
+    );
+    reindex_worker.update_blocked_prefixes(disabled_cloud_roots.clone());
 
-    let drift_healer = Arc::new(quorum_ingest::DriftHealer::new(
-        ingest_config.clone(),
-        Arc::clone(&storage),
-        Arc::clone(&classifier),
-        Arc::clone(&embedder),
-        Arc::clone(&dedup),
-    ));
+    let drift_healer = Arc::new(
+        quorum_ingest::DriftHealer::new(
+            ingest_config.clone(),
+            Arc::clone(&storage),
+            Arc::clone(&classifier),
+            Arc::clone(&embedder),
+            Arc::clone(&dedup),
+        )
+        .with_dlp_gate(dlp_gate)
+        .with_reindex_barrier(&reindex_worker),
+    );
+    drift_healer.update_blocked_prefixes(disabled_cloud_roots.clone());
 
     // 3. Dynamically bind HTTP Listener on `cli.port` (or next open port)
     let (listener, bound_http_port) = bind_next_open_http_port(&cli.host, cli.port).await?;
     let chosen_p2p_port = find_next_open_p2p_port(&cli.host, cli.p2p_port, bound_http_port);
 
-    // Initialize OshoosiClaw Mesh & PHI/PII DLP persistence in `cli.data_dir`
-    let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
-    mesh_dlp_controller.init_persistence(&cli.data_dir);
+    let isolated_watch_only = std::env::var("QUORUM_ISOLATED_WATCH_DIR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut candidate_folders = ingest_config.watch_paths.clone();
+    if !isolated_watch_only {
+        for user_root in quorum_ingest::IngestConfig::discover_user_document_roots() {
+            push_watch_root_excluding_disabled(
+                &user_root,
+                &disabled_cloud_roots,
+                &mut candidate_folders,
+            );
+        }
+    }
+    let non_cloud_candidates: Vec<std::path::PathBuf> = candidate_folders
+        .into_iter()
+        .filter(|wp| {
+            let wp_str = wp.to_string_lossy();
+            wp.is_dir()
+                && !mesh_dlp_controller.is_cloud_drive_path(&wp_str)
+                && !quorum_coordinator::OsoosiMeshDlpController::is_standard_cloud_root_marker(
+                    &wp_str,
+                )
+        })
+        .collect();
+
     {
         let mut guard = mesh_dlp_controller
             .settings
@@ -349,20 +464,8 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             guard.artemis.enabled = true;
         }
 
-        // Automatically populate discovered user document folders and watch paths into shared_folders
-        let isolated_watch_only = std::env::var("QUORUM_ISOLATED_WATCH_DIR")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let mut candidate_folders = ingest_config.watch_paths.clone();
-        if !isolated_watch_only {
-            for user_root in quorum_ingest::IngestConfig::discover_user_document_roots() {
-                if !candidate_folders.contains(&user_root) {
-                    candidate_folders.push(user_root);
-                }
-            }
-        }
-
-        for wp in &candidate_folders {
+        // Automatically populate non-cloud user document folders and watch paths into shared_folders
+        for wp in &non_cloud_candidates {
             let wp_str = wp.to_string_lossy().to_string();
             if !guard
                 .mesh
@@ -429,10 +532,10 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 .filter(quorum_network::is_allowed_trusted_bootstrap_address)
                 .collect::<Vec<_>>()
         };
-        let mut tcp_listen_addrs = vec![format!("/ip4/{}/tcp/{}", cli.host, chosen_p2p_port).parse()?];
-        let mut quic_listen_addrs = vec![
-            format!("/ip4/{}/udp/{}/quic-v1", cli.host, chosen_p2p_port).parse()?,
-        ];
+        let mut tcp_listen_addrs =
+            vec![format!("/ip4/{}/tcp/{}", cli.host, chosen_p2p_port).parse()?];
+        let mut quic_listen_addrs =
+            vec![format!("/ip4/{}/udp/{}/quic-v1", cli.host, chosen_p2p_port).parse()?];
         if cli.host == "0.0.0.0" {
             if let Ok(ma6) = format!("/ip6/::/tcp/{}", chosen_p2p_port).parse() {
                 tcp_listen_addrs.push(ma6);
@@ -579,11 +682,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Start dedicated out-of-process P2P Watcher (`quorumrag watch-p2p`) + fast startup hydration
-    p2p_watcher::start_p2p_watcher_supervisor(
-        Arc::clone(&app_state),
-        watcher_enabled,
-        cli.service,
-    );
+    p2p_watcher::start_p2p_watcher_supervisor(Arc::clone(&app_state), watcher_enabled, cli.service);
 
     // Start background periodic Artemis DFIR auto-collector (only when forensics is enabled)
     let forensics_enabled = quorum_coordinator::global_mesh_dlp_controller()
@@ -797,49 +896,45 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     let isolated_watch_only = std::env::var("QUORUM_ISOLATED_WATCH_DIR")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let mut initial_watch_dirs = if isolated_watch_only {
+    let user_watch_roots = if isolated_watch_only {
         Vec::new()
     } else {
         quorum_ingest::IngestConfig::discover_user_document_roots()
     };
-    if uploaded_docs_dir.exists() && !initial_watch_dirs.contains(&uploaded_docs_dir) {
-        initial_watch_dirs.push(uploaded_docs_dir.clone());
-    }
-    if let Ok(guard) = quorum_coordinator::global_mesh_dlp_controller().settings.read() {
+    let mut shared_watch_folders = Vec::new();
+    if let Ok(guard) = quorum_coordinator::global_mesh_dlp_controller()
+        .settings
+        .read()
+    {
         for folder in &guard.mesh.shared_folders {
             if folder.enabled {
-                let p = std::path::PathBuf::from(&folder.path);
-                if p.exists() && !initial_watch_dirs.contains(&p) {
-                    initial_watch_dirs.push(p);
-                }
+                shared_watch_folders.push(std::path::PathBuf::from(&folder.path));
             }
         }
     }
+    let mut opt_in_watch_folders = Vec::new();
     if let Ok(store) = app_state.marketplace_store() {
         if let Ok(cfg) = store.get_config() {
             for f in &cfg.opt_in_folders {
-                let p = std::path::PathBuf::from(f);
-                if p.exists() && !initial_watch_dirs.contains(&p) {
-                    initial_watch_dirs.push(p);
-                }
+                opt_in_watch_folders.push(std::path::PathBuf::from(f));
             }
         }
     }
-    for expanded in quorum_ingest::ReindexWorker::expand_drive_roots(&ingest_config.watch_paths) {
-        if expanded.is_dir() && !initial_watch_dirs.contains(&expanded) {
-            // Skip watching the raw `C:\Users\<user>` profile root recursively in ReadDirectoryChangesW
-            // because `discover_user_document_roots()` already watches Documents/Desktop/Downloads/Pictures/OneDrive,
-            // while raw `C:\Users\<user>` floods the watcher with AppData\Local\Temp and browser cache churn.
-            let is_user_profile_root = expanded
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().eq_ignore_ascii_case("users"))
-                .unwrap_or(false);
-            if !is_user_profile_root {
-                initial_watch_dirs.push(expanded);
-            }
-        }
-    }
+    let live_enabled_cloud_paths = handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+        &mesh_dlp_controller,
+        &disabled_cloud_roots,
+    );
+    let expanded_watch_paths =
+        expand_physical_watch_paths(&ingest_config.watch_paths, &disabled_cloud_roots);
+    let initial_watch_dirs = collect_filtered_initial_watch_dirs(
+        &user_watch_roots,
+        Some(&uploaded_docs_dir),
+        &shared_watch_folders,
+        &opt_in_watch_folders,
+        &live_enabled_cloud_paths,
+        &expanded_watch_paths,
+        &disabled_cloud_roots,
+    );
     reindex_worker.add_watch_paths(&initial_watch_dirs);
 
     // Start real-time OS FilesystemWatcher (`ReadDirectoryChangesW` / `inotify` / `FSEvents`)
@@ -852,6 +947,12 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 && p.is_dir()
                 && p.parent().is_some()
                 && p.to_string_lossy().len() > 3
+                && !handlers::cloud_drives::is_user_profile_root_dir(p)
+                && !is_disabled_cloud_root(p, &disabled_cloud_roots)
+                && !handlers::cloud_drives::is_strict_ancestor_of_disabled_cloud_root(
+                    p,
+                    &disabled_cloud_roots,
+                )
         })
         .cloned()
         .collect();
@@ -881,6 +982,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 .to_ascii_lowercase();
             let excluded_data_dir = cli.data_dir.clone();
             let allowed_uploads_dir = uploaded_docs_dir.clone();
+            let watcher_discovered_cloud = discovered_cloud_drives.clone();
 
             tokio::spawn(async move {
                 let is_internal_noise = |p: &std::path::Path| -> bool {
@@ -943,14 +1045,21 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                     };
 
                     let mut batch_events = vec![first_evt];
-                    let coalesce_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
-                    while let Ok(Some(next_evt)) = tokio::time::timeout_at(coalesce_deadline, watcher_rx.recv()).await {
+                    let coalesce_deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(150);
+                    while let Ok(Some(next_evt)) =
+                        tokio::time::timeout_at(coalesce_deadline, watcher_rx.recv()).await
+                    {
                         batch_events.push(next_evt);
                         if batch_events.len() >= 256 {
                             break;
                         }
                     }
 
+                    let live_disabled_cloud = collect_disabled_cloud_roots(
+                        &quorum_coordinator::global_mesh_dlp_controller(),
+                        &watcher_discovered_cloud,
+                    );
                     let mut paths_to_index: Vec<std::path::PathBuf> = Vec::new();
                     let mut paths_to_remove: Vec<String> = Vec::new();
 
@@ -958,7 +1067,11 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                         match evt {
                             quorum_ingest::WatcherEvent::Create(p)
                             | quorum_ingest::WatcherEvent::Modify(p) => {
-                                if !is_internal_noise(&p) && p.exists() && !paths_to_index.contains(&p) {
+                                if !is_internal_noise(&p)
+                                    && !is_disabled_cloud_root(&p, &live_disabled_cloud)
+                                    && p.exists()
+                                    && !paths_to_index.contains(&p)
+                                {
                                     paths_to_index.push(p);
                                 }
                             }
@@ -966,7 +1079,11 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                                 if !is_internal_noise(&from) {
                                     paths_to_remove.push(from.to_string_lossy().to_string());
                                 }
-                                if !is_internal_noise(&to) && to.exists() && !paths_to_index.contains(&to) {
+                                if !is_internal_noise(&to)
+                                    && !is_disabled_cloud_root(&to, &live_disabled_cloud)
+                                    && to.exists()
+                                    && !paths_to_index.contains(&to)
+                                {
                                     paths_to_index.push(to);
                                 }
                             }
@@ -976,15 +1093,22 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                                 }
                             }
                             quorum_ingest::WatcherEvent::QueueOverflow { root, .. } => {
-                                if !root.as_os_str().is_empty() && root.exists() && !paths_to_index.contains(&root) {
-                                    paths_to_index.push(root);
+                                if !root.as_os_str().is_empty() && root.exists() {
+                                    push_watch_root_excluding_disabled(
+                                        &root,
+                                        &live_disabled_cloud,
+                                        &mut paths_to_index,
+                                    );
                                 }
                             }
                         }
                     }
 
                     if !paths_to_remove.is_empty() {
-                        let _ = watcher_state.storage.delete_by_file_paths(&paths_to_remove).await;
+                        let _ = watcher_state
+                            .storage
+                            .delete_by_file_paths(&paths_to_remove)
+                            .await;
                     }
                     if !paths_to_index.is_empty() {
                         info!(
@@ -1007,7 +1131,6 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     let bg_storage = Arc::clone(&storage);
     let bg_state = Arc::clone(&app_state);
     let bg_data_dir = cli.data_dir.clone();
-    let bg_default_paths = ingest_config.watch_paths.clone();
     let bg_shutdown = Arc::clone(&shutdown_notify);
 
     tokio::spawn(async move {
@@ -1036,26 +1159,21 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         }
 
         // Pass 0: Priority fast pass over user document & screenshot folders (Documents, Desktop, Downloads before Pictures)
-        let mut priority_user_roots = if isolated_watch_only {
+        let pass0_controller = quorum_coordinator::global_mesh_dlp_controller();
+        let pass0_disabled_cloud =
+            collect_disabled_cloud_roots(&pass0_controller, &discovered_cloud_drives);
+        let pass0_raw_roots = if isolated_watch_only {
             Vec::new()
         } else {
             quorum_ingest::IngestConfig::discover_user_document_roots()
         };
-        priority_user_roots.sort_by_key(|r| {
-            let name = r.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            match name.as_str() {
-                "documents" => 0,
-                "desktop" => 1,
-                "downloads" => 2,
-                "pictures" => 10,
-                _ => 5,
-            }
-        });
         let up_dir = bg_data_dir.join("uploaded_documents");
-        if up_dir.exists() && !priority_user_roots.contains(&up_dir) {
-            priority_user_roots.insert(0, up_dir);
-        }
-        if !priority_user_roots.is_empty() {
+        let priority_user_roots = collect_pass0_priority_user_roots(
+            &pass0_raw_roots,
+            Some(&up_dir),
+            &pass0_disabled_cloud,
+        );
+        if !priority_user_roots.is_empty() && bg_worker.get_progress().await.is_none() {
             let fast_opts = quorum_ingest::ReindexOptions {
                 target_paths: priority_user_roots,
                 full_rebuild: false,
@@ -1068,22 +1186,36 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         }
         loop {
-            let mut target_paths = bg_default_paths.clone();
-            for dyn_p in bg_worker.dynamic_watch_paths() {
-                if !target_paths.contains(&dyn_p) {
-                    target_paths.push(dyn_p);
-                }
+            let controller = quorum_coordinator::global_mesh_dlp_controller();
+            let live_discovered_cloud =
+                tokio::task::spawn_blocking(quorum_ingest::discover_cloud_drives)
+                    .await
+                    .unwrap_or_default();
+            handlers::cloud_drives::reconcile_discovered_cloud_drives(
+                &controller,
+                &live_discovered_cloud,
+            );
+            let live_disabled_cloud =
+                collect_disabled_cloud_roots(&controller, &live_discovered_cloud);
+            let mut target_paths: Vec<std::path::PathBuf> = Vec::new();
+            for p in bg_worker.all_watch_paths() {
+                push_watch_root_excluding_disabled(&p, &live_disabled_cloud, &mut target_paths);
             }
-            if let Ok(guard) = quorum_coordinator::global_mesh_dlp_controller()
-                .settings
-                .read()
-            {
+            for cp in handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+                &controller,
+                &live_disabled_cloud,
+            ) {
+                push_watch_root_excluding_disabled(&cp, &live_disabled_cloud, &mut target_paths);
+            }
+            if let Ok(guard) = controller.settings.read() {
                 for folder in &guard.mesh.shared_folders {
                     if folder.enabled {
                         let p = std::path::PathBuf::from(&folder.path);
-                        if !target_paths.contains(&p) {
-                            target_paths.push(p);
-                        }
+                        push_watch_root_excluding_disabled(
+                            &p,
+                            &live_disabled_cloud,
+                            &mut target_paths,
+                        );
                     }
                 }
             }
@@ -1091,8 +1223,12 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 if let Ok(cfg) = store.get_config() {
                     for folder in &cfg.opt_in_folders {
                         let p = std::path::PathBuf::from(folder);
-                        if p.exists() && !target_paths.contains(&p) {
-                            target_paths.push(p);
+                        if p.exists() {
+                            push_watch_root_excluding_disabled(
+                                &p,
+                                &live_disabled_cloud,
+                                &mut target_paths,
+                            );
                         }
                     }
                 }
@@ -1109,7 +1245,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 None => false,
             };
 
-            if !is_running {
+            if !is_running && !target_paths.is_empty() {
                 let pass_options = quorum_ingest::ReindexOptions {
                     target_paths,
                     full_rebuild: false,
@@ -1259,11 +1395,36 @@ pub async fn run_standalone_reindex(
     }
     let _ = dedup.hydrate_from_storage(&storage).await;
 
-    let target_paths = path.map(|p| vec![p]).unwrap_or_else(|| {
-        cli.watch_dir
-            .map(|w| vec![w])
-            .unwrap_or_else(quorum_ingest::IngestConfig::discover_physical_drives)
-    });
+    let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
+    mesh_dlp_controller.init_persistence(&cli.data_dir);
+    let discovered_cloud = quorum_ingest::discover_cloud_drives();
+    handlers::cloud_drives::reconcile_discovered_cloud_drives(
+        &mesh_dlp_controller,
+        &discovered_cloud,
+    );
+    let disabled_cloud_roots =
+        collect_disabled_cloud_roots(&mesh_dlp_controller, &discovered_cloud);
+    let cloud_drives_settings = mesh_dlp_controller.get_cloud_drives_settings();
+
+    let target_paths = if let Some(p) = path {
+        let mut filtered = Vec::new();
+        push_watch_root_excluding_disabled(&p, &disabled_cloud_roots, &mut filtered);
+        filtered
+    } else if let Some(w) = cli.watch_dir {
+        let mut filtered = Vec::new();
+        push_watch_root_excluding_disabled(&w, &disabled_cloud_roots, &mut filtered);
+        filtered
+    } else {
+        let physical = quorum_ingest::IngestConfig::discover_physical_drives();
+        let mut expanded = expand_physical_watch_paths(&physical, &disabled_cloud_roots);
+        for cp in handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+            &mesh_dlp_controller,
+            &disabled_cloud_roots,
+        ) {
+            push_watch_root_excluding_disabled(&cp, &disabled_cloud_roots, &mut expanded);
+        }
+        expanded
+    };
 
     let options = quorum_ingest::ReindexOptions {
         target_paths,
@@ -1276,17 +1437,21 @@ pub async fn run_standalone_reindex(
 
     let mut ingest_cfg = quorum_ingest::IngestConfig::default();
     ingest_cfg.exclude_source_code = true;
+    ingest_cfg.max_file_size_bytes = effective_ingest_max_file_size_bytes(&cloud_drives_settings);
+    ingest_cfg.access_tier_rules = mesh_dlp_controller.cloud_drive_access_tier_rules();
+    ingest_cfg.placeholder_policy = cloud_drives_settings
+        .placeholder_policy()
+        .unwrap_or_default();
     ingest_cfg.dedup_catalog_path = Some(catalog_path);
-    if !ingest_cfg
-        .excluded_paths
-        .iter()
-        .any(|p| p == &cli.data_dir)
-    {
+    if !ingest_cfg.excluded_paths.iter().any(|p| p == &cli.data_dir) {
         ingest_cfg.excluded_paths.push(cli.data_dir.clone());
     }
 
+    let dlp_gate: Arc<dyn quorum_types::DlpContentGate> =
+        Arc::clone(&mesh_dlp_controller) as Arc<dyn quorum_types::DlpContentGate>;
     let worker =
-        quorum_ingest::ReindexWorker::new(ingest_cfg, storage, classifier, embedder, dedup);
+        quorum_ingest::ReindexWorker::new(ingest_cfg, storage, classifier, embedder, dedup)
+            .with_dlp_gate(dlp_gate);
 
     let task_id = worker.start_reindex(options).await?;
     info!(task_id = %task_id, "Reindex task started. Streaming progress...");
@@ -1332,15 +1497,44 @@ pub async fn run_standalone_fix_drift(
     let dedup = Arc::new(quorum_ingest::TwoLevelDedupEngine::new());
     let _ = dedup.hydrate_from_storage(&storage).await;
 
+    let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
+    mesh_dlp_controller.init_persistence(&cli.data_dir);
+    let discovered_cloud = quorum_ingest::discover_cloud_drives();
+    handlers::cloud_drives::reconcile_discovered_cloud_drives(
+        &mesh_dlp_controller,
+        &discovered_cloud,
+    );
+    let access_tier_rules = mesh_dlp_controller.cloud_drive_access_tier_rules();
+    let disabled_cloud_roots =
+        collect_disabled_cloud_roots(&mesh_dlp_controller, &discovered_cloud);
+    let cloud_drives_settings = mesh_dlp_controller.get_cloud_drives_settings();
+
     let mut ingest_cfg = quorum_ingest::IngestConfig::default();
     ingest_cfg.exclude_source_code = true;
+    ingest_cfg.max_file_size_bytes = effective_ingest_max_file_size_bytes(&cloud_drives_settings);
+    ingest_cfg.access_tier_rules = access_tier_rules.clone();
+    ingest_cfg.placeholder_policy = cloud_drives_settings
+        .placeholder_policy()
+        .unwrap_or_default();
     if let Some(ref w) = cli.watch_dir {
-        ingest_cfg.watch_paths = vec![w.clone()];
+        push_watch_root_excluding_disabled(w, &disabled_cloud_roots, &mut ingest_cfg.watch_paths);
     } else {
-        ingest_cfg.watch_paths = quorum_ingest::IngestConfig::discover_physical_drives();
+        let physical = quorum_ingest::IngestConfig::discover_physical_drives();
+        let mut expanded = expand_physical_watch_paths(&physical, &disabled_cloud_roots);
+        for cp in handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+            &mesh_dlp_controller,
+            &disabled_cloud_roots,
+        ) {
+            push_watch_root_excluding_disabled(&cp, &disabled_cloud_roots, &mut expanded);
+        }
+        ingest_cfg.watch_paths = expanded;
     }
 
-    let healer = quorum_ingest::DriftHealer::new(ingest_cfg, storage, classifier, embedder, dedup);
+    let dlp_gate: Arc<dyn quorum_types::DlpContentGate> =
+        Arc::clone(&mesh_dlp_controller) as Arc<dyn quorum_types::DlpContentGate>;
+    let healer = quorum_ingest::DriftHealer::new(ingest_cfg, storage, classifier, embedder, dedup)
+        .with_dlp_gate(dlp_gate);
+    healer.update_blocked_prefixes(disabled_cloud_roots);
 
     let mut targets = Vec::new();
     if let Some(t) = drift_type {
@@ -1358,7 +1552,7 @@ pub async fn run_standalone_fix_drift(
         .fix_all_drifts(quorum_ingest::DriftFixOptions {
             target_drifts: targets,
             dry_run,
-            access_tier_rules: Vec::new(),
+            access_tier_rules,
         })
         .await?;
 

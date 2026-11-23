@@ -47,18 +47,17 @@ pub async fn recache_handler(
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let req = payload.map(|p| p.0).unwrap_or_default();
-    info!(clear = req.clear, warm = req.warm, "Executing POST /api/cache/recache");
+    info!(
+        clear = req.clear,
+        warm = req.warm,
+        "Executing POST /api/cache/recache"
+    );
 
     let embedder = quorum_contract::DeterministicOfflineEngine::new();
     let resp = state
         .coordinator
         .cache_manager
-        .recache(
-            Some(&state.storage),
-            Some(&embedder),
-            req.clear,
-            req.warm,
-        )
+        .recache(Some(&state.storage), Some(&embedder), req.clear, req.warm)
         .await;
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -73,9 +72,7 @@ pub async fn recache_handler(
 }
 
 /// GET /api/cache/stats - Returns live telemetry for QueryCache and EmbeddingCache.
-pub async fn cache_stats_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+pub async fn cache_stats_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let stats = state.coordinator.cache_stats();
     Json(CacheStatsResponse {
         status: "ok".to_string(),
