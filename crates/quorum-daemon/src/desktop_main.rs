@@ -285,6 +285,7 @@ fn run_default_desktop_launcher() -> i32 {
 
     // 1. Fast reuse guard: if local daemon already responds on `/api/health`, open UI immediately.
     if probe_daemon_health(port, 1200) {
+        let _ = send_cloud_drive_relay_registration(port);
         open_browser_native(&url);
         return 0;
     }
@@ -296,7 +297,9 @@ fn run_default_desktop_launcher() -> i32 {
             win_native::ServiceStateSummary::Running
             | win_native::ServiceStateSummary::StartPending
             | win_native::ServiceStateSummary::ContinuePending => {
-                let _ = wait_for_daemon_health(port, 90);
+                if wait_for_daemon_health(port, 90) {
+                    let _ = send_cloud_drive_relay_registration(port);
+                }
                 open_browser_native(&url);
                 return 0;
             }
@@ -305,6 +308,7 @@ fn run_default_desktop_launcher() -> i32 {
                 std::thread::sleep(Duration::from_secs(2));
                 let _ = win_native::start_windows_service("QuorumRAGDaemon");
                 if wait_for_daemon_health(port, 45) {
+                    let _ = send_cloud_drive_relay_registration(port);
                     open_browser_native(&url);
                     return 0;
                 }
@@ -315,6 +319,7 @@ fn run_default_desktop_launcher() -> i32 {
             | win_native::ServiceStateSummary::Other(_) => {
                 let _ = win_native::start_windows_service("QuorumRAGDaemon");
                 if wait_for_daemon_health(port, 45) {
+                    let _ = send_cloud_drive_relay_registration(port);
                     open_browser_native(&url);
                     return 0;
                 }
@@ -493,7 +498,9 @@ fn main() {
             let port = parse_u16_flag(&args, "--port", default_http_port());
             let timeout_secs = parse_u64_flag(&args, "--timeout-secs", 90);
             let url = format!("http://127.0.0.1:{port}/");
-            let _ = wait_for_daemon_health(port, timeout_secs);
+            if wait_for_daemon_health(port, timeout_secs) {
+                let _ = send_cloud_drive_relay_registration(port);
+            }
             open_browser_native(&url);
             std::process::exit(0);
         }

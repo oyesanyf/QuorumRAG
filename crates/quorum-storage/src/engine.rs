@@ -746,6 +746,7 @@ impl StorageEngine {
             let _ = self.catalog.delete_by_file_path(p);
             let _ = self.atlaskv.delete_by_file_path(p);
         }
+        let _ = self.bump_index_epoch("delete_by_file_paths");
         Ok(())
     }
 

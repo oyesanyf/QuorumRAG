@@ -695,7 +695,8 @@ impl ImageIndexer {
         )
     }
 
-    /// Index an image file into a `DocumentChunk` while enforcing `policy` and scrubbing metadata.
+    /// Index an image file into a `DocumentChunk` while enforcing `policy`, pornography/explicit
+    /// visual + metadata content safety filtering, and secret scrubbing.
     pub fn index_image_with_policy(
         path: &Path,
         bytes: &[u8],
@@ -704,7 +705,37 @@ impl ImageIndexer {
         embedding_generator: &dyn EmbeddingGenerator,
         policy: quorum_types::CloudPlaceholderPolicy,
     ) -> Result<DocumentChunk, TypeError> {
+        if let crate::content_safety::ContentSafetyDecision::Blocked { reason, .. } =
+            crate::content_safety::evaluate_image_safety(path, bytes)
+        {
+            tracing::warn!(path = %path.display(), reason = %reason, "Blocked explicit/pornographic image at ingestion");
+            return Err(TypeError::ContentSafetyBlocked(reason));
+        }
+
         let mut metadata = Self::extract_metadata_with_policy(path, bytes, identity, policy);
+
+        let combined_ocr_or_extracted: Option<String> = match (
+            metadata.ocr_text.as_deref(),
+            metadata.extracted_text.as_deref(),
+        ) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (Some(a), None) => Some(a.to_string()),
+            (None, Some(b)) => Some(b.to_string()),
+            (None, None) => None,
+        };
+        if let crate::content_safety::ContentSafetyDecision::Blocked { reason, .. } =
+            crate::content_safety::evaluate_image_metadata_and_text(
+                path,
+                &metadata.keywords,
+                metadata.user_comment.as_deref(),
+                combined_ocr_or_extracted.as_deref(),
+                metadata.visual_description.as_deref(),
+            )
+        {
+            tracing::warn!(path = %path.display(), reason = %reason, "Blocked explicit/pornographic image via metadata/OCR/vision filter");
+            return Err(TypeError::ContentSafetyBlocked(reason));
+        }
+
         Self::sanitize_metadata(&mut metadata);
         let search_text = Self::build_search_text(&metadata, path);
         let file_b3 = blake3::hash(bytes).to_hex().to_string();

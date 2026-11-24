@@ -43,6 +43,8 @@ cfb = "0.7"
 flate2 = "1.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 regex = "1"
+# Pure-Rust multi-format raster pixel decoding for explicit/pornography visual image filtering
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

@@ -1489,6 +1489,64 @@ impl OsoosiMeshDlpController {
 
         let effective_mode = mode_override.unwrap_or(policy.mode);
 
+        // Mandatory always-on pornography & explicit visual-content gate (fail-closed, even if DLP toggle is off).
+        let explicit_block_reason = if !file_path.is_empty() {
+            match quorum_types::content_safety::check_path_explicit_content(std::path::Path::new(
+                file_path,
+            )) {
+                quorum_types::content_safety::ContentSafetyDecision::Blocked { reason, .. } => {
+                    Some(reason)
+                }
+                quorum_types::content_safety::ContentSafetyDecision::Allowed => {
+                    if !text.is_empty() {
+                        match quorum_types::content_safety::check_text_explicit_content(text) {
+                            quorum_types::content_safety::ContentSafetyDecision::Blocked {
+                                reason,
+                                ..
+                            } => Some(reason),
+                            quorum_types::content_safety::ContentSafetyDecision::Allowed => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else if !text.is_empty() {
+            match quorum_types::content_safety::check_text_explicit_content(text) {
+                quorum_types::content_safety::ContentSafetyDecision::Blocked { reason, .. } => {
+                    Some(reason)
+                }
+                quorum_types::content_safety::ContentSafetyDecision::Allowed => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(reason) = explicit_block_reason {
+            if let Ok(mut stats) = self.stats.write() {
+                stats.total_inspected_chunks += 1;
+                stats.total_blocked_chunks += 1;
+            }
+            tracing::warn!(
+                file_path = %file_path,
+                peer_id = %peer_id,
+                direction = %direction,
+                reason = %reason,
+                "Blocked explicit/pornographic content unconditionally at DLP/Mesh boundary"
+            );
+            return DlpInspectionResult {
+                allowed_to_share: false,
+                action_taken: "Blocked".to_string(),
+                engine_used: "QuorumContentSafetyGate".to_string(),
+                scrubbed_text: String::new(),
+                detected_categories: vec!["EXPLICIT_CONTENT_BLOCKED".to_string()],
+                detected_spans: Vec::new(),
+                redacted_span_count: 0,
+                sensitivity_phi_score: 1.0,
+                zk_commitment_hex: Self::sha256_hex(text),
+            };
+        }
+
         if !policy.enabled || text.is_empty() {
             return DlpInspectionResult {
                 allowed_to_share: true,

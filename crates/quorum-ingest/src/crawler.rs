@@ -361,7 +361,10 @@ impl FilesystemCrawler {
         let excluded_paths = self.config.excluded_paths.clone();
         builder.filter_entry(move |entry| {
             let entry_path = entry.path();
-            if excluded_paths.iter().any(|ex| entry_path == ex || entry_path.starts_with(ex)) {
+            if excluded_paths
+                .iter()
+                .any(|ex| crate::config::path_matches_prefix(entry_path, ex))
+            {
                 return false;
             }
             if entry.depth() == 0 {

@@ -80,17 +80,68 @@ const VISION_PROMPT: &str = "Describe this image factually in 3 to 5 sentences: 
 (people, animals with likely breed/species, objects), their colours and appearance, what they are doing, \
 the setting/background, and any readable text. Do not guess names or locations that are not visible.";
 
+static PIXEL_SAFETY_HOOK: OnceLock<fn(&Path, &[u8]) -> bool> = OnceLock::new();
+
+/// Registers the daemon's raster pixel pornography/explicit-content safety verifier so
+/// query-time Ollama vision inspection refuses explicit images even with benign filenames.
+pub fn register_vision_pixel_safety_hook(hook: fn(&Path, &[u8]) -> bool) {
+    let _ = PIXEL_SAFETY_HOOK.set(hook);
+}
+
+fn is_cloud_placeholder_for_vision(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const MASK: u32 = 0x0040_0000 | 0x0004_0000 | 0x0000_1000;
+        (meta.file_attributes() & MASK) != 0
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.len() > 0 && meta.blocks() == 0
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
 /// Send one image to the local Ollama vision model and return its description.
-/// Fails closed (returns `None`) on any network, timeout, or parse error.
+/// Fails closed (returns `None`) on any network, timeout, placeholder, safety, or parse error.
 pub fn describe_image_file(addr: &SocketAddr, host_port: &str, model: &str, path: &Path, question: &str) -> Option<String> {
     if !addr.ip().is_loopback() {
+        return None;
+    }
+    if quorum_types::content_safety::check_path_explicit_content(path).is_blocked() {
+        tracing::warn!(path = %path.display(), "Refusing local vision inspection for explicit/pornographic image path");
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_VISION_IMAGE_BYTES {
         return None;
     }
+    if is_cloud_placeholder_for_vision(&meta) {
+        let policy = crate::global_mesh_dlp_controller()
+            .get_cloud_drives_settings()
+            .placeholder_policy()
+            .unwrap_or_default();
+        match policy {
+            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly => return None,
+            quorum_types::CloudPlaceholderPolicy::HydrateOnDemand { max_file_size_bytes } => {
+                if meta.len() > max_file_size_bytes {
+                    return None;
+                }
+            }
+        }
+    }
     let bytes = std::fs::read(path).ok()?;
+    if let Some(hook) = PIXEL_SAFETY_HOOK.get() {
+        if !hook(path, &bytes) {
+            tracing::warn!(path = %path.display(), "Refusing local vision inspection: blocked by raster pixel content-safety filter");
+            return None;
+        }
+    }
     let key = blake3::hash(&bytes).to_hex().to_string();
     if let Some(hit) = cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
         return Some(hit);
@@ -131,6 +182,10 @@ pub fn describe_image_file(addr: &SocketAddr, host_port: &str, model: &str, path
     let val: serde_json::Value = serde_json::from_str(text[body_at..].trim()).ok()?;
     let desc = val.get("response")?.as_str()?.trim().to_string();
     if desc.len() < 12 {
+        return None;
+    }
+    if quorum_types::content_safety::check_text_explicit_content(&desc).is_blocked() {
+        tracing::warn!(path = %path.display(), "Discarded vision description flagged by pornography/explicit content safety filter");
         return None;
     }
     if let Ok(mut c) = cache().lock() {

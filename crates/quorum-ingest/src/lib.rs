@@ -8,6 +8,7 @@ pub mod classifier_router;
 pub mod cloud_drives;
 pub mod chunker;
 pub mod config;
+pub mod content_safety;
 pub mod crawler;
 pub mod dedup;
 pub mod document_extractor;
@@ -51,6 +52,12 @@ pub use chunker::{
 pub use config::{
     normalize_path_for_prefix, path_matches_prefix, ChunkerConfig, DriftFixOptions, DriftType,
     IngestConfig, ReindexOptions,
+};
+pub use content_safety::{
+    analyze_image_pixels, check_path_explicit_content, check_text_explicit_content,
+    evaluate_image_file_safety, evaluate_image_metadata_and_text, evaluate_image_safety,
+    is_raster_image_extension, is_visual_media_extension, ContentSafetyDecision,
+    VisualSafetyMetrics,
 };
 pub use crawler::{CrawlerStats, DiscoveredCandidate, FilesystemCrawler};
 pub use dedup::{

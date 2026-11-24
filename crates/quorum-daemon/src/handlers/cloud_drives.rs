@@ -807,8 +807,19 @@ pub fn reconcile_discovered_cloud_drives(
                 .iter_mut()
                 .find(|e| e.id.eq_ignore_ascii_case(&disc.id))
             {
-                if existing.root_path.is_none() && disc_root.is_some() {
+                let existing_root_valid = existing
+                    .root_path
+                    .as_deref()
+                    .is_some_and(|rp| Path::new(rp.trim()).is_dir());
+                if disc_root.is_some() && (!existing_root_valid || existing.root_path.is_none()) {
                     existing.root_path = disc_root;
+                    changed = true;
+                } else if !existing.enabled
+                    && existing.root_path.is_some()
+                    && !existing_root_valid
+                    && disc_root.is_none()
+                {
+                    existing.root_path = None;
                     changed = true;
                 }
                 if existing.account_kind.is_none() && disc.account_kind.is_some() {
@@ -932,6 +943,12 @@ pub struct CloudDrivesConfigPayload {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloudDrivesReindexPayload {
     pub id: String,
+    #[serde(default)]
+    pub full_rebuild: Option<bool>,
+    #[serde(default)]
+    pub force_reembed: Option<bool>,
+    #[serde(default)]
+    pub batch_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1169,7 +1186,7 @@ pub async fn build_cloud_drives_status_response_with_context(
         let custom_exists_on_disk = entry.custom_paths.iter().any(|cp| Path::new(cp).is_dir());
 
         let disc_mounted = disc_opt.is_some_and(|d| d.mounted) && root_exists_on_disk;
-        let mounted = disc_mounted || root_exists_on_disk;
+        let mounted = disc_mounted || root_exists_on_disk || custom_exists_on_disk;
 
         let disc_virtual = disc_opt.is_some_and(|d| d.virtual_drive)
             || matches!(
@@ -1193,12 +1210,17 @@ pub async fn build_cloud_drives_status_response_with_context(
 
         let (status, virtual_drive, session_only, session_guidance, final_root_path, detected) =
             if mounted {
+                let effective_root = if root_exists_on_disk {
+                    root_path
+                } else {
+                    None
+                };
                 (
                     CloudDriveMountStatus::Mounted,
-                    disc_virtual,
+                    disc_virtual && root_exists_on_disk,
                     false,
                     None,
-                    root_path,
+                    effective_root,
                     true,
                 )
             } else if is_session_scoped {
@@ -1243,7 +1265,7 @@ pub async fn build_cloud_drives_status_response_with_context(
                     disc_virtual,
                     false,
                     None,
-                    root_path,
+                    None,
                     disc_opt.is_some_and(|d| d.detected),
                 )
             };
@@ -1395,6 +1417,21 @@ pub async fn update_cloud_drives_config_handler(
             ) {
                 return error_response(StatusCode::BAD_REQUEST, e.to_string());
             }
+            let became_more_permissive = (next.placeholder_mode
+                == CloudPlaceholderMode::HydrateOnDemand
+                && current_settings.placeholder_mode != CloudPlaceholderMode::HydrateOnDemand)
+                || (next.placeholder_mode == CloudPlaceholderMode::HydrateOnDemand
+                    && next.hydration_max_file_size_mb
+                        > current_settings.hydration_max_file_size_mb);
+            if became_more_permissive {
+                let disabled_now = collect_disabled_cloud_roots_for_settings(&next, &discovered, None);
+                for drv in next.drives.iter().filter(|d| d.enabled) {
+                    paths_to_watch.extend(collect_drive_existing_paths_excluding_disabled(
+                        drv,
+                        &disabled_now,
+                    ));
+                }
+            }
             next
         }
         Some("toggle_drive") => {
@@ -1450,21 +1487,42 @@ pub async fn update_cloud_drives_config_handler(
                             "Invalid, unsafe, or non-canonical cloud drive root_path",
                         );
                     };
-                    if !clean_rp.is_dir() {
-                        return error_response(
-                            StatusCode::BAD_REQUEST,
-                            format!(
-                                "Cloud drive root_path does not exist on disk: {}",
-                                clean_rp.display()
-                            ),
-                        );
+                    if clean_rp.is_dir() {
+                        if let Some(conflict_msg) =
+                            check_cloud_drive_path_conflict(&clean_rp, &other_disabled)
+                        {
+                            return error_response(StatusCode::CONFLICT, conflict_msg);
+                        }
+                        next.drives[idx].root_path = Some(clean_rp.to_string_lossy().to_string());
+                    } else {
+                        // If the drive already has valid custom local folder(s) on disk, ignore
+                        // a stale or session-only `root_path` hint (such as `G:\My Drive`) and
+                        // allow enabling indexing on the configured local folder(s).
+                        let has_existing_local = !collect_drive_existing_paths_excluding_disabled(
+                            &next.drives[idx],
+                            &other_disabled,
+                        )
+                        .is_empty();
+                        if !has_existing_local {
+                            let label = next.drives[idx].label.as_str();
+                            let msg = if running_as_local_system()
+                                && matches!(
+                                    next.drives[idx].provider,
+                                    CloudDriveProvider::GoogleDrive | CloudDriveProvider::Pcloud
+                                ) {
+                                format!(
+                                    "{label} ({}) is not directly mounted in the Windows service session. Start {label} in Mirror mode or click Select Folder to pick a local sync folder.",
+                                    clean_rp.display()
+                                )
+                            } else {
+                                format!(
+                                    "{label} sync folder is not mounted on disk ({}). Start {label} or click Select Folder to choose a local folder.",
+                                    clean_rp.display()
+                                )
+                            };
+                            return error_response(StatusCode::BAD_REQUEST, msg);
+                        }
                     }
-                    if let Some(conflict_msg) =
-                        check_cloud_drive_path_conflict(&clean_rp, &other_disabled)
-                    {
-                        return error_response(StatusCode::CONFLICT, conflict_msg);
-                    }
-                    next.drives[idx].root_path = Some(clean_rp.to_string_lossy().to_string());
                 }
 
                 let existing = collect_drive_existing_paths_excluding_disabled(
@@ -1475,13 +1533,16 @@ pub async fn update_cloud_drives_config_handler(
                     return error_response(
                         StatusCode::CONFLICT,
                         format!(
-                            "Cannot enable cloud drive '{}': no permitted mounted root path or existing custom folder found",
-                            next.drives[idx].id
+                            "Cannot enable {}: no mounted sync folder found on disk yet. Start {} or click Select Folder to choose a local folder.",
+                            next.drives[idx].label, next.drives[idx].label
                         ),
                     );
                 }
                 next.drives[idx].enabled = true;
                 if !prev.enabled {
+                    for pref in collect_drive_all_prefixes(&next.drives[idx]) {
+                        tier_syncs.push((pref, next.drives[idx].access_tier));
+                    }
                     paths_to_watch.extend(existing);
                 } else {
                     let old_norm_opt = prev
@@ -1639,6 +1700,9 @@ pub async fn update_cloud_drives_config_handler(
                     }
                 }
                 if clean_rp.is_dir() {
+                    if let Ok(norm_new) = normalize_prefix_for_match(&clean_rp_str) {
+                        tier_syncs.push((norm_new, next.drives[idx].access_tier));
+                    }
                     paths_to_watch.push(clean_rp);
                 }
             }
@@ -1699,7 +1763,16 @@ pub async fn update_cloud_drives_config_handler(
             if !already_present {
                 entry.custom_paths.push(clean_str);
             }
-            if entry.enabled {
+            if payload.enabled == Some(true) && !entry.enabled {
+                entry.enabled = true;
+                for pref in collect_drive_all_prefixes(entry) {
+                    tier_syncs.push((pref, entry.access_tier));
+                }
+                let all_existing =
+                    collect_drive_existing_paths_excluding_disabled(entry, &disabled_for_add);
+                paths_to_watch.extend(all_existing);
+            } else if entry.enabled {
+                tier_syncs.push((norm_new, entry.access_tier));
                 paths_to_watch.push(clean_p);
             }
             next
@@ -2028,6 +2101,7 @@ pub async fn update_cloud_drives_config_handler(
                 }
             }
             state.reindex_worker.add_watch_paths(&surviving_descendants);
+            state.sync_drift_healer_watch_paths().await;
         }
     }
 
@@ -2140,7 +2214,49 @@ pub async fn reindex_cloud_drive_handler(
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
-    let task_id = state.watch_and_index_paths(paths).await;
+    let wants_full_or_reembed =
+        payload.full_rebuild.unwrap_or(false) || payload.force_reembed.unwrap_or(false);
+    let task_id = if wants_full_or_reembed {
+        if let Some(watcher) = state.fs_watcher() {
+            for p in &paths {
+                let _ = watcher.watch_path(p);
+            }
+        }
+        state.reindex_worker.add_watch_paths(&paths);
+        state.sync_drift_healer_watch_paths().await;
+        let opts = quorum_ingest::ReindexOptions {
+            target_paths: paths.clone(),
+            full_rebuild: payload.full_rebuild.unwrap_or(false),
+            force_reembed: payload.force_reembed.unwrap_or(false),
+            batch_size: payload.batch_size.unwrap_or(64),
+            num_threads: 0,
+            dry_run: false,
+        };
+        match state.reindex_worker.start_reindex(opts).await {
+            Ok(tid) => Some(tid),
+            Err(quorum_ingest::IngestError::TaskAlreadyRunning(_)) => {
+                state.reindex_worker.trigger_paths(paths).await.ok()
+            }
+            Err(e) => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    format!("Failed to start cloud drive reindex: {e}"),
+                );
+            }
+        }
+    } else {
+        state.watch_and_index_paths(paths).await
+    };
+
+    let Some(task_id) = task_id else {
+        return error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Unable to dispatch reindex for cloud drive '{}': no permitted mounted paths available",
+                entry.id
+            ),
+        );
+    };
 
     Json(serde_json::json!({
         "ok": true,

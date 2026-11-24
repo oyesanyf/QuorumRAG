@@ -250,8 +250,15 @@ impl ClassifierRouter {
         };
 
         // 5. Ingestion Routing Invariant:
-        // DO NOT SKIP IMAGES! Images must route to ImageIndexer.
+        // DO NOT SKIP IMAGES! Images must route to ImageIndexer — EXCEPT pornography / explicit
+        // adult media paths, which are always blocked fail-closed before reading or indexing.
         if identity.category == FileCategory::Image || Self::is_image_mime(&identity.mime_type) || Self::is_image_label(&identity.label) {
+            if let crate::content_safety::ContentSafetyDecision::Blocked { reason, .. } =
+                crate::content_safety::check_path_explicit_content(path)
+            {
+                tracing::warn!(path = %path.display(), reason = %reason, "Skipped explicit/pornographic image during classification");
+                return FilterDecision::SkipBinary { identity };
+            }
             return FilterDecision::Accept {
                 identity: identity.clone(),
                 kind: CandidateKind::Image {

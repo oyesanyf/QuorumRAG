@@ -687,6 +687,17 @@ impl ReindexWorker {
             let placeholder_policy = cfg_snapshot.placeholder_policy;
             let access_tier = cfg_snapshot.resolve_access_tier(file_path);
 
+            enum LegacyImageUpgradeAction {
+                Upgraded(
+                    DocumentChunk,
+                    String,
+                    u64,
+                    i64,
+                    quorum_types::IngestedParentDocument,
+                ),
+                PurgeExplicit(String),
+            }
+
             let blocking_fut = tokio::task::spawn_blocking(move || {
                 let bytes = match crate::cloud_drives::read_bytes_with_placeholder_policy(
                     &file_path_buf,
@@ -703,16 +714,24 @@ impl ReindexWorker {
                     return None;
                 }
 
-                let identity = classifier_c.classify_file(&file_path_buf).ok()?;
-                let mut upgraded_chunk = ImageIndexer::index_image_with_policy(
+                let identity = match classifier_c.classify_file(&file_path_buf) {
+                    Ok(i) => i,
+                    Err(_) => return None,
+                };
+                let mut upgraded_chunk = match ImageIndexer::index_image_with_policy(
                     &file_path_buf,
                     &bytes,
                     &identity,
                     access_tier,
                     embedder_c.as_ref(),
                     placeholder_policy,
-                )
-                .ok()?;
+                ) {
+                    Ok(c) => c,
+                    Err(quorum_types::TypeError::ContentSafetyBlocked(reason)) => {
+                        return Some(LegacyImageUpgradeAction::PurgeExplicit(reason));
+                    }
+                    Err(_) => return None,
+                };
 
                 // Ensure chunk_id and document_id are strictly preserved
                 assert_eq!(upgraded_chunk.chunk_id, chunk_id);
@@ -759,7 +778,7 @@ impl ReindexWorker {
                     placeholder_policy,
                 );
 
-                Some((
+                Some(LegacyImageUpgradeAction::Upgraded(
                     upgraded_chunk,
                     file_b3,
                     bytes.len() as u64,
@@ -768,7 +787,7 @@ impl ReindexWorker {
                 ))
             });
 
-            let built = tokio::select! {
+            let action = tokio::select! {
                 biased;
                 _ = Self::wait_upgrade_cancelled(
                     &mut cancel_rx,
@@ -781,6 +800,21 @@ impl ReindexWorker {
                 join_res = blocking_fut => match join_res {
                     Ok(Some(res)) => res,
                     Ok(None) | Err(_) => continue,
+                }
+            };
+
+            let built = match action {
+                LegacyImageUpgradeAction::Upgraded(c, b3, len, mt, pdoc) => (c, b3, len, mt, pdoc),
+                LegacyImageUpgradeAction::PurgeExplicit(reason) => {
+                    warn!(
+                        path = %file_path.display(),
+                        reason = %reason,
+                        "Purging explicit/pornographic legacy image chunk from index"
+                    );
+                    let _commit_guard = self.commit_gate.read().await;
+                    let _ = self.storage.delete_by_file_path(&chunk.file_path).await;
+                    self.dedup.remove_file(file_path);
+                    continue;
                 }
             };
 
@@ -1567,7 +1601,7 @@ impl ReindexWorker {
                 !config
                     .excluded_paths
                     .iter()
-                    .any(|ex| t == ex || t.starts_with(ex))
+                    .any(|ex| crate::config::path_matches_prefix(t, ex))
                     && !Self::is_path_str_blocked(&t.to_string_lossy(), &blocked_initial)
             })
             .collect();
@@ -1693,7 +1727,7 @@ impl ReindexWorker {
                             !live_cfg
                                 .excluded_paths
                                 .iter()
-                                .any(|ex| t == ex || t.starts_with(ex))
+                                .any(|ex| crate::config::path_matches_prefix(t, ex))
                                 && !Self::is_path_str_blocked(&t.to_string_lossy(), &blocked_now)
                         })
                         .collect();
@@ -1781,7 +1815,7 @@ impl ReindexWorker {
                                 old_path,
                                 new_path,
                                 file_blake3,
-                                chunk_hashes,
+                                ..
                             } => {
                                 let _commit_guard = commit_gate.read().await;
                                 if Self::is_pipeline_cancelled(
@@ -1793,6 +1827,9 @@ impl ReindexWorker {
                                 ) {
                                     return Err(IngestError::Cancelled);
                                 }
+                                let old_key = old_path.to_string_lossy().to_string();
+                                let _ = storage.delete_by_file_path(&old_key).await;
+                                dedup.remove_file(&old_path);
                                 let blocked_now = blocked_prefixes_lock
                                     .read()
                                     .map(|g| g.clone())
@@ -1803,28 +1840,10 @@ impl ReindexWorker {
                                 ) {
                                     continue;
                                 }
-                                info!(old = %old_path.display(), new = %new_path.display(), "Detected moved/renamed file during reindex; updating path with 0 re-embeddings");
-                                dedup.register_entry(FileCatalogEntry {
-                                    file_path: new_path,
-                                    file_blake3,
-                                    mtime_secs: candidate.mtime_secs,
-                                    size_bytes: candidate.size_bytes,
-                                    chunk_hashes,
-                                });
-                                let mut lock = progress.write().await;
-                                if let Some(ref mut p) = *lock {
-                                    p.files_scanned += 1;
-                                    p.files_total_estimated =
-                                        p.files_total_estimated.max(p.files_scanned);
-                                    p.files_indexed += 1;
-                                    p.bytes_processed += candidate.size_bytes;
-                                }
-                                if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30)
-                                {
-                                    let _ = dedup.save_catalog_to_file(&catalog_path);
-                                    last_catalog_save = std::time::Instant::now();
-                                }
-                                continue;
+                                info!(old = %old_path.display(), new = %new_path.display(), "Detected moved/renamed file during reindex; purging old path and re-indexing under new path/tier (L2 vector cache reused)");
+                                precomputed_file_b3 = Some(file_blake3);
+                                // Fall through to insert chunks under `(new_path, access_tier)` across
+                                // LanceDB, Tantivy, SQLite parent_documents, and AtlasKV.
                             }
                             DedupAction::ModifiedOrNew { file_blake3, .. } => {
                                 precomputed_file_b3 = Some(file_blake3);
@@ -1973,6 +1992,23 @@ impl ReindexWorker {
                                 p.files_total_estimated =
                                     p.files_total_estimated.max(p.files_scanned);
                                 p.files_failed += 1;
+                            }
+                        }
+                        CandidateOutcome::ContentSafetyBlocked { path, reason } => {
+                            warn!(
+                                path = %path.display(),
+                                reason = %reason,
+                                "Blocked explicit/pornographic image during reindex and purging any prior index entry"
+                            );
+                            let path_key = path.to_string_lossy().to_string();
+                            let _ = storage.delete_by_file_path(&path_key).await;
+                            dedup.remove_file(&path);
+                            let mut lock = progress.write().await;
+                            if let Some(ref mut p) = *lock {
+                                p.files_scanned += 1;
+                                p.files_total_estimated =
+                                    p.files_total_estimated.max(p.files_scanned);
+                                p.files_skipped_unmodified += 1;
                             }
                         }
                     },
@@ -2386,6 +2422,10 @@ enum CandidateOutcome {
         path: std::path::PathBuf,
         error: String,
     },
+    ContentSafetyBlocked {
+        path: std::path::PathBuf,
+        reason: String,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2600,6 +2640,17 @@ fn process_candidate_sync(
                 }
             };
 
+            // Enforce zero-tolerance pornography/explicit image filter BEFORE the AlreadyIndexedInFts
+            // short-circuit so previously indexed explicit images are actively purged from storage.
+            if let crate::content_safety::ContentSafetyDecision::Blocked { reason, .. } =
+                crate::content_safety::evaluate_image_safety(path, &bytes)
+            {
+                return CandidateOutcome::ContentSafetyBlocked {
+                    path: path.clone(),
+                    reason,
+                };
+            }
+
             let img_b3 = match precomputed_file_b3 {
                 Some(b3) => b3,
                 None => blake3::hash(&bytes).to_hex().to_string(),
@@ -2695,6 +2746,12 @@ fn process_candidate_sync(
                         size_bytes: candidate.size_bytes,
                         chunks_reused: 0,
                         chunks_new: 1,
+                    }
+                }
+                Err(quorum_types::TypeError::ContentSafetyBlocked(reason)) => {
+                    CandidateOutcome::ContentSafetyBlocked {
+                        path: path.clone(),
+                        reason,
                     }
                 }
                 Err(e) => CandidateOutcome::Failed {

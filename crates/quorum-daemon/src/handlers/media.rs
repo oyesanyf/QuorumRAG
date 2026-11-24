@@ -46,6 +46,7 @@ pub enum MediaPathError {
     Executable,
     NotIndexed,
     TierDenied,
+    ExplicitContentBlocked,
     NotFound,
 }
 
@@ -64,6 +65,10 @@ impl MediaPathError {
             Self::TierDenied => (
                 StatusCode::FORBIDDEN,
                 "Access denied: file is above the permitted access tier",
+            ),
+            Self::ExplicitContentBlocked => (
+                StatusCode::FORBIDDEN,
+                "Access denied: blocked by pornography and explicit content safety filter",
             ),
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
@@ -173,6 +178,9 @@ pub fn authorize_media_path_with_loopback(
         return Err(MediaPathError::TierDenied);
     }
     let path = validate_media_path_syntax(raw)?;
+    if quorum_types::content_safety::check_path_explicit_content(&path).is_blocked() {
+        return Err(MediaPathError::ExplicitContentBlocked);
+    }
 
     let settings = quorum_coordinator::global_mesh_dlp_controller()
         .settings
@@ -287,6 +295,32 @@ pub async fn serve_media_handler(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
+
+    // Pixel-level + path pornography/explicit image safety gate before streaming any bytes.
+    let path_for_check = path.clone();
+    let safety = tokio::task::spawn_blocking(move || {
+        quorum_ingest::content_safety::evaluate_image_file_safety(&path_for_check)
+    })
+    .await
+    .unwrap_or_else(|_| quorum_ingest::content_safety::ContentSafetyDecision::Blocked {
+        category: "content_safety_worker_error",
+        reason: "Content safety check worker failed (fail-closed)".to_string(),
+        confidence: 1.0,
+    });
+    if let quorum_ingest::content_safety::ContentSafetyDecision::Blocked { reason, .. } = safety {
+        tracing::warn!(path = %path.display(), reason = %reason, "Blocked explicit image at /api/media and purging from index");
+        let storage_for_purge = Arc::clone(&state.storage);
+        let dedup_for_purge = Arc::clone(&state.dedup);
+        let coord_for_purge = Arc::clone(&state.coordinator);
+        let path_for_purge = path.clone();
+        let key_for_purge = path.to_string_lossy().to_string();
+        tokio::spawn(async move {
+            let _ = storage_for_purge.delete_by_file_path(&key_for_purge).await;
+            dedup_for_purge.remove_file(&path_for_purge);
+            coord_for_purge.cache_clear_all();
+        });
+        return MediaPathError::ExplicitContentBlocked.into_response();
+    }
     let attachment = matches!(q.download.as_deref(), Some("1") | Some("true"));
     let mime = mime_for(&path);
 
@@ -360,6 +394,42 @@ pub async fn open_file_handler(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(quorum_types::content_safety::is_visual_media_extension)
+    {
+        let path_for_check = path.clone();
+        let safety = tokio::task::spawn_blocking(move || {
+            quorum_ingest::content_safety::evaluate_image_file_safety(&path_for_check)
+        })
+        .await
+        .unwrap_or_else(|_| quorum_ingest::content_safety::ContentSafetyDecision::Blocked {
+            category: "content_safety_worker_error",
+            reason: "Content safety check worker failed (fail-closed)".to_string(),
+            confidence: 1.0,
+        });
+        if let quorum_ingest::content_safety::ContentSafetyDecision::Blocked { reason, .. } =
+            safety
+        {
+            tracing::warn!(
+                path = %path.display(),
+                reason = %reason,
+                "Blocked explicit image at /api/open-file and purging from index"
+            );
+            let storage_for_purge = Arc::clone(&state.storage);
+            let dedup_for_purge = Arc::clone(&state.dedup);
+            let coord_for_purge = Arc::clone(&state.coordinator);
+            let path_for_purge = path.clone();
+            let key_for_purge = path.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                let _ = storage_for_purge.delete_by_file_path(&key_for_purge).await;
+                dedup_for_purge.remove_file(&path_for_purge);
+                coord_for_purge.cache_clear_all();
+            });
+            return MediaPathError::ExplicitContentBlocked.into_response();
+        }
+    }
     let parent_dir = path
         .parent()
         .map(|p| p.to_string_lossy().to_string())

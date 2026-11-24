@@ -33,6 +33,7 @@ pub async fn start_reindex_handler(
     let explicit_targets_requested = payload.target_paths.is_some();
     let raw_targets = payload
         .target_paths
+        .filter(|v| !v.is_empty())
         .unwrap_or_else(|| state.reindex_worker.all_watch_paths());
 
     let discovered = tokio::task::spawn_blocking(quorum_ingest::discover_cloud_drives)
@@ -66,6 +67,20 @@ pub async fn start_reindex_handler(
             &disabled_cloud_roots,
             &mut target_paths,
         );
+    }
+    // When running a full/default reindex (no explicit single target), always include
+    // every enabled cloud drive alongside local watched drives using the exact same stack.
+    if !explicit_targets_requested {
+        for cp in crate::handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+            &controller,
+            &disabled_cloud_roots,
+        ) {
+            crate::handlers::cloud_drives::push_watch_root_excluding_disabled(
+                &cp,
+                &disabled_cloud_roots,
+                &mut target_paths,
+            );
+        }
     }
 
     if target_paths.is_empty() {
@@ -382,6 +397,41 @@ pub async fn add_documents_handler(
                 continue;
             }
             if clean_pb.exists() {
+                if let quorum_types::content_safety::ContentSafetyDecision::Blocked {
+                    reason, ..
+                } = quorum_types::content_safety::check_path_explicit_content(&clean_pb)
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({ "error": reason })),
+                    )
+                        .into_response();
+                }
+                if clean_pb.is_file() {
+                    let check_pb = clean_pb.clone();
+                    let file_safety = tokio::task::spawn_blocking(move || {
+                        quorum_ingest::content_safety::evaluate_image_file_safety(&check_pb)
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        quorum_ingest::content_safety::ContentSafetyDecision::Blocked {
+                            category: "content_safety_worker_error",
+                            reason: "Content safety check worker failed (fail-closed)".to_string(),
+                            confidence: 1.0,
+                        }
+                    });
+                    if let quorum_ingest::content_safety::ContentSafetyDecision::Blocked {
+                        reason,
+                        ..
+                    } = file_safety
+                    {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({ "error": reason })),
+                        )
+                            .into_response();
+                    }
+                }
                 had_existing_local = true;
                 raw_local_candidates.push(clean_pb);
             }
@@ -455,6 +505,39 @@ pub async fn add_documents_handler(
             };
 
             let dest = uploads_dir.join(&clean_name);
+            if let quorum_ingest::content_safety::ContentSafetyDecision::Blocked {
+                reason, ..
+            } = quorum_ingest::content_safety::evaluate_image_safety(&dest, &bytes)
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
+            let ext_lower = dest
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(
+                ext_lower.as_str(),
+                "svg" | "txt" | "md" | "html" | "htm" | "csv" | "json" | "xml"
+            ) {
+                if let Ok(as_utf8) = std::str::from_utf8(&bytes) {
+                    if let quorum_types::content_safety::ContentSafetyDecision::Blocked {
+                        reason,
+                        ..
+                    } = quorum_types::content_safety::check_text_explicit_content(as_utf8)
+                    {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({ "error": reason })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
             if let Err(e) = std::fs::write(&dest, &bytes) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -554,6 +637,27 @@ pub async fn add_documents_handler(
         }
     }
     state.reindex_worker.add_watch_paths(&target_paths);
+    let mut drift_paths = state.drift_healer.config_snapshot().await.watch_paths;
+    let mut drift_changed = false;
+    for p in &target_paths {
+        let dir_p = if p.is_dir() {
+            p.clone()
+        } else if let Some(parent) = p.parent() {
+            parent.to_path_buf()
+        } else {
+            continue;
+        };
+        if dir_p.is_dir()
+            && !state.reindex_worker.is_path_blocked(&dir_p)
+            && !drift_paths.iter().any(|existing| existing == &dir_p)
+        {
+            drift_paths.push(dir_p);
+            drift_changed = true;
+        }
+    }
+    if drift_changed {
+        state.drift_healer.update_watch_paths(drift_paths).await;
+    }
 
     let has_directory_target = target_paths.iter().any(|p| p.is_dir());
     let indexed_chunks_delta = if has_directory_target {

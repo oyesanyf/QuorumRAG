@@ -215,24 +215,20 @@ impl IngestEngine {
                 old_path,
                 new_path,
                 file_blake3,
-                chunk_hashes,
+                ..
             } => {
                 let _commit_guard = self.reindex_worker.acquire_commit_read_guard().await;
+                let old_key = old_path.to_string_lossy().to_string();
+                let _ = self.storage.delete_by_file_path(&old_key).await;
+                self.dedup.remove_file(&old_path);
                 if self.reindex_worker.current_purge_epoch() != task_purge_epoch
                     || self.reindex_worker.is_path_blocked(path)
                     || self.reindex_worker.is_path_blocked(&new_path)
                 {
                     return Err(IngestError::Cancelled);
                 }
-                info!(old = %old_path.display(), new = %new_path.display(), "Detected moved/renamed file; updating catalog path with 0 re-embeddings");
-                self.dedup.register_entry(FileCatalogEntry {
-                    file_path: new_path,
-                    file_blake3,
-                    mtime_secs,
-                    size_bytes,
-                    chunk_hashes,
-                });
-                return Ok(Some(Vec::new()));
+                info!(old = %old_path.display(), new = %new_path.display(), "Detected moved/renamed file; purging old path and re-indexing under new path/tier (L2 vector cache reused)");
+                Some(file_blake3)
             }
             DedupAction::ModifiedOrNew { file_blake3, .. } => Some(file_blake3),
         };
@@ -446,7 +442,7 @@ impl IngestEngine {
                 let path_str_c = path_str.clone();
                 let dlp_gate_c = dlp_gate.clone();
 
-                let (doc_chunk, file_b3) = crate::thread_pool::IngestThreadPool::shared()
+                let image_res = crate::thread_pool::IngestThreadPool::shared()
                     .spawn_blocking_pinned(ext_permit, move || -> Result<_, IngestError> {
                         let bytes = crate::cloud_drives::read_bytes_with_placeholder_policy(
                             &path_buf,
@@ -494,7 +490,21 @@ impl IngestEngine {
                         let file_b3 = doc_chunk.document_id.clone();
                         Ok((doc_chunk, file_b3))
                     })
-                    .await??;
+                    .await?;
+                let (doc_chunk, file_b3) = match image_res {
+                    Ok(pair) => pair,
+                    Err(IngestError::TypeError(
+                        quorum_types::TypeError::ContentSafetyBlocked(reason),
+                    )) => {
+                        let _commit_guard = self.reindex_worker.acquire_commit_read_guard().await;
+                        let _ = self.storage.delete_by_file_path(&path_str).await;
+                        self.dedup.remove_file(path);
+                        return Err(IngestError::TypeError(
+                            quorum_types::TypeError::ContentSafetyBlocked(reason),
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                };
 
                 if self.reindex_worker.current_purge_epoch() != task_purge_epoch
                     || self.reindex_worker.is_path_blocked(path)

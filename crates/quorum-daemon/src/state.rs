@@ -589,6 +589,26 @@ impl DaemonState {
             }
         }
         self.reindex_worker.add_watch_paths(&clean_paths);
+        // Keep DriftHealer watch_paths synchronized with newly watched folders & enabled cloud drives
+        // so periodic drift healing also auto-indexes cloud drive changes.
+        let mut drift_paths = self.drift_healer.config_snapshot().await.watch_paths;
+        let mut drift_changed = false;
+        for p in &clean_paths {
+            let dir_p = if p.is_dir() {
+                p.clone()
+            } else if let Some(parent) = p.parent() {
+                parent.to_path_buf()
+            } else {
+                continue;
+            };
+            if dir_p.is_dir() && !drift_paths.iter().any(|existing| existing == &dir_p) {
+                drift_paths.push(dir_p);
+                drift_changed = true;
+            }
+        }
+        if drift_changed {
+            self.drift_healer.update_watch_paths(drift_paths).await;
+        }
         self.reindex_worker.trigger_paths(clean_paths).await.ok()
     }
 
@@ -646,10 +666,22 @@ impl DaemonState {
         self.drift_healer
             .update_blocked_prefixes(disabled_cloud_roots.clone());
         let current_paths = self.drift_healer.config_snapshot().await.watch_paths;
-        let mut filtered = Vec::with_capacity(current_paths.len());
+        let enabled_cloud_paths =
+            crate::handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+                &controller,
+                &disabled_cloud_roots,
+            );
+        let mut filtered = Vec::with_capacity(current_paths.len() + enabled_cloud_paths.len());
         for p in &current_paths {
             crate::handlers::cloud_drives::push_watch_root_excluding_disabled(
                 p,
+                &disabled_cloud_roots,
+                &mut filtered,
+            );
+        }
+        for cp in &enabled_cloud_paths {
+            crate::handlers::cloud_drives::push_watch_root_excluding_disabled(
+                cp,
                 &disabled_cloud_roots,
                 &mut filtered,
             );

@@ -512,6 +512,35 @@ impl DriftHealer {
                     self.dedup.remove_file(path);
                 }
                 report.orphaned_db_files_purged += 1;
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(quorum_types::content_safety::is_visual_media_extension)
+                && matches!(
+                    tokio::task::spawn_blocking({
+                        let p_check = path.to_path_buf();
+                        move || crate::content_safety::evaluate_image_file_safety(&p_check)
+                    })
+                    .await
+                    .unwrap_or_else(|_| crate::content_safety::ContentSafetyDecision::Blocked {
+                        category: "content_safety_worker_error",
+                        reason: "Content safety check worker failed (fail-closed)".to_string(),
+                        confidence: 1.0,
+                    }),
+                    crate::content_safety::ContentSafetyDecision::Blocked { .. }
+                )
+            {
+                // Explicit/pornographic visual media is unconditionally purged from index & dedup catalog.
+                if !dry_run {
+                    let _commit_guard = self.commit_gate.read().await;
+                    if self.is_cancelled(task_purge_epoch, cancel_rx, cancel_baseline_seq) {
+                        return Err(IngestError::Cancelled);
+                    }
+                    let path_str = path.to_string_lossy().to_string();
+                    let _ = self.storage.delete_by_file_path(&path_str).await;
+                    self.dedup.remove_file(path);
+                }
+                report.orphaned_db_files_purged += 1;
             } else if let Ok(meta) = std::fs::metadata(path) {
                 if let Some(entry) = self.dedup.get_file_entry(path) {
                     let mtime = meta
@@ -1084,7 +1113,7 @@ impl DriftHealer {
                         let path_str_c = path_str.clone();
                         let dlp_gate_c = dlp_gate.clone();
 
-                        let (doc_chunk, file_b3, parent_doc) = crate::thread_pool::IngestThreadPool::shared()
+                        let image_result = crate::thread_pool::IngestThreadPool::shared()
                             .spawn_blocking_pinned(ext_permit, move || -> Result<_, IngestError> {
                                 let bytes = crate::cloud_drives::read_bytes_with_placeholder_policy(
                                     &path_buf,
@@ -1148,7 +1177,25 @@ impl DriftHealer {
                                 })?;
                                 Ok((doc_chunk, file_b3, pdoc))
                             })
-                            .await??;
+                            .await?;
+
+                        let (doc_chunk, file_b3, parent_doc) = match image_result {
+                            Ok(triple) => triple,
+                            Err(IngestError::TypeError(
+                                quorum_types::TypeError::ContentSafetyBlocked(reason),
+                            )) => {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    reason = %reason,
+                                    "DriftHealer blocked and purged explicit image"
+                                );
+                                let _commit_guard = self.commit_gate.read().await;
+                                let _ = self.storage.delete_by_file_path(&path_str).await;
+                                self.dedup.remove_file(path);
+                                return Ok(false);
+                            }
+                            Err(e) => return Err(e),
+                        };
 
                         if self.is_cancelled(task_purge_epoch, cancel_rx, cancel_baseline_seq) {
                             return Err(IngestError::Cancelled);

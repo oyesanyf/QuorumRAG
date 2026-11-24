@@ -426,13 +426,20 @@ pub fn discover_cloud_drives_with_env(env: &dyn CloudDiscoveryEnv) -> Vec<Discov
                     google_virtual = true;
                 }
             } else {
-                // Even if volume label is generic, check for Google Drive signature subfolders on virtual/non-C drives
-                if mount.letter.to_ascii_uppercase() != 'C' && mount.is_virtual {
+                // Check for Google Drive signature subfolders on virtual/non-C drives (both Stream and Mirror on D:\My Drive etc.)
+                if mount.letter.to_ascii_uppercase() != 'C' {
                     let my_drive = mount.root.join("My Drive");
                     if env.dir_exists(&my_drive) {
                         try_add_dir(my_drive, &mut google_roots);
                         try_add_dir(mount.root.join("Shared drives"), &mut google_roots);
-                        google_virtual = true;
+                        if mount.is_virtual {
+                            google_virtual = true;
+                        }
+                    } else if !mount.is_virtual {
+                        let gdrive_dir = mount.root.join("Google Drive");
+                        if env.dir_exists(&gdrive_dir) {
+                            try_add_dir(gdrive_dir, &mut google_roots);
+                        }
                     }
                 }
             }
@@ -461,6 +468,20 @@ pub fn discover_cloud_drives_with_env(env: &dyn CloudDiscoveryEnv) -> Vec<Discov
                         try_add_dir(reg.root_path.clone(), &mut onedrive_business_roots);
                     } else {
                         try_add_dir(reg.root_path.clone(), &mut onedrive_personal_roots);
+                    }
+                }
+                CloudDriveProvider::IcloudDrive => {
+                    try_add_dir(reg.root_path.clone(), &mut icloud_roots);
+                }
+                CloudDriveProvider::Box => {
+                    try_add_dir(reg.root_path.clone(), &mut box_roots);
+                }
+                CloudDriveProvider::Pcloud => {
+                    let is_virt = env.is_virtual_mount(&reg.root_path);
+                    let before = pcloud_roots.len();
+                    try_add_dir(reg.root_path.clone(), &mut pcloud_roots);
+                    if pcloud_roots.len() > before && is_virt {
+                        pcloud_virtual = true;
                     }
                 }
                 _ => {}
@@ -564,6 +585,7 @@ pub fn discover_cloud_drives_with_env(env: &dyn CloudDiscoveryEnv) -> Vec<Discov
                 try_add_dir(profile.join("ProtonDrive"), &mut proton_roots);
                 try_add_dir(profile.join("pCloud Drive"), &mut pcloud_roots);
                 try_add_dir(profile.join("pCloudDrive"), &mut pcloud_roots);
+                try_add_dir(profile.join("pCloud Sync"), &mut pcloud_roots);
             }
             TargetOs::MacOs => {
                 let cloud_storage = profile.join("Library").join("CloudStorage");
@@ -598,6 +620,7 @@ pub fn discover_cloud_drives_with_env(env: &dyn CloudDiscoveryEnv) -> Vec<Discov
 
                 // Classic / direct paths on macOS
                 try_add_dir(profile.join("Google Drive"), &mut google_roots);
+                try_add_dir(profile.join("My Drive"), &mut google_roots);
                 try_add_dir(profile.join("OneDrive"), &mut onedrive_personal_roots);
                 try_add_dir(
                     profile.join("OneDrive - Personal"),
@@ -654,6 +677,7 @@ pub fn discover_cloud_drives_with_env(env: &dyn CloudDiscoveryEnv) -> Vec<Discov
             TargetOs::Linux => {
                 // F1: Google Drive
                 try_add_dir(profile.join("Google Drive"), &mut google_roots);
+                try_add_dir(profile.join("My Drive"), &mut google_roots);
                 try_add_dir(profile.join("GoogleDrive"), &mut google_roots);
                 try_add_dir(profile.join("google-drive"), &mut google_roots);
 
@@ -1188,6 +1212,104 @@ fn live_windows_registry_sync_roots() -> Vec<RegistrySyncRoot> {
         RegCloseKey(h_accounts);
     }
 
+    unsafe fn scan_other_provider_roots(
+        hive: *mut std::ffi::c_void,
+        prefix: &str,
+        roots: &mut Vec<RegistrySyncRoot>,
+    ) {
+        let join_sub = |sub: &str| {
+            if prefix.is_empty() {
+                sub.to_string()
+            } else {
+                format!(r"{prefix}\{sub}")
+            }
+        };
+
+        // Google Drive Mirror/Stream configured mount point (only added later if dir_exists)
+        for (sub, val) in [
+            (r"Software\Google\DriveFS\Share", "MountPoint"),
+            (r"Software\Google\DriveFS", "DefaultMountPoint"),
+            (r"Software\Google\DriveFS", "MountPoint"),
+        ] {
+            let full = join_sub(sub);
+            let sub_w: Vec<u16> = full.encode_utf16().chain(Some(0)).collect();
+            let mut h_key: *mut std::ffi::c_void = std::ptr::null_mut();
+            if RegOpenKeyExW(hive, sub_w.as_ptr(), 0, KEY_READ, &mut h_key) == 0 {
+                if let Some(raw) = read_reg_sz(h_key, val) {
+                    let trimmed = raw.trim().trim_matches('"');
+                    let pb = if trimmed.len() == 1
+                        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+                    {
+                        PathBuf::from(format!(r"{}:\My Drive", trimmed.to_ascii_uppercase()))
+                    } else if trimmed.len() == 2
+                        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+                        && trimmed.as_bytes()[1] == b':'
+                    {
+                        PathBuf::from(format!(r"{}\My Drive", trimmed))
+                    } else if trimmed.len() == 3
+                        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+                        && trimmed.as_bytes()[1] == b':'
+                        && (trimmed.as_bytes()[2] == b'\\' || trimmed.as_bytes()[2] == b'/')
+                    {
+                        PathBuf::from(format!(r"{}:\My Drive", &trimmed[..1]))
+                    } else {
+                        PathBuf::from(trimmed)
+                    };
+                    roots.push(RegistrySyncRoot {
+                        provider: CloudDriveProvider::GoogleDrive,
+                        account_kind: None,
+                        root_path: pb,
+                        label_hint: Some("Google Drive".to_string()),
+                    });
+                }
+                RegCloseKey(h_key);
+            }
+        }
+
+        // iCloud Drive (Windows Store / Classic)
+        for (sub, val) in [
+            (
+                r"Software\Apple Inc.\Internet Services\Shell\iCloudDrive",
+                "RootDirectory",
+            ),
+            (
+                r"Software\Apple Inc.\Internet Services",
+                "iCloudDrivePath",
+            ),
+        ] {
+            let full = join_sub(sub);
+            let sub_w: Vec<u16> = full.encode_utf16().chain(Some(0)).collect();
+            let mut h_key: *mut std::ffi::c_void = std::ptr::null_mut();
+            if RegOpenKeyExW(hive, sub_w.as_ptr(), 0, KEY_READ, &mut h_key) == 0 {
+                if let Some(folder) = read_reg_sz(h_key, val) {
+                    roots.push(RegistrySyncRoot {
+                        provider: CloudDriveProvider::IcloudDrive,
+                        account_kind: None,
+                        root_path: PathBuf::from(folder),
+                        label_hint: Some("iCloud Drive".to_string()),
+                    });
+                }
+                RegCloseKey(h_key);
+            }
+        }
+
+        // Box Drive custom sync directory
+        let box_full = join_sub(r"Software\Box\Box\preferences");
+        let box_w: Vec<u16> = box_full.encode_utf16().chain(Some(0)).collect();
+        let mut h_box: *mut std::ffi::c_void = std::ptr::null_mut();
+        if RegOpenKeyExW(hive, box_w.as_ptr(), 0, KEY_READ, &mut h_box) == 0 {
+            if let Some(folder) = read_reg_sz(h_box, "sync_directory_path") {
+                roots.push(RegistrySyncRoot {
+                    provider: CloudDriveProvider::Box,
+                    account_kind: None,
+                    root_path: PathBuf::from(folder),
+                    label_hint: Some("Box".to_string()),
+                });
+            }
+            RegCloseKey(h_box);
+        }
+    }
+
     let mut roots = Vec::new();
     unsafe {
         scan_onedrive_accounts(
@@ -1195,6 +1317,7 @@ fn live_windows_registry_sync_roots() -> Vec<RegistrySyncRoot> {
             r"Software\Microsoft\OneDrive\Accounts",
             &mut roots,
         );
+        scan_other_provider_roots(HKEY_CURRENT_USER, "", &mut roots);
 
         let empty_w = [0u16];
         let mut h_users: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -1211,6 +1334,7 @@ fn live_windows_registry_sync_roots() -> Vec<RegistrySyncRoot> {
                 }
                 let sub = format!(r"{sid}\Software\Microsoft\OneDrive\Accounts");
                 scan_onedrive_accounts(HKEY_USERS, &sub, &mut roots);
+                scan_other_provider_roots(HKEY_USERS, &sid, &mut roots);
             }
             RegCloseKey(h_users);
         }
