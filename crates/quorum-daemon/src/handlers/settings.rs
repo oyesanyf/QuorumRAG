@@ -443,8 +443,11 @@ pub async fn manage_shared_folders_handler(
     let mut clean_add_path: Option<std::path::PathBuf> = None;
 
     if action == "add" {
+        let test_override = crate::handlers::cloud_drives::is_test_profile_override_active();
         let p = Path::new(raw_path);
-        if !p.exists() || !p.is_dir() {
+        let p_is_dir = p.is_dir()
+            || (!test_override && quorum_types::session_fs_bridge::path_is_dir_or_bridged(p));
+        if !p_is_dir {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -464,7 +467,10 @@ pub async fn manage_shared_folders_handler(
             )
                 .into_response();
         };
-        if !clean_p.exists() || !clean_p.is_dir() {
+        let clean_is_dir = clean_p.is_dir()
+            || (!test_override
+                && quorum_types::session_fs_bridge::path_is_dir_or_bridged(&clean_p));
+        if !clean_is_dir {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -898,7 +904,9 @@ async fn pure_rust_browse_directory(
     let mut drives_raw = if test_profile_override {
         Vec::new()
     } else {
-        quorum_ingest::IngestConfig::discover_physical_drives()
+        tokio::task::spawn_blocking(quorum_ingest::IngestConfig::discover_browsable_drives)
+            .await
+            .unwrap_or_default()
     };
     drives_raw.sort_by(|a, b| {
         a.to_string_lossy()
@@ -913,8 +921,12 @@ async fn pure_rust_browse_directory(
     // Build concise, deduplicated quick-access folder list from the primary interactive user profile
     // (never system32/systemprofile and never flooding the UI with duplicate secondary profile pills).
     let mut quick_access: Vec<serde_json::Value> = Vec::new();
-    let mut push_quick = |label: String, path_buf: std::path::PathBuf| {
-        if !path_buf.is_dir() || quick_access.len() >= 8 {
+    let mut push_quick = |label: String, path_buf: std::path::PathBuf, allow_bridged: bool| {
+        let dir_ok = path_buf.is_dir()
+            || (allow_bridged
+                && !test_profile_override
+                && quorum_types::session_fs_bridge::path_is_dir_or_bridged(&path_buf));
+        if !dir_ok || quick_access.len() >= 10 {
             return;
         }
         let s = path_buf.to_string_lossy().to_string();
@@ -960,20 +972,37 @@ async fn pure_rust_browse_directory(
         for (label, sub) in quick_folders {
             let candidate = primary_home.join(sub);
             if candidate.is_dir() {
-                push_quick(label.to_string(), candidate);
+                push_quick(label.to_string(), candidate, false);
             } else if matches!(sub, "Desktop" | "Documents" | "Pictures")
                 && primary_home.join("OneDrive").join(sub).is_dir()
             {
-                push_quick(label.to_string(), primary_home.join("OneDrive").join(sub));
+                push_quick(label.to_string(), primary_home.join("OneDrive").join(sub), false);
             }
         }
     }
 
     if !test_profile_override {
+        // Add mounted virtual cloud drives (such as Google Drive G:\My Drive) to Quick Access
+        // so users can select them in one click from any folder picker.
+        for drv in &drives_raw {
+            let drv_s = drv.to_string_lossy();
+            if drv_s.len() >= 2 && !drv_s.to_ascii_lowercase().starts_with("c:") {
+                let my_drive = drv.join("My Drive");
+                let my_drive_exists = tokio::task::spawn_blocking({
+                    let p = my_drive.clone();
+                    move || quorum_types::session_fs_bridge::path_is_dir_or_bridged(&p)
+                })
+                .await
+                .unwrap_or(false);
+                if my_drive_exists {
+                    push_quick("Google Drive".to_string(), my_drive, true);
+                }
+            }
+        }
         if let Ok(cwd) = std::env::current_dir() {
             let cwd_str = cwd.to_string_lossy().to_string();
             if cwd.is_dir() && !is_service_or_system_profile_path(&cwd_str) {
-                push_quick("Workspace".to_string(), cwd);
+                push_quick("Workspace".to_string(), cwd, false);
             }
         }
     }
@@ -1008,7 +1037,26 @@ async fn pure_rust_browse_directory(
     }
 
     let mut target_dir_buf = Path::new(req_trimmed).to_path_buf();
-    if !target_dir_buf.is_dir() {
+    let use_session_bridge = if target_dir_buf.is_dir() {
+        false
+    } else if !test_profile_override {
+        let check_p = target_dir_buf.clone();
+        let bridged_dir = tokio::task::spawn_blocking(move || {
+            quorum_types::session_fs_bridge::path_is_dir_or_bridged(&check_p)
+        })
+        .await
+        .unwrap_or(false);
+        if !bridged_dir {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!("Directory does not exist on disk: {}", req_trimmed),
+                })),
+            ));
+        }
+        true
+    } else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -1016,8 +1064,110 @@ async fn pure_rust_browse_directory(
                 "error": format!("Directory does not exist on disk: {}", req_trimmed),
             })),
         ));
-    }
+    };
+
     let mut created_folder_path: Option<String> = None;
+
+    if use_session_bridge {
+        let req_path_owned = req_trimmed.to_string();
+        let sub_owned = create_subfolder
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref sub_trimmed) = sub_owned {
+            let created_cand = target_dir_buf.join(sub_trimmed);
+            let req_for_create = req_path_owned.clone();
+            let sub_for_create = sub_trimmed.clone();
+            let create_res = tokio::task::spawn_blocking(move || {
+                quorum_types::session_fs_bridge::browse_dir_bridged(
+                    &req_for_create,
+                    Some(&sub_for_create),
+                )
+            })
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "status": "error", "error": e.to_string() })),
+                )
+            })?;
+            if let Err((code, msg)) = create_res {
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+                return Err((
+                    status,
+                    Json(serde_json::json!({ "status": "error", "error": msg })),
+                ));
+            }
+            created_folder_path = Some(created_cand.to_string_lossy().to_string());
+            target_dir_buf = created_cand;
+        }
+
+        let resolved_path_str = target_dir_buf.to_string_lossy().to_string();
+        let is_drive_root = physical_drives.iter().any(|d| {
+            let d_trimmed = d.trim_end_matches(['\\', '/']);
+            let r_trimmed = resolved_path_str.trim_end_matches(['\\', '/']);
+            d_trimmed.eq_ignore_ascii_case(r_trimmed)
+        });
+        let parent_path = if is_drive_root {
+            String::new()
+        } else {
+            target_dir_buf
+                .parent()
+                .map(|p| {
+                    let s = p.to_string_lossy().to_string();
+                    if s.len() == 2 && s.ends_with(':') {
+                        format!("{}\\", s)
+                    } else {
+                        s
+                    }
+                })
+                .unwrap_or_default()
+        };
+        let browse_path = resolved_path_str.clone();
+        let bridged = tokio::task::spawn_blocking(move || {
+            quorum_types::session_fs_bridge::browse_dir_bridged(&browse_path, None)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "status": "error", "error": e.to_string() })),
+            )
+        })?;
+        let (dirs, read_error) = match bridged {
+            Ok(entries) => {
+                let mapped: Vec<serde_json::Value> = entries
+                    .into_iter()
+                    .take(1000)
+                    .map(|e| {
+                        let shared = is_shared_fn(&e.path);
+                        serde_json::json!({
+                            "name": e.name,
+                            "path": e.path,
+                            "is_drive": false,
+                            "is_quick_access": false,
+                            "is_shared": shared
+                        })
+                    })
+                    .collect();
+                (mapped, None)
+            }
+            Err((_, msg)) => (Vec::new(), Some(msg)),
+        };
+
+        return Ok(serde_json::json!({
+            "status": "ok",
+            "engine": "session_fs_bridge",
+            "path": resolved_path_str,
+            "current_path": resolved_path_str,
+            "parent_path": parent_path,
+            "created_folder": created_folder_path,
+            "read_error": read_error,
+            "drives": physical_drives,
+            "quick_access": quick_access,
+            "directories": dirs,
+            "cancelled": false
+        }));
+    }
 
     if let Some(sub_name) = create_subfolder {
         let sub_trimmed = sub_name.trim();

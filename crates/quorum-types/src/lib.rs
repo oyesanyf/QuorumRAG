@@ -18,6 +18,9 @@ pub use cloud_drives::*;
 pub mod content_safety;
 pub use content_safety::*;
 
+pub mod session_fs_bridge;
+pub use session_fs_bridge::*;
+
 /// Error types for `quorum-types` domain logic.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TypeError {

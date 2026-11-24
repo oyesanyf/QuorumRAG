@@ -4273,7 +4273,7 @@ function secureRandomIndex(n) {
     const seenPaths = new Set();
     const seenCategories = new Set();
     const pushQa = (name, pathVal, isShared = false) => {
-      if (cleaned.length >= 5) return;
+      if (cleaned.length >= 8) return;
       const p = String(pathVal || '').trim();
       if (!p || isServiceProfilePathJs(p)) return;
       const pathKey = canonicalComparePathJs(p);

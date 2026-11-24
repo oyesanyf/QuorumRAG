@@ -1135,6 +1135,72 @@ unsafe fn read_reg_sz_raw(h_key: *mut std::ffi::c_void, value_name: &str) -> Opt
     }
 }
 
+unsafe fn read_reg_binary_raw(h_key: *mut std::ffi::c_void, value_name: &str) -> Option<Vec<u8>> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegQueryValueExW(
+            h_key: *mut std::ffi::c_void,
+            lp_value_name: *const u16,
+            lp_reserved: *const u32,
+            lp_type: *mut u32,
+            lp_data: *mut u8,
+            lpcb_data: *mut u32,
+        ) -> i32;
+    }
+
+    const REG_BINARY: u32 = 3;
+    let val_w = wide_nul(value_name);
+    let mut reg_type: u32 = 0;
+    let mut byte_len: u32 = 0;
+    let status = RegQueryValueExW(
+        h_key,
+        val_w.as_ptr(),
+        std::ptr::null(),
+        &mut reg_type,
+        std::ptr::null_mut(),
+        &mut byte_len,
+    );
+    if status != 0 || reg_type != REG_BINARY || byte_len == 0 || byte_len > 65_536 {
+        return None;
+    }
+    let mut buf = vec![0u8; byte_len as usize];
+    let status2 = RegQueryValueExW(
+        h_key,
+        val_w.as_ptr(),
+        std::ptr::null(),
+        &mut reg_type,
+        buf.as_mut_ptr(),
+        &mut byte_len,
+    );
+    if status2 != 0 {
+        return None;
+    }
+    buf.truncate(byte_len as usize);
+    Some(buf)
+}
+
+/// Extracts a Google Drive File Stream virtual drive letter (e.g. `G:` -> `G:\My Drive`)
+/// from Google Drive for Desktop v134+ `HKCU\Software\Google\DriveFS\Share\SyncTargets`
+/// protobuf blobs where the mount drive letter is stored as a length-delimited 2-byte field
+/// (`[0x02, b'G', b':']`) rather than legacy `MountPoint`/`DefaultMountPoint` string values.
+fn extract_drivefs_mount_from_sync_targets(raw: &[u8]) -> Option<String> {
+    for idx in 0..raw.len().saturating_sub(2) {
+        if raw[idx] == 2 && raw[idx + 2] == b':' {
+            let letter = raw[idx + 1];
+            if letter.is_ascii_alphabetic() {
+                let upper = (letter as char).to_ascii_uppercase();
+                if upper != 'C' {
+                    return normalize_virtual_drive_mount_hint(
+                        &format!("{upper}:"),
+                        Some("My Drive"),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
 unsafe fn enum_reg_subkeys_raw(h_key: *mut std::ffi::c_void) -> Vec<String> {
     #[link(name = "advapi32")]
     extern "system" {
@@ -1507,6 +1573,10 @@ pub fn detect_interactive_session_virtual_drives() -> SessionVirtualDriveProbe {
                     {
                         if let Some(mp) = read_reg_sz_raw(h_share, "MountPoint")
                             .and_then(|v| normalize_virtual_drive_mount_hint(&v, Some("My Drive")))
+                            .or_else(|| {
+                                read_reg_binary_raw(h_share, "SyncTargets")
+                                    .and_then(|b| extract_drivefs_mount_from_sync_targets(&b))
+                            })
                         {
                             push_hint(InteractiveVirtualDriveHint {
                                 provider_id: "google_drive".to_string(),
@@ -1792,4 +1862,505 @@ pub fn probe_current_user_virtual_drives() -> Vec<InteractiveVirtualDriveHint> {
         }
     }
     out
+}
+
+/// Spawns `quorum-desktop.exe --session-fs-bridge --parent-pid <pid>` silently inside the active
+/// interactive desktop user session (Session >= 1) from a `LocalSystem` Windows service (Session 0),
+/// using `WTSQueryUserToken` (+ UAC `TokenLinkedToken` resolution so the bridge runs in the exact
+/// unelevated logon session that hosts Google Drive Dokan / WinFSP mounts like `G:\`) and
+/// `CreateProcessAsUserW`.
+///
+/// The 256-bit shared authentication token is passed strictly via an anonymous stdin pipe (never
+/// in CLI arguments or disk). Returns `(loopback_port, session_id, child_pid)` on success.
+pub fn spawn_session_fs_bridge(
+    desktop_exe: &Path,
+    token: &str,
+) -> Result<(u16, u32, u32), String> {
+    use std::ffi::c_void;
+    use std::ptr::{null, null_mut};
+
+    if is_test_profile_override_active() {
+        return Err("test profile override active".to_string());
+    }
+    if !desktop_exe.is_file() {
+        return Err(format!(
+            "quorum-desktop binary not found at {}",
+            desktop_exe.display()
+        ));
+    }
+
+    #[repr(C)]
+    struct WtsSessionInfoW {
+        session_id: u32,
+        win_station_name: *mut u16,
+        state: u32,
+    }
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        lp_security_descriptor: *mut c_void,
+        b_inherit_handle: i32,
+    }
+
+    #[repr(C)]
+    struct StartupInfoW {
+        cb: u32,
+        lp_reserved: *mut u16,
+        lp_desktop: *mut u16,
+        lp_title: *mut u16,
+        dw_x: u32,
+        dw_y: u32,
+        dw_x_size: u32,
+        dw_y_size: u32,
+        dw_x_count_chars: u32,
+        dw_y_count_chars: u32,
+        dw_fill_attribute: u32,
+        dw_flags: u32,
+        w_show_window: u16,
+        cb_reserved2: u16,
+        lp_reserved2: *mut u8,
+        h_std_input: *mut c_void,
+        h_std_output: *mut c_void,
+        h_std_error: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct ProcessInformation {
+        h_process: *mut c_void,
+        h_thread: *mut c_void,
+        dw_process_id: u32,
+        dw_thread_id: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn WTSGetActiveConsoleSessionId() -> u32;
+        fn CloseHandle(h_object: *mut c_void) -> i32;
+        fn CreatePipe(
+            h_read_pipe: *mut *mut c_void,
+            h_write_pipe: *mut *mut c_void,
+            lp_pipe_attributes: *const SecurityAttributes,
+            n_size: u32,
+        ) -> i32;
+        fn SetHandleInformation(h_object: *mut c_void, dw_mask: u32, dw_flags: u32) -> i32;
+        fn WriteFile(
+            h_file: *mut c_void,
+            lp_buffer: *const u8,
+            n_number_of_bytes_to_write: u32,
+            lp_number_of_bytes_written: *mut u32,
+            lp_overlapped: *mut c_void,
+        ) -> i32;
+        fn PeekNamedPipe(
+            h_named_pipe: *mut c_void,
+            lp_buffer: *mut u8,
+            n_buffer_size: u32,
+            lp_bytes_read: *mut u32,
+            lp_total_bytes_avail: *mut u32,
+            lp_bytes_left_this_message: *mut u32,
+        ) -> i32;
+        fn ReadFile(
+            h_file: *mut c_void,
+            lp_buffer: *mut u8,
+            n_number_of_bytes_to_read: u32,
+            lp_number_of_bytes_read: *mut u32,
+            lp_overlapped: *mut c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+        fn TerminateProcess(h_process: *mut c_void, u_exit_code: u32) -> i32;
+    }
+
+    #[link(name = "wtsapi32")]
+    extern "system" {
+        fn WTSEnumerateSessionsW(
+            h_server: *mut c_void,
+            reserved: u32,
+            version: u32,
+            pp_session_info: *mut *mut WtsSessionInfoW,
+            p_count: *mut u32,
+        ) -> i32;
+        fn WTSQueryUserToken(session_id: u32, ph_token: *mut *mut c_void) -> i32;
+        fn WTSFreeMemory(p_memory: *mut c_void);
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetTokenInformation(
+            token_handle: *mut c_void,
+            token_information_class: u32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn DuplicateTokenEx(
+            h_existing_token: *mut c_void,
+            dw_desired_access: u32,
+            lp_token_attributes: *const c_void,
+            impersonation_level: u32,
+            token_type: u32,
+            ph_new_token: *mut *mut c_void,
+        ) -> i32;
+        fn CreateProcessAsUserW(
+            h_token: *mut c_void,
+            lp_application_name: *const u16,
+            lp_command_line: *mut u16,
+            lp_process_attributes: *const c_void,
+            lp_thread_attributes: *const c_void,
+            b_inherit_handles: i32,
+            dw_creation_flags: u32,
+            lp_environment: *const c_void,
+            lp_current_directory: *const u16,
+            lp_startup_info: *const StartupInfoW,
+            lp_process_information: *mut ProcessInformation,
+        ) -> i32;
+    }
+
+    #[link(name = "userenv")]
+    extern "system" {
+        fn CreateEnvironmentBlock(
+            lp_environment: *mut *mut c_void,
+            h_token: *mut c_void,
+            b_inherit: i32,
+        ) -> i32;
+        fn DestroyEnvironmentBlock(lp_environment: *mut c_void) -> i32;
+    }
+
+    struct RawHandleGuard(*mut c_void);
+    impl Drop for RawHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct EnvBlockGuard(*mut c_void);
+    impl Drop for EnvBlockGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    DestroyEnvironmentBlock(self.0);
+                }
+            }
+        }
+    }
+
+    struct WtsMemGuard(*mut c_void);
+    impl Drop for WtsMemGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    WTSFreeMemory(self.0);
+                }
+            }
+        }
+    }
+
+    const WTS_ACTIVE: u32 = 0;
+    const WTS_CONNECTED: u32 = 1;
+    const TOKEN_ELEVATION_TYPE: u32 = 18;
+    const TOKEN_LINKED_TOKEN: u32 = 19;
+    const TOKEN_ELEVATION_TYPE_FULL: u32 = 2;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const SECURITY_IMPERSONATION: u32 = 2;
+    const TOKEN_PRIMARY: u32 = 1;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+    const STARTF_USESHOWWINDOW: u32 = 0x0000_0001;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+
+    let mut candidate_sessions: Vec<u32> = Vec::new();
+    let active_console = unsafe { WTSGetActiveConsoleSessionId() };
+    if active_console != 0 && active_console != u32::MAX {
+        candidate_sessions.push(active_console);
+    }
+
+    let mut sessions_ptr: *mut WtsSessionInfoW = null_mut();
+    let mut session_count: u32 = 0;
+    if unsafe { WTSEnumerateSessionsW(null_mut(), 0, 1, &mut sessions_ptr, &mut session_count) }
+        != 0
+        && !sessions_ptr.is_null()
+    {
+        let _guard = WtsMemGuard(sessions_ptr.cast());
+        let entries = unsafe { std::slice::from_raw_parts(sessions_ptr, session_count as usize) };
+        for s in entries {
+            if s.session_id != 0
+                && matches!(s.state, WTS_ACTIVE | WTS_CONNECTED)
+                && !candidate_sessions.contains(&s.session_id)
+            {
+                candidate_sessions.push(s.session_id);
+            }
+        }
+    }
+
+    if candidate_sessions.is_empty() {
+        return Err("no active interactive Windows user session found".to_string());
+    }
+
+    let mut chosen_session: u32 = 0;
+    let mut raw_user_token: *mut c_void = null_mut();
+    for sid in candidate_sessions {
+        let mut h_tok: *mut c_void = null_mut();
+        if unsafe { WTSQueryUserToken(sid, &mut h_tok) } != 0 && !h_tok.is_null() {
+            chosen_session = sid;
+            raw_user_token = h_tok;
+            break;
+        }
+    }
+    if raw_user_token.is_null() {
+        return Err(format!(
+            "WTSQueryUserToken failed for all active sessions (err={})",
+            unsafe { GetLastError() }
+        ));
+    }
+    let _raw_user_tok_guard = RawHandleGuard(raw_user_token);
+
+    let mut _linked_tok_guard = RawHandleGuard(null_mut());
+    let mut source_token = raw_user_token;
+    let mut elev_type: u32 = 0;
+    let mut ret_len: u32 = 0;
+    if unsafe {
+        GetTokenInformation(
+            raw_user_token,
+            TOKEN_ELEVATION_TYPE,
+            (&mut elev_type as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+            &mut ret_len,
+        )
+    } != 0
+        && elev_type == TOKEN_ELEVATION_TYPE_FULL
+    {
+        let mut linked_handle: *mut c_void = null_mut();
+        let mut linked_len: u32 = 0;
+        if unsafe {
+            GetTokenInformation(
+                raw_user_token,
+                TOKEN_LINKED_TOKEN,
+                (&mut linked_handle as *mut *mut c_void).cast(),
+                std::mem::size_of::<*mut c_void>() as u32,
+                &mut linked_len,
+            )
+        } != 0
+            && !linked_handle.is_null()
+        {
+            _linked_tok_guard = RawHandleGuard(linked_handle);
+            source_token = linked_handle;
+        }
+    }
+
+    let mut primary_token: *mut c_void = null_mut();
+    if unsafe {
+        DuplicateTokenEx(
+            source_token,
+            MAXIMUM_ALLOWED,
+            null(),
+            SECURITY_IMPERSONATION,
+            TOKEN_PRIMARY,
+            &mut primary_token,
+        )
+    } == 0
+        || primary_token.is_null()
+    {
+        return Err(format!("DuplicateTokenEx failed (err={})", unsafe {
+            GetLastError()
+        }));
+    }
+    let _primary_tok_guard = RawHandleGuard(primary_token);
+
+    let mut env_block: *mut c_void = null_mut();
+    let _env_guard = if unsafe { CreateEnvironmentBlock(&mut env_block, primary_token, 0) } != 0
+        && !env_block.is_null()
+    {
+        EnvBlockGuard(env_block)
+    } else {
+        EnvBlockGuard(null_mut())
+    };
+
+    let sa = SecurityAttributes {
+        n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+        lp_security_descriptor: null_mut(),
+        b_inherit_handle: 1,
+    };
+    let mut child_stdin_r: *mut c_void = null_mut();
+    let mut parent_stdin_w: *mut c_void = null_mut();
+    let mut parent_stdout_r: *mut c_void = null_mut();
+    let mut child_stdout_w: *mut c_void = null_mut();
+    if unsafe { CreatePipe(&mut child_stdin_r, &mut parent_stdin_w, &sa, 0) } == 0 {
+        return Err("CreatePipe(stdin) failed".to_string());
+    }
+    let mut g_child_stdin_r = RawHandleGuard(child_stdin_r);
+    let mut g_parent_stdin_w = RawHandleGuard(parent_stdin_w);
+
+    if unsafe { CreatePipe(&mut parent_stdout_r, &mut child_stdout_w, &sa, 0) } == 0 {
+        return Err("CreatePipe(stdout) failed".to_string());
+    }
+    let g_parent_stdout_r = RawHandleGuard(parent_stdout_r);
+    let mut g_child_stdout_w = RawHandleGuard(child_stdout_w);
+
+    unsafe {
+        SetHandleInformation(parent_stdin_w, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(parent_stdout_r, HANDLE_FLAG_INHERIT, 0);
+    }
+
+    let mut desktop_w = wide_nul(r"winsta0\default");
+    let app_w = wide_nul(&desktop_exe.to_string_lossy());
+    let mut cmd_w = wide_nul(&format!(
+        "\"{}\" --session-fs-bridge --parent-pid {}",
+        desktop_exe.display(),
+        std::process::id()
+    ));
+    let work_dir_w = desktop_exe
+        .parent()
+        .map(|p| wide_nul(&p.to_string_lossy()));
+
+    let si = StartupInfoW {
+        cb: std::mem::size_of::<StartupInfoW>() as u32,
+        lp_reserved: null_mut(),
+        lp_desktop: desktop_w.as_mut_ptr(),
+        lp_title: null_mut(),
+        dw_x: 0,
+        dw_y: 0,
+        dw_x_size: 0,
+        dw_y_size: 0,
+        dw_x_count_chars: 0,
+        dw_y_count_chars: 0,
+        dw_fill_attribute: 0,
+        dw_flags: STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW,
+        w_show_window: 0,
+        cb_reserved2: 0,
+        lp_reserved2: null_mut(),
+        h_std_input: child_stdin_r,
+        h_std_output: child_stdout_w,
+        h_std_error: child_stdout_w,
+    };
+    let mut pi = ProcessInformation {
+        h_process: null_mut(),
+        h_thread: null_mut(),
+        dw_process_id: 0,
+        dw_thread_id: 0,
+    };
+
+    let flags = CREATE_NO_WINDOW
+        | if !_env_guard.0.is_null() {
+            CREATE_UNICODE_ENVIRONMENT
+        } else {
+            0
+        };
+    let ok = unsafe {
+        CreateProcessAsUserW(
+            primary_token,
+            app_w.as_ptr(),
+            cmd_w.as_mut_ptr(),
+            null(),
+            null(),
+            1,
+            flags,
+            _env_guard.0,
+            work_dir_w.as_ref().map_or(null(), |v| v.as_ptr()),
+            &si,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        return Err(format!("CreateProcessAsUserW failed (err={})", unsafe {
+            GetLastError()
+        }));
+    }
+    let g_proc = RawHandleGuard(pi.h_process);
+    let _g_thread = RawHandleGuard(pi.h_thread);
+
+    drop(std::mem::replace(
+        &mut g_child_stdin_r,
+        RawHandleGuard(null_mut()),
+    ));
+    drop(std::mem::replace(
+        &mut g_child_stdout_w,
+        RawHandleGuard(null_mut()),
+    ));
+
+    let secret_line = format!("{token}\n");
+    let mut written: u32 = 0;
+    let w_ok = unsafe {
+        WriteFile(
+            g_parent_stdin_w.0,
+            secret_line.as_ptr(),
+            secret_line.len() as u32,
+            &mut written,
+            null_mut(),
+        )
+    };
+    drop(std::mem::replace(
+        &mut g_parent_stdin_w,
+        RawHandleGuard(null_mut()),
+    ));
+    if w_ok == 0 || written as usize != secret_line.len() {
+        unsafe {
+            TerminateProcess(g_proc.0, 1);
+        }
+        return Err("failed to write bridge token to stdin pipe".to_string());
+    }
+
+    let mut collected = Vec::with_capacity(128);
+    let mut chunk = [0u8; 128];
+    for _ in 0..100 {
+        let mut avail: u32 = 0;
+        let peek_ok = unsafe {
+            PeekNamedPipe(
+                g_parent_stdout_r.0,
+                null_mut(),
+                0,
+                null_mut(),
+                &mut avail,
+                null_mut(),
+            )
+        };
+        if peek_ok == 0 {
+            break;
+        }
+        if avail > 0 {
+            let to_read = (avail as usize).min(chunk.len()) as u32;
+            let mut got: u32 = 0;
+            if unsafe {
+                ReadFile(
+                    g_parent_stdout_r.0,
+                    chunk.as_mut_ptr(),
+                    to_read,
+                    &mut got,
+                    null_mut(),
+                )
+            } != 0
+                && got > 0
+            {
+                collected.extend_from_slice(&chunk[..got as usize]);
+                if collected.contains(&b'\n') || collected.len() >= 128 {
+                    break;
+                }
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let line = String::from_utf8_lossy(&collected);
+    if let Some(port_str) = line
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("READY "))
+    {
+        if let Ok(port) = port_str.trim().parse::<u16>() {
+            if port > 0 {
+                return Ok((port, chosen_session, pi.dw_process_id));
+            }
+        }
+    }
+
+    unsafe {
+        TerminateProcess(g_proc.0, 1);
+    }
+    Err(format!(
+        "session-fs-bridge did not report READY <port> (got '{}')",
+        line.trim()
+    ))
 }

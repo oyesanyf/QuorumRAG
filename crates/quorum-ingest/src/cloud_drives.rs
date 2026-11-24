@@ -90,19 +90,46 @@ pub fn ensure_open_allowed_for_placeholder(
     path: &Path,
     policy: CloudPlaceholderPolicy,
 ) -> std::io::Result<()> {
-    let meta = std::fs::metadata(path)?;
-    if should_skip_cloud_placeholder(is_cloud_placeholder_metadata(&meta), meta.len(), policy) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            format!(
-                "Skipped cloud placeholder '{}' (size={} bytes) under {:?}",
-                path.display(),
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if should_skip_cloud_placeholder(
+                is_cloud_placeholder_metadata(&meta),
                 meta.len(),
-                policy
-            ),
-        ));
+                policy,
+            ) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "Skipped cloud placeholder '{}' (size={} bytes) under {:?}",
+                        path.display(),
+                        meta.len(),
+                        policy
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Err(local_err) => {
+            if let Some(st) = quorum_types::session_fs_bridge::stat_via_bridge(path) {
+                if !st.exists {
+                    return Err(local_err);
+                }
+                if should_skip_cloud_placeholder(st.is_placeholder, st.len, policy) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "Skipped bridged cloud placeholder '{}' (size={} bytes) under {:?}",
+                            path.display(),
+                            st.len,
+                            policy
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+            Err(local_err)
+        }
     }
-    Ok(())
 }
 
 /// Reads all bytes of `path` only after passing `ensure_open_allowed_for_placeholder`.
@@ -111,7 +138,11 @@ pub fn read_bytes_with_placeholder_policy(
     policy: CloudPlaceholderPolicy,
 ) -> std::io::Result<Vec<u8>> {
     ensure_open_allowed_for_placeholder(path, policy)?;
-    std::fs::read(path)
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(local_err) => quorum_types::session_fs_bridge::read_bytes_via_bridge(path, 0, policy)
+            .map_err(|_| local_err),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,8 +297,13 @@ impl CloudDiscoveryEnv for LiveCloudDiscoveryEnv {
             if !crate::config::path_matches_prefix(path, &test_dir) {
                 return false;
             }
+            return path.is_dir() && std::fs::read_dir(path).is_ok();
         }
-        path.is_dir() && std::fs::read_dir(path).is_ok()
+        if path.is_dir() && std::fs::read_dir(path).is_ok() {
+            return true;
+        }
+        quorum_types::session_fs_bridge::stat_via_bridge(path)
+            .is_some_and(|st| st.exists && st.is_dir)
     }
 
     fn file_exists(&self, path: &Path) -> bool {
@@ -275,8 +311,13 @@ impl CloudDiscoveryEnv for LiveCloudDiscoveryEnv {
             if !crate::config::path_matches_prefix(path, &test_dir) {
                 return false;
             }
+            return path.is_file();
         }
-        path.is_file()
+        if path.is_file() {
+            return true;
+        }
+        quorum_types::session_fs_bridge::stat_via_bridge(path)
+            .is_some_and(|st| st.exists && st.is_file)
     }
 
     fn read_dir_names(&self, path: &Path) -> Vec<String> {
@@ -1069,6 +1110,25 @@ fn live_windows_drive_mounts() -> Vec<WindowsDriveMount> {
             nt_target,
         });
     }
+
+    // Merge virtual/per-user drives visible inside the active interactive desktop session
+    // (e.g., Google Drive G:\ or pCloud P:\ when running as Windows LocalSystem in Session 0).
+    for drv in quorum_types::session_fs_bridge::list_session_drives() {
+        let upper = drv.letter.to_ascii_uppercase();
+        if !mounts
+            .iter()
+            .any(|m| m.letter.to_ascii_uppercase() == upper)
+        {
+            mounts.push(WindowsDriveMount {
+                letter: upper,
+                root: PathBuf::from(drv.root),
+                volume_label: drv.volume_label,
+                is_virtual: drv.is_virtual,
+                nt_target: drv.nt_target,
+            });
+        }
+    }
+
     mounts
 }
 

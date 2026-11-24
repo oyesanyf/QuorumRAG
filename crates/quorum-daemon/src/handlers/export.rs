@@ -875,13 +875,15 @@ fn load_images(state: &DaemonState, paths: &[String], is_loopback: bool) -> Vec<
         else {
             continue;
         };
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        if meta.len() > 15 * 1024 * 1024 {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let policy = quorum_coordinator::global_mesh_dlp_controller()
+            .get_cloud_drives_settings()
+            .placeholder_policy()
+            .unwrap_or_default();
+        let Ok(bytes) = quorum_types::session_fs_bridge::read_bytes_or_bridged(
+            &path,
+            15 * 1024 * 1024,
+            policy,
+        ) else {
             continue;
         };
         if quorum_ingest::content_safety::evaluate_image_safety(&path, &bytes).is_blocked() {

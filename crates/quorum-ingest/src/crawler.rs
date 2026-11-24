@@ -185,8 +185,11 @@ impl FilesystemCrawler {
 
     /// Synchronously crawls a directory and collects all candidates into a Vec.
     pub fn crawl_path_sync(&self, root: &Path) -> Result<Vec<DiscoveredCandidate>, IngestError> {
-        let (tx, rx) = std::sync::mpsc::channel();
         let stats = Arc::new(AtomicCrawlerStats::new());
+        if !root.exists() && quorum_types::session_fs_bridge::path_is_dir_or_bridged(root) {
+            return Ok(self.crawl_bridged_root(root, &stats));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
         let walker = self.build_walker(root);
         let router = self.router.clone();
 
@@ -225,7 +228,7 @@ impl FilesystemCrawler {
         let stats = Arc::new(AtomicCrawlerStats::new());
 
         for root in &self.config.watch_paths {
-            if !root.exists() {
+            if !quorum_types::session_fs_bridge::path_exists_or_bridged(root) {
                 warn!("Configured watch path does not exist: {}", root.display());
                 continue;
             }
@@ -247,44 +250,61 @@ impl FilesystemCrawler {
 
     /// Synchronously crawls multiple directory roots in a unified work-stealing parallel traversal.
     pub fn crawl_multi_root_sync(&self, roots: &[PathBuf]) -> Result<Vec<DiscoveredCandidate>, IngestError> {
-        let valid_roots: Vec<&Path> = roots.iter().map(|p| p.as_path()).filter(|p| p.exists()).collect();
-        if valid_roots.is_empty() {
+        let mut valid_roots: Vec<&Path> = Vec::new();
+        let mut bridged_roots: Vec<&Path> = Vec::new();
+        for p in roots {
+            if p.exists() {
+                valid_roots.push(p.as_path());
+            } else if quorum_types::session_fs_bridge::path_is_dir_or_bridged(p) {
+                bridged_roots.push(p.as_path());
+            }
+        }
+        if valid_roots.is_empty() && bridged_roots.is_empty() {
             return Ok(Vec::new());
         }
-        let (tx, rx) = std::sync::mpsc::channel();
         let stats = Arc::new(AtomicCrawlerStats::new());
-        let mut builder = WalkBuilder::new(valid_roots[0]);
-        for root in &valid_roots[1..] {
-            builder.add(root);
-        }
-        self.configure_builder(&mut builder);
-        let walker = builder.build_parallel();
-        let router = self.router.clone();
+        let mut collected: Vec<DiscoveredCandidate> = Vec::new();
+        if !valid_roots.is_empty() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut builder = WalkBuilder::new(valid_roots[0]);
+            for root in &valid_roots[1..] {
+                builder.add(root);
+            }
+            self.configure_builder(&mut builder);
+            let walker = builder.build_parallel();
+            let router = self.router.clone();
+            let stats_c = Arc::clone(&stats);
 
-        let io_sem = Arc::clone(&self.io_semaphore);
-        walker.run(move || {
-            crate::throttling::set_background_thread_priority();
-            let tx = tx.clone();
-            let router = router.clone();
-            let stats = Arc::clone(&stats);
-            let io_sem = Arc::clone(&io_sem);
+            let io_sem = Arc::clone(&self.io_semaphore);
+            walker.run(move || {
+                crate::throttling::set_background_thread_priority();
+                let tx = tx.clone();
+                let router = router.clone();
+                let stats = Arc::clone(&stats_c);
+                let io_sem = Arc::clone(&io_sem);
 
-            Box::new(move |entry_result| {
-                let _io_permit = match Self::acquire_io_permit_blocking(&io_sem) {
-                    Some(p) => p,
-                    None => return WalkState::Quit,
-                };
-                if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats) {
-                    drop(_io_permit);
-                    if tx.send(candidate).is_err() {
-                        return WalkState::Quit;
+                Box::new(move |entry_result| {
+                    let _io_permit = match Self::acquire_io_permit_blocking(&io_sem) {
+                        Some(p) => p,
+                        None => return WalkState::Quit,
+                    };
+                    if let Some(candidate) = Self::process_walk_entry(entry_result, &router, &stats)
+                    {
+                        drop(_io_permit);
+                        if tx.send(candidate).is_err() {
+                            return WalkState::Quit;
+                        }
                     }
-                }
-                WalkState::Continue
-            })
-        });
+                    WalkState::Continue
+                })
+            });
+            collected.extend(rx);
+        }
+        for broot in bridged_roots {
+            collected.extend(self.crawl_bridged_root(broot, &stats));
+        }
 
-        Ok(rx.into_iter().collect())
+        Ok(collected)
     }
 
     /// Streams candidate files across multiple directory roots through a bounded Tokio MPSC channel
@@ -300,7 +320,15 @@ impl FilesystemCrawler {
             let start = Instant::now();
             let stats = Arc::new(AtomicCrawlerStats::new());
 
-            let valid_roots: Vec<PathBuf> = roots.into_iter().filter(|p| p.exists()).collect();
+            let mut valid_roots: Vec<PathBuf> = Vec::new();
+            let mut bridged_roots: Vec<PathBuf> = Vec::new();
+            for p in roots {
+                if p.exists() {
+                    valid_roots.push(p);
+                } else if quorum_types::session_fs_bridge::path_is_dir_or_bridged(&p) {
+                    bridged_roots.push(p);
+                }
+            }
             if !valid_roots.is_empty() {
                 let mut builder = WalkBuilder::new(&valid_roots[0]);
                 for root in &valid_roots[1..] {
@@ -334,6 +362,13 @@ impl FilesystemCrawler {
                         WalkState::Continue
                     })
                 });
+            }
+            for broot in bridged_roots {
+                for cand in self.crawl_bridged_root(&broot, &stats) {
+                    if tx.blocking_send(cand).is_err() {
+                        break;
+                    }
+                }
             }
 
             let summary = stats.snapshot(start.elapsed().as_millis() as u64);
@@ -478,12 +513,103 @@ impl FilesystemCrawler {
         builder.build_parallel()
     }
 
+    fn crawl_bridged_root(
+        &self,
+        root: &Path,
+        stats: &AtomicCrawlerStats,
+    ) -> Vec<DiscoveredCandidate> {
+        let excluded: Vec<String> = self
+            .config
+            .excluded_paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let Ok((entries, skipped_ph)) = quorum_types::session_fs_bridge::walk_dir_bridged(
+            root,
+            &excluded,
+            self.config.max_file_size_bytes,
+            self.config.skip_hidden,
+            self.config.placeholder_policy,
+        ) else {
+            return Vec::new();
+        };
+        if skipped_ph > 0 {
+            stats
+                .files_skipped_placeholder
+                .fetch_add(skipped_ph, Ordering::Relaxed);
+        }
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            stats.files_scanned.fetch_add(1, Ordering::Relaxed);
+            let p = PathBuf::from(&entry.path);
+            match self.router.evaluate_bridged_entry(
+                &p,
+                entry.size_bytes,
+                entry.mtime_secs,
+                entry.is_placeholder,
+                &self.config,
+            ) {
+                FilterDecision::Accept {
+                    identity,
+                    kind,
+                    size_bytes,
+                    mtime_secs,
+                } => {
+                    match kind {
+                        CandidateKind::Text { .. } => {
+                            stats.files_accepted_text.fetch_add(1, Ordering::Relaxed);
+                        }
+                        CandidateKind::Image { .. } => {
+                            stats.files_accepted_image.fetch_add(1, Ordering::Relaxed);
+                        }
+                        CandidateKind::Audio { .. } => {
+                            stats.files_accepted_audio.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    out.push(DiscoveredCandidate {
+                        path: p,
+                        size_bytes,
+                        mtime_secs,
+                        file_identity: identity,
+                        kind,
+                    });
+                }
+                FilterDecision::SkipCloudPlaceholder => {
+                    stats
+                        .files_skipped_placeholder
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                FilterDecision::SkipExceedsSizeCap { .. } => {
+                    stats.files_skipped_size.fetch_add(1, Ordering::Relaxed);
+                }
+                FilterDecision::SkipHidden | FilterDecision::SkipSymlink => {
+                    stats.files_skipped_hidden.fetch_add(1, Ordering::Relaxed);
+                }
+                FilterDecision::SkipBinary { .. } => {
+                    stats.files_skipped_binary.fetch_add(1, Ordering::Relaxed);
+                }
+                FilterDecision::SkipIoError { .. } => {
+                    stats.files_skipped_io.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        out
+    }
+
     fn crawl_single_root(
         &self,
         root: &Path,
         tx: &mpsc::Sender<DiscoveredCandidate>,
         stats: &Arc<AtomicCrawlerStats>,
     ) -> Result<(), IngestError> {
+        if !root.exists() && quorum_types::session_fs_bridge::path_is_dir_or_bridged(root) {
+            for cand in self.crawl_bridged_root(root, stats) {
+                if tx.blocking_send(cand).is_err() {
+                    break;
+                }
+            }
+            return Ok(());
+        }
         let walker = self.build_walker(root);
         let router = self.router.clone();
         let tx_channel = tx.clone();

@@ -267,7 +267,7 @@ impl Level1DedupCatalog {
                     file_blake3: file_b3,
                     chunk_hashes: entry.chunk_hashes.clone(),
                 };
-            } else if !entry.file_path.exists() {
+            } else if !quorum_types::session_fs_bridge::path_exists_or_bridged(&entry.file_path) {
                 let old_path = entry.file_path.clone();
                 let chunk_hashes = entry.chunk_hashes.clone();
                 entry.file_path = path.to_path_buf();
@@ -311,7 +311,17 @@ impl Level1DedupCatalog {
     ) -> io::Result<String> {
         let p = path.as_ref();
         crate::cloud_drives::ensure_open_allowed_for_placeholder(p, policy)?;
-        let f = quorum_classifier::FileTypeClassifier::open_file_with_retry(p)?;
+        let f = match quorum_classifier::FileTypeClassifier::open_file_with_retry(p) {
+            Ok(f) => f,
+            Err(local_err) => {
+                if let Ok(bytes) =
+                    quorum_types::session_fs_bridge::read_bytes_via_bridge(p, 0, policy)
+                {
+                    return Ok(blake3::hash(&bytes).to_hex().to_string());
+                }
+                return Err(local_err);
+            }
+        };
         let mut reader = BufReader::with_capacity(64 * 1024, f);
         let mut hasher = blake3::Hasher::new();
         let mut buffer = [0u8; 64 * 1024];
