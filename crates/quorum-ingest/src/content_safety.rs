@@ -522,21 +522,35 @@ pub fn evaluate_image_file_safety(path: &Path) -> ContentSafetyDecision {
         return path_decision;
     }
 
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let canonical_path = match std::fs::canonicalize(path) {
+        Ok(c) => c,
+        Err(_) => path.to_path_buf(),
+    };
+    if canonical_path != path {
+        let canonical_decision = check_path_explicit_content(&canonical_path);
+        if canonical_decision.is_blocked() {
+            return canonical_decision;
+        }
+    }
+
+    let ext = canonical_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     if !is_raster_image_extension(ext) {
         return ContentSafetyDecision::Allowed;
     }
 
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(meta) = std::fs::metadata(&canonical_path) else {
         return ContentSafetyDecision::Allowed;
     };
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_MEDIA_BYTES_FOR_PIXEL_CHECK {
         return ContentSafetyDecision::Allowed;
     }
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(bytes) = std::fs::read(&canonical_path) else {
         return ContentSafetyDecision::Allowed;
     };
-    evaluate_image_safety(path, &bytes)
+    evaluate_image_safety(&canonical_path, &bytes)
 }
 
 /// Evaluates extracted image metadata (keywords, EXIF comments, OCR text, and vision description).
