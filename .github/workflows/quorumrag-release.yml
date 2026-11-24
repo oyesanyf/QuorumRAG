@@ -40,11 +40,36 @@ jobs:
       - name: Ensure protoc & WiX v5
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
-            choco install protoc --no-progress -y
+            $protocZip = Join-Path $env:RUNNER_TEMP "protoc-29.3-win64.zip"
+            $protocDir = Join-Path $env:RUNNER_TEMP "protoc-29.3"
+            $expectedSha = "57ea59e9f551ad8d71ffaa9b5cfbe0ca1f4e720972a1db7ec2d12ab44bff9383"
+            Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip" -OutFile $protocZip
+            $actualSha = (Get-FileHash -Path $protocZip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualSha -ne $expectedSha) {
+              throw "protoc-29.3-win64.zip SHA-256 mismatch: expected $expectedSha, got $actualSha"
+            }
+            if (Test-Path $protocDir) { Remove-Item -Recurse -Force $protocDir }
+            Expand-Archive -Path $protocZip -DestinationPath $protocDir -Force
+            Remove-Item -Force $protocZip
+            $protocBin = Join-Path $protocDir "bin"
+            $protocExe = Join-Path $protocBin "protoc.exe"
+            if (-not (Test-Path $protocExe)) { throw "Missing protoc.exe after extraction at $protocExe" }
+            Add-Content -Path $env:GITHUB_PATH -Value $protocBin -Encoding utf8
+            Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$protocExe" -Encoding utf8
+            $env:PATH = "$protocBin;$env:PATH"
+            $env:PROTOC = $protocExe
           }
-          try { dotnet tool install --global wix --version 5.0.2 } catch {}
+          $protocVer = & protoc --version
+          if ($LASTEXITCODE -ne 0) { throw "protoc --version failed with exit code $LASTEXITCODE" }
+          Write-Host "protoc version: $protocVer"
+          if (-not (Test-Path "$env:USERPROFILE\.dotnet\tools\wix.exe")) {
+            dotnet tool install --global wix --version 5.0.2
+            if ($LASTEXITCODE -ne 0) { throw "dotnet tool install wix failed with exit code $LASTEXITCODE" }
+          }
           $wixVer = & "$env:USERPROFILE\.dotnet\tools\wix.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "wix --version failed with exit code $LASTEXITCODE" }
           Write-Host "WiX version: $wixVer"
 
       - name: Install Rust stable
