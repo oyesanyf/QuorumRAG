@@ -1160,41 +1160,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     if (win_native::is_running_as_local_system() || win_native::is_session_zero())
         && !handlers::cloud_drives::is_test_profile_override_active()
     {
-        let bridge_state = Arc::clone(&app_state);
-        let bridge_shutdown = Arc::clone(&shutdown_notify);
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = bridge_shutdown.notified() => break,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(2500)) => {}
-                }
-                if quorum_types::session_fs_bridge::active_bridge_info().is_none() {
-                    continue;
-                }
-                let events = tokio::task::spawn_blocking(
-                    quorum_types::session_fs_bridge::poll_watch_events_bridged,
-                )
-                .await
-                .unwrap_or_default();
-                if events.is_empty() {
-                    continue;
-                }
-                let mut paths_to_index: Vec<std::path::PathBuf> = Vec::new();
-                for ev in events {
-                    let ev_path = std::path::PathBuf::from(&ev.path);
-                    if ev.kind == "remove" {
-                        let _ = bridge_state.storage.delete_by_file_path(&ev.path).await;
-                        bridge_state.dedup.remove_file(&ev_path);
-                        bridge_state.coordinator.cache_clear_all();
-                    } else if !bridge_state.reindex_worker.is_path_blocked(&ev_path) {
-                        paths_to_index.push(ev_path);
-                    }
-                }
-                if !paths_to_index.is_empty() {
-                    let _ = bridge_state.watch_and_index_paths(paths_to_index).await;
-                }
-            }
-        });
+        spawn_session_bridge_event_consumer(Arc::clone(&app_state), Arc::clone(&shutdown_notify));
     }
 
     // Continuously run background crawl & incremental ingestion unconditionally
@@ -1889,6 +1855,49 @@ pub async fn run_standalone_recache(cli: Cli, clear: bool, warm: bool) -> anyhow
     println!("======================================================\n");
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_session_bridge_event_consumer(
+    bridge_state: Arc<DaemonState>,
+    bridge_shutdown: Arc<tokio::sync::Notify>,
+) {
+    const MAX_BRIDGE_EVENTS_PER_TICK: usize = 256;
+    const MAX_BRIDGE_POLL_TICKS: u64 = u64::MAX;
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(2500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        for _step in 0..MAX_BRIDGE_POLL_TICKS {
+            tokio::select! {
+                _ = bridge_shutdown.notified() => break,
+                _ = tick.tick() => {}
+            }
+            if quorum_types::session_fs_bridge::active_bridge_info().is_some() {
+                let events = tokio::task::spawn_blocking(
+                    quorum_types::session_fs_bridge::poll_watch_events_bridged,
+                )
+                .await
+                .unwrap_or_default();
+
+                let mut paths_to_index: Vec<std::path::PathBuf> = Vec::new();
+                for ev in events.into_iter().take(MAX_BRIDGE_EVENTS_PER_TICK) {
+                    let ev_path = std::path::PathBuf::from(&ev.path);
+                    if ev.kind == "remove" {
+                        let _ = bridge_state.storage.delete_by_file_path(&ev.path).await;
+                        bridge_state.dedup.remove_file(&ev_path);
+                        bridge_state.coordinator.cache_clear_all();
+                    } else if !bridge_state.reindex_worker.is_path_blocked(&ev_path) {
+                        paths_to_index.push(ev_path);
+                    }
+                }
+                if !paths_to_index.is_empty() {
+                    let _ = bridge_state.watch_and_index_paths(paths_to_index).await;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
