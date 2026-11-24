@@ -117,7 +117,12 @@ pub fn describe_image_file(addr: &SocketAddr, host_port: &str, model: &str, path
         tracing::warn!(path = %path.display(), "Refusing local vision inspection for explicit/pornographic image path");
         return None;
     }
-    let meta = std::fs::metadata(path).ok()?;
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    if quorum_types::content_safety::check_path_explicit_content(&canonical_path).is_blocked() {
+        tracing::warn!(path = %canonical_path.display(), "Refusing local vision inspection for canonical explicit/pornographic image path");
+        return None;
+    }
+    let meta = std::fs::metadata(&canonical_path).ok()?;
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_VISION_IMAGE_BYTES {
         return None;
     }
@@ -135,10 +140,10 @@ pub fn describe_image_file(addr: &SocketAddr, host_port: &str, model: &str, path
             }
         }
     }
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = std::fs::read(&canonical_path).ok()?;
     if let Some(hook) = PIXEL_SAFETY_HOOK.get() {
-        if !hook(path, &bytes) {
-            tracing::warn!(path = %path.display(), "Refusing local vision inspection: blocked by raster pixel content-safety filter");
+        if !hook(&canonical_path, &bytes) {
+            tracing::warn!(path = %canonical_path.display(), "Refusing local vision inspection: blocked by raster pixel content-safety filter");
             return None;
         }
     }
