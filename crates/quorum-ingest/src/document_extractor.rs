@@ -305,7 +305,9 @@ impl DocumentExtractor {
         policy: quorum_types::CloudPlaceholderPolicy,
     ) -> io::Result<String> {
         crate::cloud_drives::ensure_open_allowed_for_placeholder(path, policy)?;
-        let res = Self::extract_text_inner(path, identity, policy);
+        let mat = quorum_types::session_fs_bridge::materialize_file_for_io(path, 0, policy)?;
+        let io_path = mat.io_path();
+        let res = Self::extract_text_inner(io_path, identity, policy);
         match res {
             Ok(text) => Ok(text),
             Err(e) if Self::is_lock_or_permission_error(&e) => {

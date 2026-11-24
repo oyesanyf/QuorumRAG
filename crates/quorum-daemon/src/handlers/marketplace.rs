@@ -1275,8 +1275,12 @@ pub async fn marketplace_opt_in_handler(
                 )
                     .into_response();
             }
+            let test_override = crate::handlers::cloud_drives::is_test_profile_override_active();
             let mut expanded = Vec::new();
-            if clean_p.exists() && clean_p.is_dir() {
+            let clean_is_dir = clean_p.is_dir()
+                || (!test_override
+                    && quorum_types::session_fs_bridge::path_is_dir_or_bridged(&clean_p));
+            if clean_is_dir {
                 crate::handlers::cloud_drives::push_watch_root_excluding_disabled(
                     &clean_p,
                     &disabled_cloud_roots,
@@ -1319,11 +1323,16 @@ pub async fn marketplace_opt_in_handler(
     };
     match store.update_config(req) {
         Ok(cfg) => {
+            let test_override = crate::handlers::cloud_drives::is_test_profile_override_active();
             let opt_in_paths: Vec<std::path::PathBuf> = cfg
                 .opt_in_folders
                 .iter()
                 .map(std::path::PathBuf::from)
-                .filter(|p| p.exists())
+                .filter(|p| {
+                    p.exists()
+                        || (!test_override
+                            && quorum_types::session_fs_bridge::path_exists_or_bridged(p))
+                })
                 .collect();
             if !opt_in_paths.is_empty() {
                 let _ = state.watch_and_index_paths(opt_in_paths).await;

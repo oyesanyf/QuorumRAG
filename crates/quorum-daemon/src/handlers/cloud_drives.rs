@@ -158,6 +158,17 @@ pub fn canonicalize_for_cloud_filter(path: &Path) -> Option<PathBuf> {
         return None;
     }
 
+    if !is_test_profile_override_active() {
+        if let Some(canon) = quorum_types::session_fs_bridge::canonicalize_or_bridged(path) {
+            let clean = strip_windows_drive_verbatim_prefix(&canon);
+            let clean_str = clean.to_string_lossy();
+            if normalize_prefix_for_match(&clean_str).is_ok() {
+                return Some(clean);
+            }
+            return None;
+        }
+    }
+
     if std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
@@ -340,6 +351,19 @@ pub fn collect_disabled_cloud_roots(
     collect_disabled_cloud_roots_for_settings(&settings, discovered, None)
 }
 
+/// Returns true when `path` is a live directory on local disk or via the active Session-1 bridge
+/// (respecting `QUORUM_CLOUD_TEST_PROFILE_DIR` hermetic test isolation).
+fn dir_exists_live(path: &Path) -> bool {
+    if path.is_dir() {
+        return true;
+    }
+    if is_test_profile_override_active() {
+        return false;
+    }
+    quorum_types::session_fs_bridge::stat_via_bridge(path)
+        .is_some_and(|st| st.exists && st.is_dir)
+}
+
 pub fn collect_enabled_cloud_paths_filtered(
     controller: &OsoosiMeshDlpController,
     disabled_cloud_roots: &[String],
@@ -349,7 +373,7 @@ pub fn collect_enabled_cloud_paths_filtered(
     for entry in settings.drives.iter().filter(|d| d.enabled) {
         for raw in entry.root_path.iter().chain(entry.custom_paths.iter()) {
             if let Some(p) = canonicalize_for_cloud_filter(Path::new(raw.trim())) {
-                if p.exists() && p.is_dir() {
+                if dir_exists_live(&p) {
                     push_watch_root_excluding_disabled(
                         &p,
                         disabled_cloud_roots,
@@ -396,7 +420,7 @@ fn collect_drive_existing_paths_excluding_disabled(
     let mut out = Vec::new();
     for raw in entry.root_path.iter().chain(entry.custom_paths.iter()) {
         if let Some(clean_p) = canonicalize_for_cloud_filter(Path::new(raw.trim())) {
-            if clean_p.is_dir() {
+            if dir_exists_live(&clean_p) {
                 push_watch_root_excluding_disabled(&clean_p, disabled_roots, &mut out);
             }
         }
@@ -810,7 +834,7 @@ pub fn reconcile_discovered_cloud_drives(
                 let existing_root_valid = existing
                     .root_path
                     .as_deref()
-                    .is_some_and(|rp| Path::new(rp.trim()).is_dir());
+                    .is_some_and(|rp| dir_exists_live(Path::new(rp.trim())));
                 if disc_root.is_some() && (!existing_root_valid || existing.root_path.is_none()) {
                     existing.root_path = disc_root;
                     changed = true;
@@ -1182,8 +1206,11 @@ pub async fn build_cloud_drives_status_response_with_context(
 
         let root_exists_on_disk = root_path
             .as_deref()
-            .is_some_and(|rp| Path::new(rp).is_dir());
-        let custom_exists_on_disk = entry.custom_paths.iter().any(|cp| Path::new(cp).is_dir());
+            .is_some_and(|rp| dir_exists_live(Path::new(rp)));
+        let custom_exists_on_disk = entry
+            .custom_paths
+            .iter()
+            .any(|cp| dir_exists_live(Path::new(cp)));
 
         let disc_mounted = disc_opt.is_some_and(|d| d.mounted) && root_exists_on_disk;
         let mounted = disc_mounted || root_exists_on_disk || custom_exists_on_disk;
@@ -1325,9 +1352,15 @@ pub async fn build_cloud_drives_status_response_with_context(
     }
 
     let virtual_drive_guidance = if local_system {
-        Some(
-            "QuorumRAGDaemon is running as Windows LocalSystem (Session 0). Folder-backed cloud syncs under C:\\Users\\* remain directly readable; per-user virtual stream drives (such as Google Drive G:\\) are session-scoped and require Mirror mode, running `quorum-desktop.exe --cloud-drive-relay` in your user session, or selecting a local folder.".to_string(),
-        )
+        if quorum_types::session_fs_bridge::active_bridge_info().is_some() && !any_session_only {
+            Some(
+                "QuorumRAGDaemon is running as Windows LocalSystem (Session 0) with the automatic interactive user-session bridge connected. Both folder-backed syncs (OneDrive, Dropbox) and per-user virtual drives (Google Drive G:\\, pCloud P:\\) are directly mountable, selectable, and auto-indexed.".to_string(),
+            )
+        } else {
+            Some(
+                "QuorumRAGDaemon is running as Windows LocalSystem (Session 0). Folder-backed cloud syncs under C:\\Users\\* remain directly readable; per-user virtual stream drives (such as Google Drive G:\\) are bridged automatically when an interactive desktop user session is active, or can use Mirror mode / Select Folder.".to_string(),
+            )
+        }
     } else if any_session_only {
         Some(
             "One or more virtual cloud drives are active only in an interactive user session; switch to Mirror mode or run `quorum-desktop.exe --cloud-drive-relay`.".to_string(),
@@ -1487,7 +1520,7 @@ pub async fn update_cloud_drives_config_handler(
                             "Invalid, unsafe, or non-canonical cloud drive root_path",
                         );
                     };
-                    if clean_rp.is_dir() {
+                    if dir_exists_live(&clean_rp) {
                         if let Some(conflict_msg) =
                             check_cloud_drive_path_conflict(&clean_rp, &other_disabled)
                         {
@@ -1654,7 +1687,7 @@ pub async fn update_cloud_drives_config_handler(
                     format!("Unknown cloud drive id '{}'", raw_id.trim()),
                 );
             };
-            if next.drives[idx].enabled && !clean_rp.is_dir() {
+            if next.drives[idx].enabled && !dir_exists_live(&clean_rp) {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     format!(
@@ -1699,7 +1732,7 @@ pub async fn update_cloud_drives_config_handler(
                         }
                     }
                 }
-                if clean_rp.is_dir() {
+                if dir_exists_live(&clean_rp) {
                     if let Ok(norm_new) = normalize_prefix_for_match(&clean_rp_str) {
                         tier_syncs.push((norm_new, next.drives[idx].access_tier));
                     }
@@ -1725,7 +1758,7 @@ pub async fn update_cloud_drives_config_handler(
                     "Invalid, unsafe, or non-canonical folder path",
                 );
             };
-            if !clean_p.is_dir() {
+            if !dir_exists_live(&clean_p) {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     format!("Folder does not exist on disk: {}", clean_p.display()),
@@ -2022,7 +2055,7 @@ pub async fn update_cloud_drives_config_handler(
                             if let Ok(norm_new) = normalize_prefix_for_match(raw_new) {
                                 if !old_prefs.contains(&norm_new) {
                                     let p = PathBuf::from(raw_new.trim());
-                                    if p.is_dir() {
+                                    if dir_exists_live(&p) {
                                         push_watch_root_excluding_disabled(
                                             &p,
                                             &other_disabled,

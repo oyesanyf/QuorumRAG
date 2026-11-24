@@ -434,6 +434,63 @@ impl IngestConfig {
         }
     }
 
+    /// Discovers all user-browsable mounted drives for folder pickers (`This PC`), including
+    /// fixed physical disks (`C:\`, `D:\`), ready removable/network/virtual cloud drives
+    /// (such as Google Drive `G:\` and pCloud `P:\`), and interactive Session-1 drives bridged
+    /// into a Windows `LocalSystem` service. Excludes unready/empty optical CD-ROM drives.
+    pub fn discover_browsable_drives() -> Vec<PathBuf> {
+        let mut out = Self::discover_physical_drives();
+
+        #[cfg(target_os = "windows")]
+        {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
+            }
+            const DRIVE_UNKNOWN: u32 = 0;
+            const DRIVE_NO_ROOT_DIR: u32 = 1;
+            const DRIVE_CDROM: u32 = 5;
+
+            let mut push_unique = |cand: PathBuf| {
+                let key = cand.to_string_lossy().to_ascii_lowercase();
+                if !out
+                    .iter()
+                    .any(|e| e.to_string_lossy().to_ascii_lowercase() == key)
+                {
+                    out.push(cand);
+                }
+            };
+
+            for letter in b'C'..=b'Z' {
+                let root_str = format!("{}:\\", letter as char);
+                let wide: Vec<u16> = root_str.encode_utf16().chain(std::iter::once(0)).collect();
+                let dt = unsafe { GetDriveTypeW(wide.as_ptr()) };
+                if dt == DRIVE_UNKNOWN || dt == DRIVE_NO_ROOT_DIR || dt == DRIVE_CDROM {
+                    continue;
+                }
+                let p = PathBuf::from(&root_str);
+                if p.is_dir() && std::fs::read_dir(&p).is_ok() {
+                    push_unique(p);
+                }
+            }
+
+            // Merge drives visible inside the active interactive user session (e.g., G:\ Google Drive
+            // when QuorumRAGDaemon runs as LocalSystem in Session 0).
+            for drv in quorum_types::session_fs_bridge::list_session_drives() {
+                if !drv.root.trim().is_empty() {
+                    push_unique(PathBuf::from(&drv.root));
+                }
+            }
+        }
+
+        out.sort_by(|a, b| {
+            a.to_string_lossy()
+                .to_ascii_lowercase()
+                .cmp(&b.to_string_lossy().to_ascii_lowercase())
+        });
+        out
+    }
+
     /// Discovers user profile directories from Windows Registry ProfileList
     /// (HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList),
     /// skipping standard system SIDs (S-1-5-18 LocalSystem, S-1-5-19 LocalService, S-1-5-20 NetworkService).

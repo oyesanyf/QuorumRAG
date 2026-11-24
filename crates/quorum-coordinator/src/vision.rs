@@ -117,30 +117,46 @@ pub fn describe_image_file(addr: &SocketAddr, host_port: &str, model: &str, path
         tracing::warn!(path = %path.display(), "Refusing local vision inspection for explicit/pornographic image path");
         return None;
     }
-    let canonical_path = std::fs::canonicalize(path).ok()?;
+    let canonical_path = std::fs::canonicalize(path)
+        .ok()
+        .or_else(|| quorum_types::session_fs_bridge::canonicalize_or_bridged(path))?;
     if quorum_types::content_safety::check_path_explicit_content(&canonical_path).is_blocked() {
         tracing::warn!(path = %canonical_path.display(), "Refusing local vision inspection for canonical explicit/pornographic image path");
         return None;
     }
-    let meta = std::fs::metadata(&canonical_path).ok()?;
-    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_VISION_IMAGE_BYTES {
-        return None;
-    }
-    if is_cloud_placeholder_for_vision(&meta) {
-        let policy = crate::global_mesh_dlp_controller()
-            .get_cloud_drives_settings()
-            .placeholder_policy()
-            .unwrap_or_default();
-        match policy {
-            quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly => return None,
-            quorum_types::CloudPlaceholderPolicy::HydrateOnDemand { max_file_size_bytes } => {
-                if meta.len() > max_file_size_bytes {
-                    return None;
+    let policy = crate::global_mesh_dlp_controller()
+        .get_cloud_drives_settings()
+        .placeholder_policy()
+        .unwrap_or_default();
+    let bytes = match std::fs::metadata(&canonical_path) {
+        Ok(meta) => {
+            if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_VISION_IMAGE_BYTES {
+                return None;
+            }
+            if is_cloud_placeholder_for_vision(&meta) {
+                match policy {
+                    quorum_types::CloudPlaceholderPolicy::LocallySyncedOnly => return None,
+                    quorum_types::CloudPlaceholderPolicy::HydrateOnDemand {
+                        max_file_size_bytes,
+                    } => {
+                        if meta.len() > max_file_size_bytes {
+                            return None;
+                        }
+                    }
                 }
             }
+            std::fs::read(&canonical_path).ok()?
         }
+        Err(_) => quorum_types::session_fs_bridge::read_bytes_via_bridge(
+            &canonical_path,
+            MAX_VISION_IMAGE_BYTES,
+            policy,
+        )
+        .ok()?,
+    };
+    if bytes.is_empty() || bytes.len() as u64 > MAX_VISION_IMAGE_BYTES {
+        return None;
     }
-    let bytes = std::fs::read(&canonical_path).ok()?;
     if let Some(hook) = PIXEL_SAFETY_HOOK.get() {
         if !hook(&canonical_path, &bytes) {
             tracing::warn!(path = %canonical_path.display(), "Refusing local vision inspection: blocked by raster pixel content-safety filter");

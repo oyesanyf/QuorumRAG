@@ -524,7 +524,8 @@ pub fn evaluate_image_file_safety(path: &Path) -> ContentSafetyDecision {
 
     let canonical_path = match std::fs::canonicalize(path) {
         Ok(c) => c,
-        Err(_) => path.to_path_buf(),
+        Err(_) => quorum_types::session_fs_bridge::canonicalize_or_bridged(path)
+            .unwrap_or_else(|| path.to_path_buf()),
     };
     if canonical_path != path {
         let canonical_decision = check_path_explicit_content(&canonical_path);
@@ -541,14 +542,26 @@ pub fn evaluate_image_file_safety(path: &Path) -> ContentSafetyDecision {
         return ContentSafetyDecision::Allowed;
     }
 
-    let Ok(meta) = std::fs::metadata(&canonical_path) else {
-        return ContentSafetyDecision::Allowed;
-    };
-    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_MEDIA_BYTES_FOR_PIXEL_CHECK {
-        return ContentSafetyDecision::Allowed;
-    }
-    let Ok(bytes) = std::fs::read(&canonical_path) else {
-        return ContentSafetyDecision::Allowed;
+    let bytes = match std::fs::metadata(&canonical_path) {
+        Ok(meta) => {
+            if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_MEDIA_BYTES_FOR_PIXEL_CHECK {
+                return ContentSafetyDecision::Allowed;
+            }
+            match std::fs::read(&canonical_path) {
+                Ok(b) => b,
+                Err(_) => return ContentSafetyDecision::Allowed,
+            }
+        }
+        Err(_) => match quorum_types::session_fs_bridge::read_bytes_via_bridge(
+            &canonical_path,
+            MAX_MEDIA_BYTES_FOR_PIXEL_CHECK,
+            quorum_types::CloudPlaceholderPolicy::HydrateOnDemand {
+                max_file_size_bytes: MAX_MEDIA_BYTES_FOR_PIXEL_CHECK,
+            },
+        ) {
+            Ok(b) if !b.is_empty() => b,
+            _ => return ContentSafetyDecision::Allowed,
+        },
     };
     evaluate_image_safety(&canonical_path, &bytes)
 }

@@ -257,6 +257,20 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         !quorum_ingest::content_safety::evaluate_image_safety(p, b).is_blocked()
     });
 
+    // When running as a Windows LocalSystem service (Session 0), register the automatic
+    // interactive Session-1 filesystem bridge launcher so per-user Dokan/WinFSP cloud drives
+    // (such as Google Drive G:\My Drive and pCloud P:\) are natively mounted, browsable,
+    // selectable, watched, and auto-indexed with zero manual configuration.
+    #[cfg(windows)]
+    {
+        quorum_types::session_fs_bridge::register_bridge_ensurer(ensure_win_session_fs_bridge);
+        if (win_native::is_running_as_local_system() || win_native::is_session_zero())
+            && !handlers::cloud_drives::is_test_profile_override_active()
+        {
+            let _ = tokio::task::spawn_blocking(ensure_win_session_fs_bridge).await;
+        }
+    }
+
     let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
     mesh_dlp_controller.init_persistence(&cli.data_dir);
     let discovered_cloud_drives = quorum_ingest::discover_cloud_drives();
@@ -1140,6 +1154,49 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // Real-time Session-1 virtual cloud drive event consumer (drains bridged G:\ / P:\ watch events
+    // into the full ReindexWorker + StorageEngine + Dedup + Cache invalidation stack).
+    #[cfg(windows)]
+    if (win_native::is_running_as_local_system() || win_native::is_session_zero())
+        && !handlers::cloud_drives::is_test_profile_override_active()
+    {
+        let bridge_state = Arc::clone(&app_state);
+        let bridge_shutdown = Arc::clone(&shutdown_notify);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = bridge_shutdown.notified() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(2500)) => {}
+                }
+                if quorum_types::session_fs_bridge::active_bridge_info().is_none() {
+                    continue;
+                }
+                let events = tokio::task::spawn_blocking(
+                    quorum_types::session_fs_bridge::poll_watch_events_bridged,
+                )
+                .await
+                .unwrap_or_default();
+                if events.is_empty() {
+                    continue;
+                }
+                let mut paths_to_index: Vec<std::path::PathBuf> = Vec::new();
+                for ev in events {
+                    let ev_path = std::path::PathBuf::from(&ev.path);
+                    if ev.kind == "remove" {
+                        let _ = bridge_state.storage.delete_by_file_path(&ev.path).await;
+                        bridge_state.dedup.remove_file(&ev_path);
+                        bridge_state.coordinator.cache_clear_all();
+                    } else if !bridge_state.reindex_worker.is_path_blocked(&ev_path) {
+                        paths_to_index.push(ev_path);
+                    }
+                }
+                if !paths_to_index.is_empty() {
+                    let _ = bridge_state.watch_and_index_paths(paths_to_index).await;
+                }
+            }
+        });
+    }
+
     // Continuously run background crawl & incremental ingestion unconditionally
     let bg_worker = Arc::clone(&reindex_worker);
     let bg_storage = Arc::clone(&storage);
@@ -1234,15 +1291,33 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             );
             // Evict temporarily unmounted or disabled cloud roots so remounting re-attaches
             // the OS FilesystemWatcher handle automatically.
-            watched_cloud_paths_seen.retain(|p| p.is_dir() && live_enabled_cloud.contains(p));
+            watched_cloud_paths_seen.retain(|p| {
+                quorum_types::session_fs_bridge::path_is_dir_or_bridged(p)
+                    && live_enabled_cloud.contains(p)
+            });
             // Automatically attach any newly mounted or enabled cloud drives to the real-time
-            // FilesystemWatcher, ReindexWorker, and DriftHealer, and priority-queue them if a
-            // long physical scan is already underway.
+            // FilesystemWatcher, ReindexWorker, DriftHealer, and Session-1 bridge watcher, and
+            // priority-queue them if a long physical scan is already underway.
             let mut newly_mounted_cloud: Vec<std::path::PathBuf> = Vec::new();
+            let mut bridged_cloud_roots: Vec<std::path::PathBuf> = Vec::new();
             for cp in &live_enabled_cloud {
-                if cp.is_dir() && watched_cloud_paths_seen.insert(cp.clone()) {
+                if !cp.is_dir() && quorum_types::session_fs_bridge::path_is_dir_or_bridged(cp) {
+                    bridged_cloud_roots.push(cp.clone());
+                }
+                if quorum_types::session_fs_bridge::path_is_dir_or_bridged(cp)
+                    && watched_cloud_paths_seen.insert(cp.clone())
+                {
                     newly_mounted_cloud.push(cp.clone());
                 }
+            }
+            if !bridged_cloud_roots.is_empty()
+                || quorum_types::session_fs_bridge::active_bridge_info().is_some()
+            {
+                let roots_for_bridge = bridged_cloud_roots.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    quorum_types::session_fs_bridge::set_watch_roots_bridged(&roots_for_bridge)
+                })
+                .await;
             }
             if !newly_mounted_cloud.is_empty() {
                 if let Some(watcher) = bg_state.fs_watcher() {
@@ -1463,6 +1538,20 @@ pub async fn run_standalone_reindex(
         !quorum_ingest::content_safety::evaluate_image_safety(p, b).is_blocked()
     });
 
+    // When running as a Windows LocalSystem service (Session 0), register the automatic
+    // interactive Session-1 filesystem bridge launcher so per-user Dokan/WinFSP cloud drives
+    // (such as Google Drive G:\My Drive and pCloud P:\) are natively mounted, browsable,
+    // selectable, watched, and auto-indexed with zero manual configuration.
+    #[cfg(windows)]
+    {
+        quorum_types::session_fs_bridge::register_bridge_ensurer(ensure_win_session_fs_bridge);
+        if (win_native::is_running_as_local_system() || win_native::is_session_zero())
+            && !handlers::cloud_drives::is_test_profile_override_active()
+        {
+            let _ = tokio::task::spawn_blocking(ensure_win_session_fs_bridge).await;
+        }
+    }
+
     let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
     mesh_dlp_controller.init_persistence(&cli.data_dir);
     let discovered_cloud = quorum_ingest::discover_cloud_drives();
@@ -1570,6 +1659,20 @@ pub async fn run_standalone_fix_drift(
     quorum_coordinator::vision::register_vision_pixel_safety_hook(|p, b| {
         !quorum_ingest::content_safety::evaluate_image_safety(p, b).is_blocked()
     });
+
+    // When running as a Windows LocalSystem service (Session 0), register the automatic
+    // interactive Session-1 filesystem bridge launcher so per-user Dokan/WinFSP cloud drives
+    // (such as Google Drive G:\My Drive and pCloud P:\) are natively mounted, browsable,
+    // selectable, watched, and auto-indexed with zero manual configuration.
+    #[cfg(windows)]
+    {
+        quorum_types::session_fs_bridge::register_bridge_ensurer(ensure_win_session_fs_bridge);
+        if (win_native::is_running_as_local_system() || win_native::is_session_zero())
+            && !handlers::cloud_drives::is_test_profile_override_active()
+        {
+            let _ = tokio::task::spawn_blocking(ensure_win_session_fs_bridge).await;
+        }
+    }
 
     let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
     mesh_dlp_controller.init_persistence(&cli.data_dir);
@@ -1679,6 +1782,46 @@ pub async fn run_standalone_fix_drift(
     println!("============================================\n");
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_win_session_fs_bridge() -> bool {
+    if handlers::cloud_drives::is_test_profile_override_active() {
+        return false;
+    }
+    if !(win_native::is_running_as_local_system() || win_native::is_session_zero()) {
+        return false;
+    }
+    if let Ok(cur_exe) = std::env::current_exe() {
+        if let Some(dir) = cur_exe.parent() {
+            let desktop_exe = dir.join("quorum-desktop.exe");
+            if desktop_exe.is_file() {
+                let token = format!(
+                    "{}{}",
+                    uuid::Uuid::new_v4().simple(),
+                    uuid::Uuid::new_v4().simple()
+                );
+                match win_native::spawn_session_fs_bridge(&desktop_exe, &token) {
+                    Ok((port, session_id, child_pid)) => {
+                        quorum_types::session_fs_bridge::set_bridge_endpoint(
+                            port, token, session_id, child_pid,
+                        );
+                        info!(
+                            port,
+                            session_id,
+                            child_pid,
+                            "Attached silent Session-1 filesystem bridge for interactive cloud drives (Google Drive / pCloud)"
+                        );
+                        return true;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Session-1 filesystem bridge not yet available");
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Executes standalone or client recache command.

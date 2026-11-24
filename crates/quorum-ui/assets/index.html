@@ -7,7 +7,7 @@
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="icon" type="image/png" sizes="64x64" href="/assets/quorumrag-icon.png">
   <link rel="apple-touch-icon" href="/assets/quorumrag-icon.png">
-  <link rel="stylesheet" href="/assets/styles.css?v=20261123a">
+  <link rel="stylesheet" href="/assets/styles.css?v=20261124b">
   <style>
     /* Inlined fallback styles ensuring test assertions pass */
     :root {
@@ -354,49 +354,81 @@
       <div class="chatgpt-nav-section-label">Personal</div>
 
       <nav id="settings-nav-list" class="chatgpt-settings-nav">
-        <button class="chatgpt-nav-item active" data-tab="general">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
-          <span class="nav-item-label">General</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="marketplace">
-          <span class="nav-item-icon">💎</span>
-          <span class="nav-item-label">Data Opt-In &amp; Folders</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="marketplace-ledger">
-          <span class="nav-item-icon">📜</span>
-          <span class="nav-item-label">Opt-In &amp; Revenue Ledger</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="diagnostics">
-          <span class="nav-item-icon">🔬</span>
-          <span class="nav-item-label">Deep Research &amp; Diagnostics</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="appearance">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg></span>
-          <span class="nav-item-label">Appearance</span>
+        <button class="chatgpt-nav-item" data-tab="account">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
+          <span class="nav-item-label">Account</span>
         </button>
         <button class="chatgpt-nav-item" data-tab="models">
           <span class="nav-item-icon">🧠</span>
           <span class="nav-item-label">AI Models &amp; Endpoints</span>
         </button>
-        <button class="chatgpt-nav-item" data-tab="mesh">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span>
-          <span class="nav-item-label">Mesh &amp; Shared Folders</span>
+        <button class="chatgpt-nav-item" data-tab="appearance">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg></span>
+          <span class="nav-item-label">Appearance</span>
         </button>
-        <button class="chatgpt-nav-item" data-tab="dlp">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
-          <span class="nav-item-label">DLP &amp; PHI Protection</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="atlaskv" title="AtlasKV Hierarchical Knowledge Graph (Layer-1)">
-          <span class="nav-item-icon">🪐</span>
-          <span class="nav-item-label">AtlasKV Knowledge Graph</span>
+        <button class="chatgpt-nav-item" data-tab="archived">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg></span>
+          <span class="nav-item-label">Archived chats</span>
         </button>
         <button class="chatgpt-nav-item" data-tab="artemis-dfir" title="🛡️ Artemis DFIR &amp; Forensics (Local-Only)">
           <span class="nav-item-icon">🛡️</span>
           <span class="nav-item-label">Artemis DFIR &amp; Forensics</span>
         </button>
+        <button class="chatgpt-nav-item" data-tab="atlaskv" title="AtlasKV Hierarchical Knowledge Graph (Layer-1)">
+          <span class="nav-item-icon">🪐</span>
+          <span class="nav-item-label">AtlasKV Knowledge Graph</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="cloud-drives" title="Cloud Drives (Opt-In Local Sync Indexing)">
+          <span class="nav-item-icon">☁️</span>
+          <span class="nav-item-label">Cloud Drives</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="datacontrols">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
+          <span class="nav-item-label">Data controls</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="marketplace">
+          <span class="nav-item-icon">💎</span>
+          <span class="nav-item-label">Data Opt-In &amp; Folders</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="diagnostics">
+          <span class="nav-item-icon">🔬</span>
+          <span class="nav-item-label">Deep Research &amp; Diagnostics</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="dlp">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
+          <span class="nav-item-label">DLP &amp; PHI Protection</span>
+        </button>
+        <button class="chatgpt-nav-item active" data-tab="general">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
+          <span class="nav-item-label">General</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="keyboard">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="6" y1="8" x2="6" y2="8"/><line x1="10" y1="8" x2="10" y2="8"/><line x1="14" y1="8" x2="14" y2="8"/><line x1="18" y1="8" x2="18" y2="8"/><line x1="8" y1="16" x2="16" y2="16"/></svg></span>
+          <span class="nav-item-label">Keyboard</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="mesh">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span>
+          <span class="nav-item-label">Mesh &amp; Shared Folders</span>
+        </button>
         <button class="chatgpt-nav-item" data-tab="notifications">
           <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></span>
           <span class="nav-item-label">Notifications</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="marketplace-ledger">
+          <span class="nav-item-icon">📜</span>
+          <span class="nav-item-label">Opt-In &amp; Revenue Ledger</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="parental">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+          <span class="nav-item-label">Parental controls</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="personalization">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
+          <span class="nav-item-label">Personalization</span>
+        </button>
+        <button class="chatgpt-nav-item" data-tab="pets">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/><path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/></svg></span>
+          <span class="nav-item-label">Pets</span>
         </button>
         <button class="chatgpt-nav-item" data-tab="profile">
           <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3"/><path d="M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662"/></svg></span>
@@ -407,53 +439,21 @@
           <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg></span>
           <span class="nav-item-label">Security and login</span>
         </button>
-        <button class="chatgpt-nav-item" data-tab="account">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
-          <span class="nav-item-label">Account</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="archived">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg></span>
-          <span class="nav-item-label">Archived chats</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="parental">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
-          <span class="nav-item-label">Parental controls</span>
+        <button class="chatgpt-nav-item" data-tab="storage">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span>
+          <span class="nav-item-label">Storage</span>
         </button>
         <button class="chatgpt-nav-item" data-tab="trusted">
           <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><polyline points="17 11 19 13 23 9"/></svg></span>
           <span class="nav-item-label">Trusted contact</span>
         </button>
-        <button class="chatgpt-nav-item" data-tab="voice">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></span>
-          <span class="nav-item-label">Voice</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="storage">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span>
-          <span class="nav-item-label">Storage</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="cloud-drives" title="Cloud Drives (Opt-In Local Sync Indexing)">
-          <span class="nav-item-icon">☁️</span>
-          <span class="nav-item-label">Cloud Drives</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="personalization">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
-          <span class="nav-item-label">Personalization</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="pets">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/><path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/></svg></span>
-          <span class="nav-item-label">Pets</span>
-        </button>
-        <button class="chatgpt-nav-item" data-tab="keyboard">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="6" y1="8" x2="6" y2="8"/><line x1="10" y1="8" x2="10" y2="8"/><line x1="14" y1="8" x2="14" y2="8"/><line x1="18" y1="8" x2="18" y2="8"/><line x1="8" y1="16" x2="16" y2="16"/></svg></span>
-          <span class="nav-item-label">Keyboard</span>
-        </button>
         <button class="chatgpt-nav-item" data-tab="usage">
           <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg></span>
           <span class="nav-item-label">Usage</span>
         </button>
-        <button class="chatgpt-nav-item" data-tab="datacontrols">
-          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
-          <span class="nav-item-label">Data controls</span>
+        <button class="chatgpt-nav-item" data-tab="voice">
+          <span class="nav-item-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></span>
+          <span class="nav-item-label">Voice</span>
         </button>
       </nav>
     </aside>
@@ -832,6 +832,6 @@
     };
   </script>
 
-  <script src="/assets/app.js?v=20261123a"></script>
+  <script src="/assets/app.js?v=20261124b"></script>
 </body>
 </html>

@@ -212,7 +212,9 @@ pub fn authorize_media_path_with_loopback(
         let any_disabled = best_matches.iter().any(|(_, _, enabled)| !*enabled);
         let any_enabled_mounted = best_matches
             .iter()
-            .any(|(_, p, enabled)| *enabled && Path::new(p).is_dir());
+            .any(|(_, p, enabled)| {
+                *enabled && quorum_types::session_fs_bridge::path_is_dir_or_bridged(Path::new(p))
+            });
         if any_disabled || !any_enabled_mounted {
             return Err(MediaPathError::TierDenied);
         }
@@ -235,7 +237,10 @@ pub fn authorize_media_path_with_loopback(
     }
     match std::fs::metadata(&path) {
         Ok(m) if m.is_file() => Ok(path),
-        _ => Err(MediaPathError::NotFound),
+        _ => match quorum_types::session_fs_bridge::stat_via_bridge(&path) {
+            Some(st) if st.exists && st.is_file => Ok(path),
+            _ => Err(MediaPathError::NotFound),
+        },
     }
 }
 
@@ -343,11 +348,27 @@ pub async fn serve_media_handler(
 
     let mime_hv = HeaderValue::from_str(&mime)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    let resp = match ServeFile::new(&path).oneshot(fwd).await {
-        Ok(r) => r,
-        Err(never) => match never {},
+    let mut resp = if path.is_file() {
+        let resp = match ServeFile::new(&path).oneshot(fwd).await {
+            Ok(r) => r,
+            Err(never) => match never {},
+        };
+        resp.map(Body::new)
+    } else {
+        let policy = quorum_coordinator::global_mesh_dlp_controller()
+            .get_cloud_drives_settings()
+            .placeholder_policy()
+            .unwrap_or_default();
+        let path_c = path.clone();
+        match tokio::task::spawn_blocking(move || {
+            quorum_types::session_fs_bridge::read_bytes_via_bridge(&path_c, 0, policy)
+        })
+        .await
+        {
+            Ok(Ok(bytes)) => (StatusCode::OK, Body::from(bytes)).into_response(),
+            _ => return MediaPathError::NotFound.into_response(),
+        }
     };
-    let mut resp = resp.map(Body::new);
     let status = resp.status();
     let h = resp.headers_mut();
     if status.is_success() {

@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 mod win_native;
+mod session_bridge_server;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -568,6 +569,10 @@ fn main() {
         }
         "--cloud-drive-relay" => {
             std::process::exit(run_cloud_drive_relay(&args));
+        }
+        "--session-fs-bridge" => {
+            let parent_pid = parse_u64_flag(&args, "--parent-pid", 0) as u32;
+            std::process::exit(session_bridge_server::run_session_fs_bridge(parent_pid));
         }
         _ => {
             // Forward explicit CLI flags directly to `quorumrag` without console window allocation.

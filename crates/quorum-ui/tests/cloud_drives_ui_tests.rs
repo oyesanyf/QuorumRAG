@@ -19,6 +19,43 @@ fn test_cloud_drives_nav_item_and_storage_quick_jump() {
         "index.html #settings-nav-list must include top-level Cloud Drives nav item"
     );
 
+    // Verify all Settings sidebar navigation items inside #settings-nav-list are sorted alphabetically (A -> Z).
+    let nav_start = html
+        .find(r#"<nav id="settings-nav-list""#)
+        .expect("#settings-nav-list must exist in index.html");
+    let nav_end = html[nav_start..]
+        .find("</nav>")
+        .expect("#settings-nav-list must have closing </nav>")
+        + nav_start;
+    let nav_slice = &html[nav_start..nav_end];
+    let mut nav_labels: Vec<String> = Vec::new();
+    let needle = r#"<span class="nav-item-label">"#;
+    let mut cursor = 0usize;
+    while let Some(pos) = nav_slice[cursor..].find(needle) {
+        let start = cursor + pos + needle.len();
+        if let Some(end_rel) = nav_slice[start..].find("</span>") {
+            let label = nav_slice[start..start + end_rel]
+                .replace("&amp;", "&")
+                .trim()
+                .to_string();
+            nav_labels.push(label);
+            cursor = start + end_rel + 7;
+        } else {
+            break;
+        }
+    }
+    assert!(
+        nav_labels.len() >= 20,
+        "Expected all settings nav items in #settings-nav-list, got {}",
+        nav_labels.len()
+    );
+    let mut sorted_labels = nav_labels.clone();
+    sorted_labels.sort_by_key(|a| a.to_ascii_lowercase());
+    assert_eq!(
+        nav_labels, sorted_labels,
+        "Settings sidebar items must be arranged in strict alphabetical order"
+    );
+
     let storage_idx = js
         .find("else if (tab === 'storage')")
         .expect("storage tab branch must exist in app.js");

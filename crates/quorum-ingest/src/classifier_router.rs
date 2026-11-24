@@ -168,10 +168,23 @@ impl ClassifierRouter {
             }
         }
 
-        // 3. Inspect metadata with retry for Windows sharing violations
+        // 3. Inspect metadata with retry for Windows sharing violations (with Session-1 bridge fallback)
         let metadata = match self.read_metadata_with_retry(path, 3) {
             Ok(m) => m,
-            Err(e) => return FilterDecision::SkipIoError { error: e.to_string() },
+            Err(e) => {
+                if let Some(st) = quorum_types::session_fs_bridge::stat_via_bridge(path) {
+                    if st.exists && st.is_file {
+                        return self.evaluate_bridged_entry(
+                            path,
+                            st.len,
+                            st.modified_secs,
+                            st.is_placeholder,
+                            config,
+                        );
+                    }
+                }
+                return FilterDecision::SkipIoError { error: e.to_string() };
+            }
         };
 
         if !metadata.is_file() {
@@ -316,6 +329,132 @@ impl ClassifierRouter {
             category = %identity.category,
             "Filtered out non-indexable binary/media file"
         );
+        FilterDecision::SkipBinary { identity }
+    }
+
+    /// Evaluates a candidate file discovered via the interactive Session-1 filesystem bridge
+    /// (e.g., `G:\My Drive\...` when QuorumRAGDaemon runs as Windows LocalSystem in Session 0),
+    /// enforcing the exact same excluded-prefix, hidden, temp, source-code, placeholder, size-cap,
+    /// extension, and pornography content-safety rules as local files.
+    pub fn evaluate_bridged_entry(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime: i64,
+        is_placeholder: bool,
+        config: &IngestConfig,
+    ) -> FilterDecision {
+        for excl in &config.excluded_paths {
+            if crate::config::path_matches_prefix(path, excl) {
+                return FilterDecision::SkipHidden;
+            }
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !file_name.is_empty() {
+            if config.skip_hidden && file_name.starts_with('.') {
+                return FilterDecision::SkipHidden;
+            }
+            let lower_name = file_name.to_ascii_lowercase();
+            if lower_name.starts_with('~')
+                || lower_name.starts_with(".~lock")
+                || lower_name.ends_with(".tmp")
+                || lower_name.ends_with(".bak")
+                || lower_name.ends_with(".wbk")
+                || lower_name.ends_with(".exe")
+                || lower_name.ends_with(".dll")
+                || lower_name.ends_with(".sys")
+                || lower_name.ends_with(".msi")
+                || lower_name.ends_with(".so")
+                || lower_name.ends_with(".dylib")
+            {
+                return FilterDecision::SkipHidden;
+            }
+            if config.exclude_source_code {
+                const EXCLUDED_SOURCE_EXTS: &[&str] = &[
+                    ".rs", ".py", ".js", ".ts", ".jsx", ".tsx", ".c", ".cpp", ".h", ".hpp",
+                    ".cc", ".cs", ".java", ".go", ".kt", ".rb", ".php", ".swift", ".scala",
+                    ".sh", ".bash", ".ps1", ".bat", ".cmd", ".sql", ".css", ".scss", ".less",
+                    ".vue", ".svelte", ".toml", ".yaml", ".yml", ".lock", ".dat", ".log",
+                    ".json", ".jsonl", ".xml", ".html", ".htm", ".tex", ".aux", ".bbl",
+                    ".blg", ".out", ".toc", ".synctex", ".crt", ".pem", ".key",
+                ];
+                if EXCLUDED_SOURCE_EXTS
+                    .iter()
+                    .any(|ext| lower_name.ends_with(ext))
+                {
+                    let identity = self.classifier.classify_by_extension(file_name, 1.0);
+                    return FilterDecision::SkipBinary { identity };
+                }
+            }
+        }
+
+        if crate::cloud_drives::should_skip_cloud_placeholder(
+            is_placeholder,
+            size,
+            config.placeholder_policy,
+        ) {
+            return FilterDecision::SkipCloudPlaceholder;
+        }
+        if size > config.max_file_size_bytes {
+            return FilterDecision::SkipExceedsSizeCap {
+                size_bytes: size,
+                max_bytes: config.max_file_size_bytes,
+            };
+        }
+
+        let identity = self.classifier.classify_by_extension(file_name, 0.9);
+        if identity.category == FileCategory::Image
+            || Self::is_image_mime(&identity.mime_type)
+            || Self::is_image_label(&identity.label)
+        {
+            if let crate::content_safety::ContentSafetyDecision::Blocked { reason, .. } =
+                crate::content_safety::check_path_explicit_content(path)
+            {
+                tracing::warn!(path = %path.display(), reason = %reason, "Skipped explicit/pornographic bridged image during classification");
+                return FilterDecision::SkipBinary { identity };
+            }
+            return FilterDecision::Accept {
+                identity: identity.clone(),
+                kind: CandidateKind::Image {
+                    format_label: identity.label,
+                    mime_type: identity.mime_type,
+                },
+                size_bytes: size,
+                mtime_secs: mtime,
+            };
+        }
+        if identity.category == FileCategory::Audio
+            || Self::is_audio_mime(&identity.mime_type)
+            || Self::is_audio_label(&identity.label)
+        {
+            return FilterDecision::Accept {
+                identity: identity.clone(),
+                kind: CandidateKind::Audio {
+                    format_label: identity.label,
+                    mime_type: identity.mime_type,
+                },
+                size_bytes: size,
+                mtime_secs: mtime,
+            };
+        }
+        if config.exclude_source_code && identity.category == FileCategory::Code {
+            return FilterDecision::SkipBinary { identity };
+        }
+        if identity.is_text
+            || matches!(
+                identity.category,
+                FileCategory::Code | FileCategory::Text | FileCategory::Document
+            )
+        {
+            return FilterDecision::Accept {
+                identity,
+                kind: CandidateKind::Text {
+                    char_count_estimate: size as usize,
+                },
+                size_bytes: size,
+                mtime_secs: mtime,
+            };
+        }
         FilterDecision::SkipBinary { identity }
     }
 

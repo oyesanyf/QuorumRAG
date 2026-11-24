@@ -497,7 +497,7 @@ impl DriftHealer {
             if self.is_path_blocked(path) {
                 continue;
             }
-            if !path.exists() {
+            if !quorum_types::session_fs_bridge::path_exists_or_bridged(path) {
                 // File deleted while watcher was offline -> purge orphan
                 if !dry_run {
                     let _commit_guard = self.commit_gate.read().await;
@@ -588,7 +588,9 @@ impl DriftHealer {
             if self.is_cancelled(task_purge_epoch, cancel_rx, cancel_baseline_seq) {
                 return Err(IngestError::Cancelled);
             }
-            if self.is_path_blocked(root) || !root.exists() {
+            if self.is_path_blocked(root)
+                || !quorum_types::session_fs_bridge::path_exists_or_bridged(root)
+            {
                 continue;
             }
             let crawler = FilesystemCrawler::new(cfg_snapshot.clone());

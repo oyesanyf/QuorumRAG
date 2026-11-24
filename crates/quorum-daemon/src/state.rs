@@ -542,13 +542,17 @@ impl DaemonState {
             crate::handlers::cloud_drives::collect_disabled_cloud_roots(&controller, &discovered);
 
         let mut clean_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        let test_override = crate::handlers::cloud_drives::is_test_profile_override_active();
         for p in paths {
             if p.as_os_str().is_empty() {
                 continue;
             }
             if let Some(clean_p) = crate::handlers::cloud_drives::canonicalize_for_cloud_filter(&p)
             {
-                if clean_p.exists() {
+                let exists_ok = clean_p.exists()
+                    || (!test_override
+                        && quorum_types::session_fs_bridge::path_exists_or_bridged(&clean_p));
+                if exists_ok {
                     crate::handlers::cloud_drives::push_watch_root_excluding_disabled(
                         &clean_p,
                         &disabled_cloud_roots,
@@ -594,20 +598,41 @@ impl DaemonState {
         let mut drift_paths = self.drift_healer.config_snapshot().await.watch_paths;
         let mut drift_changed = false;
         for p in &clean_paths {
-            let dir_p = if p.is_dir() {
+            let p_is_dir = p.is_dir()
+                || (!test_override
+                    && quorum_types::session_fs_bridge::path_is_dir_or_bridged(p));
+            let dir_p = if p_is_dir {
                 p.clone()
             } else if let Some(parent) = p.parent() {
                 parent.to_path_buf()
             } else {
                 continue;
             };
-            if dir_p.is_dir() && !drift_paths.iter().any(|existing| existing == &dir_p) {
+            let dir_ok = dir_p.is_dir()
+                || (!test_override
+                    && quorum_types::session_fs_bridge::path_is_dir_or_bridged(&dir_p));
+            if dir_ok && !drift_paths.iter().any(|existing| existing == &dir_p) {
                 drift_paths.push(dir_p);
                 drift_changed = true;
             }
         }
         if drift_changed {
             self.drift_healer.update_watch_paths(drift_paths).await;
+        }
+        // Sync any bridged (Session-1 only) enabled cloud drive roots into the interactive watcher.
+        if !test_override && quorum_types::session_fs_bridge::active_bridge_info().is_some() {
+            let bridged_roots: Vec<PathBuf> =
+                crate::handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+                    &controller,
+                    &disabled_cloud_roots,
+                )
+                .into_iter()
+                .filter(|p| !p.is_dir())
+                .collect();
+            let _ = tokio::task::spawn_blocking(move || {
+                quorum_types::session_fs_bridge::set_watch_roots_bridged(&bridged_roots)
+            })
+            .await;
         }
         self.reindex_worker.trigger_paths(clean_paths).await.ok()
     }
@@ -724,6 +749,26 @@ impl DaemonState {
             .update_access_tier_rules(rules)
             .await
             .map_err(|e| e.to_string())?;
+        if !crate::handlers::cloud_drives::is_test_profile_override_active()
+            && quorum_types::session_fs_bridge::active_bridge_info().is_some()
+        {
+            let disabled_now = crate::handlers::cloud_drives::collect_disabled_cloud_roots(
+                &controller,
+                &discovered,
+            );
+            let bridged_roots: Vec<PathBuf> =
+                crate::handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+                    &controller,
+                    &disabled_now,
+                )
+                .into_iter()
+                .filter(|p| !p.is_dir())
+                .collect();
+            let _ = tokio::task::spawn_blocking(move || {
+                quorum_types::session_fs_bridge::set_watch_roots_bridged(&bridged_roots)
+            })
+            .await;
+        }
         Ok(())
     }
 

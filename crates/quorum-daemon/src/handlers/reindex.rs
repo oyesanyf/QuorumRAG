@@ -396,7 +396,18 @@ pub async fn add_documents_handler(
                 had_disabled_or_profile = true;
                 continue;
             }
-            if clean_pb.exists() {
+            let test_override_local =
+                crate::handlers::cloud_drives::is_test_profile_override_active();
+            let pb_stat = if clean_pb.exists() {
+                Some((clean_pb.is_file(), true))
+            } else if !test_override_local {
+                quorum_types::session_fs_bridge::stat_via_bridge(&clean_pb)
+                    .filter(|s| s.exists)
+                    .map(|s| (s.is_file, true))
+            } else {
+                None
+            };
+            if let Some((pb_is_file, true)) = pb_stat {
                 if let quorum_types::content_safety::ContentSafetyDecision::Blocked {
                     reason, ..
                 } = quorum_types::content_safety::check_path_explicit_content(&clean_pb)
@@ -407,7 +418,7 @@ pub async fn add_documents_handler(
                     )
                         .into_response();
                 }
-                if clean_pb.is_file() {
+                if pb_is_file {
                     let check_pb = clean_pb.clone();
                     let file_safety = tokio::task::spawn_blocking(move || {
                         quorum_ingest::content_safety::evaluate_image_file_safety(&check_pb)
@@ -639,15 +650,20 @@ pub async fn add_documents_handler(
     state.reindex_worker.add_watch_paths(&target_paths);
     let mut drift_paths = state.drift_healer.config_snapshot().await.watch_paths;
     let mut drift_changed = false;
+    let test_override = crate::handlers::cloud_drives::is_test_profile_override_active();
     for p in &target_paths {
-        let dir_p = if p.is_dir() {
+        let p_is_dir = p.is_dir()
+            || (!test_override && quorum_types::session_fs_bridge::path_is_dir_or_bridged(p));
+        let dir_p = if p_is_dir {
             p.clone()
         } else if let Some(parent) = p.parent() {
             parent.to_path_buf()
         } else {
             continue;
         };
-        if dir_p.is_dir()
+        let dir_ok = dir_p.is_dir()
+            || (!test_override && quorum_types::session_fs_bridge::path_is_dir_or_bridged(&dir_p));
+        if dir_ok
             && !state.reindex_worker.is_path_blocked(&dir_p)
             && !drift_paths.iter().any(|existing| existing == &dir_p)
         {
@@ -659,7 +675,10 @@ pub async fn add_documents_handler(
         state.drift_healer.update_watch_paths(drift_paths).await;
     }
 
-    let has_directory_target = target_paths.iter().any(|p| p.is_dir());
+    let has_directory_target = target_paths.iter().any(|p| {
+        p.is_dir()
+            || (!test_override && quorum_types::session_fs_bridge::path_is_dir_or_bridged(p))
+    });
     let indexed_chunks_delta = if has_directory_target {
         // Directory / drive selections dispatch immediately onto the priority background
         // reindex worker so selecting a large folder or physical drive never blocks the UI.
