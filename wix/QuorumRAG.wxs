@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?ifndef ProductVersion ?>
-<?define ProductVersion = "0.9.0" ?>
+<?define ProductVersion = "0.9.1" ?>
 <?endif ?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
     <Package Name="QuorumRAG P2P Agentic RAG"
@@ -136,7 +136,7 @@
         </Feature>
 
         <!-- Scoped Private-LAN Firewall Rules for QuorumRAG P2P Mesh & libp2p mDNS/UDP/TCP
-             Opt out during silent install via: msiexec /i QuorumRAG-0.9.0-x86_64.msi FIREWALLRULE=0 -->
+             Opt out during silent install via: msiexec /i QuorumRAG-0.9.1-x86_64.msi FIREWALLRULE=0 -->
         <Property Id="FIREWALLRULE" Value="1" Secure="yes" />
         <CustomAction Id="AddQuorumFirewallRules"
                       BinaryRef="QuorumDesktopHelper"
@@ -168,7 +168,7 @@
                       Return="asyncNoWait"
                       ExeCommand="--open-ui" />
 
-        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.9.0-x86_64.msi REMOVEDATA=1
+        <!-- Optional full data removal on uninstall: msiexec /x QuorumRAG-0.9.1-x86_64.msi REMOVEDATA=1
              deletes the index and logs in %ProgramData%\QuorumRAG (kept by default). -->
         <Property Id="REMOVEDATA" Value="0" Secure="yes" />
         <CustomAction Id="RemoveQuorumData"

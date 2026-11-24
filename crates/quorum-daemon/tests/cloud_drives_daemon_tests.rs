@@ -3478,3 +3478,278 @@ async fn t5_marketplace_opt_in_splits_strict_ancestor_and_blocks_only_cloud_pare
         "Persisted opt_in_folders must NOT store unsplit strict ancestor ParentCloud: {persisted:?}"
     );
 }
+
+#[tokio::test]
+async fn test_v091_cloud_drive_enable_auto_indexes_full_stack_and_atlaskv_and_rename() {
+    let _lock = TEST_LOCK.lock().await;
+    let tmp = tempdir().unwrap();
+    let profile = tmp.path().join("Profile");
+    let onedrive = profile.join("OneDrive");
+    std::fs::create_dir_all(&onedrive).unwrap();
+
+    let cloud_doc = onedrive.join("quarterly_architecture_plan.txt");
+    std::fs::write(
+        &cloud_doc,
+        "Project Helios operates on SolarGrid telemetry cluster 9941 with QuorumRAG cloud indexing parity.",
+    )
+    .unwrap();
+
+    let _env = EnvGuard::set(
+        "QUORUM_CLOUD_TEST_PROFILE_DIR",
+        profile.to_string_lossy().as_ref(),
+    );
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let state = make_test_state(&data_dir).await;
+    let app = build_router(Arc::clone(&state));
+
+    // 1. Before enabling, unmounted drives must report mounted=false and root_path=null
+    let (st_get, snap0) = send_json(&app, "GET", "/api/cloud-drives", None).await;
+    assert_eq!(st_get, StatusCode::OK);
+    let gd0 = find_drive(&snap0, "google_drive");
+    assert_eq!(gd0["mounted"].as_bool(), Some(false));
+    assert!(
+        gd0["root_path"].is_null(),
+        "Unmounted google_drive must not expose phantom root_path: {gd0}"
+    );
+    let od0 = find_drive(&snap0, "onedrive_personal");
+    assert_eq!(od0["mounted"].as_bool(), Some(true));
+    assert_eq!(od0["enabled"].as_bool(), Some(false));
+
+    // 2. Enabling OneDrive must immediately auto-index using the exact same ReindexWorker +
+    //    4-store StorageEngine (LanceDB + Tantivy + SQLite parent_documents + AtlasKV) + DriftHealer stack
+    let (st_en, snap_en) = send_json(
+        &app,
+        "POST",
+        "/api/cloud-drives/config",
+        Some(json!({
+            "action": "toggle_drive",
+            "id": "onedrive_personal",
+            "enabled": true
+        })),
+    )
+    .await;
+    assert_eq!(st_en, StatusCode::OK, "enable failed: {snap_en}");
+
+    // Wait up to 8s for background auto-index triggered on enable to finish
+    let mut indexed = false;
+    for _ in 0..80 {
+        let hits = state
+            .storage
+            .search_text("SolarGrid 9941", 3, 10)
+            .await
+            .unwrap_or_default();
+        if !hits.is_empty() {
+            indexed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        indexed,
+        "Enabling OneDrive must auto-index files into Tantivy/LanceDB without manual Reindex Now"
+    );
+
+    // Verify DriftHealer watch_paths also received the enabled cloud drive
+    let drift_paths = state.drift_healer.config_snapshot().await.watch_paths;
+    assert!(
+        drift_paths.iter().any(|p| p
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("onedrive")),
+        "DriftHealer watch_paths must include enabled cloud drive: {drift_paths:?}"
+    );
+
+    // 3. Build AtlasKV and verify POST /api/v1/atlaskv/query returns enabled Tier 3 cloud triples by default
+    let (st_build, build_body) = send_json(&app, "POST", "/api/v1/atlaskv/build", Some(json!({}))).await;
+    assert_eq!(st_build, StatusCode::OK, "atlaskv build failed: {build_body}");
+    let (st_q, q_body) = send_json(
+        &app,
+        "POST",
+        "/api/v1/atlaskv/query",
+        Some(json!({ "query": "Project Helios SolarGrid" })),
+    )
+    .await;
+    assert_eq!(st_q, StatusCode::OK, "atlaskv query failed: {q_body}");
+
+    // 4. Rename the cloud file (simulating OneDrive/Dropbox atomic rename) and verify reindex updates storage cleanly
+    let renamed_doc = onedrive.join("quarterly_architecture_plan_v2.txt");
+    std::fs::rename(&cloud_doc, &renamed_doc).unwrap();
+    let _ = state.watch_and_index_paths(vec![renamed_doc.clone()]).await;
+    let mut renamed_found = false;
+    for _ in 0..80 {
+        let hits = state
+            .storage
+            .search_text("SolarGrid 9941", 3, 10)
+            .await
+            .unwrap_or_default();
+        if hits.iter().any(|h| {
+            h.chunk
+                .file_path
+                .to_ascii_lowercase()
+                .contains("quarterly_architecture_plan_v2.txt")
+        }) {
+            renamed_found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        renamed_found,
+        "Renamed cloud file must remain searchable under new filename without vanishing"
+    );
+}
+
+#[tokio::test]
+async fn test_v091_pornography_filter_blocks_uploads_local_paths_media_and_export() {
+    let _lock = TEST_LOCK.lock().await;
+    let tmp = tempdir().unwrap();
+    let profile = tmp.path().join("Profile");
+    std::fs::create_dir_all(&profile).unwrap();
+    let _env = EnvGuard::set(
+        "QUORUM_CLOUD_TEST_PROFILE_DIR",
+        profile.to_string_lossy().as_ref(),
+    );
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let state = make_test_state(&data_dir).await;
+    let app = build_router(Arc::clone(&state));
+
+    // 1. Explicit filename upload via /api/documents/add must be rejected with 403 Forbidden
+    let (st_up, body_up) = send_json(
+        &app,
+        "POST",
+        "/api/documents/add",
+        Some(json!({
+            "uploaded_files": [{
+                "file_name": "pornhub_still.png",
+                "content_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(st_up, StatusCode::FORBIDDEN, "Explicit upload must return 403: {body_up}");
+
+    // 2. Explicit local_paths via /api/documents/add must be rejected with 403 Forbidden
+    let bad_dir = tmp.path().join("gallery");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    let bad_file = bad_dir.join("nude_selfie.jpg");
+    std::fs::write(&bad_file, b"fake jpg").unwrap();
+    let (st_loc, body_loc) = send_json(
+        &app,
+        "POST",
+        "/api/documents/add",
+        Some(json!({
+            "local_paths": [bad_file.to_string_lossy()]
+        })),
+    )
+    .await;
+    assert_eq!(st_loc, StatusCode::FORBIDDEN, "Explicit local_path must return 403: {body_loc}");
+
+    // 3. Explicit SVG text upload must be rejected with 403 Forbidden
+    let (st_svg, body_svg) = send_json(
+        &app,
+        "POST",
+        "/api/documents/add",
+        Some(json!({
+            "uploaded_files": [{
+                "file_name": "diagram.svg",
+                "content_text": "<svg><title>pornhub explicit sexual act</title></svg>"
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(st_svg, StatusCode::FORBIDDEN, "Explicit SVG upload must return 403: {body_svg}");
+
+    // 4. Explicit path at /api/media and /api/open-file must return 403 Forbidden
+    let (st_open, body_open) = send_json(
+        &app,
+        "POST",
+        "/api/open-file",
+        Some(json!({ "path": bad_file.to_string_lossy() })),
+    )
+    .await;
+    assert_eq!(st_open, StatusCode::FORBIDDEN, "/api/open-file must reject explicit media: {body_open}");
+}
+
+#[tokio::test]
+async fn test_v091_mount_point_gating_set_tier_and_folder_picker_hardening() {
+    let _lock = TEST_LOCK.lock().await;
+    let tmp = tempdir().unwrap();
+    let profile = tmp.path().join("Profile");
+    let custom_dir = tmp.path().join("MyCustomGoogleFolder");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::create_dir_all(&custom_dir).unwrap();
+    std::fs::write(
+        custom_dir.join("custom_drive_note.txt"),
+        "Custom folder atomic auto-enable indexing verification token 77421.",
+    )
+    .unwrap();
+
+    let _env = EnvGuard::set(
+        "QUORUM_CLOUD_TEST_PROFILE_DIR",
+        profile.to_string_lossy().as_ref(),
+    );
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let state = make_test_state(&data_dir).await;
+    let app = build_router(Arc::clone(&state));
+
+    // 1. set_tier on disabled/unmounted google_drive must succeed cleanly with zero root_path error
+    let (st_tier, body_tier) = send_json(
+        &app,
+        "POST",
+        "/api/cloud-drives/config",
+        Some(json!({
+            "action": "set_tier",
+            "id": "google_drive",
+            "access_tier": 2
+        })),
+    )
+    .await;
+    assert_eq!(st_tier, StatusCode::OK, "set_tier on unmounted drive failed: {body_tier}");
+    assert_eq!(find_drive(&body_tier, "google_drive")["access_tier"].as_u64(), Some(2));
+
+    // 2. add_folder with enabled: true atomically adds folder, marks drive mounted/enabled, and auto-indexes
+    let (st_add, body_add) = send_json(
+        &app,
+        "POST",
+        "/api/cloud-drives/config",
+        Some(json!({
+            "action": "add_folder",
+            "id": "google_drive",
+            "path": custom_dir.to_string_lossy(),
+            "enabled": true
+        })),
+    )
+    .await;
+    assert_eq!(st_add, StatusCode::OK, "add_folder with enabled=true failed: {body_add}");
+    let gd = find_drive(&body_add, "google_drive");
+    assert_eq!(gd["enabled"].as_bool(), Some(true));
+    assert_eq!(gd["mounted"].as_bool(), Some(true));
+
+    // 3. Folder picker backend checks: nonexistent directory returns 404, normal workspace dir is not system profile
+    assert!(
+        !quorum_daemon::handlers::settings::is_service_or_system_profile_path(
+            r"D:\Projects\site\assets"
+        ),
+        "Normal user workspace directory must not be flagged as OS system profile"
+    );
+    assert!(
+        quorum_daemon::handlers::settings::is_service_or_system_profile_path(
+            r"C:\Users\Public\Documents"
+        ),
+        "Windows C:\\Users\\Public must still be treated as system profile"
+    );
+    let missing_path = tmp.path().join("does_not_exist_dir_v091");
+    let missing_qs = format!(
+        "/api/fs/browse-folders?path={}",
+        missing_path.to_string_lossy().replace('\\', "%5C")
+    );
+    let (st_missing, _) = send_json(&app, "GET", &missing_qs, None).await;
+    assert_eq!(
+        st_missing,
+        StatusCode::NOT_FOUND,
+        "Nonexistent browse-folders path must return 404"
+    );
+}

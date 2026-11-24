@@ -141,6 +141,7 @@ pub async fn atlaskv_build_handler(State(state): State<Arc<DaemonState>>) -> imp
     let forensics_enabled = artemis_airgap::is_forensics_enabled();
     let dim = atlaskv.config().embedding_dim;
 
+    let reindex_worker_for_filter = Arc::clone(&state.reindex_worker);
     let res = tokio::task::spawn_blocking(move || {
         let extractor = Kg2KvExtractor::new(Kg2KvExtractorConfig {
             max_triples_per_chunk: cfg.max_triples_per_chunk,
@@ -153,6 +154,9 @@ pub async fn atlaskv_build_handler(State(state): State<Arc<DaemonState>>) -> imp
         let mut val_vecs = Vec::new();
 
         for ch in &chunks {
+            if reindex_worker_for_filter.is_path_blocked(std::path::Path::new(&ch.file_path)) {
+                continue;
+            }
             let src = KgSourceChunk {
                 chunk_id: ch.chunk_id.clone(),
                 document_id: ch.document_id.clone(),
@@ -249,21 +253,28 @@ pub async fn atlaskv_query_handler(
     };
 
     let atlaskv = state.storage.atlaskv();
-    let forensics_on = artemis_airgap::is_forensics_enabled();
-    let max_tier = payload.max_tier;
+    let settings_snapshot = global_mesh_dlp_controller()
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let local_policy = artemis_airgap::resolve_local_retrieval_policy(
+        &settings_snapshot,
+        payload.max_tier,
+        &[payload.query.as_str()],
+    );
+    let effective_max_tier = local_policy.local_access_tier;
     let top_k = payload.top_k.clamp(1, 256);
     let allowed = payload.allowed_folders;
 
     let res = tokio::task::spawn_blocking(move || {
-        atlaskv.hikvp_search(&q_vec, max_tier, top_k, allowed.as_deref())
+        atlaskv.hikvp_search(&q_vec, effective_max_tier, top_k, allowed.as_deref())
     })
     .await;
 
     match res {
         Ok(Ok((mut triples, trace))) => {
-            if !forensics_on {
-                triples.retain(|t| !artemis_airgap::is_artemis_uri(&t.triple.file_path));
-            }
+            triples.retain(|t| local_policy.permits_local_triple(&t.triple));
             let formatted_context = format_grounded_kg_context(&triples);
             Json(serde_json::json!({
                 "status": "ok",

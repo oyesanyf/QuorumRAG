@@ -15,6 +15,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub mod cloud_drives;
 pub use cloud_drives::*;
 
+pub mod content_safety;
+pub use content_safety::*;
+
 /// Error types for `quorum-types` domain logic.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TypeError {
@@ -42,6 +45,9 @@ pub enum TypeError {
 
     #[error("Invalid cloud drive configuration: {0}")]
     InvalidCloudDriveConfig(String),
+
+    #[error("Blocked by pornography/explicit content safety filter: {0}")]
+    ContentSafetyBlocked(String),
 }
 
 /// Access tiers for document and chunk level authorization.

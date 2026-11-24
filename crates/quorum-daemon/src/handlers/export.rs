@@ -11,11 +11,12 @@
 //! Images listed in `attached_media` are only embedded if they pass the same index gate as
 //! `/api/media`, so export cannot be used to read arbitrary files.
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::state::DaemonState;
@@ -866,10 +867,12 @@ fn safe_file_stem(title: &str) -> String {
     }
 }
 
-fn load_images(state: &DaemonState, paths: &[String]) -> Vec<EmbedImage> {
+fn load_images(state: &DaemonState, paths: &[String], is_loopback: bool) -> Vec<EmbedImage> {
     let mut out = Vec::new();
     for p in paths.iter().take(12) {
-        let Ok(path) = crate::handlers::media::authorize_media_path(state, p) else {
+        let Ok(path) =
+            crate::handlers::media::authorize_media_path_with_loopback(state, p, is_loopback)
+        else {
             continue;
         };
         let Ok(meta) = std::fs::metadata(&path) else {
@@ -881,6 +884,13 @@ fn load_images(state: &DaemonState, paths: &[String]) -> Vec<EmbedImage> {
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
+        if quorum_ingest::content_safety::evaluate_image_safety(&path, &bytes).is_blocked() {
+            tracing::warn!(
+                path = %path.display(),
+                "Refusing to embed explicit/pornographic image in PDF/DOCX export"
+            );
+            continue;
+        }
         let Some((w, h, is_jpeg, comps)) = image_dims(&bytes) else {
             continue;
         };
@@ -902,8 +912,12 @@ fn load_images(state: &DaemonState, paths: &[String]) -> Vec<EmbedImage> {
 
 pub async fn export_handler(
     State(state): State<Arc<DaemonState>>,
+    connect: Option<ConnectInfo<SocketAddr>>,
     Json(req): Json<ExportRequest>,
 ) -> Response {
+    let is_loopback = connect
+        .map(|ConnectInfo(addr)| addr.ip().is_loopback())
+        .unwrap_or(true);
     if req.markdown_content.len() > 4 * 1024 * 1024 {
         return (StatusCode::PAYLOAD_TOO_LARGE, "Export content too large").into_response();
     }
@@ -911,11 +925,11 @@ pub async fn export_handler(
     let fmt = req.format.to_ascii_lowercase();
     let (bytes, mime, ext) = match fmt.as_str() {
         "pdf" => {
-            let imgs = load_images(&state, &req.attached_media);
+            let imgs = load_images(&state, &req.attached_media, is_loopback);
             (generate_pdf(&req, &imgs), "application/pdf", "pdf")
         }
         "docx" | "word" => {
-            let imgs = load_images(&state, &req.attached_media);
+            let imgs = load_images(&state, &req.attached_media, is_loopback);
             (
                 generate_docx(&req, &imgs),
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

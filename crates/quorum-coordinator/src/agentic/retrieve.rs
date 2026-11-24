@@ -1255,6 +1255,26 @@ impl RetrieveMeshNode {
             chunks = paired.into_iter().map(|(c, _)| c).collect();
         }
 
+        // Mandatory zero-tolerance pornography/explicit content filter on retrieved chunks
+        // (strips explicit media paths and explicit image captions/OCR before synthesis or thumbnails).
+        chunks.retain(|c| {
+            let p = std::path::Path::new(&c.chunk.file_path);
+            if quorum_types::content_safety::check_path_explicit_content(p).is_blocked() {
+                return false;
+            }
+            let is_img = crate::vision::is_image_chunk_text(&c.chunk.text_content)
+                || p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(quorum_types::content_safety::is_visual_media_extension);
+            if is_img
+                && quorum_types::content_safety::check_text_explicit_content(&c.chunk.text_content)
+                    .is_blocked()
+            {
+                return false;
+            }
+            true
+        });
+
         // Phase 2 (#18 Adaptive RAG + #8 Query Decomposition + #4 Stage-2a/2b Reranking):
         // Re-score non-forensic candidates against the clean primary subject and decomposed
         // sub-questions (Stage-2a CrossSignalReranker), then optionally fuse local Stage-2b

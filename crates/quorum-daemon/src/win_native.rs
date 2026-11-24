@@ -1174,8 +1174,183 @@ unsafe fn enum_reg_subkeys_raw(h_key: *mut std::ffi::c_void) -> Vec<String> {
     out
 }
 
+/// Returns usernames for active/connected interactive Windows Terminal Services sessions
+/// (`WTSActive` first, then `WTSConnected`, then `WTSDisconnected`, excluding Session 0).
+///
+/// Allows Session-0 `LocalSystem` services to prioritize the actually logged-in user's
+/// `C:\Users\<username>` profile in folder pickers and Quick Access shortcuts instead of
+/// falling back to the first alphabetical folder under `C:\Users`.
+pub fn active_interactive_session_usernames() -> Vec<String> {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+
+    if is_test_profile_override_active() {
+        return Vec::new();
+    }
+
+    #[repr(C)]
+    struct WtsSessionInfoW {
+        session_id: u32,
+        win_station_name: *mut u16,
+        state: u32,
+    }
+
+    #[link(name = "wtsapi32")]
+    extern "system" {
+        fn WTSEnumerateSessionsW(
+            h_server: *mut c_void,
+            reserved: u32,
+            version: u32,
+            pp_session_info: *mut *mut WtsSessionInfoW,
+            p_count: *mut u32,
+        ) -> i32;
+        fn WTSQuerySessionInformationW(
+            h_server: *mut c_void,
+            session_id: u32,
+            wts_info_class: u32,
+            pp_buffer: *mut *mut u16,
+            p_bytes_returned: *mut u32,
+        ) -> i32;
+        fn WTSFreeMemory(p_memory: *mut c_void);
+    }
+
+    struct WtsMemGuard(*mut c_void);
+    impl Drop for WtsMemGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    WTSFreeMemory(self.0);
+                }
+            }
+        }
+    }
+
+    const WTS_ACTIVE: u32 = 0;
+    const WTS_CONNECTED: u32 = 1;
+    const WTS_DISCONNECTED: u32 = 4;
+    const WTS_USER_NAME: u32 = 5;
+
+    let mut ranked: Vec<(u8, String)> = Vec::new();
+    let mut sessions_ptr: *mut WtsSessionInfoW = null_mut();
+    let mut session_count: u32 = 0;
+    // SAFETY: `WTSEnumerateSessionsW` allocates `sessions_ptr` freed by `WtsMemGuard`.
+    if unsafe { WTSEnumerateSessionsW(null_mut(), 0, 1, &mut sessions_ptr, &mut session_count) }
+        != 0
+        && !sessions_ptr.is_null()
+    {
+        let _guard = WtsMemGuard(sessions_ptr.cast());
+        // SAFETY: `session_count` entries reside at `sessions_ptr`.
+        let entries = unsafe { std::slice::from_raw_parts(sessions_ptr, session_count as usize) };
+        for s in entries {
+            let prio = match s.state {
+                WTS_ACTIVE if s.session_id > 0 => 0u8,
+                WTS_CONNECTED if s.session_id > 0 => 1u8,
+                WTS_DISCONNECTED if s.session_id > 0 => 2u8,
+                _ => continue,
+            };
+            let mut user_ptr: *mut u16 = null_mut();
+            let mut bytes_ret: u32 = 0;
+            if unsafe {
+                WTSQuerySessionInformationW(
+                    null_mut(),
+                    s.session_id,
+                    WTS_USER_NAME,
+                    &mut user_ptr,
+                    &mut bytes_ret,
+                )
+            } != 0
+                && !user_ptr.is_null()
+            {
+                let _user_guard = WtsMemGuard(user_ptr.cast());
+                let max_u16 = (bytes_ret as usize) / 2;
+                let slice = unsafe { std::slice::from_raw_parts(user_ptr, max_u16) };
+                let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+                let username = String::from_utf16_lossy(&slice[..end]).trim().to_string();
+                if !username.is_empty() {
+                    ranked.push((prio, username));
+                }
+            }
+        }
+    }
+
+    ranked.sort_by_key(|(prio, _)| *prio);
+    let mut out = Vec::new();
+    for (_, user) in ranked {
+        if !out.iter().any(|u: &String| u.eq_ignore_ascii_case(&user)) {
+            out.push(user);
+        }
+    }
+    out
+}
+
+/// Returns `true` when any process whose executable name matches `exe_names` (case-insensitive)
+/// is actively running inside an interactive Windows user session (`SessionId > 0`).
+///
+/// Prevents Session-0 `LocalSystem` services from fabricating `session_only` virtual drive hints
+/// (such as `G:\My Drive` or `P:\`) from stale registry keys when the cloud sync client is not
+/// actually running.
+pub fn is_process_running_in_interactive_session(exe_names: &[&str]) -> bool {
+    if exe_names.is_empty() || is_test_profile_override_active() {
+        return false;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ProcessIdToSessionId(dw_process_id: u32, p_session_id: *mut u32) -> i32;
+    }
+
+    // SAFETY: `CreateToolhelp32Snapshot` with `TH32CS_SNAPPROCESS` takes a point-in-time process snapshot.
+    let snapshot = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+
+    let mut found = false;
+    // SAFETY: `entry.dwSize` is initialized to `size_of::<PROCESSENTRY32W>()`.
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while has_entry {
+        let pid = entry.th32ProcessID;
+        if pid != 0 && pid != 4 {
+            let nul_pos = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let current_name = String::from_utf16_lossy(&entry.szExeFile[..nul_pos]);
+            if exe_names
+                .iter()
+                .any(|target| current_name.eq_ignore_ascii_case(target))
+            {
+                let mut sid: u32 = 0;
+                // SAFETY: `sid` is a valid stack `u32`.
+                if unsafe { ProcessIdToSessionId(pid, &mut sid) } != 0 && sid > 0 {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        // SAFETY: Advances snapshot cursor.
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+
+    // SAFETY: Closes Toolhelp32 snapshot handle.
+    unsafe {
+        let _ = CloseHandle(snapshot);
+    }
+    found
+}
+
 /// Detects active interactive user sessions (`WTSEnumerateSessionsW`) and per-user virtual
 /// stream drive registrations (`HKEY_USERS\<SID>\Software\Google\DriveFS*`, `pCloud`, `Network\*`).
+///
+/// Virtual-drive hints are only emitted when the corresponding cloud client process is actually
+/// running inside an interactive user session (`SessionId > 0`), avoiding phantom `G:\My Drive`
+/// or `P:\` hints when the client is closed or uninstalled.
 ///
 /// Immediately returns an empty probe when `QUORUM_CLOUD_TEST_PROFILE_DIR` is active.
 pub fn detect_interactive_session_virtual_drives() -> SessionVirtualDriveProbe {
@@ -1293,6 +1468,16 @@ pub fn detect_interactive_session_virtual_drives() -> SessionVirtualDriveProbe {
         }
     };
 
+    let google_drive_running = is_process_running_in_interactive_session(&[
+        "GoogleDriveFS.exe",
+        "googledrivesync.exe",
+    ]);
+    let pcloud_running = is_process_running_in_interactive_session(&[
+        "pCloud.exe",
+        "pCloud Drive.exe",
+        "pCloudDrive.exe",
+    ]);
+
     unsafe {
         let empty_w = [0u16];
         let mut h_users: *mut c_void = null_mut();
@@ -1311,75 +1496,73 @@ pub fn detect_interactive_session_virtual_drives() -> SessionVirtualDriveProbe {
                 }
 
                 // 1. Google Drive for Desktop (`Software\Google\DriveFS\Share` & `DriveFS`)
-                let mut found_drivefs = false;
-                let share_sub = wide_nul(&format!(r"{sid}\Software\Google\DriveFS\Share"));
-                let mut h_share: *mut c_void = null_mut();
-                if RegOpenKeyExW(HKEY_USERS, share_sub.as_ptr(), 0, KEY_READ, &mut h_share) == 0
-                    && !h_share.is_null()
-                {
-                    if let Some(mp) = read_reg_sz_raw(h_share, "MountPoint")
-                        .and_then(|v| normalize_virtual_drive_mount_hint(&v, Some("My Drive")))
+                // Only emit a Session-Only virtual drive hint when GoogleDriveFS is actively
+                // running in an interactive session — stale registry keys when closed must NOT
+                // fabricate a non-existent `G:\My Drive` path.
+                if google_drive_running {
+                    let share_sub = wide_nul(&format!(r"{sid}\Software\Google\DriveFS\Share"));
+                    let mut h_share: *mut c_void = null_mut();
+                    if RegOpenKeyExW(HKEY_USERS, share_sub.as_ptr(), 0, KEY_READ, &mut h_share) == 0
+                        && !h_share.is_null()
                     {
-                        found_drivefs = true;
-                        push_hint(InteractiveVirtualDriveHint {
-                            provider_id: "google_drive".to_string(),
-                            root_path: mp,
-                            account_kind: None,
-                            source: format!(r"HKU\{sid}\Software\Google\DriveFS\Share"),
-                        });
-                    }
-                    RegCloseKey(h_share);
-                }
-
-                let dfs_sub = wide_nul(&format!(r"{sid}\Software\Google\DriveFS"));
-                let mut h_dfs: *mut c_void = null_mut();
-                if RegOpenKeyExW(HKEY_USERS, dfs_sub.as_ptr(), 0, KEY_READ, &mut h_dfs) == 0
-                    && !h_dfs.is_null()
-                {
-                    if let Some(mp) = read_reg_sz_raw(h_dfs, "DefaultMountPoint")
-                        .or_else(|| read_reg_sz_raw(h_dfs, "MountPoint"))
-                        .and_then(|v| normalize_virtual_drive_mount_hint(&v, Some("My Drive")))
-                    {
-                        push_hint(InteractiveVirtualDriveHint {
-                            provider_id: "google_drive".to_string(),
-                            root_path: mp,
-                            account_kind: None,
-                            source: format!(r"HKU\{sid}\Software\Google\DriveFS"),
-                        });
-                    } else if !found_drivefs && probe.active_interactive_sessions > 0 {
-                        push_hint(InteractiveVirtualDriveHint {
-                            provider_id: "google_drive".to_string(),
-                            root_path: r"G:\My Drive".to_string(),
-                            account_kind: None,
-                            source: format!(r"HKU\{sid}\Software\Google\DriveFS"),
-                        });
-                    }
-                    RegCloseKey(h_dfs);
-                }
-
-                // 2. pCloud Drive (`Software\pCloud`)
-                for pcloud_key in [
-                    format!(r"{sid}\Software\pCloud\pCloud Drive"),
-                    format!(r"{sid}\Software\pCloud"),
-                ] {
-                    let pc_w = wide_nul(&pcloud_key);
-                    let mut h_pc: *mut c_void = null_mut();
-                    if RegOpenKeyExW(HKEY_USERS, pc_w.as_ptr(), 0, KEY_READ, &mut h_pc) == 0
-                        && !h_pc.is_null()
-                    {
-                        if let Some(mp) = read_reg_sz_raw(h_pc, "MountPoint")
-                            .or_else(|| read_reg_sz_raw(h_pc, "mount_point"))
-                            .or_else(|| read_reg_sz_raw(h_pc, "drive_letter"))
-                            .and_then(|v| normalize_virtual_drive_mount_hint(&v, None))
+                        if let Some(mp) = read_reg_sz_raw(h_share, "MountPoint")
+                            .and_then(|v| normalize_virtual_drive_mount_hint(&v, Some("My Drive")))
                         {
                             push_hint(InteractiveVirtualDriveHint {
-                                provider_id: "pcloud".to_string(),
+                                provider_id: "google_drive".to_string(),
                                 root_path: mp,
                                 account_kind: None,
-                                source: format!(r"HKU\{pcloud_key}"),
+                                source: format!(r"HKU\{sid}\Software\Google\DriveFS\Share"),
                             });
                         }
-                        RegCloseKey(h_pc);
+                        RegCloseKey(h_share);
+                    }
+
+                    let dfs_sub = wide_nul(&format!(r"{sid}\Software\Google\DriveFS"));
+                    let mut h_dfs: *mut c_void = null_mut();
+                    if RegOpenKeyExW(HKEY_USERS, dfs_sub.as_ptr(), 0, KEY_READ, &mut h_dfs) == 0
+                        && !h_dfs.is_null()
+                    {
+                        if let Some(mp) = read_reg_sz_raw(h_dfs, "DefaultMountPoint")
+                            .or_else(|| read_reg_sz_raw(h_dfs, "MountPoint"))
+                            .and_then(|v| normalize_virtual_drive_mount_hint(&v, Some("My Drive")))
+                        {
+                            push_hint(InteractiveVirtualDriveHint {
+                                provider_id: "google_drive".to_string(),
+                                root_path: mp,
+                                account_kind: None,
+                                source: format!(r"HKU\{sid}\Software\Google\DriveFS"),
+                            });
+                        }
+                        RegCloseKey(h_dfs);
+                    }
+                }
+
+                // 2. pCloud Drive (`Software\pCloud`) — only when pCloud is actually running
+                if pcloud_running {
+                    for pcloud_key in [
+                        format!(r"{sid}\Software\pCloud\pCloud Drive"),
+                        format!(r"{sid}\Software\pCloud"),
+                    ] {
+                        let pc_w = wide_nul(&pcloud_key);
+                        let mut h_pc: *mut c_void = null_mut();
+                        if RegOpenKeyExW(HKEY_USERS, pc_w.as_ptr(), 0, KEY_READ, &mut h_pc) == 0
+                            && !h_pc.is_null()
+                        {
+                            if let Some(mp) = read_reg_sz_raw(h_pc, "MountPoint")
+                                .or_else(|| read_reg_sz_raw(h_pc, "mount_point"))
+                                .or_else(|| read_reg_sz_raw(h_pc, "drive_letter"))
+                                .and_then(|v| normalize_virtual_drive_mount_hint(&v, None))
+                            {
+                                push_hint(InteractiveVirtualDriveHint {
+                                    provider_id: "pcloud".to_string(),
+                                    root_path: mp,
+                                    account_kind: None,
+                                    source: format!(r"HKU\{pcloud_key}"),
+                                });
+                            }
+                            RegCloseKey(h_pc);
+                        }
                     }
                 }
 
@@ -1397,8 +1580,9 @@ pub fn detect_interactive_session_virtual_drives() -> SessionVirtualDriveProbe {
                         {
                             if let Some(remote) = read_reg_sz_raw(h_drive, "RemotePath") {
                                 let rem_lower = remote.to_ascii_lowercase();
-                                if rem_lower.contains("googledrive")
-                                    || rem_lower.contains("drivefs")
+                                if google_drive_running
+                                    && (rem_lower.contains("googledrive")
+                                        || rem_lower.contains("drivefs"))
                                 {
                                     if let Some(mp) = normalize_virtual_drive_mount_hint(
                                         &letter,
@@ -1411,7 +1595,7 @@ pub fn detect_interactive_session_virtual_drives() -> SessionVirtualDriveProbe {
                                             source: format!(r"HKU\{sid}\Network\{letter}"),
                                         });
                                     }
-                                } else if rem_lower.contains("pcloud") {
+                                } else if pcloud_running && rem_lower.contains("pcloud") {
                                     if let Some(mp) =
                                         normalize_virtual_drive_mount_hint(&letter, None)
                                     {
@@ -1507,6 +1691,74 @@ pub fn probe_current_user_virtual_drives() -> Vec<InteractiveVirtualDriveHint> {
                 }
                 RegCloseKey(h_key);
             }
+        }
+    }
+
+    // Scan all mounted drive letters D:\..Z:\ in the current user session for Google Drive and pCloud
+    // virtual mounts (handles custom drive letters beyond G:\ and P:\).
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+        fn GetVolumeInformationW(
+            lp_root_path_name: *const u16,
+            lp_volume_name_buffer: *mut u16,
+            n_volume_name_size: u32,
+            lp_volume_serial_number: *mut u32,
+            lp_maximum_component_length: *mut u32,
+            lp_file_system_flags: *mut u32,
+            lp_file_system_name_buffer: *mut u16,
+            n_file_system_name_size: u32,
+        ) -> i32;
+    }
+    const DRIVE_UNKNOWN: u32 = 0;
+    const DRIVE_NO_ROOT_DIR: u32 = 1;
+    for letter in b'D'..=b'Z' {
+        let ch = letter as char;
+        let root_str = format!("{ch}:\\");
+        let root_w = wide_nul(&root_str);
+        // SAFETY: `root_w` is NUL-terminated UTF-16.
+        let dt = unsafe { GetDriveTypeW(root_w.as_ptr()) };
+        if dt == DRIVE_UNKNOWN || dt == DRIVE_NO_ROOT_DIR {
+            continue;
+        }
+        let mut vol_buf = [0u16; 261];
+        let mut fs_buf = [0u16; 261];
+        // SAFETY: Valid writable stack buffers sized by `.len()`.
+        let vol_ok = unsafe {
+            GetVolumeInformationW(
+                root_w.as_ptr(),
+                vol_buf.as_mut_ptr(),
+                vol_buf.len() as u32,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                fs_buf.as_mut_ptr(),
+                fs_buf.len() as u32,
+            )
+        };
+        let vol_label = if vol_ok != 0 {
+            let vlen = vol_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            String::from_utf16_lossy(&vol_buf[..vlen]).to_ascii_lowercase()
+        } else {
+            String::new()
+        };
+        if vol_label.contains("google drive") {
+            candidates.push((
+                "google_drive".to_string(),
+                format!("{ch}:\\My Drive"),
+                "drive_letter_probe".to_string(),
+            ));
+            candidates.push((
+                "google_drive".to_string(),
+                format!("{ch}:\\Shared drives"),
+                "drive_letter_probe".to_string(),
+            ));
+        } else if vol_label.contains("pcloud") {
+            candidates.push((
+                "pcloud".to_string(),
+                root_str,
+                "drive_letter_probe".to_string(),
+            ));
         }
     }
 

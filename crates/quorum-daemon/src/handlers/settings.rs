@@ -758,6 +758,22 @@ fn discover_interactive_user_homes() -> Vec<std::path::PathBuf> {
         }
     }
 
+    // Prioritize the actively logged-in interactive Windows user session(s) before scanning
+    // alphabetical `C:\Users\*` profiles (so LocalSystem services show the real active user's
+    // Quick Access folders rather than an unused alphabetical profile such as `Owner`).
+    #[cfg(windows)]
+    {
+        let sys_drive = std::env::var("SystemDrive")
+            .ok()
+            .map(|d| d.trim().trim_end_matches(['\\', '/']).to_string())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| "C:".to_string());
+        for active_user in crate::win_native::active_interactive_session_usernames() {
+            let candidate = std::path::PathBuf::from(format!(r"{sys_drive}\Users\{active_user}"));
+            push_unique(candidate);
+        }
+    }
+
     let candidate_roots = [r"C:\Users", "/Users", "/home"];
     let skip_names = [
         "public",
@@ -879,11 +895,16 @@ async fn pure_rust_browse_directory(
     };
 
     let test_profile_override = crate::handlers::cloud_drives::is_test_profile_override_active();
-    let drives_raw = if test_profile_override {
+    let mut drives_raw = if test_profile_override {
         Vec::new()
     } else {
         quorum_ingest::IngestConfig::discover_physical_drives()
     };
+    drives_raw.sort_by(|a, b| {
+        a.to_string_lossy()
+            .to_ascii_lowercase()
+            .cmp(&b.to_string_lossy().to_ascii_lowercase())
+    });
     let physical_drives: Vec<String> = drives_raw
         .iter()
         .map(|d| d.to_string_lossy().to_string())
@@ -893,7 +914,7 @@ async fn pure_rust_browse_directory(
     // (never system32/systemprofile and never flooding the UI with duplicate secondary profile pills).
     let mut quick_access: Vec<serde_json::Value> = Vec::new();
     let mut push_quick = |label: String, path_buf: std::path::PathBuf| {
-        if !path_buf.is_dir() || quick_access.len() >= 5 {
+        if !path_buf.is_dir() || quick_access.len() >= 8 {
             return;
         }
         let s = path_buf.to_string_lossy().to_string();
@@ -932,12 +953,17 @@ async fn pure_rust_browse_directory(
             ("Documents", "Documents"),
             ("Downloads", "Downloads"),
             ("Pictures", "Pictures"),
+            ("OneDrive", "OneDrive"),
+            ("My Drive", "My Drive"),
+            ("Dropbox", "Dropbox"),
         ];
         for (label, sub) in quick_folders {
             let candidate = primary_home.join(sub);
             if candidate.is_dir() {
                 push_quick(label.to_string(), candidate);
-            } else if primary_home.join("OneDrive").join(sub).is_dir() {
+            } else if matches!(sub, "Desktop" | "Documents" | "Pictures")
+                && primary_home.join("OneDrive").join(sub).is_dir()
+            {
                 push_quick(label.to_string(), primary_home.join("OneDrive").join(sub));
             }
         }
@@ -982,15 +1008,40 @@ async fn pure_rust_browse_directory(
     }
 
     let mut target_dir_buf = Path::new(req_trimmed).to_path_buf();
+    if !target_dir_buf.is_dir() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": format!("Directory does not exist on disk: {}", req_trimmed),
+            })),
+        ));
+    }
     let mut created_folder_path: Option<String> = None;
 
     if let Some(sub_name) = create_subfolder {
         let sub_trimmed = sub_name.trim();
-        if is_safe_single_folder_name(sub_name) && target_dir_buf.is_dir() {
+        if !sub_trimmed.is_empty() {
             let candidate = target_dir_buf.join(sub_trimmed);
-            if std::fs::create_dir_all(&candidate).is_ok() {
-                created_folder_path = Some(candidate.to_string_lossy().to_string());
-                target_dir_buf = candidate;
+            match std::fs::create_dir_all(&candidate) {
+                Ok(()) => {
+                    created_folder_path = Some(candidate.to_string_lossy().to_string());
+                    target_dir_buf = candidate;
+                }
+                Err(e) => {
+                    let status = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    return Err((
+                        status,
+                        Json(serde_json::json!({
+                            "status": "error",
+                            "error": format!("Could not create subfolder '{}': {}", sub_trimmed, e),
+                        })),
+                    ));
+                }
             }
         }
     }
@@ -1020,56 +1071,67 @@ async fn pure_rust_browse_directory(
 
     let dir_path_buf = target_dir_buf.clone();
     let shared_folders_clone = shared_folders.clone();
-    let dirs: Vec<serde_json::Value> = tokio::task::spawn_blocking(move || {
-        let is_shared = |candidate: &str| -> bool {
-            let Some(norm_c) =
-                quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(candidate)
-            else {
-                return false;
-            };
-            shared_folders_clone.iter().any(|f| {
-                f.enabled
-                    && quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(&f.path)
+    let (dirs, read_error): (Vec<serde_json::Value>, Option<String>) =
+        tokio::task::spawn_blocking(move || {
+            let is_shared = |candidate: &str| -> bool {
+                let Some(norm_c) =
+                    quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(candidate)
+                else {
+                    return false;
+                };
+                shared_folders_clone.iter().any(|f| {
+                    f.enabled
+                        && quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(
+                            &f.path,
+                        )
                         .as_deref()
-                        == Some(norm_c.as_str())
-            })
-        };
+                            == Some(norm_c.as_str())
+                })
+            };
 
-        let mut dirs = Vec::new();
-        if let Ok(read_dir) = std::fs::read_dir(&dir_path_buf) {
-            for entry in read_dir.flatten() {
-                if let Ok(ft) = entry.file_type() {
-                    if ft.is_dir() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with('$')
-                            || name.eq_ignore_ascii_case("System Volume Information")
-                            || name.eq_ignore_ascii_case(".git")
-                        {
-                            continue;
+            let mut dirs = Vec::new();
+            let read_err = match std::fs::read_dir(&dir_path_buf) {
+                Ok(read_dir) => {
+                    for entry in read_dir.flatten() {
+                        if let Ok(ft) = entry.file_type() {
+                            if ft.is_dir() {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if name.starts_with('$')
+                                    || name.eq_ignore_ascii_case("System Volume Information")
+                                    || name.eq_ignore_ascii_case(".git")
+                                {
+                                    continue;
+                                }
+                                let full_path = entry.path();
+                                let full = full_path.to_string_lossy().to_string();
+                                dirs.push(serde_json::json!({
+                                    "name": name,
+                                    "path": full,
+                                    "is_drive": false,
+                                    "is_quick_access": false,
+                                    "is_shared": is_shared(&full)
+                                }));
+                            }
                         }
-                        let full_path = entry.path();
-                        let full = full_path.to_string_lossy().to_string();
-                        dirs.push(serde_json::json!({
-                            "name": name,
-                            "path": full,
-                            "is_drive": false,
-                            "is_quick_access": false,
-                            "is_shared": is_shared(&full)
-                        }));
                     }
+                    None
                 }
-            }
-        }
-        dirs.sort_by(|a, b| {
-            let na = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let nb = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            na.to_ascii_lowercase().cmp(&nb.to_ascii_lowercase())
-        });
-        dirs.truncate(1000);
-        dirs
-    })
-    .await
-    .unwrap_or_default();
+                Err(e) => Some(format!(
+                    "Unable to list subdirectories of '{}': {}",
+                    dir_path_buf.display(),
+                    e
+                )),
+            };
+            dirs.sort_by(|a, b| {
+                let na = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let nb = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                na.to_ascii_lowercase().cmp(&nb.to_ascii_lowercase())
+            });
+            dirs.truncate(1000);
+            (dirs, read_err)
+        })
+        .await
+        .unwrap_or_else(|_| (Vec::new(), None));
 
     Ok(serde_json::json!({
         "status": "ok",
@@ -1078,6 +1140,7 @@ async fn pure_rust_browse_directory(
         "current_path": resolved_path_str,
         "parent_path": parent_path,
         "created_folder": created_folder_path,
+        "read_error": read_error,
         "drives": physical_drives,
         "quick_access": quick_access,
         "directories": dirs,

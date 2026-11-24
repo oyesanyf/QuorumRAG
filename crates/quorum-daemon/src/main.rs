@@ -252,6 +252,11 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Initialize OshoosiClaw Mesh, PHI/PII DLP & Cloud Drives persistence BEFORE constructing workers
+    // Register raster pixel pornography/explicit-content safety hook for query-time Ollama vision.
+    quorum_coordinator::vision::register_vision_pixel_safety_hook(|p, b| {
+        !quorum_ingest::content_safety::evaluate_image_safety(p, b).is_blocked()
+    });
+
     let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
     mesh_dlp_controller.init_persistence(&cli.data_dir);
     let discovered_cloud_drives = quorum_ingest::discover_cloud_drives();
@@ -943,10 +948,10 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
     rt_watcher_cfg.watch_paths = initial_watch_dirs
         .iter()
         .filter(|p| {
+            let is_enabled_cloud_drive = live_enabled_cloud_paths.iter().any(|cp| cp == *p);
             p.exists()
                 && p.is_dir()
-                && p.parent().is_some()
-                && p.to_string_lossy().len() > 3
+                && (is_enabled_cloud_drive || (p.parent().is_some() && p.to_string_lossy().len() > 3))
                 && !handlers::cloud_drives::is_user_profile_root_dir(p)
                 && !is_disabled_cloud_root(p, &disabled_cloud_roots)
                 && !handlers::cloud_drives::is_strict_ancestor_of_disabled_cloud_root(
@@ -1069,6 +1074,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                             | quorum_ingest::WatcherEvent::Modify(p) => {
                                 if !is_internal_noise(&p)
                                     && !is_disabled_cloud_root(&p, &live_disabled_cloud)
+                                    && !watcher_state.reindex_worker.is_path_blocked(&p)
                                     && p.exists()
                                     && !paths_to_index.contains(&p)
                                 {
@@ -1081,6 +1087,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                                 }
                                 if !is_internal_noise(&to)
                                     && !is_disabled_cloud_root(&to, &live_disabled_cloud)
+                                    && !watcher_state.reindex_worker.is_path_blocked(&to)
                                     && to.exists()
                                     && !paths_to_index.contains(&to)
                                 {
@@ -1093,7 +1100,10 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                                 }
                             }
                             quorum_ingest::WatcherEvent::QueueOverflow { root, .. } => {
-                                if !root.as_os_str().is_empty() && root.exists() {
+                                if !root.as_os_str().is_empty()
+                                    && root.exists()
+                                    && !watcher_state.reindex_worker.is_path_blocked(&root)
+                                {
                                     push_watch_root_excluding_disabled(
                                         &root,
                                         &live_disabled_cloud,
@@ -1109,6 +1119,10 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                             .storage
                             .delete_by_file_paths(&paths_to_remove)
                             .await;
+                        for removed in &paths_to_remove {
+                            watcher_state.dedup.remove_file(std::path::Path::new(removed));
+                        }
+                        watcher_state.coordinator.cache_clear_all();
                     }
                     if !paths_to_index.is_empty() {
                         info!(
@@ -1158,7 +1172,8 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             );
         }
 
-        // Pass 0: Priority fast pass over user document & screenshot folders (Documents, Desktop, Downloads before Pictures)
+        // Pass 0: Priority fast pass over user document folders AND enabled cloud drives
+        // so enabled cloud drives start auto-indexing immediately on startup.
         let pass0_controller = quorum_coordinator::global_mesh_dlp_controller();
         let pass0_disabled_cloud =
             collect_disabled_cloud_roots(&pass0_controller, &discovered_cloud_drives);
@@ -1168,11 +1183,21 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             quorum_ingest::IngestConfig::discover_user_document_roots()
         };
         let up_dir = bg_data_dir.join("uploaded_documents");
-        let priority_user_roots = collect_pass0_priority_user_roots(
+        let mut priority_user_roots = collect_pass0_priority_user_roots(
             &pass0_raw_roots,
             Some(&up_dir),
             &pass0_disabled_cloud,
         );
+        for cp in handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+            &pass0_controller,
+            &pass0_disabled_cloud,
+        ) {
+            push_watch_root_excluding_disabled(
+                &cp,
+                &pass0_disabled_cloud,
+                &mut priority_user_roots,
+            );
+        }
         if !priority_user_roots.is_empty() && bg_worker.get_progress().await.is_none() {
             let fast_opts = quorum_ingest::ReindexOptions {
                 target_paths: priority_user_roots,
@@ -1185,6 +1210,8 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             let _ = bg_worker.start_reindex(fast_opts).await;
             tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         }
+        let mut watched_cloud_paths_seen: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
         loop {
             let controller = quorum_coordinator::global_mesh_dlp_controller();
             let live_discovered_cloud =
@@ -1197,15 +1224,49 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
             );
             let live_disabled_cloud =
                 collect_disabled_cloud_roots(&controller, &live_discovered_cloud);
-            let mut target_paths: Vec<std::path::PathBuf> = Vec::new();
-            for p in bg_worker.all_watch_paths() {
-                push_watch_root_excluding_disabled(&p, &live_disabled_cloud, &mut target_paths);
-            }
-            for cp in handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
+            bg_worker.update_blocked_prefixes(live_disabled_cloud.clone());
+            bg_state
+                .drift_healer
+                .update_blocked_prefixes(live_disabled_cloud.clone());
+            let live_enabled_cloud = handlers::cloud_drives::collect_enabled_cloud_paths_filtered(
                 &controller,
                 &live_disabled_cloud,
-            ) {
-                push_watch_root_excluding_disabled(&cp, &live_disabled_cloud, &mut target_paths);
+            );
+            // Evict temporarily unmounted or disabled cloud roots so remounting re-attaches
+            // the OS FilesystemWatcher handle automatically.
+            watched_cloud_paths_seen.retain(|p| p.is_dir() && live_enabled_cloud.contains(p));
+            // Automatically attach any newly mounted or enabled cloud drives to the real-time
+            // FilesystemWatcher, ReindexWorker, and DriftHealer, and priority-queue them if a
+            // long physical scan is already underway.
+            let mut newly_mounted_cloud: Vec<std::path::PathBuf> = Vec::new();
+            for cp in &live_enabled_cloud {
+                if cp.is_dir() && watched_cloud_paths_seen.insert(cp.clone()) {
+                    newly_mounted_cloud.push(cp.clone());
+                }
+            }
+            if !newly_mounted_cloud.is_empty() {
+                if let Some(watcher) = bg_state.fs_watcher() {
+                    for cp in &newly_mounted_cloud {
+                        if !handlers::cloud_drives::is_user_profile_root_dir(cp)
+                            && !is_disabled_cloud_root(cp, &live_disabled_cloud)
+                            && !handlers::cloud_drives::is_strict_ancestor_of_disabled_cloud_root(
+                                cp,
+                                &live_disabled_cloud,
+                            )
+                        {
+                            let _ = watcher.watch_path(cp);
+                        }
+                    }
+                }
+                bg_worker.add_watch_paths(&newly_mounted_cloud);
+                bg_state.sync_drift_healer_watch_paths().await;
+            }
+            let mut target_paths: Vec<std::path::PathBuf> = Vec::new();
+            for cp in &live_enabled_cloud {
+                push_watch_root_excluding_disabled(cp, &live_disabled_cloud, &mut target_paths);
+            }
+            for p in bg_worker.all_watch_paths() {
+                push_watch_root_excluding_disabled(&p, &live_disabled_cloud, &mut target_paths);
             }
             if let Ok(guard) = controller.settings.read() {
                 for folder in &guard.mesh.shared_folders {
@@ -1257,6 +1318,8 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                 if let Err(e) = bg_worker.start_reindex(pass_options).await {
                     error!("Continuous background indexer pass warning: {}", e);
                 }
+            } else if is_running && !newly_mounted_cloud.is_empty() {
+                let _ = bg_worker.trigger_paths(newly_mounted_cloud).await;
             }
 
             tokio::select! {
@@ -1395,6 +1458,11 @@ pub async fn run_standalone_reindex(
     }
     let _ = dedup.hydrate_from_storage(&storage).await;
 
+    // Register raster pixel pornography/explicit-content safety hook for query-time Ollama vision.
+    quorum_coordinator::vision::register_vision_pixel_safety_hook(|p, b| {
+        !quorum_ingest::content_safety::evaluate_image_safety(p, b).is_blocked()
+    });
+
     let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
     mesh_dlp_controller.init_persistence(&cli.data_dir);
     let discovered_cloud = quorum_ingest::discover_cloud_drives();
@@ -1452,6 +1520,7 @@ pub async fn run_standalone_reindex(
     let worker =
         quorum_ingest::ReindexWorker::new(ingest_cfg, storage, classifier, embedder, dedup)
             .with_dlp_gate(dlp_gate);
+    worker.update_blocked_prefixes(disabled_cloud_roots);
 
     let task_id = worker.start_reindex(options).await?;
     info!(task_id = %task_id, "Reindex task started. Streaming progress...");
@@ -1496,6 +1565,11 @@ pub async fn run_standalone_fix_drift(
         Arc::new(quorum_contract::DeterministicOfflineEngine::new());
     let dedup = Arc::new(quorum_ingest::TwoLevelDedupEngine::new());
     let _ = dedup.hydrate_from_storage(&storage).await;
+
+    // Register raster pixel pornography/explicit-content safety hook for query-time Ollama vision.
+    quorum_coordinator::vision::register_vision_pixel_safety_hook(|p, b| {
+        !quorum_ingest::content_safety::evaluate_image_safety(p, b).is_blocked()
+    });
 
     let mesh_dlp_controller = quorum_coordinator::global_mesh_dlp_controller();
     mesh_dlp_controller.init_persistence(&cli.data_dir);

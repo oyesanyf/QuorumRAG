@@ -2267,7 +2267,7 @@ function secureRandomIndex(n) {
         const data = await res.json().catch(() => ({}));
         const parentDir = data.parent_dir || String(path || '').replace(/[\\/][^\\/]+$/, '');
         if (typeof window.openPureRustFolderPicker === 'function' && parentDir) {
-          await window.openPureRustFolderPicker('storage', parentDir);
+          await window.openPureRustFolderPicker('storage', parentDir, btn || null);
         }
         if (btn) btn.textContent = '\u2713 Opened in UI';
       } else {
@@ -3340,7 +3340,16 @@ function secureRandomIndex(n) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      const data = await resp.json();
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const msg = data.message || data.error || `Reindex request failed (HTTP ${resp.status})`;
+        reindexProgressText.textContent = `⚠ ${msg}`;
+        reindexStatusPill.className = 'status-pill idle';
+        reindexStatusPill.textContent = 'Idle';
+        btnCancelReindex.classList.add('hidden');
+        showSettingsToast('⚠ ' + msg);
+        return;
+      }
       reindexProgressText.textContent = `Task started: ${data.task_id || 'active'}`;
       reindexStatusPill.className = 'status-pill active';
       reindexStatusPill.textContent = 'Active';
@@ -3348,6 +3357,12 @@ function secureRandomIndex(n) {
       pollReindexProgress();
     } catch (e) {
       reindexProgressText.textContent = `Error: ${e.message}`;
+      reindexStatusPill.className = 'status-pill idle';
+      reindexStatusPill.textContent = 'Idle';
+      btnCancelReindex.classList.add('hidden');
+      showSettingsToast('⚠ Reindex error: ' + e.message);
+    } finally {
+      btnStartReindex.disabled = false;
     }
   });
 
@@ -3810,6 +3825,7 @@ function secureRandomIndex(n) {
   let cloudDrivesError = null;
   let cloudDrivesBusyIds = new Set();
   let pendingCloudDrivePickerId = '';
+  let pendingCloudDriveAutoEnableId = '';
   let cloudDrivesFetchSeq = 0;
 
   function setCloudDriveCardBusyState(driveId, busy) {
@@ -3889,7 +3905,7 @@ function secureRandomIndex(n) {
     }
   }
 
-  window.quorumCloudDriveAddFolder = async function(driveId, folderPath) {
+  window.quorumCloudDriveAddFolder = async function(driveId, folderPath, autoEnable = false) {
     const cleanId = String(driveId || '').trim();
     const cleanPath = String(folderPath || '').trim();
     if (!cleanId || !cleanPath) return false;
@@ -3900,18 +3916,25 @@ function secureRandomIndex(n) {
     cloudDrivesBusyIds.add(cleanId);
     setCloudDriveCardBusyState(cleanId, true);
     try {
-      const res = await postCloudDrivesConfig({
+      const payload = {
         action: 'add_folder',
         id: cleanId,
         path: cleanPath
-      });
+      };
+      if (autoEnable) {
+        payload.enabled = true;
+      }
+      const res = await postCloudDrivesConfig(payload);
       if (!res.ok) {
         showSettingsToast('⚠ ' + (res.error || 'Failed to add custom cloud folder'));
         return false;
       }
       const hiddenInp = document.getElementById('cloud-drives-selected-folder-input');
       if (hiddenInp) hiddenInp.value = cleanPath;
-      showSettingsToast(`✓ Added custom folder to ${cleanId}: ${cleanPath}`);
+      if (typeof checkReindexStatus === 'function') checkReindexStatus();
+      showSettingsToast(autoEnable
+        ? `✓ Added folder and enabled ${cleanId} auto-indexing: ${cleanPath}`
+        : `✓ Added custom folder to ${cleanId}: ${cleanPath}`);
       return true;
     } finally {
       cloudDrivesBusyIds.delete(cleanId);
@@ -4290,14 +4313,28 @@ function secureRandomIndex(n) {
     return cleaned;
   }
 
+  let browseFoldersFetchSeq = 0;
+  let lastBrowseFoldersError = '';
+
   async function fetchBrowseFolders(pathStr) {
+    const seq = ++browseFoldersFetchSeq;
+    lastBrowseFoldersError = '';
     try {
       let resp = await fetch(`/api/fs/browse-folders?path=${encodeURIComponent(pathStr || '')}`);
-      if (!resp.ok) {
+      if (!resp.ok && resp.status === 404 && !pathStr) {
         resp = await fetch(`/api/mesh/browse-folders?path=${encodeURIComponent(pathStr || '')}`);
       }
-      if (!resp.ok) return;
-      const data = await resp.json();
+      if (seq !== browseFoldersFetchSeq) return false;
+      const data = await resp.json().catch(() => ({}));
+      if (seq !== browseFoldersFetchSeq) return false;
+      if (!resp.ok) {
+        lastBrowseFoldersError = data.error || `Unable to open folder (HTTP ${resp.status})`;
+        showSettingsToast('⚠ ' + lastBrowseFoldersError);
+        return false;
+      }
+      if (data.read_error) {
+        lastBrowseFoldersError = String(data.read_error);
+      }
       currentBrowsePath = data.current_path || '';
       currentBrowseParentPath = data.parent_path || '';
       if (Array.isArray(data.drives) && data.drives.length > 0) {
@@ -4331,7 +4368,13 @@ function secureRandomIndex(n) {
       } else {
         cachedBrowseDirs = rawDirs.filter(d => d && (!d.is_quick_access || !isServiceProfilePathJs(d.path)));
       }
-    } catch (_) {}
+      return true;
+    } catch (err) {
+      if (seq !== browseFoldersFetchSeq) return false;
+      lastBrowseFoldersError = (err && err.message) ? err.message : 'Unable to reach folder browser';
+      showSettingsToast('⚠ ' + lastBrowseFoldersError);
+      return false;
+    }
   }
 
   function buildPathBreadcrumbs(currentPath) {
@@ -4554,6 +4597,7 @@ function secureRandomIndex(n) {
         ` : ''}
 
         <div class="folder-explorer-list custom-scroll">
+          ${lastBrowseFoldersError && currentPath ? `<div style="padding:8px 12px; margin-bottom:6px; border-radius:8px; background:rgba(220,38,38,0.14); border:1px solid rgba(220,38,38,0.35); color:#fca5a5; font-size:12px;">⚠ ${escapeHtml(lastBrowseFoldersError)}</div>` : ''}
           ${dirRowsHtml}
         </div>
       </div>
@@ -4568,6 +4612,12 @@ function secureRandomIndex(n) {
   let pureRustPickerDirectories = [];
   let pureRustPickerFilterText = '';
   let pureRustPickerListenersBound = false;
+  let pureRustPickerFetchSeq = 0;
+  let pureRustPickerLoading = false;
+  let pureRustPickerError = '';
+  let pureRustPickerSessionId = 0;
+  let pureRustPickerSubmitting = false;
+  let mktFoldersBusy = false;
 
   const CONTEXT_LABELS = {
     general: 'Marketplace Opt-In Folder',
@@ -4593,6 +4643,9 @@ function secureRandomIndex(n) {
     const modal = document.getElementById('modal-pure-rust-folder-picker');
     if (modal) modal.classList.add('hidden');
     pendingCloudDrivePickerId = '';
+    pendingCloudDriveAutoEnableId = '';
+    pureRustPickerError = '';
+    pureRustPickerLoading = false;
     if (pureRustPickerInvokerEl && typeof pureRustPickerInvokerEl.focus === 'function') {
       try {
         pureRustPickerInvokerEl.focus();
@@ -4608,21 +4661,29 @@ function secureRandomIndex(n) {
       return false;
     }
 
-    await fetchBrowseFolders(chosen);
-
     if (ctx === 'reindex') {
+      const browseOk = await fetchBrowseFolders(chosen);
+      if (!browseOk) return false;
       updateReindexSelectedBadge(chosen);
       renderReindexExplorer();
       showSettingsToast('✓ Target reindex folder set: ' + chosen);
     } else if (ctx === 'newdoc' || ctx === 'storage') {
-      await window.quorumIndexFolderImmediate(chosen);
+      const ok = await window.quorumIndexFolderImmediate(chosen);
+      if (ok) await fetchBrowseFolders(chosen);
+      return ok;
     } else if (ctx === 'mesh') {
-      await window.quorumShareFolder(chosen);
+      const ok = await window.quorumShareFolder(chosen);
+      if (ok) await fetchBrowseFolders(chosen);
+      return ok;
     } else if (ctx === 'mkt' || ctx === 'general') {
       const mktInp = document.getElementById('mkt-folder-input');
       if (mktInp) mktInp.value = chosen;
-      await toggleMarketplaceFolder(chosen, true);
+      const ok = await toggleMarketplaceFolder(chosen, true);
+      if (ok) await fetchBrowseFolders(chosen);
+      return ok;
     } else if (ctx === 'dlp') {
+      const browseOk = await fetchBrowseFolders(chosen);
+      if (!browseOk) return false;
       dlpSelectedSimFolder = chosen;
       dlpSelectedSimPath = formatDlpSimulationFilePath(chosen);
       const simPathInp = document.getElementById('dlp-sim-path');
@@ -4637,6 +4698,8 @@ function secureRandomIndex(n) {
       renderSettingsTabContent('dlp', '');
       showSettingsToast('✓ DLP simulation folder set: ' + dlpSelectedSimPath);
     } else if (ctx === 'artemis') {
+      const browseOk = await fetchBrowseFolders(chosen);
+      if (!browseOk) return false;
       artemisSelectedDir = chosen;
       const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
       const displayPill = document.getElementById('artemis-selected-folder-display');
@@ -4658,12 +4721,18 @@ function secureRandomIndex(n) {
         showSettingsToast('⚠ No cloud drive selected for custom folder.');
         return false;
       }
-      const ok = await window.quorumCloudDriveAddFolder(targetDriveId, chosen);
+      const autoEnable = pendingCloudDriveAutoEnableId === targetDriveId;
+      const ok = await window.quorumCloudDriveAddFolder(targetDriveId, chosen, autoEnable);
       if (ok) {
         pendingCloudDrivePickerId = '';
       }
+      if (ok) {
+        pendingCloudDriveAutoEnableId = '';
+        await fetchBrowseFolders(chosen);
+      }
       return ok;
     } else {
+      await fetchBrowseFolders(chosen);
       renderSettingsTabContent(activeSettingsTab, '');
       showSettingsToast('✓ Selected folder: ' + chosen);
     }
@@ -4748,6 +4817,13 @@ function secureRandomIndex(n) {
 
     const listEl = document.getElementById('pure-rust-picker-dir-list');
     if (listEl) {
+      const errBanner = pureRustPickerError
+        ? `<div style="padding:8px 12px; margin-bottom:8px; border-radius:8px; background:rgba(220,38,38,0.14); border:1px solid rgba(220,38,38,0.35); color:#fca5a5; font-size:12px;">⚠ ${escapeHtml(pureRustPickerError)}</div>`
+        : '';
+      if (pureRustPickerLoading && pureRustPickerDirectories.length === 0) {
+        listEl.innerHTML = `${errBanner}<div style="padding:18px; text-align:center; color:var(--text-muted); font-size:12.5px;">⏳ Loading folders...</div>`;
+        return;
+      }
       const q = (pureRustPickerFilterText || '').trim().toLowerCase();
       const filtered = pureRustPickerDirectories.filter(d => {
         if (!d) return false;
@@ -4757,13 +4833,13 @@ function secureRandomIndex(n) {
       });
 
       if (filtered.length === 0) {
-        listEl.innerHTML = `
+        listEl.innerHTML = `${errBanner}
           <div style="padding:18px; text-align:center; color:var(--text-muted); font-size:12.5px;">
             ${q ? 'No drives or subfolders match filter "' + escapeHtml(pureRustPickerFilterText) + '".' : 'No subdirectories in this folder. Click "✅ Select Folder" below to choose this directory, or create a new subfolder above.'}
           </div>
         `;
       } else {
-        listEl.innerHTML = filtered.map(d => {
+        listEl.innerHTML = errBanner + filtered.map(d => {
           const p = String(d.path || '');
           const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
           const displayName = d.is_drive ? (p === '/' ? 'Root Filesystem (/)' : `Drive ${p}`) : String(d.name || p);
@@ -4795,54 +4871,80 @@ function secureRandomIndex(n) {
   }
 
   async function loadPureRustPickerDirectory(targetPath, createSubfolder) {
+    const seq = ++pureRustPickerFetchSeq;
     const requested = targetPath !== undefined ? targetPath : pureRustPickerCurrentPath;
     const qs = `path=${encodeURIComponent(requested || '')}` + (createSubfolder ? `&create_subfolder=${encodeURIComponent(createSubfolder)}` : '');
+    pureRustPickerLoading = true;
+    pureRustPickerError = '';
+    renderPureRustPickerModalContent();
     try {
       let data = null;
+      let lastErrMsg = '';
 
       if (createSubfolder) {
         const respPost = await fetch('/api/fs/pick-folder', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: requested, create_subfolder: createSubfolder })
-        }).catch(() => null);
-        if (respPost && respPost.ok) {
+        }).catch((err) => { lastErrMsg = err.message || 'Network error'; return null; });
+        if (seq !== pureRustPickerFetchSeq) return false;
+        if (respPost) {
           const candidate = await respPost.json().catch(() => null);
-          if (candidate && candidate.cancelled !== true && candidate.status !== 'cancelled' && Array.isArray(candidate.directories)) {
+          if (respPost.ok && candidate && candidate.cancelled !== true && candidate.status !== 'cancelled' && Array.isArray(candidate.directories)) {
             data = candidate;
+          } else {
+            lastErrMsg = (candidate && candidate.error) || `Unable to create subfolder (HTTP ${respPost.status})`;
+            pureRustPickerError = lastErrMsg;
+            showSettingsToast('⚠ ' + lastErrMsg);
+            return false;
           }
         }
       }
 
       if (!data) {
-        let respBrowse = await fetch(`/api/fs/browse-folders?${qs}`).catch(() => null);
-        if (!respBrowse || !respBrowse.ok) {
+        let respBrowse = await fetch(`/api/fs/browse-folders?${qs}`).catch((err) => { lastErrMsg = err.message || 'Network error'; return null; });
+        if (seq !== pureRustPickerFetchSeq) return false;
+        if (respBrowse && !respBrowse.ok && respBrowse.status === 404 && !requested) {
           respBrowse = await fetch(`/api/mesh/browse-folders?${qs}`).catch(() => null);
         }
-        if (respBrowse && respBrowse.ok) {
+        if (seq !== pureRustPickerFetchSeq) return false;
+        if (respBrowse) {
           const candidate = await respBrowse.json().catch(() => null);
-          if (candidate && candidate.cancelled !== true && candidate.status !== 'cancelled') {
+          if (respBrowse.ok && candidate && candidate.cancelled !== true && candidate.status !== 'cancelled') {
             data = candidate;
+          } else if (candidate && candidate.error) {
+            lastErrMsg = String(candidate.error);
+          } else if (!respBrowse.ok) {
+            lastErrMsg = `Unable to browse folder (HTTP ${respBrowse.status})`;
           }
         }
       }
 
-      if (!data) {
+      if (!data && !lastErrMsg) {
         const respFallback = await fetch('/api/fs/pick-folder', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: requested })
-        }).catch(() => null);
-        if (respFallback && respFallback.ok) {
+        }).catch((err) => { lastErrMsg = err.message || 'Network error'; return null; });
+        if (seq !== pureRustPickerFetchSeq) return false;
+        if (respFallback) {
           const candidate = await respFallback.json().catch(() => null);
-          if (candidate && candidate.cancelled !== true && candidate.status !== 'cancelled' && Array.isArray(candidate.directories)) {
+          if (respFallback.ok && candidate && candidate.cancelled !== true && candidate.status !== 'cancelled' && Array.isArray(candidate.directories)) {
             data = candidate;
+          } else if (candidate && candidate.error) {
+            lastErrMsg = String(candidate.error);
           }
         }
       }
 
-      if (!data) return;
+      if (seq !== pureRustPickerFetchSeq) return false;
+      if (!data) {
+        pureRustPickerError = lastErrMsg || 'Unable to open folder.';
+        showSettingsToast('⚠ ' + pureRustPickerError);
+        return false;
+      }
 
+      pureRustPickerError = data.read_error ? String(data.read_error) : '';
       pureRustPickerCurrentPath = data.current_path !== undefined ? data.current_path : (data.path || '');
       pureRustPickerParentPath = data.parent_path || '';
       if (Array.isArray(data.drives) && data.drives.length > 0) {
@@ -4879,25 +4981,32 @@ function secureRandomIndex(n) {
       } else {
         pureRustPickerDirectories = rawDirs.filter(d => d && (!d.is_quick_access || !isServiceProfilePathJs(d.path)));
       }
+      return true;
     } catch (err) {
-      showSettingsToast('Folder browser error: ' + err.message);
+      if (seq !== pureRustPickerFetchSeq) return false;
+      pureRustPickerError = (err && err.message) ? err.message : 'Folder browser error';
+      showSettingsToast('⚠ Folder browser error: ' + pureRustPickerError);
+      return false;
     } finally {
-      if (pureRustPickerDirectories.length === 0 && !pureRustPickerCurrentPath) {
-        const fallbackDrives = pureRustPickerDrives.length ? pureRustPickerDrives : (IS_POSIX_CLIENT ? ['/'] : ['C:\\']);
-        pureRustPickerDirectories = [
-          ...fallbackDrives.map(drv => ({
-            name: drv === '/' ? 'Root Filesystem (/)' : `Drive ${drv}`,
-            path: drv,
-            is_drive: true
-          })),
-          ...pureRustPickerQuickAccess.map(qa => ({
-            name: qa.name,
-            path: qa.path,
-            is_quick_access: true
-          }))
-        ];
+      if (seq === pureRustPickerFetchSeq) {
+        pureRustPickerLoading = false;
+        if (pureRustPickerDirectories.length === 0 && !pureRustPickerCurrentPath) {
+          const fallbackDrives = pureRustPickerDrives.length ? pureRustPickerDrives : (IS_POSIX_CLIENT ? ['/'] : ['C:\\']);
+          pureRustPickerDirectories = [
+            ...fallbackDrives.map(drv => ({
+              name: drv === '/' ? 'Root Filesystem (/)' : `Drive ${drv}`,
+              path: drv,
+              is_drive: true
+            })),
+            ...pureRustPickerQuickAccess.map(qa => ({
+              name: qa.name,
+              path: qa.path,
+              is_quick_access: true
+            }))
+          ];
+        }
+        renderPureRustPickerModalContent();
       }
-      renderPureRustPickerModalContent();
     }
   }
 
@@ -4975,25 +5084,41 @@ function secureRandomIndex(n) {
 
     const newFolderInp = document.getElementById('pure-rust-picker-new-folder-input');
     const btnCreateFolder = document.getElementById('btn-pure-rust-picker-create-folder');
-    if (btnCreateFolder) {
-      btnCreateFolder.addEventListener('click', async () => {
-        const subName = (newFolderInp ? newFolderInp.value : '').trim();
-        if (!pureRustPickerCurrentPath) {
-          showSettingsToast('Open a drive or parent folder first before creating a subfolder.');
-          return;
-        }
-        if (!subName) {
-          showSettingsToast('Enter a name for the new subfolder.');
-          if (newFolderInp) newFolderInp.focus();
-          return;
-        }
+    const handleCreateSubfolder = async () => {
+      const subName = (newFolderInp ? newFolderInp.value : '').trim();
+      if (!pureRustPickerCurrentPath) {
+        showSettingsToast('⚠ Open a drive or parent folder first before creating a subfolder.');
+        return;
+      }
+      if (!subName) {
+        showSettingsToast('⚠ Enter a name for the new subfolder.');
+        if (newFolderInp) newFolderInp.focus();
+        return;
+      }
+      if (btnCreateFolder) btnCreateFolder.disabled = true;
+      try {
         const prevPath = pureRustPickerCurrentPath;
-        await loadPureRustPickerDirectory(pureRustPickerCurrentPath, subName);
-        if (newFolderInp) newFolderInp.value = '';
-        if (pureRustPickerCurrentPath && pureRustPickerCurrentPath !== prevPath) {
-          showSettingsToast('✓ Created and opened subfolder: ' + subName);
-        } else {
-          showSettingsToast('Refreshed folder view for: ' + prevPath);
+        const ok = await loadPureRustPickerDirectory(pureRustPickerCurrentPath, subName);
+        if (ok) {
+          if (newFolderInp) newFolderInp.value = '';
+          if (pureRustPickerCurrentPath && pureRustPickerCurrentPath !== prevPath) {
+            showSettingsToast('✓ Created and opened subfolder: ' + subName);
+          } else {
+            showSettingsToast('✓ Folder refreshed: ' + prevPath);
+          }
+        }
+      } finally {
+        if (btnCreateFolder) btnCreateFolder.disabled = false;
+      }
+    };
+    if (btnCreateFolder) {
+      btnCreateFolder.addEventListener('click', handleCreateSubfolder);
+    }
+    if (newFolderInp) {
+      newFolderInp.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          handleCreateSubfolder();
         }
       });
     }
@@ -5019,12 +5144,21 @@ function secureRandomIndex(n) {
     const btnConfirm = document.getElementById('btn-confirm-pure-rust-picker');
     if (btnConfirm) {
       btnConfirm.addEventListener('click', async () => {
+        if (pureRustPickerSubmitting || pureRustPickerLoading) return;
         if (!pureRustPickerCurrentPath) {
           showSettingsToast('Click a drive to drill down into folders or click "✓ Select Folder" on any row.');
           return;
         }
-        const ok = await window.applyPickedFolderToContext(pureRustPickerContext, pureRustPickerCurrentPath);
-        if (ok) closePicker();
+        const sessionAtClick = pureRustPickerSessionId;
+        pureRustPickerSubmitting = true;
+        btnConfirm.disabled = true;
+        try {
+          const ok = await window.applyPickedFolderToContext(pureRustPickerContext, pureRustPickerCurrentPath);
+          if (ok && sessionAtClick === pureRustPickerSessionId) closePicker();
+        } finally {
+          pureRustPickerSubmitting = false;
+          btnConfirm.disabled = !pureRustPickerCurrentPath;
+        }
       });
     }
 
@@ -5037,10 +5171,19 @@ function secureRandomIndex(n) {
       if (pickBtn) {
         e.preventDefault();
         e.stopPropagation();
+        if (pureRustPickerSubmitting || pureRustPickerLoading) return;
         const chosen = pickBtn.getAttribute('data-picker-pick') || '';
         if (chosen) {
-          const ok = await window.applyPickedFolderToContext(pureRustPickerContext, chosen);
-          if (ok) closePicker();
+          const sessionAtClick = pureRustPickerSessionId;
+          pureRustPickerSubmitting = true;
+          pickBtn.disabled = true;
+          try {
+            const ok = await window.applyPickedFolderToContext(pureRustPickerContext, chosen);
+            if (ok && sessionAtClick === pureRustPickerSessionId) closePicker();
+          } finally {
+            pureRustPickerSubmitting = false;
+            pickBtn.disabled = false;
+          }
         }
         return;
       }
@@ -5057,12 +5200,17 @@ function secureRandomIndex(n) {
   }
 
   window.openPureRustFolderPicker = async function(contextId = 'general', initialPath = '', invokerEl = null) {
+    pureRustPickerSessionId += 1;
+    const mySession = pureRustPickerSessionId;
     pureRustPickerContext = contextId || 'general';
     pureRustPickerFilterText = '';
+    pureRustPickerError = '';
     pureRustPickerInvokerEl = invokerEl || document.activeElement || null;
     bindPureRustPickerModalListeners();
     const filterInp = document.getElementById('pure-rust-picker-filter-input');
     if (filterInp) filterInp.value = '';
+    const newFolderInp = document.getElementById('pure-rust-picker-new-folder-input');
+    if (newFolderInp) newFolderInp.value = '';
     const modal = ensurePureRustPickerModal();
     const startPath = String(initialPath || '').trim();
     pureRustPickerCurrentPath = startPath;
@@ -5086,8 +5234,15 @@ function secureRandomIndex(n) {
           is_quick_access: true
         }))
       ];
-    } else if (Array.isArray(cachedBrowseDirs) && cachedBrowseDirs.length > 0) {
+    } else if (
+      currentBrowsePath &&
+      canonicalComparePathJs(startPath) === canonicalComparePathJs(currentBrowsePath) &&
+      Array.isArray(cachedBrowseDirs) &&
+      cachedBrowseDirs.length > 0
+    ) {
       pureRustPickerDirectories = cachedBrowseDirs;
+    } else {
+      pureRustPickerDirectories = [];
     }
     if (modal) {
       modal.classList.remove('hidden');
@@ -5095,7 +5250,11 @@ function secureRandomIndex(n) {
       if (filterInp && typeof filterInp.focus === 'function') {
         setTimeout(() => { try { filterInp.focus(); } catch (_) {} }, 0);
       }
-      await loadPureRustPickerDirectory(startPath);
+      const loaded = await loadPureRustPickerDirectory(startPath);
+      if (!loaded && mySession === pureRustPickerSessionId && startPath) {
+        pureRustPickerCurrentPath = '';
+        renderPureRustPickerModalContent();
+      }
     }
   };
   window.openSelectFolderModal = window.openPureRustFolderPicker;
@@ -5145,7 +5304,13 @@ function secureRandomIndex(n) {
   }
 
   async function toggleMarketplaceFolder(targetPath, forceAdd) {
-    if (!targetPath) return;
+    if (!targetPath) return false;
+    if (mktFoldersBusy) {
+      showSettingsToast('⏳ Folder scope update already in progress...');
+      renderSettingsTabContent(activeSettingsTab, '');
+      return false;
+    }
+    mktFoldersBusy = true;
     syncPendingMarketplaceInputsFromDom();
     const mkt = cachedMarketplaceStatus || {};
     const curFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders.slice() : [];
@@ -5157,9 +5322,10 @@ function secureRandomIndex(n) {
     let toastMsg = '';
     if (existingIdx >= 0) {
       if (forceAdd) {
+        mktFoldersBusy = false;
         showSettingsToast('✓ Folder already in Opt-In scope: ' + targetPath);
         renderSettingsTabContent(activeSettingsTab, '');
-        return;
+        return true;
       }
       curFolders.splice(existingIdx, 1);
       toastMsg = 'Removed folder from Opt-In scope: ' + targetPath;
@@ -5167,39 +5333,57 @@ function secureRandomIndex(n) {
       curFolders.push(targetPath);
       toastMsg = '✓ Added folder to Opt-In scope: ' + targetPath;
     }
-    await fetch('/api/v1/marketplace/opt-in', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        opt_in_enabled: !!mkt.opt_in_enabled,
-        user_consent_checked: !!mkt.user_consent_checked,
-        opt_in_folders: curFolders
-      })
-    });
-    await fetchMarketplaceData();
-    checkReindexStatus();
-    renderSettingsTabContent(activeSettingsTab, '');
-    if (toastMsg) showSettingsToast(toastMsg);
+    try {
+      const resp = await fetch('/api/v1/marketplace/opt-in', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          opt_in_enabled: !!mkt.opt_in_enabled,
+          user_consent_checked: !!mkt.user_consent_checked,
+          opt_in_folders: curFolders
+        })
+      });
+      const resData = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showSettingsToast('⚠ ' + (resData.error || `Failed to update Opt-In folder scope (HTTP ${resp.status})`));
+        renderSettingsTabContent(activeSettingsTab, '');
+        return false;
+      }
+      await fetchMarketplaceData();
+      checkReindexStatus();
+      renderSettingsTabContent(activeSettingsTab, '');
+      if (toastMsg) showSettingsToast(toastMsg);
+      return true;
+    } catch (err) {
+      showSettingsToast('⚠ Failed to update Opt-In folder scope: ' + err.message);
+      renderSettingsTabContent(activeSettingsTab, '');
+      return false;
+    } finally {
+      mktFoldersBusy = false;
+    }
   }
 
   window.quorumBrowseDir = async function(pathStr) {
     syncPendingMarketplaceInputsFromDom();
-    await fetchBrowseFolders(pathStr);
+    const ok = await fetchBrowseFolders(pathStr);
     renderSettingsTabContent(activeSettingsTab, '');
     renderReindexExplorer();
-    showSettingsToast(pathStr ? ('Browsing ' + pathStr) : (IS_POSIX_CLIENT ? 'Showing filesystems & quick access' : 'Showing physical drives & quick access'));
+    if (ok) {
+      showSettingsToast(pathStr ? ('Browsing ' + pathStr) : (IS_POSIX_CLIENT ? 'Showing filesystems & quick access' : 'Showing physical drives & quick access'));
+    }
   };
 
   window.quorumIndexFolderImmediate = async function(folderPath) {
     const clean = (folderPath || '').trim();
-    if (!clean) return;
+    if (!clean) return false;
     syncPendingMarketplaceInputsFromDom();
     const inp = document.getElementById('new-doc-path-input');
     if (inp) inp.value = clean;
     const chkOptIn = document.getElementById('chk-add-doc-optin');
     const includeOptIn = chkOptIn ? Boolean(chkOptIn.checked) : addDocIncludeOptIn;
 
-    if (!clientWatchedFolders.some(p => p.toLowerCase() === clean.toLowerCase())) {
+    const alreadyInClient = clientWatchedFolders.some(p => p.toLowerCase() === clean.toLowerCase());
+    if (!alreadyInClient) {
       clientWatchedFolders.push(clean);
       saveClientWatchedFolders();
     }
@@ -5217,8 +5401,13 @@ function secureRandomIndex(n) {
       });
       const resData = await resp.json().catch(() => ({}));
       if (!resp.ok) {
+        if (!alreadyInClient) {
+          clientWatchedFolders = clientWatchedFolders.filter(p => p.toLowerCase() !== clean.toLowerCase());
+          saveClientWatchedFolders();
+        }
+        renderSettingsTabContent(activeSettingsTab, '');
         showSettingsToast('⚠ ' + (resData.error || 'Failed to index folder'));
-        return;
+        return false;
       }
       await Promise.all([
         fetchMarketplaceData(),
@@ -5227,8 +5416,15 @@ function secureRandomIndex(n) {
       checkReindexStatus();
       renderSettingsTabContent(activeSettingsTab, '');
       showSettingsToast(`✓ Watching & indexing folder: ${clean}`);
+      return true;
     } catch (err) {
+      if (!alreadyInClient) {
+        clientWatchedFolders = clientWatchedFolders.filter(p => p.toLowerCase() !== clean.toLowerCase());
+        saveClientWatchedFolders();
+        renderSettingsTabContent(activeSettingsTab, '');
+      }
       showSettingsToast('⚠ Folder indexing error: ' + err.message);
+      return false;
     }
   };
 
@@ -5244,84 +5440,154 @@ function secureRandomIndex(n) {
   window.quorumShareFolder = async function(pathStr) {
     if (!pathStr || !pathStr.trim()) {
       showSettingsToast('Please enter or select a folder path to share');
-      return;
+      return false;
     }
-    const resp = await fetch('/api/mesh/shared-folders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'add', path: pathStr.trim(), enabled: true, access_tier: 0 })
-    });
-    const res = await resp.json().catch(() => ({}));
-    if (!resp.ok) {
-      showSettingsToast('⚠ ' + (res.error || 'Failed to share folder'));
-      return;
+    try {
+      const resp = await fetch('/api/mesh/shared-folders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'add', path: pathStr.trim(), enabled: true, access_tier: 0 })
+      });
+      const res = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showSettingsToast('⚠ ' + (res.error || 'Failed to share folder'));
+        renderSettingsTabContent(activeSettingsTab, '');
+        return false;
+      }
+      await loadFullSettings();
+      await fetchBrowseFolders(currentBrowsePath);
+      checkReindexStatus();
+      renderSettingsTabContent('mesh', '');
+      showSettingsToast('✓ Shared & indexing folder: ' + pathStr.trim());
+      return true;
+    } catch (err) {
+      showSettingsToast('⚠ Failed to share folder: ' + err.message);
+      return false;
     }
-    await loadFullSettings();
-    await fetchBrowseFolders(currentBrowsePath);
-    checkReindexStatus();
-    renderSettingsTabContent('mesh', '');
-    showSettingsToast('✓ Shared & indexing folder: ' + pathStr.trim());
   };
 
   window.quorumRemoveSharedFolder = async function(pathStr) {
-    await fetch('/api/mesh/shared-folders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'remove', path: pathStr })
-    });
-    await loadFullSettings();
-    await fetchBrowseFolders(currentBrowsePath);
-    renderSettingsTabContent('mesh', '');
-    showSettingsToast('Removed folder from Mesh sharing: ' + pathStr);
+    try {
+      const resp = await fetch('/api/mesh/shared-folders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'remove', path: pathStr })
+      });
+      const res = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showSettingsToast('⚠ ' + (res.error || `Failed to remove shared folder (HTTP ${resp.status})`));
+        renderSettingsTabContent('mesh', '');
+        return false;
+      }
+      await loadFullSettings();
+      await fetchBrowseFolders(currentBrowsePath);
+      renderSettingsTabContent('mesh', '');
+      showSettingsToast('Removed folder from Mesh sharing: ' + pathStr);
+      return true;
+    } catch (err) {
+      showSettingsToast('⚠ Failed to remove shared folder: ' + err.message);
+      renderSettingsTabContent('mesh', '');
+      return false;
+    }
   };
 
   window.quorumToggleSharedFolder = async function(pathStr, enabled) {
-    await fetch('/api/mesh/shared-folders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'toggle', path: pathStr, enabled: Boolean(enabled) })
-    });
-    await loadFullSettings();
-    await fetchBrowseFolders(currentBrowsePath);
-    checkReindexStatus();
-    renderSettingsTabContent('mesh', '');
-    showSettingsToast(enabled ? ('✓ Enabled Mesh sharing for ' + pathStr) : ('Paused Mesh sharing for ' + pathStr));
+    try {
+      const resp = await fetch('/api/mesh/shared-folders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'toggle', path: pathStr, enabled: Boolean(enabled) })
+      });
+      const res = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showSettingsToast('⚠ ' + (res.error || `Failed to toggle Mesh folder (HTTP ${resp.status})`));
+        renderSettingsTabContent('mesh', '');
+        return false;
+      }
+      await loadFullSettings();
+      await fetchBrowseFolders(currentBrowsePath);
+      checkReindexStatus();
+      renderSettingsTabContent('mesh', '');
+      showSettingsToast(enabled ? ('✓ Enabled Mesh sharing for ' + pathStr) : ('Paused Mesh sharing for ' + pathStr));
+      return true;
+    } catch (err) {
+      showSettingsToast('⚠ Failed to toggle Mesh folder: ' + err.message);
+      renderSettingsTabContent('mesh', '');
+      return false;
+    }
   };
 
   window.quorumUpdateFolderPolicy = async function(pathStr, accessTier, dlpModeOverride) {
-    await fetch('/api/mesh/shared-folders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'update',
-        path: pathStr,
-        access_tier: Number(accessTier),
-        dlp_mode_override: dlpModeOverride
-      })
-    });
-    await loadFullSettings();
-    renderSettingsTabContent('mesh', '');
-    showSettingsToast('✓ Updated Mesh policy for ' + pathStr);
+    try {
+      const resp = await fetch('/api/mesh/shared-folders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'update',
+          path: pathStr,
+          access_tier: Number(accessTier),
+          dlp_mode_override: dlpModeOverride
+        })
+      });
+      const res = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showSettingsToast('⚠ ' + (res.error || `Failed to update Mesh policy (HTTP ${resp.status})`));
+        renderSettingsTabContent('mesh', '');
+        return false;
+      }
+      await loadFullSettings();
+      renderSettingsTabContent('mesh', '');
+      showSettingsToast('✓ Updated Mesh policy for ' + pathStr);
+      return true;
+    } catch (err) {
+      showSettingsToast('⚠ Failed to update Mesh policy: ' + err.message);
+      renderSettingsTabContent('mesh', '');
+      return false;
+    }
   };
 
   window.quorumUpdateMeshConfig = async function(payload) {
-    await fetch('/api/mesh/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    await loadFullSettings();
-    renderSettingsTabContent(activeSettingsTab, '');
+    try {
+      const resp = await fetch('/api/mesh/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const res = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showSettingsToast('⚠ ' + (res.error || `Failed to update Mesh config (HTTP ${resp.status})`));
+        renderSettingsTabContent(activeSettingsTab, '');
+        return false;
+      }
+      await loadFullSettings();
+      renderSettingsTabContent(activeSettingsTab, '');
+      return true;
+    } catch (err) {
+      showSettingsToast('⚠ Mesh config error: ' + err.message);
+      return false;
+    }
   };
 
   window.quorumUpdateDlpPolicy = async function(payload) {
-    await fetch('/api/dlp/policy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    await loadFullSettings();
-    renderSettingsTabContent('dlp', '');
+    try {
+      const resp = await fetch('/api/dlp/policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const res = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showSettingsToast('⚠ ' + (res.error || `Failed to update DLP policy (HTTP ${resp.status})`));
+        renderSettingsTabContent('dlp', '');
+        return false;
+      }
+      await loadFullSettings();
+      renderSettingsTabContent('dlp', '');
+      return true;
+    } catch (err) {
+      showSettingsToast('⚠ DLP policy error: ' + err.message);
+      return false;
+    }
   };
 
   window.quorumRunDlpTest = async function() {
@@ -5436,13 +5702,16 @@ function secureRandomIndex(n) {
       toast.id = 'quorum-settings-toast';
       toast.setAttribute('role', 'status');
       toast.setAttribute('aria-live', 'polite');
-      toast.style.cssText = 'position:fixed; bottom:24px; right:24px; z-index:250000; pointer-events:none; background:var(--accent, #10a37f); color:#fff; padding:10px 18px; border-radius:999px; font-size:13px; font-weight:600; box-shadow:0 6px 20px rgba(0,0,0,0.45); transition:opacity 0.2s ease;';
+      toast.style.cssText = 'position:fixed; bottom:78px; right:24px; z-index:250000; pointer-events:none; background:var(--accent, #10a37f); color:#fff; padding:10px 18px; border-radius:999px; font-size:13px; font-weight:600; max-width:min(540px, calc(100vw - 48px)); box-shadow:0 6px 20px rgba(0,0,0,0.45); transition:opacity 0.2s ease;';
       document.body.appendChild(toast);
     }
+    const text = String(msg || '');
+    const isWarn = text.startsWith('⚠');
+    toast.style.background = isWarn ? '#dc2626' : 'var(--accent, #10a37f)';
     clearTimeout(window._quorumToastTimer);
     clearTimeout(window._quorumToastClearTimer);
     toast.style.display = 'block';
-    toast.textContent = msg;
+    toast.textContent = text;
     toast.style.opacity = '1';
     window._quorumToastTimer = setTimeout(() => {
       if (toast) toast.style.opacity = '0';
@@ -5452,7 +5721,7 @@ function secureRandomIndex(n) {
           toast.style.display = 'none';
         }
       }, 240);
-    }, 2600);
+    }, isWarn ? 4500 : 2800);
   }
 
   // State caches for Mesh & TPM subsystem
@@ -5657,6 +5926,7 @@ function secureRandomIndex(n) {
           e.preventDefault();
           e.stopPropagation();
           const ctx = actionEl.dataset.context || 'general';
+          pendingCloudDriveAutoEnableId = '';
           if (ctx === 'cloud-drives') {
             const driveId = actionEl.dataset.driveId || '';
             if (driveId && cloudDrivesBusyIds.has(driveId)) {
@@ -5664,6 +5934,8 @@ function secureRandomIndex(n) {
               return;
             }
             pendingCloudDrivePickerId = driveId;
+          } else {
+            pendingCloudDrivePickerId = '';
           }
           await window.openPureRustFolderPicker(ctx, '', actionEl);
           break;
@@ -6805,36 +7077,55 @@ function secureRandomIndex(n) {
           const mkt = cachedMarketplaceStatus || {};
           const curFolders = (Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders : [])
             .filter(f => f.toLowerCase() !== targetPath.toLowerCase());
-          await fetch('/api/v1/marketplace/opt-in', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              opt_in_enabled: !!mkt.opt_in_enabled,
-              user_consent_checked: !!mkt.user_consent_checked,
-              opt_in_folders: curFolders
-            })
-          });
-          await fetchMarketplaceData();
-          renderSettingsTabContent(activeSettingsTab, '');
-          showSettingsToast('Removed folder from Opt-In scope: ' + targetPath);
+          try {
+            const resp = await fetch('/api/v1/marketplace/opt-in', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                opt_in_enabled: !!mkt.opt_in_enabled,
+                user_consent_checked: !!mkt.user_consent_checked,
+                opt_in_folders: curFolders
+              })
+            });
+            const resData = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              showSettingsToast('⚠ ' + (resData.error || `Failed to remove Opt-In folder (HTTP ${resp.status})`));
+              renderSettingsTabContent(activeSettingsTab, '');
+              break;
+            }
+            await fetchMarketplaceData();
+            renderSettingsTabContent(activeSettingsTab, '');
+            showSettingsToast('Removed folder from Opt-In scope: ' + targetPath);
+          } catch (err) {
+            showSettingsToast('⚠ Failed to remove Opt-In folder: ' + err.message);
+          }
           break;
         }
 
         case 'mkt-clear-all-folders': {
           e.preventDefault();
           const mkt = cachedMarketplaceStatus || {};
-          await fetch('/api/v1/marketplace/opt-in', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              opt_in_enabled: !!mkt.opt_in_enabled,
-              user_consent_checked: !!mkt.user_consent_checked,
-              opt_in_folders: []
-            })
-          });
-          await fetchMarketplaceData();
-          renderSettingsTabContent(activeSettingsTab, '');
-          showSettingsToast('Cleared all selected Opt-In folders');
+          try {
+            const resp = await fetch('/api/v1/marketplace/opt-in', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                opt_in_enabled: !!mkt.opt_in_enabled,
+                user_consent_checked: !!mkt.user_consent_checked,
+                opt_in_folders: []
+              })
+            });
+            const resData = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              showSettingsToast('⚠ ' + (resData.error || `Failed to clear Opt-In folders (HTTP ${resp.status})`));
+              break;
+            }
+            await fetchMarketplaceData();
+            renderSettingsTabContent(activeSettingsTab, '');
+            showSettingsToast('Cleared all selected Opt-In folders');
+          } catch (err) {
+            showSettingsToast('⚠ Failed to clear Opt-In folders: ' + err.message);
+          }
           break;
         }
 
@@ -7207,6 +7498,8 @@ function secureRandomIndex(n) {
             showSettingsToast(`✓ Added & indexed ${resData.added_count || files.length} new document(s)`);
           } catch (err) {
             showSettingsToast('⚠ Upload failed: ' + err.message);
+          } finally {
+            changeEl.value = '';
           }
           break;
         }
@@ -7349,16 +7642,26 @@ function secureRandomIndex(n) {
           const nextEnabled = !!changeEl.checked;
           const prevDrives = (cachedCloudDrivesData && Array.isArray(cachedCloudDrivesData.drives)) ? cachedCloudDrivesData.drives : [];
           const drv = prevDrives.find(d => d && d.id === driveId) || {};
+          const customPaths = Array.isArray(drv.custom_paths) ? drv.custom_paths : [];
+          if (nextEnabled && !drv.mounted && customPaths.length === 0) {
+            changeEl.checked = !nextEnabled;
+            pendingCloudDrivePickerId = driveId;
+            pendingCloudDriveAutoEnableId = driveId;
+            showSettingsToast(`ℹ ${drv.label || driveId} is not mounted on disk — select a local sync folder to enable auto-indexing.`);
+            await window.openPureRustFolderPicker('cloud-drives', '', changeEl);
+            break;
+          }
           cloudDrivesBusyIds.add(driveId);
           setCloudDriveCardBusyState(driveId, true);
           changeEl.disabled = true;
           try {
+            const safeRootPath = (drv.mounted && drv.root_path) ? drv.root_path : null;
             const res = await postCloudDrivesConfig({
               action: 'toggle_drive',
               id: driveId,
               enabled: nextEnabled,
               access_tier: Number(drv.access_tier ?? DEFAULT_CLOUD_DRIVES_POLICY.default_access_tier),
-              root_path: drv.root_path || null
+              root_path: safeRootPath
             });
             if (!res.ok) {
               changeEl.checked = !nextEnabled;
@@ -7368,7 +7671,7 @@ function secureRandomIndex(n) {
             }
             if (typeof checkReindexStatus === 'function' && nextEnabled) checkReindexStatus();
             if (nextEnabled) {
-              showSettingsToast(`✓ Enabled ${drv.label || driveId} indexing`);
+              showSettingsToast(`✓ Enabled ${drv.label || driveId} — real-time watch & auto-indexing started`);
             } else {
               const pf = Number((res.data && res.data.purged_files) || 0);
               const pc = Number((res.data && res.data.purged_chunks) || 0);
@@ -7401,11 +7704,9 @@ function secureRandomIndex(n) {
           setCloudDriveCardBusyState(driveId, true);
           try {
             const res = await postCloudDrivesConfig({
-              action: 'toggle_drive',
+              action: 'set_tier',
               id: driveId,
-              enabled: Boolean(drv.enabled),
-              access_tier: nextTier,
-              root_path: drv.root_path || null
+              access_tier: nextTier
             });
             if (!res.ok) {
               changeEl.value = String(prevTier);
@@ -7438,17 +7739,16 @@ function secureRandomIndex(n) {
           setCloudDriveCardBusyState(driveId, true);
           try {
             const res = await postCloudDrivesConfig({
-              action: 'toggle_drive',
+              action: 'set_root',
               id: driveId,
-              enabled: Boolean(drv.enabled),
-              access_tier: Number(drv.access_tier ?? DEFAULT_CLOUD_DRIVES_POLICY.default_access_tier),
-              root_path: nextRoot || null
+              root_path: nextRoot
             });
             if (!res.ok) {
               changeEl.value = prevRoot;
               showSettingsToast('⚠ ' + (res.error || 'Failed to select cloud drive sync root'));
               break;
             }
+            if (typeof checkReindexStatus === 'function' && drv.enabled) checkReindexStatus();
             showSettingsToast(`✓ Updated sync root for ${drv.label || driveId}`);
           } finally {
             cloudDrivesBusyIds.delete(driveId);
@@ -8981,7 +9281,10 @@ function secureRandomIndex(n) {
               parentPath: currentBrowseParentPath,
               drives: cachedDrives,
               directories: cachedBrowseDirs,
-              selectedSet: new Set(sharedFolders.filter(f => f.enabled).map(f => String(f.path || '').toLowerCase())),
+              selectedSet: new Set(sharedFolders.filter(f => f.enabled).flatMap(f => {
+                const s = String(f.path || '').toLowerCase();
+                return s ? [s, s.replace(/[\\/]+$/, '')] : [];
+              })),
               selectAction: 'share-folder',
               selectButtonText: '+ Share Folder',
               activePathAction: 'share-folder',
@@ -9695,7 +9998,7 @@ function secureRandomIndex(n) {
                   parentPath: currentBrowseParentPath,
                   drives: cachedDrives,
                   directories: cachedBrowseDirs,
-                  selectedSet: new Set(curSelectedDir ? [curSelectedDir.toLowerCase()] : []),
+                  selectedSet: new Set(curSelectedDir ? [curSelectedDir.toLowerCase(), curSelectedDir.replace(/[\\/]+$/, '').toLowerCase()] : []),
                   selectAction: 'artemis-pick-folder',
                   selectButtonText: '+ Select Forensic Folder',
                   activePathAction: 'artemis-pick-folder',
@@ -10394,7 +10697,7 @@ function secureRandomIndex(n) {
           </div>
         `;
       } else {
-        const cards = drives.map((drv) => {
+        const renderCloudDriveCard = (drv) => {
           const drvId = String(drv.id || '');
           const providerKey = String(drv.provider || drvId);
           const meta = CLOUD_DRIVE_PROVIDER_META[drvId] || CLOUD_DRIVE_PROVIDER_META[providerKey] || { label: drvId, icon: '☁️' };
@@ -10433,7 +10736,10 @@ function secureRandomIndex(n) {
               </div>
             `;
           } else {
-            rootHtml = `<div class="cloud-drive-path-line">Sync Root: <code>${escapeHtml(drv.root_path || 'Not detected automatically')}</code></div>`;
+            const fallbackRootText = customPaths.length > 0
+              ? `${customPaths.length} custom folder(s) selected`
+              : 'Not mounted on this computer';
+            rootHtml = `<div class="cloud-drive-path-line">Sync Root: <code>${escapeHtml(drv.root_path || fallbackRootText)}</code></div>`;
           }
 
           let sessionNoticeHtml = '';
@@ -10480,21 +10786,53 @@ function secureRandomIndex(n) {
                 </div>
               </div>
               <div style="font-size:12px; color:var(--text-muted);">
-                Local-only by default — never shared over P2P Mesh unless explicitly added in Mesh &amp; Shared Folders with Tier &lt; 3. Disabling purges this drive's indexed chunks and AtlasKV triples.
+                ${isEnabled ? 'Auto-indexing &amp; real-time watch active via the full QuorumRAG indexing stack (OCR, Vision, BM25, Vector, AtlasKV, DriftHealer). ' : ''}Local-only by default — never shared over P2P Mesh unless explicitly added in Mesh &amp; Shared Folders with Tier &lt; 3. Disabling purges this drive's indexed chunks and AtlasKV triples.
               </div>
               ${sessionNoticeHtml}
               ${customFoldersHtml}
             </div>
           `;
-        }).join('');
+        };
+
+        const detectedDrives = drives.filter((drv) => {
+          if (!drv) return false;
+          const hasCustom = Array.isArray(drv.custom_paths) && drv.custom_paths.length > 0;
+          return Boolean(drv.mounted || drv.session_only || drv.enabled || hasCustom);
+        });
+        const unmountedDrives = drives.filter((drv) => drv && !detectedDrives.includes(drv));
+
+        const detectedCardsHtml = detectedDrives.length > 0
+          ? detectedDrives.map(renderCloudDriveCard).join('')
+          : `
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">No cloud drive mount points detected on this computer.</span>
+                <div class="settings-row-desc">QuorumRAG queried live mount points on this computer and only lists cloud drives that exist locally. Mount a cloud drive client and click Refresh Discovery, or expand below to link a custom local folder.</div>
+              </div>
+            </div>
+          `;
+
+        const unmountedDisclosureHtml = unmountedDrives.length > 0
+          ? `
+            <details class="cloud-drive-unmounted-details" style="margin-top:12px; border:1px solid var(--border-color); border-radius:10px; padding:10px 14px; background:rgba(255,255,255,0.02);">
+              <summary style="cursor:pointer; font-size:12.5px; font-weight:600; color:var(--text-muted); user-select:none;">
+                ➕ Other Cloud Providers Not Mounted on This Computer (${unmountedDrives.length}) — Link Custom Folder Manually
+              </summary>
+              <div style="margin-top:12px; display:flex; flex-direction:column; gap:10px;">
+                ${unmountedDrives.map(renderCloudDriveCard).join('')}
+              </div>
+            </details>
+          `
+          : '';
 
         drivesSectionHtml = `
           <div class="settings-card">
             <div class="settings-card-title">
-              <span>☁️ Discovered &amp; Opt-In Cloud Sync Providers</span>
+              <span>☁️ Mounted Cloud Drives on This Computer (${detectedDrives.length})</span>
               <button type="button" class="pill-btn" data-action="cloud-drive-refresh">🔄 Refresh Discovery</button>
             </div>
-            ${cards}
+            ${detectedCardsHtml}
+            ${unmountedDisclosureHtml}
           </div>
         `;
       }
