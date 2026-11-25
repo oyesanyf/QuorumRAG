@@ -1194,12 +1194,15 @@ pub async fn build_cloud_drives_status_response_with_context(
     } = ctx;
 
     let storage = Arc::clone(&state.storage);
-    let catalog_identities =
-        tokio::task::spawn_blocking(move || storage.list_catalog_file_identities())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+    let catalog_identities = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || storage.list_catalog_file_identities()),
+    )
+    .await
+    .ok()
+    .and_then(|res| res.ok())
+    .and_then(Result::ok)
+    .unwrap_or_default();
 
     let controller = global_mesh_dlp_controller();
     reconcile_discovered_cloud_drives(&controller, &discovered);
@@ -1213,6 +1216,43 @@ pub async fn build_cloud_drives_status_response_with_context(
     };
 
     let entries = merged_entries_in_order(&settings, &discovered);
+
+    // Offload all filesystem / Session-1 bridge directory existence probes off the Tokio async
+    // worker pool in one deduplicated blocking pass so slow virtual drives never starve HTTP handlers.
+    let mut probe_paths: Vec<String> = Vec::new();
+    let mut seen_probe_paths: HashSet<String> = HashSet::new();
+    for entry in &entries {
+        let disc_opt = discovered
+            .iter()
+            .find(|d| d.id.eq_ignore_ascii_case(&entry.id));
+        let root_path = entry.root_path.clone().or_else(|| {
+            disc_opt
+                .and_then(|d| d.root_path.as_ref())
+                .map(|p| p.to_string_lossy().to_string())
+        });
+        if let Some(rp) = root_path {
+            if seen_probe_paths.insert(rp.clone()) {
+                probe_paths.push(rp);
+            }
+        }
+        for cp in &entry.custom_paths {
+            if seen_probe_paths.insert(cp.clone()) {
+                probe_paths.push(cp.clone());
+            }
+        }
+    }
+    let live_dir_map: std::collections::HashMap<String, bool> =
+        tokio::task::spawn_blocking(move || {
+            let mut map = std::collections::HashMap::with_capacity(probe_paths.len());
+            for rp in probe_paths {
+                let exists = dir_exists_live(Path::new(&rp));
+                map.insert(rp, exists);
+            }
+            map
+        })
+        .await
+        .unwrap_or_default();
+
     let mut drive_dtos = Vec::with_capacity(entries.len());
     let mut any_session_only = false;
 
@@ -1238,11 +1278,11 @@ pub async fn build_cloud_drives_status_response_with_context(
 
         let root_exists_on_disk = root_path
             .as_deref()
-            .is_some_and(|rp| dir_exists_live(Path::new(rp)));
+            .is_some_and(|rp| live_dir_map.get(rp).copied().unwrap_or(false));
         let custom_exists_on_disk = entry
             .custom_paths
             .iter()
-            .any(|cp| dir_exists_live(Path::new(cp)));
+            .any(|cp| live_dir_map.get(cp).copied().unwrap_or(false));
 
         let disc_mounted = disc_opt.is_some_and(|d| d.mounted) && root_exists_on_disk;
         let mounted = disc_mounted || root_exists_on_disk || custom_exists_on_disk;

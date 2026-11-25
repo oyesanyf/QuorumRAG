@@ -221,7 +221,7 @@ fn test_cloud_drives_api_endpoints_and_delegated_actions() {
     let (_html, js, _css) = normalized_assets();
 
     assert!(
-        js.contains("fetch('/api/cloud-drives')")
+        (js.contains("fetchWithTimeout('/api/cloud-drives'") || js.contains("fetch('/api/cloud-drives')"))
             && js.contains("fetch('/api/cloud-drives/config'")
             && js.contains("fetch('/api/cloud-drives/reindex'"),
         "app.js must call GET /api/cloud-drives, POST /api/cloud-drives/config, and POST /api/cloud-drives/reindex"
@@ -547,5 +547,31 @@ fn test_folder_picker_select_and_unselect_any_folder_controls() {
             && css.contains(".folder-checkbox-hit")
             && css.contains(".folder-row-checkbox:focus-visible"),
         "styles.css must style the selected-folders chip bar, checkbox hit target, and :focus-visible ring"
+    );
+}
+
+#[test]
+fn test_single_flight_status_polling_and_bounded_cloud_drives_fetch() {
+    let (_html, js, _css) = normalized_assets();
+
+    assert!(
+        js.contains("let reindexStatusInFlight = false;")
+            && js.contains("if (reindexStatusInFlight) return;")
+            && js.contains("fetchWithTimeout('/api/reindex/status', {}, 5000)"),
+        "checkReindexStatus must be single-flight guarded with a bounded timeout so it never exhausts Chrome's HTTP/1.1 pool"
+    );
+    assert!(
+        js.contains("let cacheStatsInFlight = false;")
+            && js.contains("if (cacheStatsInFlight) return;")
+            && js.contains("fetchWithTimeout('/api/cache/stats', {}, 5000)"),
+        "refreshCacheStats must be single-flight guarded with a bounded timeout"
+    );
+    assert!(
+        js.contains("fetchWithTimeout('/api/cloud-drives', {}, 15000)"),
+        "fetchCloudDrivesData must enforce a bounded timeout so Cloud Drives never stays stuck loading forever"
+    );
+    assert!(
+        !js.contains("setInterval(checkReindexStatus, 2000)"),
+        "app.js must not run a second unguarded setInterval(checkReindexStatus, 2000) alongside pollReindexProgress"
     );
 }

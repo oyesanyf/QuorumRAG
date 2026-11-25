@@ -794,6 +794,11 @@ impl StorageEngine {
         self.vector_store.count().await
     }
 
+    /// Lock-free / 200ms-bounded chunk count for high-frequency UI polling endpoints.
+    pub async fn count_fast(&self) -> usize {
+        self.vector_store.count_fast().await
+    }
+
     /// Whether storage is currently empty.
     pub async fn is_empty(&self) -> Result<bool, StorageError> {
         Ok(self.count().await? == 0)
