@@ -10,6 +10,7 @@ pub mod handlers;
 pub mod nimble_provisioner;
 pub mod p2p_watcher;
 pub mod server;
+pub mod session_bridge_server;
 pub mod shutdown;
 pub mod state;
 pub mod wan_mesh;
@@ -97,6 +98,23 @@ fn init_tracing(cli: &Cli) {
 }
 
 pub fn main() -> anyhow::Result<()> {
+    // Fast-path interactive Session-1 filesystem bridge entrypoint (`quorumrag --session-fs-bridge
+    // --parent-pid <pid>`), used as a zero-dependency fallback if `quorum-desktop.exe` is absent or
+    // blocked by OS Application Control policy. Runs before Tokio/tracing/console init so stdio pipes
+    // stay clean and memory footprint stays minimal.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.iter().any(|a| a == "--session-fs-bridge") {
+        let parent_pid = raw_args
+            .windows(2)
+            .find_map(|w| {
+                (w[0] == "--parent-pid")
+                    .then(|| w[1].trim().parse::<u32>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        std::process::exit(session_bridge_server::run_session_fs_bridge(parent_pid));
+    }
+
     let cli = Cli::parse();
     #[cfg(windows)]
     detach_and_hide_windows_console(&cli);
@@ -1759,32 +1777,55 @@ fn ensure_win_session_fs_bridge() -> bool {
         return false;
     }
     if let Ok(cur_exe) = std::env::current_exe() {
+        // Prefer spawning our own already-running executable (`quorumrag.exe --session-fs-bridge`)
+        // first: because it is already executing under OS policy, Windows 11 Smart App Control
+        // never blocks it or triggers a desktop toast popup (unlike small 1 MB self-signed helper
+        // binaries), and Windows demand-paging keeps bridge RSS minimal before Tokio/DB init.
+        // Fall back to sibling `quorum-desktop.exe` if needed.
+        let mut candidates: Vec<std::path::PathBuf> = Vec::with_capacity(2);
+        if cur_exe.is_file() {
+            candidates.push(cur_exe.clone());
+        }
         if let Some(dir) = cur_exe.parent() {
             let desktop_exe = dir.join("quorum-desktop.exe");
-            if desktop_exe.is_file() {
-                let token = format!(
-                    "{}{}",
-                    uuid::Uuid::new_v4().simple(),
-                    uuid::Uuid::new_v4().simple()
-                );
-                match win_native::spawn_session_fs_bridge(&desktop_exe, &token) {
-                    Ok((port, session_id, child_pid)) => {
-                        quorum_types::session_fs_bridge::set_bridge_endpoint(
-                            port, token, session_id, child_pid,
-                        );
-                        info!(
-                            port,
-                            session_id,
-                            child_pid,
-                            "Attached silent Session-1 filesystem bridge for interactive cloud drives (Google Drive / pCloud)"
-                        );
-                        return true;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Session-1 filesystem bridge not yet available");
-                    }
+            if desktop_exe.is_file() && !candidates.iter().any(|p| p == &desktop_exe) {
+                candidates.push(desktop_exe);
+            }
+        }
+
+        let mut last_err: Option<String> = None;
+        for bridge_exe in candidates {
+            let token = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            match win_native::spawn_session_fs_bridge(&bridge_exe, &token) {
+                Ok((port, session_id, child_pid)) => {
+                    quorum_types::session_fs_bridge::set_bridge_endpoint(
+                        port, token, session_id, child_pid,
+                    );
+                    info!(
+                        port,
+                        session_id,
+                        child_pid,
+                        binary = %bridge_exe.display(),
+                        "Attached silent Session-1 filesystem bridge for interactive cloud drives (Google Drive / pCloud)"
+                    );
+                    return true;
+                }
+                Err(e) => {
+                    warn!(
+                        binary = %bridge_exe.display(),
+                        error = %e,
+                        "Session-1 filesystem bridge candidate unavailable; trying fallback if present"
+                    );
+                    last_err = Some(e);
                 }
             }
+        }
+        if let Some(e) = last_err {
+            warn!(error = %e, "Session-1 filesystem bridge not yet available");
         }
     }
     false
