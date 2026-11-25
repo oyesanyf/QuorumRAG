@@ -149,7 +149,30 @@ pub fn canonicalize_for_cloud_filter(path: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    if let Ok(canon) = std::fs::canonicalize(path) {
+    if !is_test_profile_override_active() {
+        match quorum_types::session_fs_bridge::local_canonicalize_bounded(
+            path,
+            Duration::from_millis(2000),
+        ) {
+            Ok(Some(canon)) => {
+                let clean = strip_windows_drive_verbatim_prefix(&canon);
+                let clean_str = clean.to_string_lossy();
+                if normalize_prefix_for_match(&clean_str).is_ok() {
+                    return Some(clean);
+                }
+                return None;
+            }
+            Err(_) => {
+                // Virtual drive is currently busy/timed out; avoid blocking on fallback syscalls.
+                let clean = strip_windows_drive_verbatim_prefix(path);
+                if normalize_prefix_for_match(&clean.to_string_lossy()).is_ok() {
+                    return Some(clean);
+                }
+                return None;
+            }
+            Ok(None) => {}
+        }
+    } else if let Ok(canon) = std::fs::canonicalize(path) {
         let clean = strip_windows_drive_verbatim_prefix(&canon);
         let clean_str = clean.to_string_lossy();
         if normalize_prefix_for_match(&clean_str).is_ok() {
@@ -354,11 +377,17 @@ pub fn collect_disabled_cloud_roots(
 /// Returns true when `path` is a live directory on local disk or via the active Session-1 bridge
 /// (respecting `QUORUM_CLOUD_TEST_PROFILE_DIR` hermetic test isolation).
 fn dir_exists_live(path: &Path) -> bool {
-    if path.is_dir() {
-        return true;
-    }
     if is_test_profile_override_active() {
-        return false;
+        return path.is_dir();
+    }
+    match quorum_types::session_fs_bridge::local_is_dir_bounded(
+        path,
+        false,
+        Duration::from_millis(2000),
+    ) {
+        Ok(true) => return true,
+        Err(_) => return false,
+        Ok(false) => {}
     }
     quorum_types::session_fs_bridge::stat_via_bridge(path)
         .is_some_and(|st| st.exists && st.is_dir)
@@ -835,7 +864,10 @@ pub fn reconcile_discovered_cloud_drives(
                     .root_path
                     .as_deref()
                     .is_some_and(|rp| dir_exists_live(Path::new(rp.trim())));
-                if disc_root.is_some() && (!existing_root_valid || existing.root_path.is_none()) {
+                if disc_root.is_some()
+                    && existing.custom_paths.is_empty()
+                    && (!existing_root_valid || existing.root_path.is_none())
+                {
                     existing.root_path = disc_root;
                     changed = true;
                 } else if !existing.enabled
@@ -1065,7 +1097,7 @@ fn merged_entries_in_order(
             .find(|e| e.id.eq_ignore_ascii_case(&disc.id))
         {
             let mut merged = existing.clone();
-            if merged.root_path.is_none() {
+            if merged.root_path.is_none() && merged.custom_paths.is_empty() {
                 merged.root_path = disc
                     .root_path
                     .as_ref()
@@ -1114,7 +1146,7 @@ pub async fn build_cloud_drives_status_response(
         .await
         .unwrap_or_default();
 
-    let session_hints = if !test_override && (local_system || session_zero) {
+    let session_hints = if !test_override {
         tokio::task::spawn_blocking(probe_session_virtual_drive_hints)
             .await
             .unwrap_or_default()
@@ -1230,7 +1262,14 @@ pub async fn build_cloud_drives_status_response_with_context(
                 .find(|rd| rd.id.eq_ignore_ascii_case(&entry.id))
         });
 
+        let hinted_root_for_timeout = root_path
+            .as_deref()
+            .or_else(|| session_hint_match.map(|h| h.root_path.as_str()));
+        let root_timeout_msg = hinted_root_for_timeout
+            .and_then(|rp| quorum_types::session_fs_bridge::drive_timeout_message(Path::new(rp)));
+
         let is_session_scoped = !mounted
+            && root_timeout_msg.is_none()
             && allow_session_only_eval
             && (local_system || session_zero)
             && (session_hint_match.is_some() || relay_match.is_some());
@@ -1248,6 +1287,16 @@ pub async fn build_cloud_drives_status_response_with_context(
                     false,
                     None,
                     effective_root,
+                    true,
+                )
+            } else if let Some(busy_msg) = root_timeout_msg {
+                let busy_root = root_path.or_else(|| session_hint_match.map(|h| h.root_path.clone()));
+                (
+                    CloudDriveMountStatus::Error,
+                    disc_virtual,
+                    false,
+                    Some(busy_msg),
+                    busy_root,
                     true,
                 )
             } else if is_session_scoped {
@@ -1759,6 +1808,11 @@ pub async fn update_cloud_drives_config_handler(
                 );
             };
             if !dir_exists_live(&clean_p) {
+                if let Some(busy_msg) =
+                    quorum_types::session_fs_bridge::drive_timeout_message(&clean_p)
+                {
+                    return error_response(StatusCode::GATEWAY_TIMEOUT, busy_msg);
+                }
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     format!("Folder does not exist on disk: {}", clean_p.display()),
@@ -1840,11 +1894,24 @@ pub async fn update_cloud_drives_config_handler(
             next.drives[idx].custom_paths.retain(|existing| {
                 normalize_prefix_for_match(existing).ok().as_deref() != Some(norm_target.as_str())
             });
-            if next.drives[idx].custom_paths.len() == before_len {
+            let removed_custom = next.drives[idx].custom_paths.len() < before_len;
+            let mut removed_root = false;
+            if let Some(ref existing_root) = next.drives[idx].root_path {
+                if normalize_prefix_for_match(existing_root).ok().as_deref()
+                    == Some(norm_target.as_str())
+                {
+                    next.drives[idx].root_path = None;
+                    removed_root = true;
+                }
+            }
+            if !removed_custom && !removed_root {
                 return error_response(
                     StatusCode::NOT_FOUND,
                     "Folder path is not configured on this cloud drive",
                 );
+            }
+            if next.drives[idx].root_path.is_none() && next.drives[idx].custom_paths.is_empty() {
+                next.drives[idx].enabled = false;
             }
 
             is_purge_action = true;

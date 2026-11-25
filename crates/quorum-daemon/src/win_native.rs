@@ -1967,8 +1967,28 @@ pub fn spawn_session_fs_bridge(
             lp_overlapped: *mut c_void,
         ) -> i32;
         fn GetLastError() -> u32;
+        fn GetExitCodeProcess(h_process: *mut c_void, lp_exit_code: *mut u32) -> i32;
         fn TerminateProcess(h_process: *mut c_void, u_exit_code: u32) -> i32;
     }
+
+    static BRIDGE_KEEPALIVE_HANDLES: std::sync::OnceLock<std::sync::Mutex<Option<(usize, usize)>>> =
+        std::sync::OnceLock::new();
+    let store_bridge_keepalive = |stdin_w: *mut c_void, proc_h: *mut c_void| {
+        let cell = BRIDGE_KEEPALIVE_HANDLES.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(mut guard) = cell.lock() {
+            if let Some((old_stdin, old_proc)) = guard.replace((stdin_w as usize, proc_h as usize))
+            {
+                unsafe {
+                    if old_stdin != 0 {
+                        CloseHandle(old_stdin as *mut c_void);
+                    }
+                    if old_proc != 0 {
+                        CloseHandle(old_proc as *mut c_void);
+                    }
+                }
+            }
+        }
+    };
 
     #[link(name = "wtsapi32")]
     extern "system" {
@@ -2208,7 +2228,7 @@ pub fn spawn_session_fs_bridge(
     let mut desktop_w = wide_nul(r"winsta0\default");
     let app_w = wide_nul(&desktop_exe.to_string_lossy());
     let mut cmd_w = wide_nul(&format!(
-        "\"{}\" --session-fs-bridge --parent-pid {}",
+        "\"{}\" --session-fs-bridge --parent-pid {} --keepalive-stdin",
         desktop_exe.display(),
         std::process::id()
     ));
@@ -2269,7 +2289,7 @@ pub fn spawn_session_fs_bridge(
             GetLastError()
         }));
     }
-    let g_proc = RawHandleGuard(pi.h_process);
+    let mut g_proc = RawHandleGuard(pi.h_process);
     let _g_thread = RawHandleGuard(pi.h_thread);
 
     drop(std::mem::replace(
@@ -2292,10 +2312,6 @@ pub fn spawn_session_fs_bridge(
             null_mut(),
         )
     };
-    drop(std::mem::replace(
-        &mut g_parent_stdin_w,
-        RawHandleGuard(null_mut()),
-    ));
     if w_ok == 0 || written as usize != secret_line.len() {
         unsafe {
             TerminateProcess(g_proc.0, 1);
@@ -2303,9 +2319,10 @@ pub fn spawn_session_fs_bridge(
         return Err("failed to write bridge token to stdin pipe".to_string());
     }
 
-    let mut collected = Vec::with_capacity(128);
-    let mut chunk = [0u8; 128];
-    for _ in 0..100 {
+    let mut collected = Vec::with_capacity(256);
+    let mut chunk = [0u8; 256];
+    let mut peek_err: u32 = 0;
+    for _ in 0..160 {
         let mut avail: u32 = 0;
         let peek_ok = unsafe {
             PeekNamedPipe(
@@ -2318,6 +2335,7 @@ pub fn spawn_session_fs_bridge(
             )
         };
         if peek_ok == 0 {
+            peek_err = unsafe { GetLastError() };
             break;
         }
         if avail > 0 {
@@ -2335,7 +2353,7 @@ pub fn spawn_session_fs_bridge(
                 && got > 0
             {
                 collected.extend_from_slice(&chunk[..got as usize]);
-                if collected.contains(&b'\n') || collected.len() >= 128 {
+                if collected.contains(&b'\n') || collected.len() >= 256 {
                     break;
                 }
             }
@@ -2351,16 +2369,26 @@ pub fn spawn_session_fs_bridge(
     {
         if let Ok(port) = port_str.trim().parse::<u16>() {
             if port > 0 {
+                // Keep `parent_stdin_w` open for the exact lifetime of `QuorumRAGDaemon` so the
+                // Windows kernel delivers an instant EOF to the Session-1 bridge when the service
+                // stops or restarts (works across Session 0 LocalSystem -> unelevated Session 1).
+                let keep_stdin = std::mem::replace(&mut g_parent_stdin_w.0, null_mut());
+                let keep_proc = std::mem::replace(&mut g_proc.0, null_mut());
+                store_bridge_keepalive(keep_stdin, keep_proc);
                 return Ok((port, chosen_session, pi.dw_process_id));
             }
         }
     }
 
+    let mut exit_code: u32 = 0;
     unsafe {
+        let _ = GetExitCodeProcess(g_proc.0, &mut exit_code);
         TerminateProcess(g_proc.0, 1);
     }
     Err(format!(
-        "session-fs-bridge did not report READY <port> (got '{}')",
-        line.trim()
+        "session-fs-bridge did not report READY <port> (got '{}', exit_code=0x{:08x}, peek_err={})",
+        line.trim(),
+        exit_code,
+        peek_err
     ))
 }

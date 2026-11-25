@@ -112,7 +112,11 @@ pub fn main() -> anyhow::Result<()> {
                     .flatten()
             })
             .unwrap_or(0);
-        std::process::exit(session_bridge_server::run_session_fs_bridge(parent_pid));
+        let keepalive_stdin = raw_args.iter().any(|a| a == "--keepalive-stdin");
+        std::process::exit(session_bridge_server::run_session_fs_bridge_with_options(
+            parent_pid,
+            keepalive_stdin,
+        ));
     }
 
     let cli = Cli::parse();

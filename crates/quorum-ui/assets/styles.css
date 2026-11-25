@@ -2375,10 +2375,89 @@ input[type="checkbox"][switch]:focus-visible {
 .folder-row-checkbox {
   width: 17px;
   height: 17px;
+  inline-size: 1.15em;
+  aspect-ratio: 1;
   margin: 0;
   cursor: pointer;
   accent-color: #10a37f;
   flex-shrink: 0;
+}
+
+.folder-row-checkbox:focus-visible {
+  outline: 2px solid #10a37f;
+  outline-offset: 2px;
+}
+
+.folder-row-checkbox:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.folder-checkbox-hit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-inline-size: 32px;
+  min-block-size: 32px;
+  margin: -4px 0 -4px -4px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.folder-checkbox-hit:hover {
+  background: rgba(16, 163, 127, 0.12);
+}
+
+.picker-selected-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(16, 163, 127, 0.08);
+  border: 1px solid rgba(16, 163, 127, 0.32);
+  font-size: 11.5px;
+}
+
+.picker-selected-bar.hidden {
+  display: none;
+}
+
+.picker-selected-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  font-size: 11.5px;
+  border-color: #10a37f;
+  color: #10a37f;
+  background: rgba(16, 163, 127, 0.14);
+  max-width: 100%;
+}
+
+.picker-selected-chip:hover {
+  border-color: #ef4444;
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.14);
+}
+
+.picker-selected-chip code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+
+.folder-active-action-btn.is-unselect {
+  background: rgba(239, 68, 68, 0.16);
+  border-color: rgba(239, 68, 68, 0.5);
+  color: #fca5a5;
+}
+
+.folder-active-action-btn.is-unselect:hover {
+  background: rgba(239, 68, 68, 0.28);
 }
 
 .folder-row-icon {
@@ -2430,6 +2509,19 @@ input[type="checkbox"][switch]:focus-visible {
   border-color: #10a37f;
   color: #10a37f;
   background: rgba(16, 163, 127, 0.16);
+}
+
+.folder-select-btn.selected:hover {
+  border-color: #ef4444;
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.15);
+}
+
+.folder-select-btn:focus-visible,
+.folder-open-btn:focus-visible,
+.picker-selected-chip:focus-visible {
+  outline: 2px solid var(--accent, #10a37f);
+  outline-offset: 2px;
 }
 
 .folder-open-btn {

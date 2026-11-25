@@ -514,3 +514,38 @@ fn test_cloud_drives_concurrency_hydration_footer_and_light_theme_contrast() {
         "styles.css must provide readable light-theme overrides for cloud-drives .dlp-badge-redact"
     );
 }
+
+#[test]
+fn test_folder_picker_select_and_unselect_any_folder_controls() {
+    let (html, js, css) = normalized_assets();
+
+    assert!(
+        html.contains(r#"id="pure-rust-picker-selected-bar""#)
+            && html.contains(r#"id="btn-cancel-pure-rust-picker" class="pill-btn">Done</button>"#),
+        "index.html static Select Folder modal must include #pure-rust-picker-selected-bar and Done button"
+    );
+
+    assert!(
+        js.contains("window.quorumCloudDriveRemoveFolder = async function(")
+            && js.contains("window.togglePickedFolderInContext = async function(")
+            && js.contains("function getPickerSelectedPaths(")
+            && js.contains("function isPickerPathSelected("),
+        "app.js must expose select/unselect toggle helpers across folder picker contexts"
+    );
+    assert!(
+        js.contains(r#"id="pure-rust-picker-selected-bar""#)
+            && js.contains("data-picker-toggle=")
+            && js.contains("data-picker-unselect=")
+            && js.contains("✓ Selected — Unselect")
+            && js.contains("✕ Unselect Folder (")
+            && js.contains("✕ Unselect Active Folder"),
+        "folder picker modal and inline explorer must render explicit checkboxes, selected chips, and unselect buttons"
+    );
+    assert!(
+        css.contains(".picker-selected-bar")
+            && css.contains(".picker-selected-chip")
+            && css.contains(".folder-checkbox-hit")
+            && css.contains(".folder-row-checkbox:focus-visible"),
+        "styles.css must style the selected-folders chip bar, checkbox hit target, and :focus-visible ring"
+    );
+}

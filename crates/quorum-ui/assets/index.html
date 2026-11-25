@@ -7,7 +7,7 @@
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="icon" type="image/png" sizes="64x64" href="/assets/quorumrag-icon.png">
   <link rel="apple-touch-icon" href="/assets/quorumrag-icon.png">
-  <link rel="stylesheet" href="/assets/styles.css?v=20261124c">
+  <link rel="stylesheet" href="/assets/styles.css?v=20261124f">
   <style>
     /* Inlined fallback styles ensuring test assertions pass */
     :root {
@@ -502,6 +502,7 @@
       <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
         <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
         <div id="pure-rust-picker-quick-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+        <div id="pure-rust-picker-selected-bar" class="picker-selected-bar hidden" aria-live="polite"></div>
         <div class="folder-explorer-address-bar" style="display:flex; align-items:center; gap:8px;">
           <button type="button" class="pill-btn" id="btn-pure-rust-picker-root" style="padding:4px 9px; font-size:11.5px;">💽 This PC</button>
           <button type="button" class="pill-btn" id="btn-pure-rust-picker-up" style="padding:4px 9px; font-size:11.5px;">⬅ Up</button>
@@ -521,7 +522,7 @@
           Active Path: <code id="pure-rust-picker-selected-label" style="color:#10a37f; font-weight:600;">This PC</code>
         </div>
         <div style="display:flex; gap:8px;">
-          <button type="button" id="btn-cancel-pure-rust-picker" class="pill-btn">Cancel</button>
+          <button type="button" id="btn-cancel-pure-rust-picker" class="pill-btn">Done</button>
           <button type="button" id="btn-confirm-pure-rust-picker" class="btn-primary" style="background:#10a37f; border-color:#10a37f; font-weight:700;">✅ Select Current Folder</button>
         </div>
       </div>
@@ -832,6 +833,6 @@
     };
   </script>
 
-  <script src="/assets/app.js?v=20261124c"></script>
+  <script src="/assets/app.js?v=20261124f"></script>
 </body>
 </html>
