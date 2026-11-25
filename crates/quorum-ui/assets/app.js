@@ -3984,6 +3984,37 @@ function secureRandomIndex(n) {
     }
   };
 
+  window.quorumCloudDriveRemoveFolder = async function(driveId, folderPath) {
+    const cleanId = String(driveId || '').trim();
+    const cleanPath = String(folderPath || '').trim();
+    if (!cleanId || !cleanPath) return false;
+    if (cloudDrivesBusyIds.has(cleanId)) {
+      showSettingsToast('⏳ Cloud drive update already in progress...');
+      return false;
+    }
+    cloudDrivesBusyIds.add(cleanId);
+    setCloudDriveCardBusyState(cleanId, true);
+    try {
+      const res = await postCloudDrivesConfig({
+        action: 'remove_folder',
+        id: cleanId,
+        path: cleanPath
+      });
+      if (!res.ok) {
+        showSettingsToast('⚠ ' + (res.error || 'Failed to unselect cloud folder'));
+        return false;
+      }
+      showSettingsToast(`✓ Unselected folder from ${cleanId}: ${cleanPath}`);
+      return true;
+    } finally {
+      cloudDrivesBusyIds.delete(cleanId);
+      setCloudDriveCardBusyState(cleanId, false);
+      if (activeSettingsTab === 'cloud-drives') {
+        renderSettingsTabContent('cloud-drives', settingsSearchInput ? settingsSearchInput.value : '');
+      }
+    }
+  };
+
   async function openSettingsView(tab = 'general') {
     activeSettingsTab = tab;
     const mktModal = document.getElementById('modal-marketplace');
@@ -4524,7 +4555,7 @@ function secureRandomIndex(n) {
       return `
         <div class="folder-browser-item folder-row ${isSelected ? 'selected' : ''}" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Click row to open ${escapeHtml(d.name)}">
           <div class="folder-row-left">
-            <input type="checkbox" class="folder-row-checkbox" ${isSelected ? 'checked' : ''} aria-label="Select folder ${escapeHtml(d.name)}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}" title="Toggle selection for ${escapeHtml(d.name)}">
+            <input type="checkbox" class="folder-row-checkbox" ${isSelected ? 'checked' : ''} aria-label="Select folder ${escapeHtml(d.name)}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}" title="${isSelected ? 'Unselect' : 'Select'} ${escapeHtml(d.name)}">
             <span class="folder-row-icon">${icon}</span>
             <div class="folder-row-details">
               <span class="folder-row-name">${escapeHtml(d.name)}</span>
@@ -4532,10 +4563,10 @@ function secureRandomIndex(n) {
             </div>
           </div>
           <div class="folder-row-actions">
-            <button type="button" class="pill-btn folder-select-btn ${isSelected ? 'selected' : ''}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}">
-              ${isSelected ? '✓ Selected' : (selectButtonText || '+ Select Folder')}
+            <button type="button" class="pill-btn folder-select-btn ${isSelected ? 'selected' : ''}" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${isSelected ? 'Selected — Unselect' : escapeHtml(selectButtonText || '+ Select Folder')} ${escapeHtml(d.name)}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}">
+              ${isSelected ? '✓ Selected — Unselect' : (selectButtonText || '+ Select Folder')}
             </button>
-            <button type="button" class="pill-btn folder-open-btn" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Open and drill down into ${escapeHtml(d.name)}">
+            <button type="button" class="pill-btn folder-open-btn" aria-label="Open ${escapeHtml(d.name)}" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Open and drill down into ${escapeHtml(d.name)}">
               Open →
             </button>
           </div>
@@ -4571,7 +4602,7 @@ function secureRandomIndex(n) {
           </div>
 
           ${allowNativeDialog ? `
-            <button type="button" class="pill-btn folder-native-picker-btn" data-action="trigger-native-folder-picker" data-context="${contextId}" title="Select a drive or folder on this asset">
+            <button type="button" class="pill-btn folder-native-picker-btn" data-action="trigger-native-folder-picker" data-context="${contextId}" title="Select or unselect drives and folders on this asset">
               📁 Select Folder
             </button>
           ` : ''}
@@ -4590,8 +4621,8 @@ function secureRandomIndex(n) {
               <span class="folder-active-icon">${isActiveSelected ? '✅' : '📁'}</span>
               <span class="folder-active-path">Active: <code>${escapeHtml(currentPath)}</code></span>
             </div>
-            <button type="button" class="btn-primary folder-active-action-btn" data-action="${activePathAction}" data-folder-path="${escapeHtml(currentPath)}" data-context="${contextId}">
-              ${isActiveSelected ? '✓ Active Folder Selected' : escapeHtml(activePathButtonText || '+ Select Active Folder')}
+            <button type="button" class="btn-primary folder-active-action-btn ${isActiveSelected ? 'is-unselect' : ''}" aria-pressed="${isActiveSelected ? 'true' : 'false'}" data-action="${activePathAction}" data-folder-path="${escapeHtml(currentPath)}" data-context="${contextId}">
+              ${isActiveSelected ? '✕ Unselect Active Folder' : escapeHtml(activePathButtonText || '+ Select Active Folder')}
             </button>
           </div>
         ` : ''}
@@ -4638,6 +4669,183 @@ function secureRandomIndex(n) {
     const sep = clean.startsWith('/') ? '/' : '\\';
     return clean.replace(/[\\/]+$/, '') + sep + 'clinical_note.txt';
   }
+
+  function getPickerSelectedPaths(ctx) {
+    const out = [];
+    const seen = new Set();
+    const pushUnique = (raw) => {
+      const s = String(raw || '').trim();
+      if (!s) return;
+      const key = canonicalComparePathJs(s);
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        out.push(s);
+      }
+    };
+    if (ctx === 'cloud-drives') {
+      const targetDriveId = pendingCloudDrivePickerId || '';
+      const drives = (cachedCloudDrivesData && Array.isArray(cachedCloudDrivesData.drives))
+        ? cachedCloudDrivesData.drives
+        : [];
+      const drv = drives.find(d => d && String(d.id || '').toLowerCase() === targetDriveId.toLowerCase());
+      if (drv) {
+        if (drv.root_path && (drv.enabled || drv.mounted)) {
+          pushUnique(drv.root_path);
+        }
+        if (Array.isArray(drv.custom_paths)) {
+          drv.custom_paths.forEach(pushUnique);
+        }
+      }
+    } else if (ctx === 'mesh') {
+      const shared = (cachedSettingsData && cachedSettingsData.mesh && Array.isArray(cachedSettingsData.mesh.shared_folders))
+        ? cachedSettingsData.mesh.shared_folders
+        : [];
+      shared.filter(f => f && f.enabled).forEach(f => pushUnique(f.path));
+    } else if (ctx === 'mkt' || ctx === 'general') {
+      const folders = (cachedMarketplaceStatus && Array.isArray(cachedMarketplaceStatus.opt_in_folders))
+        ? cachedMarketplaceStatus.opt_in_folders
+        : [];
+      folders.forEach(pushUnique);
+    } else if (ctx === 'newdoc' || ctx === 'storage') {
+      const rtWatched = (cachedSettingsData && cachedSettingsData.runtime && Array.isArray(cachedSettingsData.runtime.watched_paths))
+        ? cachedSettingsData.runtime.watched_paths
+        : [];
+      getCombinedWatchedPaths(rtWatched).forEach(pushUnique);
+    } else if (ctx === 'dlp') {
+      if (dlpSelectedSimFolder) pushUnique(dlpSelectedSimFolder);
+    } else if (ctx === 'artemis') {
+      if (artemisSelectedDir) pushUnique(artemisSelectedDir);
+    } else if (ctx === 'reindex') {
+      const curInp = document.getElementById('reindex-target-path');
+      const curVal = curInp ? curInp.value.trim() : '';
+      if (curVal) pushUnique(curVal);
+    }
+    return out;
+  }
+
+  function isPickerPathSelected(ctx, targetPath) {
+    const key = canonicalComparePathJs(targetPath);
+    if (!key) return false;
+    return getPickerSelectedPaths(ctx).some(p => canonicalComparePathJs(p) === key);
+  }
+
+  window.togglePickedFolderInContext = async function(ctx, chosenPath, forceSelect = null) {
+    const chosen = (chosenPath || '').trim();
+    if (!chosen) {
+      showSettingsToast('Please click a drive to drill down into folders, or toggle any folder checkbox.');
+      return false;
+    }
+    const currentlySelected = isPickerPathSelected(ctx, chosen);
+    const shouldSelect = forceSelect === null ? !currentlySelected : Boolean(forceSelect);
+
+    if (ctx === 'cloud-drives') {
+      const targetDriveId = pendingCloudDrivePickerId || '';
+      if (!targetDriveId) {
+        showSettingsToast('⚠ No cloud drive selected for folder configuration.');
+        return false;
+      }
+      if (shouldSelect) {
+        const autoEnable = pendingCloudDriveAutoEnableId === targetDriveId;
+        const ok = await window.quorumCloudDriveAddFolder(targetDriveId, chosen, autoEnable);
+        if (ok) {
+          pendingCloudDriveAutoEnableId = '';
+        }
+        return ok;
+      } else {
+        return await window.quorumCloudDriveRemoveFolder(targetDriveId, chosen);
+      }
+    } else if (ctx === 'mesh') {
+      return shouldSelect
+        ? await window.quorumShareFolder(chosen)
+        : await window.quorumRemoveSharedFolder(chosen);
+    } else if (ctx === 'mkt' || ctx === 'general') {
+      const mktInp = document.getElementById('mkt-folder-input');
+      if (mktInp && shouldSelect) mktInp.value = chosen;
+      return await toggleMarketplaceFolder(chosen, shouldSelect);
+    } else if (ctx === 'newdoc' || ctx === 'storage') {
+      if (shouldSelect) {
+        return await window.quorumIndexFolderImmediate(chosen);
+      } else {
+        const key = canonicalComparePathJs(chosen);
+        const isClientCustom = clientWatchedFolders.some(p => canonicalComparePathJs(p) === key);
+        if (isClientCustom) {
+          window.quorumRemoveClientWatchedFolder(chosen);
+          return true;
+        }
+        showSettingsToast('ℹ Default system watch roots can be managed under General → Automatic Physical Drive Indexing.');
+        return false;
+      }
+    } else if (ctx === 'dlp') {
+      if (shouldSelect) {
+        dlpSelectedSimFolder = chosen;
+        dlpSelectedSimPath = formatDlpSimulationFilePath(chosen);
+        const simPathInp = document.getElementById('dlp-sim-path');
+        const simPathBadge = document.getElementById('dlp-sim-path-badge');
+        const simPathText = document.getElementById('dlp-sim-path-text');
+        if (simPathInp) simPathInp.value = dlpSelectedSimPath;
+        if (simPathText) {
+          simPathText.textContent = dlpSelectedSimPath;
+        } else if (simPathBadge) {
+          simPathBadge.textContent = '📁 ' + dlpSelectedSimPath;
+        }
+        renderSettingsTabContent('dlp', '');
+        showSettingsToast('✓ DLP simulation folder selected: ' + dlpSelectedSimPath);
+      } else {
+        dlpSelectedSimFolder = '';
+        dlpSelectedSimPath = IS_POSIX_CLIENT ? '/tmp/clinical_note.txt' : 'D:\\harfile\\QuorumRAG\\docs\\clinical_note.txt';
+        const simPathInp = document.getElementById('dlp-sim-path');
+        const simPathText = document.getElementById('dlp-sim-path-text');
+        if (simPathInp) simPathInp.value = dlpSelectedSimPath;
+        if (simPathText) simPathText.textContent = dlpSelectedSimPath;
+        renderSettingsTabContent('dlp', '');
+        showSettingsToast('✓ Unselected DLP simulation folder');
+      }
+      return true;
+    } else if (ctx === 'artemis') {
+      if (shouldSelect) {
+        artemisSelectedDir = chosen;
+        const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
+        const displayPill = document.getElementById('artemis-selected-folder-display');
+        if (hiddenInp) hiddenInp.value = chosen;
+        if (displayPill) {
+          displayPill.textContent = '📁 Selected: ' + chosen;
+          displayPill.title = chosen;
+          displayPill.style.color = '#10a37f';
+          displayPill.style.background = 'rgba(16,163,127,0.15)';
+          displayPill.style.borderColor = 'rgba(16,163,127,0.35)';
+        }
+        renderSettingsTabContent('artemis-dfir', '');
+        showSettingsToast('✓ Selected Artemis DFIR folder: ' + chosen);
+      } else {
+        artemisSelectedDir = '';
+        const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
+        const displayPill = document.getElementById('artemis-selected-folder-display');
+        if (hiddenInp) hiddenInp.value = '';
+        if (displayPill) {
+          displayPill.textContent = 'No folder selected';
+          displayPill.title = 'No folder selected';
+          displayPill.style.color = 'var(--text-muted)';
+          displayPill.style.background = 'rgba(255,255,255,0.06)';
+          displayPill.style.borderColor = 'var(--border-color)';
+        }
+        renderSettingsTabContent('artemis-dfir', '');
+        showSettingsToast('✓ Unselected Artemis DFIR folder');
+      }
+      return true;
+    } else if (ctx === 'reindex') {
+      if (shouldSelect) {
+        updateReindexSelectedBadge(chosen);
+        renderReindexExplorer();
+        showSettingsToast('✓ Target reindex folder selected: ' + chosen);
+      } else {
+        updateReindexSelectedBadge('');
+        renderReindexExplorer();
+        showSettingsToast('✓ Unselected target reindex folder');
+      }
+      return true;
+    }
+    return await window.applyPickedFolderToContext(ctx, chosen);
+  };
 
   function closePureRustPickerModal() {
     const modal = document.getElementById('modal-pure-rust-folder-picker');
@@ -4773,6 +4981,22 @@ function secureRandomIndex(n) {
       }
     }
 
+    const selectedPaths = getPickerSelectedPaths(pureRustPickerContext);
+    const selectedBar = document.getElementById('pure-rust-picker-selected-bar');
+    if (selectedBar) {
+      if (selectedPaths.length > 0) {
+        const chipsHtml = selectedPaths.map(sp => {
+          const leaf = sp === '/' ? '/' : (sp.split(/[\\/]/).filter(Boolean).pop() || sp);
+          return `<button type="button" class="pill-btn picker-selected-chip" data-picker-unselect="${escapeHtml(sp)}" aria-label="Unselect ${escapeHtml(leaf)}" title="Click to unselect ${escapeHtml(sp)}"><span>✓</span> <code>${escapeHtml(sp)}</code> <span aria-hidden="true">✕</span></button>`;
+        }).join('');
+        selectedBar.classList.remove('hidden');
+        selectedBar.innerHTML = `<span style="font-weight:700; color:#10a37f; margin-right:4px;">Selected (${selectedPaths.length}):</span>${chipsHtml}`;
+      } else {
+        selectedBar.classList.add('hidden');
+        selectedBar.innerHTML = '';
+      }
+    }
+
     const rootBtn = document.getElementById('btn-pure-rust-picker-root');
     if (rootBtn) {
       rootBtn.textContent = IS_POSIX_CLIENT ? '💽 Computer' : '💽 This PC';
@@ -4803,22 +5027,32 @@ function secureRandomIndex(n) {
       selectedLabel.textContent = pureRustPickerCurrentPath || (IS_POSIX_CLIENT ? 'Drives & Volumes (Click any drive or folder below to drill down)' : 'Drives on this asset (Click any drive below to drill down into folders)');
     }
 
+    const isActiveSelected = pureRustPickerCurrentPath ? isPickerPathSelected(pureRustPickerContext, pureRustPickerCurrentPath) : false;
     const confirmBtn = document.getElementById('btn-confirm-pure-rust-picker');
     if (confirmBtn) {
-      confirmBtn.disabled = !pureRustPickerCurrentPath;
+      confirmBtn.disabled = !pureRustPickerCurrentPath || pureRustPickerSubmitting;
       confirmBtn.style.opacity = pureRustPickerCurrentPath ? '1' : '0.5';
+      confirmBtn.setAttribute('aria-pressed', isActiveSelected ? 'true' : 'false');
       const leafLabel = pureRustPickerCurrentPath
         ? (pureRustPickerCurrentPath === '/' ? '/' : (pureRustPickerCurrentPath.split(/[\\/]/).filter(Boolean).pop() || pureRustPickerCurrentPath))
         : '';
-      confirmBtn.textContent = pureRustPickerCurrentPath
-        ? `✅ Select Folder (${leafLabel})`
-        : 'Click a Drive to Drill Down or "✓ Select Folder"';
+      if (pureRustPickerCurrentPath && isActiveSelected) {
+        confirmBtn.style.background = '#dc2626';
+        confirmBtn.style.borderColor = '#dc2626';
+        confirmBtn.textContent = `✕ Unselect Folder (${leafLabel})`;
+      } else {
+        confirmBtn.style.background = '#10a37f';
+        confirmBtn.style.borderColor = '#10a37f';
+        confirmBtn.textContent = pureRustPickerCurrentPath
+          ? `✅ Select Folder (${leafLabel})`
+          : 'Click a Drive to Drill Down or Toggle Any Folder';
+      }
     }
 
     const listEl = document.getElementById('pure-rust-picker-dir-list');
     if (listEl) {
       const errBanner = pureRustPickerError
-        ? `<div style="padding:8px 12px; margin-bottom:8px; border-radius:8px; background:rgba(220,38,38,0.14); border:1px solid rgba(220,38,38,0.35); color:#fca5a5; font-size:12px;">⚠ ${escapeHtml(pureRustPickerError)}</div>`
+        ? `<div role="alert" style="padding:8px 12px; margin-bottom:8px; border-radius:8px; background:rgba(220,38,38,0.14); border:1px solid rgba(220,38,38,0.35); color:#fca5a5; font-size:12px;">⚠ ${escapeHtml(pureRustPickerError)}</div>`
         : '';
       if (pureRustPickerLoading && pureRustPickerDirectories.length === 0) {
         listEl.innerHTML = `${errBanner}<div style="padding:18px; text-align:center; color:var(--text-muted); font-size:12.5px;">⏳ Loading folders...</div>`;
@@ -4835,20 +5069,25 @@ function secureRandomIndex(n) {
       if (filtered.length === 0) {
         listEl.innerHTML = `${errBanner}
           <div style="padding:18px; text-align:center; color:var(--text-muted); font-size:12.5px;">
-            ${q ? 'No drives or subfolders match filter "' + escapeHtml(pureRustPickerFilterText) + '".' : 'No subdirectories in this folder. Click "✅ Select Folder" below to choose this directory, or create a new subfolder above.'}
+            ${q ? 'No drives or subfolders match filter "' + escapeHtml(pureRustPickerFilterText) + '".' : 'No subdirectories in this folder. Click the button below to select or unselect this directory, or create a new subfolder above.'}
           </div>
         `;
       } else {
-        listEl.innerHTML = errBanner + filtered.map(d => {
+        listEl.innerHTML = errBanner + filtered.map((d, idx) => {
           const p = String(d.path || '');
+          const isSelected = isPickerPathSelected(pureRustPickerContext, p);
           const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
           const displayName = d.is_drive ? (p === '/' ? 'Root Filesystem (/)' : `Drive ${p}`) : String(d.name || p);
           const subHint = d.is_drive
             ? `${p} — Click row or "Open →" to drill down into folders`
             : (p && p !== d.name ? p : '');
+          const cbId = `picker-row-cb-${idx}`;
           return `
-            <div class="folder-browser-item folder-row" data-picker-nav="${escapeHtml(p)}" title="Click to open ${escapeHtml(p)}">
+            <div class="folder-browser-item folder-row ${isSelected ? 'selected' : ''}" data-picker-nav="${escapeHtml(p)}" title="Click row to open ${escapeHtml(p)}">
               <div class="folder-row-left">
+                <label class="folder-checkbox-hit" for="${cbId}" data-picker-stop-nav="true" title="${isSelected ? 'Unselect' : 'Select'} ${escapeHtml(displayName)}">
+                  <input id="${cbId}" type="checkbox" class="folder-row-checkbox" ${isSelected ? 'checked' : ''} ${pureRustPickerSubmitting ? 'disabled' : ''} data-picker-toggle="${escapeHtml(p)}" aria-label="Select folder ${escapeHtml(displayName)}">
+                </label>
                 <span class="folder-row-icon">${icon}</span>
                 <div class="folder-row-details">
                   <span class="folder-row-name">${escapeHtml(displayName)}</span>
@@ -4856,10 +5095,10 @@ function secureRandomIndex(n) {
                 </div>
               </div>
               <div class="folder-row-actions">
-                <button type="button" class="pill-btn folder-select-btn" data-picker-pick="${escapeHtml(p)}" style="border-color:#10a37f; color:#10a37f; font-weight:600;">
-                  ✓ Select Folder
+                <button type="button" class="pill-btn folder-select-btn ${isSelected ? 'selected' : ''}" ${pureRustPickerSubmitting ? 'disabled' : ''} data-picker-toggle="${escapeHtml(p)}" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${isSelected ? 'Selected — Unselect' : 'Select Folder'} ${escapeHtml(displayName)}" style="${isSelected ? '' : 'border-color:#10a37f; color:#10a37f; font-weight:600;'}">
+                  ${isSelected ? '✓ Selected — Unselect' : '✓ Select Folder'}
                 </button>
-                <button type="button" class="pill-btn folder-open-btn" data-picker-nav="${escapeHtml(p)}">
+                <button type="button" class="pill-btn folder-open-btn" data-picker-nav="${escapeHtml(p)}" aria-label="Open ${escapeHtml(displayName)}">
                   Open →
                 </button>
               </div>
@@ -5032,6 +5271,7 @@ function secureRandomIndex(n) {
         <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
           <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
           <div id="pure-rust-picker-quick-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+          <div id="pure-rust-picker-selected-bar" class="picker-selected-bar hidden" aria-live="polite"></div>
           <div class="folder-explorer-address-bar" style="display:flex; align-items:center; gap:8px;">
             <button type="button" class="pill-btn" id="btn-pure-rust-picker-root" style="padding:4px 9px; font-size:11.5px;">💽 This PC</button>
             <button type="button" class="pill-btn" id="btn-pure-rust-picker-up" style="padding:4px 9px; font-size:11.5px;">⬅ Up</button>
@@ -5051,7 +5291,7 @@ function secureRandomIndex(n) {
             Active Path: <code id="pure-rust-picker-selected-label" style="color:#10a37f; font-weight:600;">This PC</code>
           </div>
           <div style="display:flex; gap:8px;">
-            <button type="button" id="btn-cancel-pure-rust-picker" class="pill-btn">Cancel</button>
+            <button type="button" id="btn-cancel-pure-rust-picker" class="pill-btn">Done</button>
             <button type="button" id="btn-confirm-pure-rust-picker" class="btn-primary" style="background:#10a37f; border-color:#10a37f; font-weight:700;">✅ Select Current Folder</button>
           </div>
         </div>
@@ -5146,43 +5386,81 @@ function secureRandomIndex(n) {
       btnConfirm.addEventListener('click', async () => {
         if (pureRustPickerSubmitting || pureRustPickerLoading) return;
         if (!pureRustPickerCurrentPath) {
-          showSettingsToast('Click a drive to drill down into folders or click "✓ Select Folder" on any row.');
+          showSettingsToast('Click a drive to drill down into folders or toggle any folder checkbox.');
           return;
         }
-        const sessionAtClick = pureRustPickerSessionId;
         pureRustPickerSubmitting = true;
-        btnConfirm.disabled = true;
+        renderPureRustPickerModalContent();
         try {
-          const ok = await window.applyPickedFolderToContext(pureRustPickerContext, pureRustPickerCurrentPath);
-          if (ok && sessionAtClick === pureRustPickerSessionId) closePicker();
+          await window.togglePickedFolderInContext(pureRustPickerContext, pureRustPickerCurrentPath);
         } finally {
           pureRustPickerSubmitting = false;
-          btnConfirm.disabled = !pureRustPickerCurrentPath;
+          renderPureRustPickerModalContent();
         }
       });
     }
+
+    modal.addEventListener('change', async (e) => {
+      const cb = e.target.closest('input.folder-row-checkbox[data-picker-toggle]');
+      if (!cb) return;
+      e.stopPropagation();
+      const chosen = cb.getAttribute('data-picker-toggle') || '';
+      if (!chosen || pureRustPickerSubmitting || pureRustPickerLoading) {
+        cb.checked = !cb.checked;
+        return;
+      }
+      const desired = Boolean(cb.checked);
+      pureRustPickerSubmitting = true;
+      renderPureRustPickerModalContent();
+      try {
+        await window.togglePickedFolderInContext(pureRustPickerContext, chosen, desired);
+      } finally {
+        pureRustPickerSubmitting = false;
+        renderPureRustPickerModalContent();
+      }
+    });
 
     modal.addEventListener('click', async (e) => {
       if (e.target === modal) {
         closePicker();
         return;
       }
-      const pickBtn = e.target.closest('[data-picker-pick]');
-      if (pickBtn) {
+      if (e.target.closest('[data-picker-stop-nav]')) {
+        e.stopPropagation();
+        return;
+      }
+      const unselectChip = e.target.closest('[data-picker-unselect]');
+      if (unselectChip) {
         e.preventDefault();
         e.stopPropagation();
         if (pureRustPickerSubmitting || pureRustPickerLoading) return;
-        const chosen = pickBtn.getAttribute('data-picker-pick') || '';
+        const chosen = unselectChip.getAttribute('data-picker-unselect') || '';
         if (chosen) {
-          const sessionAtClick = pureRustPickerSessionId;
           pureRustPickerSubmitting = true;
-          pickBtn.disabled = true;
+          renderPureRustPickerModalContent();
           try {
-            const ok = await window.applyPickedFolderToContext(pureRustPickerContext, chosen);
-            if (ok && sessionAtClick === pureRustPickerSessionId) closePicker();
+            await window.togglePickedFolderInContext(pureRustPickerContext, chosen, false);
           } finally {
             pureRustPickerSubmitting = false;
-            pickBtn.disabled = false;
+            renderPureRustPickerModalContent();
+          }
+        }
+        return;
+      }
+      const toggleBtn = e.target.closest('button[data-picker-toggle], [data-picker-pick]');
+      if (toggleBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (pureRustPickerSubmitting || pureRustPickerLoading) return;
+        const chosen = toggleBtn.getAttribute('data-picker-toggle') || toggleBtn.getAttribute('data-picker-pick') || '';
+        if (chosen) {
+          pureRustPickerSubmitting = true;
+          renderPureRustPickerModalContent();
+          try {
+            await window.togglePickedFolderInContext(pureRustPickerContext, chosen);
+          } finally {
+            pureRustPickerSubmitting = false;
+            renderPureRustPickerModalContent();
           }
         }
         return;
@@ -5195,6 +5473,13 @@ function secureRandomIndex(n) {
         pureRustPickerFilterText = '';
         if (filterInp) filterInp.value = '';
         await loadPureRustPickerDirectory(target);
+      }
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && modal && !modal.classList.contains('hidden')) {
+        e.preventDefault();
+        closePicker();
       }
     });
   }
@@ -5944,7 +6229,7 @@ function secureRandomIndex(n) {
         case 'dlp-select-sim-folder': {
           preventIfNotCheckbox(e, actionEl);
           e.stopPropagation();
-          const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+          const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn') || actionEl.classList.contains('folder-active-action-btn');
           if (folderPath && isRowToggle && dlpSelectedSimFolder && dlpSelectedSimFolder.toLowerCase() === folderPath.toLowerCase()) {
             dlpSelectedSimFolder = '';
             dlpSelectedSimPath = IS_POSIX_CLIENT ? '/tmp/clinical_note.txt' : 'D:\\harfile\\QuorumRAG\\docs\\clinical_note.txt';
@@ -5972,7 +6257,7 @@ function secureRandomIndex(n) {
           preventIfNotCheckbox(e, actionEl);
           e.stopPropagation();
           if (folderPath) {
-            const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+            const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn') || actionEl.classList.contains('folder-active-action-btn');
             const rtWatched = (cachedSettingsData && cachedSettingsData.runtime && Array.isArray(cachedSettingsData.runtime.watched_paths))
               ? cachedSettingsData.runtime.watched_paths
               : [];
@@ -6002,7 +6287,7 @@ function secureRandomIndex(n) {
           if (folderPath) {
             const curInp = document.getElementById('reindex-target-path');
             const curVal = curInp ? curInp.value.trim() : '';
-            const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+            const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn') || actionEl.classList.contains('folder-active-action-btn');
             if (isRowToggle && curVal && curVal.toLowerCase() === folderPath.toLowerCase()) {
               updateReindexSelectedBadge('');
               renderReindexExplorer();
@@ -6021,7 +6306,7 @@ function secureRandomIndex(n) {
           preventIfNotCheckbox(e, actionEl);
           e.stopPropagation();
           const target = folderPath || currentBrowsePath;
-          const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn');
+          const isRowToggle = actionEl.classList.contains('folder-row-checkbox') || actionEl.classList.contains('folder-select-btn') || actionEl.classList.contains('folder-active-action-btn');
           if (target && isRowToggle && artemisSelectedDir && artemisSelectedDir.toLowerCase() === target.toLowerCase()) {
             artemisSelectedDir = '';
             const hiddenInp = document.getElementById('artemis-jsonl-dir-input');
@@ -10739,7 +11024,10 @@ function secureRandomIndex(n) {
             const fallbackRootText = customPaths.length > 0
               ? `${customPaths.length} custom folder(s) selected`
               : 'Not mounted on this computer';
-            rootHtml = `<div class="cloud-drive-path-line">Sync Root: <code>${escapeHtml(drv.root_path || fallbackRootText)}</code></div>`;
+            const unselectRootBtn = (drv.root_path && (drv.mounted || drv.enabled))
+              ? ` <button type="button" class="pill-btn-danger" style="padding:1px 7px; font-size:10.5px; margin-left:6px;" data-action="cloud-drive-remove-folder" data-drive-id="${escapeHtml(drvId)}" data-folder-path="${escapeHtml(drv.root_path)}" aria-label="Unselect ${escapeHtml(drv.root_path)}" ${isBusy ? 'disabled' : ''}>✕ Unselect</button>`
+              : '';
+            rootHtml = `<div class="cloud-drive-path-line">Sync Root: <code>${escapeHtml(drv.root_path || fallbackRootText)}</code>${unselectRootBtn}</div>`;
           }
 
           let sessionNoticeHtml = '';
@@ -10797,7 +11085,7 @@ function secureRandomIndex(n) {
         const detectedDrives = drives.filter((drv) => {
           if (!drv) return false;
           const hasCustom = Array.isArray(drv.custom_paths) && drv.custom_paths.length > 0;
-          return Boolean(drv.mounted || drv.session_only || drv.enabled || hasCustom);
+          return Boolean(drv.mounted || drv.session_only || drv.enabled || hasCustom || drv.status === 'error');
         });
         const unmountedDrives = drives.filter((drv) => drv && !detectedDrives.includes(drv));
 

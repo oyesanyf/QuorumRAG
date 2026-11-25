@@ -35,6 +35,9 @@ use subtle::ConstantTimeEq;
 const MAX_REQ_HEADER_BYTES: usize = 16 * 1024;
 const MAX_REQ_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONCURRENT_CONNS: usize = 16;
+const MAX_BLOCKED_FS_OPS: usize = 12;
+const STAT_TIMEOUT_MS: u64 = 3_500;
+const BROWSE_TIMEOUT_MS: u64 = 5_500;
 const MAX_READ_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 250_000;
 const MAX_WALK_DIRS: usize = 50_000;
@@ -53,6 +56,7 @@ struct BridgeServerState {
     watch: Mutex<WatchState>,
     drives_cache: Mutex<Option<(std::time::Instant, Vec<BridgeDriveInfo>)>>,
     active_conns: AtomicUsize,
+    blocked_fs_ops: AtomicUsize,
 }
 
 struct ConnGuard {
@@ -62,6 +66,46 @@ struct ConnGuard {
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.counter.active_conns.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct BlockedFsGuard {
+    counter: Arc<BridgeServerState>,
+}
+
+impl Drop for BlockedFsGuard {
+    fn drop(&mut self) {
+        self.counter.blocked_fs_ops.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Resolves an already-validated path (`validate_cloud_drive_path` passed) to a usable existing
+/// `PathBuf`. Uses `std::fs::canonicalize` first and falls back to `std::fs::metadata` when
+/// virtual Dokan/WinFSP filesystems reject `GetFinalPathNameByHandleW` on drive roots (`G:\`).
+fn resolve_safe_existing_path(valid: &str) -> Option<PathBuf> {
+    if let Ok(canon) = std::fs::canonicalize(valid) {
+        return Some(canon);
+    }
+    let p = PathBuf::from(valid);
+    if std::fs::metadata(&p).is_ok() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+fn virtual_drive_timeout_error(valid_path: &str) -> String {
+    let b = valid_path.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        let ch = (b[0] as char).to_ascii_uppercase();
+        format!(
+            "Drive {ch}:\\ is currently busy or not responding (Google Drive for Desktop may be syncing, applying pending changes, or restarting). Save pending changes or restart Google Drive and click Refresh."
+        )
+    } else {
+        format!(
+            "Directory '{}' timed out while waiting for the virtual filesystem provider. Save pending changes or restart the cloud client and click Refresh.",
+            valid_path
+        )
     }
 }
 
@@ -182,7 +226,7 @@ fn read_hkcu_google_drive_letter_fast() -> Option<char> {
         fn RegQueryValueExW(
             h_key: *mut c_void,
             lp_value_name: *const u16,
-            lp_reserved: *mut u32,
+            lp_reserved: *const u32,
             lp_type: *mut u32,
             lp_data: *mut u8,
             lpcb_data: *mut u32,
@@ -216,7 +260,7 @@ fn read_hkcu_google_drive_letter_fast() -> Option<char> {
             RegQueryValueExW(
                 h_key,
                 val_w.as_ptr(),
-                null_mut(),
+                std::ptr::null(),
                 &mut reg_type,
                 null_mut(),
                 &mut buf_len,
@@ -232,7 +276,7 @@ fn read_hkcu_google_drive_letter_fast() -> Option<char> {
             RegQueryValueExW(
                 h_key,
                 val_w.as_ptr(),
-                null_mut(),
+                std::ptr::null(),
                 &mut reg_type,
                 buf.as_mut_ptr(),
                 &mut buf_len,
@@ -476,6 +520,63 @@ fn current_session_id() -> u32 {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn is_pid_alive_toolhelp(target_pid: u32) -> Option<bool> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        if snap.is_invalid() {
+            return None;
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = false;
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            for _ in 0..65_536 {
+                if entry.th32ProcessID == target_pid {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        Some(found)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn watch_parent_pid_via_toolhelp(parent_pid: u32) {
+    for _ in 0..u64::MAX {
+        if let Some(false) = is_pid_alive_toolhelp(parent_pid) {
+            std::process::exit(0);
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
+fn spawn_stdin_keepalive_watchdog(mut reader: std::io::BufReader<std::io::Stdin>) {
+    std::thread::spawn(move || {
+        let mut scratch = [0u8; 64];
+        for _ in 0..1024 {
+            match reader.read(&mut scratch) {
+                Ok(0) => std::process::exit(0),
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => std::process::exit(0),
+            }
+        }
+    });
+}
+
 fn spawn_parent_watchdog(parent_pid: u32) {
     if parent_pid == 0 {
         return;
@@ -494,8 +595,10 @@ fn spawn_parent_watchdog(parent_pid: u32) {
                     std::process::exit(0);
                 }
                 _ => {
-                    // Parent already exited before watchdog attached.
-                    std::process::exit(0);
+                    // An unelevated Session-1 user process cannot `OpenProcess(SYNCHRONIZE)` on
+                    // a Session-0 `LocalSystem` service (returns `ERROR_ACCESS_DENIED`). Verify
+                    // liveness via unprivileged `CreateToolhelp32Snapshot` instead of exiting.
+                    watch_parent_pid_via_toolhelp(parent_pid);
                 }
             }
         });
@@ -640,6 +743,8 @@ fn write_json(stream: &mut TcpStream, status: u16, value: &serde_json::Value) {
         404 => "Not Found",
         412 => "Precondition Failed",
         413 => "Payload Too Large",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Error",
     };
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
@@ -785,61 +890,79 @@ fn handle_client(mut stream: TcpStream, state: Arc<BridgeServerState>) {
                 );
                 return;
             };
-            let p = Path::new(&valid);
-            let Ok(canon) = std::fs::canonicalize(p) else {
+            let prev_blocked = state.blocked_fs_ops.fetch_add(1, Ordering::SeqCst);
+            if prev_blocked >= MAX_BLOCKED_FS_OPS {
+                state.blocked_fs_ops.fetch_sub(1, Ordering::SeqCst);
                 write_json(
                     &mut stream,
-                    200,
-                    &serde_json::to_value(BridgeStatInfo {
-                        exists: false,
-                        is_dir: false,
-                        is_file: false,
-                        len: 0,
-                        modified_secs: 0,
-                        is_placeholder: false,
-                        canonical_path: None,
-                    })
-                    .unwrap_or_default(),
+                    504,
+                    &serde_json::json!({
+                        "ok": false,
+                        "timeout": true,
+                        "error": virtual_drive_timeout_error(&valid)
+                    }),
                 );
                 return;
-            };
-            let Ok(meta) = std::fs::metadata(&canon) else {
-                write_json(
-                    &mut stream,
-                    200,
-                    &serde_json::to_value(BridgeStatInfo {
-                        exists: false,
-                        is_dir: false,
-                        is_file: false,
-                        len: 0,
-                        modified_secs: 0,
-                        is_placeholder: false,
-                        canonical_path: None,
-                    })
-                    .unwrap_or_default(),
-                );
-                return;
-            };
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let info = BridgeStatInfo {
-                exists: true,
-                is_dir: meta.is_dir(),
-                is_file: meta.is_file(),
-                len: meta.len(),
-                modified_secs: mtime,
-                is_placeholder: is_placeholder_meta(&meta),
-                canonical_path: Some(strip_win_verbatim(&canon.to_string_lossy())),
-            };
-            write_json(
-                &mut stream,
-                200,
-                &serde_json::to_value(info).unwrap_or_default(),
-            );
+            }
+            let (tx, rx) = std::sync::mpsc::channel::<BridgeStatInfo>();
+            let state_c = Arc::clone(&state);
+            let valid_c = valid.clone();
+            std::thread::spawn(move || {
+                let _guard = BlockedFsGuard { counter: state_c };
+                let not_found = BridgeStatInfo {
+                    exists: false,
+                    is_dir: false,
+                    is_file: false,
+                    len: 0,
+                    modified_secs: 0,
+                    is_placeholder: false,
+                    canonical_path: None,
+                };
+                let Some(resolved) = resolve_safe_existing_path(&valid_c) else {
+                    let _ = tx.send(not_found);
+                    return;
+                };
+                let Ok(meta) = std::fs::metadata(&resolved) else {
+                    let _ = tx.send(not_found);
+                    return;
+                };
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let info = BridgeStatInfo {
+                    exists: true,
+                    is_dir: meta.is_dir(),
+                    is_file: meta.is_file(),
+                    len: meta.len(),
+                    modified_secs: mtime,
+                    is_placeholder: is_placeholder_meta(&meta),
+                    canonical_path: Some(strip_win_verbatim(&resolved.to_string_lossy())),
+                };
+                let _ = tx.send(info);
+            });
+            match rx.recv_timeout(Duration::from_millis(STAT_TIMEOUT_MS)) {
+                Ok(info) => {
+                    write_json(
+                        &mut stream,
+                        200,
+                        &serde_json::to_value(info).unwrap_or_default(),
+                    );
+                }
+                Err(_) => {
+                    write_json(
+                        &mut stream,
+                        504,
+                        &serde_json::json!({
+                            "ok": false,
+                            "timeout": true,
+                            "error": virtual_drive_timeout_error(&valid)
+                        }),
+                    );
+                }
+            }
         }
         ("POST", "/bridge/browse") => {
             #[derive(Deserialize)]
@@ -864,81 +987,124 @@ fn handle_client(mut stream: TcpStream, state: Arc<BridgeServerState>) {
                 );
                 return;
             };
-            let Ok(canon) = std::fs::canonicalize(&valid) else {
-                write_json(
-                    &mut stream,
-                    404,
-                    &serde_json::json!({"ok": false, "error": format!("Directory does not exist on disk: {}", valid)}),
-                );
-                return;
-            };
-            if !canon.is_dir() {
-                write_json(
-                    &mut stream,
-                    400,
-                    &serde_json::json!({"ok": false, "error": format!("Path is not a directory: {}", valid)}),
-                );
-                return;
-            }
             if let Some(sub) = req.create_subfolder.as_deref() {
                 let sub_trimmed = sub.trim();
-                if !sub_trimmed.is_empty() {
-                    if !is_safe_single_folder_name(sub_trimmed) {
-                        write_json(
-                            &mut stream,
-                            400,
-                            &serde_json::json!({"ok": false, "error": "Invalid subfolder name"}),
-                        );
-                        return;
-                    }
-                    let new_dir = canon.join(sub_trimmed);
-                    if let Err(e) = std::fs::create_dir_all(&new_dir) {
-                        write_json(
-                            &mut stream,
-                            403,
-                            &serde_json::json!({"ok": false, "error": format!("Failed to create folder: {e}")}),
-                        );
-                        return;
-                    }
-                }
-            }
-            let rd = match std::fs::read_dir(&canon) {
-                Ok(r) => r,
-                Err(e) => {
+                if !sub_trimmed.is_empty() && !is_safe_single_folder_name(sub_trimmed) {
                     write_json(
                         &mut stream,
-                        403,
-                        &serde_json::json!({"ok": false, "error": format!("Cannot read directory: {e}")}),
+                        400,
+                        &serde_json::json!({"ok": false, "error": "Invalid subfolder name"}),
                     );
                     return;
                 }
-            };
-            let mut entries: Vec<BridgeDirEntry> = Vec::new();
-            for entry in rd.flatten() {
-                if entries.len() >= 10_000 {
-                    break;
-                }
-                let p = entry.path();
-                let is_dir = p.is_dir();
-                if !is_dir {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('$') {
-                    continue;
-                }
-                entries.push(BridgeDirEntry {
-                    name,
-                    path: strip_win_verbatim(&p.to_string_lossy()),
-                    is_dir: true,
-                });
             }
-            entries.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
-            write_json(
-                &mut stream,
-                200,
-                &serde_json::json!({ "ok": true, "entries": entries }),
-            );
+            let prev_blocked = state.blocked_fs_ops.fetch_add(1, Ordering::SeqCst);
+            if prev_blocked >= MAX_BLOCKED_FS_OPS {
+                state.blocked_fs_ops.fetch_sub(1, Ordering::SeqCst);
+                write_json(
+                    &mut stream,
+                    504,
+                    &serde_json::json!({
+                        "ok": false,
+                        "timeout": true,
+                        "error": virtual_drive_timeout_error(&valid)
+                    }),
+                );
+                return;
+            }
+            let (tx, rx) =
+                std::sync::mpsc::channel::<Result<Vec<BridgeDirEntry>, (u16, String)>>();
+            let state_c = Arc::clone(&state);
+            let valid_c = valid.clone();
+            let sub_c = req
+                .create_subfolder
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            std::thread::spawn(move || {
+                let _guard = BlockedFsGuard { counter: state_c };
+                let Some(resolved) = resolve_safe_existing_path(&valid_c) else {
+                    let _ = tx.send(Err((
+                        404,
+                        format!("Directory does not exist on disk: {}", valid_c),
+                    )));
+                    return;
+                };
+                if !resolved.is_dir() {
+                    let _ = tx.send(Err((
+                        400,
+                        format!("Path is not a directory: {}", valid_c),
+                    )));
+                    return;
+                }
+                if let Some(sub_trimmed) = sub_c {
+                    let new_dir = resolved.join(&sub_trimmed);
+                    if let Err(e) = std::fs::create_dir_all(&new_dir) {
+                        let _ = tx.send(Err((403, format!("Failed to create folder: {e}"))));
+                        return;
+                    }
+                }
+                let rd = match std::fs::read_dir(&resolved) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err((403, format!("Cannot read directory: {e}"))));
+                        return;
+                    }
+                };
+                let mut entries: Vec<BridgeDirEntry> = Vec::new();
+                for entry in rd.flatten() {
+                    if entries.len() >= 10_000 {
+                        break;
+                    }
+                    let p = entry.path();
+                    let is_dir = entry
+                        .file_type()
+                        .map(|ft| ft.is_dir())
+                        .unwrap_or_else(|_| p.is_dir());
+                    if !is_dir {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with('$') {
+                        continue;
+                    }
+                    entries.push(BridgeDirEntry {
+                        name,
+                        path: strip_win_verbatim(&p.to_string_lossy()),
+                        is_dir: true,
+                    });
+                }
+                entries
+                    .sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+                let _ = tx.send(Ok(entries));
+            });
+
+            match rx.recv_timeout(Duration::from_millis(BROWSE_TIMEOUT_MS)) {
+                Ok(Ok(entries)) => {
+                    write_json(
+                        &mut stream,
+                        200,
+                        &serde_json::json!({ "ok": true, "entries": entries }),
+                    );
+                }
+                Ok(Err((code, msg))) => {
+                    write_json(
+                        &mut stream,
+                        code,
+                        &serde_json::json!({ "ok": false, "error": msg }),
+                    );
+                }
+                Err(_) => {
+                    write_json(
+                        &mut stream,
+                        504,
+                        &serde_json::json!({
+                            "ok": false,
+                            "timeout": true,
+                            "error": virtual_drive_timeout_error(&valid)
+                        }),
+                    );
+                }
+            }
         }
         ("POST", "/bridge/walk") => {
             #[derive(Deserialize)]
@@ -974,7 +1140,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<BridgeServerState>) {
                 );
                 return;
             };
-            let Ok(canon_root) = std::fs::canonicalize(&valid_root) else {
+            let Some(canon_root) = resolve_safe_existing_path(&valid_root) else {
                 write_json(
                     &mut stream,
                     404,
@@ -1121,7 +1287,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<BridgeServerState>) {
                 );
                 return;
             };
-            let Ok(canon) = std::fs::canonicalize(&valid) else {
+            let Some(canon) = resolve_safe_existing_path(&valid) else {
                 write_http_response(
                     &mut stream,
                     404,
@@ -1216,7 +1382,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<BridgeServerState>) {
             let mut next_roots = Vec::new();
             for raw in &req.roots {
                 if let Ok(valid) = validate_cloud_drive_path(raw) {
-                    if let Ok(canon) = std::fs::canonicalize(&valid) {
+                    if let Some(canon) = resolve_safe_existing_path(&valid) {
                         if canon.is_dir() && !next_roots.contains(&canon) {
                             next_roots.push(canon);
                         }
@@ -1261,7 +1427,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<BridgeServerState>) {
                 );
                 return;
             };
-            let Ok(canon) = std::fs::canonicalize(&valid) else {
+            let Some(canon) = resolve_safe_existing_path(&valid) else {
                 write_json(
                     &mut stream,
                     404,
@@ -1306,30 +1472,40 @@ fn handle_client(mut stream: TcpStream, state: Arc<BridgeServerState>) {
     }
 }
 
-/// Entrypoint for `quorum-desktop --session-fs-bridge --parent-pid <pid>`.
+/// Entrypoint for `quorum-desktop --session-fs-bridge --parent-pid <pid>` (and `quorumrag`
+/// primary self-spawn fallback).
+#[allow(dead_code)]
 pub fn run_session_fs_bridge(parent_pid: u32) -> i32 {
+    run_session_fs_bridge_with_options(parent_pid, false)
+}
+
+/// Entrypoint with explicit stdin-EOF keepalive mode (`--keepalive-stdin`).
+pub fn run_session_fs_bridge_with_options(parent_pid: u32, keepalive_stdin: bool) -> i32 {
+    let mut stdin_reader = std::io::BufReader::new(std::io::stdin());
     let mut token = String::new();
-    {
-        let stdin = std::io::stdin();
-        let mut reader = stdin.lock();
-        if reader.read_line(&mut token).is_err() {
-            return 1;
-        }
+    if let Err(e) = stdin_reader.read_line(&mut token) {
+        let _ = writeln!(std::io::stderr(), "BRIDGE_ERR stdin_read={e}");
+        return 1;
     }
     let token = token.trim().to_string();
     if token.len() < 32 {
+        let _ = writeln!(std::io::stderr(), "BRIDGE_ERR short_token={}", token.len());
         return 1;
     }
 
-    spawn_parent_watchdog(parent_pid);
-
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
-        Err(_) => return 1,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "BRIDGE_ERR bind={e}");
+            return 1;
+        }
     };
     let port = match listener.local_addr() {
         Ok(addr) => addr.port(),
-        Err(_) => return 1,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "BRIDGE_ERR local_addr={e}");
+            return 1;
+        }
     };
 
     {
@@ -1339,11 +1515,20 @@ pub fn run_session_fs_bridge(parent_pid: u32) -> i32 {
         }
     }
 
+    // Start parent lifecycle watchdogs AFTER reporting READY so startup can never race.
+    if keepalive_stdin {
+        spawn_stdin_keepalive_watchdog(stdin_reader);
+    } else {
+        drop(stdin_reader);
+    }
+    spawn_parent_watchdog(parent_pid);
+
     let state = Arc::new(BridgeServerState {
         token,
         watch: Mutex::new(WatchState::default()),
         drives_cache: Mutex::new(None),
         active_conns: AtomicUsize::new(0),
+        blocked_fs_ops: AtomicUsize::new(0),
     });
     spawn_watch_scanner(Arc::clone(&state));
 

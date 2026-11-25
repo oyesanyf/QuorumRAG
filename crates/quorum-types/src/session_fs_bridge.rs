@@ -105,9 +105,254 @@ static BRIDGE_ENSURER: OnceLock<fn() -> bool> = OnceLock::new();
 /// Bitmask of ASCII drive letters (`bit 0 = 'A'`, ..., `bit 25 = 'Z'`) known to be
 /// mounted inside the interactive desktop session and NOT directly accessible in Session 0.
 static SESSION_ONLY_DRIVE_MASK: AtomicU32 = AtomicU32::new(0);
+/// Per-drive-letter short circuit-breaker (indexed `0..26` for `'A'..='Z'`) recording when a
+/// virtual cloud mount (e.g. Dokan `G:\`) timed out so background probes fail fast in 0 ms
+/// instead of queuing overlapping slow IRPs or respawning the bridge.
+static DRIVE_TIMEOUT_BACKOFF: OnceLock<RwLock<[Option<(Instant, String)>; 26]>> = OnceLock::new();
+
+const DRIVE_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(30);
 
 fn state_lock() -> &'static RwLock<BridgeState> {
     BRIDGE_STATE.get_or_init(|| RwLock::new(BridgeState::default()))
+}
+
+fn timeout_backoff_lock() -> &'static RwLock<[Option<(Instant, String)>; 26]> {
+    DRIVE_TIMEOUT_BACKOFF.get_or_init(|| RwLock::new(std::array::from_fn(|_| None)))
+}
+
+fn drive_letter_index(path: &Path) -> Option<usize> {
+    let s = path.to_string_lossy();
+    let trimmed = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    let b = trimmed.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        let idx = (b[0].to_ascii_uppercase() - b'A') as usize;
+        if idx < 26 {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn format_drive_busy_message(path: &Path) -> String {
+    if let Some(idx) = drive_letter_index(path) {
+        let ch = (b'A' + idx as u8) as char;
+        format!(
+            "Drive {ch}:\\ is currently busy or not responding (Google Drive for Desktop may be syncing, applying pending changes, or restarting). Save pending changes or restart Google Drive and click Refresh."
+        )
+    } else {
+        format!(
+            "Virtual cloud drive path '{}' timed out while waiting for the cloud sync client. Save pending changes or restart the cloud client and click Refresh.",
+            path.display()
+        )
+    }
+}
+
+fn record_drive_timeout(path: &Path, msg: String) {
+    if let Some(idx) = drive_letter_index(path) {
+        if let Ok(mut guard) = timeout_backoff_lock().write() {
+            guard[idx] = Some((Instant::now() + DRIVE_TIMEOUT_COOLDOWN, msg));
+        }
+    }
+}
+
+fn clear_drive_timeout(path: &Path) {
+    if let Some(idx) = drive_letter_index(path) {
+        if let Ok(mut guard) = timeout_backoff_lock().write() {
+            guard[idx] = None;
+        }
+    }
+}
+
+/// Returns the active timeout diagnostic message if `path`'s drive letter recently timed out
+/// on a virtual cloud mount (allowing callers to return HTTP 504 instead of false 404).
+pub fn drive_timeout_message(path: &Path) -> Option<String> {
+    let idx = drive_letter_index(path)?;
+    let guard = timeout_backoff_lock().read().ok()?;
+    let (until, msg) = guard[idx].as_ref()?;
+    if Instant::now() < *until {
+        Some(msg.clone())
+    } else {
+        None
+    }
+}
+
+/// Clears all per-drive timeout backoff entries (e.g., on explicit user Refresh or in tests).
+pub fn clear_drive_timeout_cache() {
+    if let Ok(mut guard) = timeout_backoff_lock().write() {
+        for slot in guard.iter_mut() {
+            *slot = None;
+        }
+    }
+}
+
+/// Records a timeout backoff entry for `path`'s drive letter from a local (non-bridge) bounded
+/// virtual-drive probe so interactive Session-1 runs also fail fast when Dokan/Google Drive is busy.
+pub fn record_local_drive_timeout(path: &Path) -> String {
+    let msg = format_drive_busy_message(path);
+    record_drive_timeout(path, msg.clone());
+    msg
+}
+
+/// Clears any timeout backoff entry for `path`'s drive letter after a successful local probe.
+pub fn clear_local_drive_timeout(path: &Path) {
+    clear_drive_timeout(path);
+}
+
+/// Returns `true` on Windows when `path` targets a drive letter whose kernel DOS device target
+/// is NOT `\Device\HarddiskVolume*` (e.g., Dokan / WinFSP / Google Drive `G:\` / pCloud `P:\` /
+/// SMB mapped drives). Pure 0 ms kernel `QueryDosDeviceW` call — never sends a filesystem IRP.
+pub fn is_local_virtual_drive_path(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn QueryDosDeviceW(
+                lp_device_name: *const u16,
+                lp_target_path: *mut u16,
+                ucch_max: u32,
+            ) -> u32;
+        }
+        let Some(idx) = drive_letter_index(path) else {
+            return false;
+        };
+        let ch = (b'A' + idx as u8) as char;
+        let dos_dev = format!("{ch}:");
+        let dos_w: Vec<u16> = dos_dev.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut buf = [0u16; 512];
+        let chars = unsafe { QueryDosDeviceW(dos_w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        if chars == 0 {
+            return false;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        let nt_target = String::from_utf16_lossy(&buf[..len]);
+        !nt_target.starts_with(r"\Device\HarddiskVolume")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+static LOCAL_BLOCKED_FS_PROBES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const MAX_LOCAL_BLOCKED_FS_PROBES: usize = 12;
+
+/// Bounded-timeout directory check safe for local Dokan/WinFSP/SMB virtual drives in interactive
+/// Windows sessions. For fixed physical drives (`\Device\HarddiskVolume*`) or non-Windows OSes,
+/// runs directly in 0 overhead; for virtual drives, enforces `timeout` and trips the per-drive
+/// timeout circuit breaker instead of hanging startup or HTTP handlers indefinitely.
+pub fn local_is_dir_bounded(path: &Path, require_readable: bool, timeout: Duration) -> Result<bool, String> {
+    if !is_local_virtual_drive_path(path) {
+        let ok = path.is_dir() && (!require_readable || std::fs::read_dir(path).is_ok());
+        return Ok(ok);
+    }
+    if let Some(msg) = drive_timeout_message(path) {
+        return Err(msg);
+    }
+    let prev = LOCAL_BLOCKED_FS_PROBES.fetch_add(1, Ordering::SeqCst);
+    if prev >= MAX_LOCAL_BLOCKED_FS_PROBES {
+        LOCAL_BLOCKED_FS_PROBES.fetch_sub(1, Ordering::SeqCst);
+        return Err(record_local_drive_timeout(path));
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let p_owned = path.to_path_buf();
+    std::thread::spawn(move || {
+        let ok = p_owned.is_dir() && (!require_readable || std::fs::read_dir(&p_owned).is_ok());
+        LOCAL_BLOCKED_FS_PROBES.fetch_sub(1, Ordering::SeqCst);
+        let _ = tx.send(ok);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(ok) => {
+            if ok {
+                clear_local_drive_timeout(path);
+            }
+            Ok(ok)
+        }
+        Err(_) => Err(record_local_drive_timeout(path)),
+    }
+}
+
+/// Bounded-timeout file existence check safe for local virtual drives.
+pub fn local_is_file_bounded(path: &Path, timeout: Duration) -> Result<bool, String> {
+    if !is_local_virtual_drive_path(path) {
+        return Ok(path.is_file());
+    }
+    if let Some(msg) = drive_timeout_message(path) {
+        return Err(msg);
+    }
+    let prev = LOCAL_BLOCKED_FS_PROBES.fetch_add(1, Ordering::SeqCst);
+    if prev >= MAX_LOCAL_BLOCKED_FS_PROBES {
+        LOCAL_BLOCKED_FS_PROBES.fetch_sub(1, Ordering::SeqCst);
+        return Err(record_local_drive_timeout(path));
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let p_owned = path.to_path_buf();
+    std::thread::spawn(move || {
+        let ok = p_owned.is_file();
+        LOCAL_BLOCKED_FS_PROBES.fetch_sub(1, Ordering::SeqCst);
+        let _ = tx.send(ok);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(ok) => {
+            if ok {
+                clear_local_drive_timeout(path);
+            }
+            Ok(ok)
+        }
+        Err(_) => Err(record_local_drive_timeout(path)),
+    }
+}
+
+/// Bounded-timeout `std::fs::canonicalize` safe for local virtual drives.
+pub fn local_canonicalize_bounded(path: &Path, timeout: Duration) -> Result<Option<PathBuf>, String> {
+    if !is_local_virtual_drive_path(path) {
+        return Ok(std::fs::canonicalize(path).ok());
+    }
+    if let Some(msg) = drive_timeout_message(path) {
+        return Err(msg);
+    }
+    let prev = LOCAL_BLOCKED_FS_PROBES.fetch_add(1, Ordering::SeqCst);
+    if prev >= MAX_LOCAL_BLOCKED_FS_PROBES {
+        LOCAL_BLOCKED_FS_PROBES.fetch_sub(1, Ordering::SeqCst);
+        return Err(record_local_drive_timeout(path));
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Option<PathBuf>>();
+    let p_owned = path.to_path_buf();
+    std::thread::spawn(move || {
+        let res = std::fs::canonicalize(&p_owned)
+            .ok()
+            .or_else(|| std::fs::metadata(&p_owned).ok().map(|_| p_owned.clone()));
+        LOCAL_BLOCKED_FS_PROBES.fetch_sub(1, Ordering::SeqCst);
+        let _ = tx.send(res);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(opt) => {
+            if opt.is_some() {
+                clear_local_drive_timeout(path);
+            }
+            Ok(opt)
+        }
+        Err(_) => Err(record_local_drive_timeout(path)),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum BridgeCallError {
+    Transport(String),
+    Timeout(String),
+}
+
+impl BridgeCallError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Transport(m) | Self::Timeout(m) => m,
+        }
+    }
+
+    fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
 }
 
 /// Registers the OS-specific launcher callback (`quorum-daemon` on Windows LocalSystem)
@@ -231,10 +476,10 @@ fn http_request_raw(
     path: &str,
     json_body: Option<&[u8]>,
     timeout: Duration,
-) -> Result<(u16, Vec<u8>), String> {
+) -> Result<(u16, Vec<u8>), BridgeCallError> {
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, ep.port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-        .map_err(|e| format!("bridge connect failed: {e}"))?;
+        .map_err(|e| BridgeCallError::Transport(format!("bridge connect failed: {e}")))?;
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
@@ -250,7 +495,7 @@ fn http_request_raw(
     req_buf.extend_from_slice(body);
     stream
         .write_all(&req_buf)
-        .map_err(|e| format!("bridge request write failed: {e}"))?;
+        .map_err(|e| BridgeCallError::Transport(format!("bridge request write failed: {e}")))?;
     let _ = stream.flush();
 
     let mut raw = Vec::with_capacity(4096);
@@ -264,7 +509,9 @@ fn http_request_raw(
             Ok(n) => {
                 if raw.len().saturating_add(n) > MAX_BRIDGE_RESPONSE_BYTES + MAX_BRIDGE_HEADER_BYTES
                 {
-                    return Err("bridge response exceeded safety size cap".to_string());
+                    return Err(BridgeCallError::Transport(
+                        "bridge response exceeded safety size cap".to_string(),
+                    ));
                 }
                 raw.extend_from_slice(&buf[..n]);
                 if header_end.is_none() {
@@ -281,7 +528,9 @@ fn http_request_raw(
                             }
                         }
                     } else if raw.len() > MAX_BRIDGE_HEADER_BYTES {
-                        return Err("bridge response header exceeded limit".to_string());
+                        return Err(BridgeCallError::Transport(
+                            "bridge response header exceeded limit".to_string(),
+                        ));
                     }
                 }
                 if let (Some(hend), Some(cl)) = (header_end, content_length) {
@@ -299,18 +548,35 @@ fn http_request_raw(
             {
                 break;
             }
-            Err(e) => return Err(format!("bridge read failed: {e}")),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(BridgeCallError::Timeout(format!(
+                    "bridge read timed out: {e}"
+                )));
+            }
+            Err(e) => {
+                return Err(BridgeCallError::Transport(format!(
+                    "bridge read failed: {e}"
+                )));
+            }
         }
     }
 
-    let hend = header_end.ok_or_else(|| "malformed bridge HTTP response".to_string())?;
+    let hend = header_end
+        .ok_or_else(|| BridgeCallError::Transport("malformed bridge HTTP response".to_string()))?;
     let head_str = String::from_utf8_lossy(&raw[..hend.saturating_sub(4)]);
     let status_line = head_str.lines().next().unwrap_or("");
     let status = status_line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| format!("malformed bridge status line: {status_line}"))?;
+        .ok_or_else(|| {
+            BridgeCallError::Transport(format!("malformed bridge status line: {status_line}"))
+        })?;
 
     let mut payload = raw[hend..].to_vec();
     if let Some(cl) = content_length {
@@ -321,17 +587,29 @@ fn http_request_raw(
     Ok((status, payload))
 }
 
-fn call_bridge_with_retry(
+fn call_bridge_with_retry_classified(
     method: &str,
     path: &str,
     json_body: Option<&[u8]>,
     timeout: Duration,
-) -> Result<(u16, Vec<u8>), String> {
-    let ep = get_or_ensure_endpoint().ok_or_else(|| "session fs bridge unavailable".to_string())?;
+) -> Result<(u16, Vec<u8>), BridgeCallError> {
+    let ep = get_or_ensure_endpoint()
+        .ok_or_else(|| BridgeCallError::Transport("session fs bridge unavailable".to_string()))?;
     match http_request_raw(&ep, method, path, json_body, timeout) {
         Ok(res) => Ok(res),
         Err(first_err) => {
-            // Connection error may indicate user session restarted or helper exited; reconnect once.
+            if first_err.is_timeout() {
+                // A timeout on a virtual cloud mount (e.g., Dokan G:\) does NOT mean the Session-1
+                // bridge process crashed. Probe /bridge/health quickly before ever respawning so
+                // a slow Google Drive mount can NEVER trigger a bridge respawn storm.
+                if http_request_raw(&ep, "GET", "/bridge/health", None, Duration::from_secs(1))
+                    .is_ok_and(|(st, _)| st == 200)
+                {
+                    return Err(first_err);
+                }
+            }
+            // Transport error (or unresponsive health probe) indicates user session restarted or
+            // helper exited; reconnect once.
             clear_bridge_endpoint();
             let Some(ep2) = get_or_ensure_endpoint() else {
                 return Err(first_err);
@@ -339,6 +617,16 @@ fn call_bridge_with_retry(
             http_request_raw(&ep2, method, path, json_body, timeout)
         }
     }
+}
+
+fn call_bridge_with_retry(
+    method: &str,
+    path: &str,
+    json_body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>), String> {
+    call_bridge_with_retry_classified(method, path, json_body, timeout)
+        .map_err(BridgeCallError::into_message)
 }
 
 fn placeholder_mode_and_cap(policy: CloudPlaceholderPolicy) -> (CloudPlaceholderMode, u64) {
@@ -356,7 +644,8 @@ pub fn list_session_drives() -> Vec<BridgeDriveInfo> {
     struct Resp {
         drives: Vec<BridgeDriveInfo>,
     }
-    let Ok((200, body)) = call_bridge_with_retry("GET", "/bridge/drives", None, Duration::from_secs(8))
+    let Ok((200, body)) =
+        call_bridge_with_retry("GET", "/bridge/drives", None, Duration::from_secs(4))
     else {
         return Vec::new();
     };
@@ -399,24 +688,58 @@ pub fn stat_or_bridged(path: &Path) -> Option<BridgeStatInfo> {
     stat_via_bridge(path)
 }
 
-/// Probes metadata strictly through the Session-1 bridge.
-pub fn stat_via_bridge(path: &Path) -> Option<BridgeStatInfo> {
+/// Probes metadata strictly through the Session-1 bridge, distinguishing a virtual-drive timeout
+/// (`Err((504, msg))`) from an absent path (`Ok(Some(exists: false))`).
+pub fn stat_via_bridge_detailed(path: &Path) -> Result<Option<BridgeStatInfo>, (u16, String)> {
+    if let Some(msg) = drive_timeout_message(path) {
+        return Err((504, msg));
+    }
     let payload = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
-    let Ok((200, body)) = call_bridge_with_retry(
+    match call_bridge_with_retry_classified(
         "POST",
         "/bridge/stat",
         Some(payload.as_bytes()),
-        Duration::from_secs(12),
-    ) else {
-        return None;
-    };
-    let info: BridgeStatInfo = serde_json::from_slice(&body).ok()?;
-    if info.exists {
-        if let Some(bit) = drive_letter_bit(path) {
-            SESSION_ONLY_DRIVE_MASK.fetch_or(bit, Ordering::Relaxed);
+        Duration::from_secs(6),
+    ) {
+        Ok((200, body)) => {
+            clear_drive_timeout(path);
+            let Some(info) = serde_json::from_slice::<BridgeStatInfo>(&body).ok() else {
+                return Ok(None);
+            };
+            if info.exists {
+                if let Some(bit) = drive_letter_bit(path) {
+                    SESSION_ONLY_DRIVE_MASK.fetch_or(bit, Ordering::Relaxed);
+                }
+            }
+            Ok(Some(info))
         }
+        Ok((504, body)) => {
+            let msg = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or_else(|| format_drive_busy_message(path));
+            record_drive_timeout(path, msg.clone());
+            Err((504, msg))
+        }
+        Ok((status, body)) => {
+            let msg = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or_else(|| format!("bridge stat failed (HTTP {status})"));
+            Err((status, msg))
+        }
+        Err(err) if err.is_timeout() => {
+            let msg = format_drive_busy_message(path);
+            record_drive_timeout(path, msg.clone());
+            Err((504, msg))
+        }
+        Err(err) => Err((503, err.into_message())),
     }
-    Some(info)
+}
+
+/// Probes metadata strictly through the Session-1 bridge.
+pub fn stat_via_bridge(path: &Path) -> Option<BridgeStatInfo> {
+    stat_via_bridge_detailed(path).ok().flatten()
 }
 
 /// Returns `true` if `path` exists locally OR via the active interactive Session-1 bridge.
@@ -466,17 +789,32 @@ pub fn browse_dir_bridged(
         "create_subfolder": create_subfolder,
     })
     .to_string();
-    let (status, body) = call_bridge_with_retry(
+    let path_ref = Path::new(path);
+    let (status, body) = match call_bridge_with_retry_classified(
         "POST",
         "/bridge/browse",
         Some(payload.as_bytes()),
-        Duration::from_secs(15),
-    )
-    .map_err(|e| (503u16, e))?;
+        Duration::from_secs(8),
+    ) {
+        Ok(res) => res,
+        Err(err) if err.is_timeout() => {
+            let msg = format_drive_busy_message(path_ref);
+            record_drive_timeout(path_ref, msg.clone());
+            return Err((504u16, msg));
+        }
+        Err(err) => return Err((503u16, err.into_message())),
+    };
     let parsed: Resp = serde_json::from_slice(&body)
         .map_err(|e| (502u16, format!("invalid bridge browse payload: {e}")))?;
     if status == 200 && parsed.ok {
+        clear_drive_timeout(path_ref);
         Ok(parsed.entries)
+    } else if status == 504 {
+        let msg = parsed
+            .error
+            .unwrap_or_else(|| format_drive_busy_message(path_ref));
+        record_drive_timeout(path_ref, msg.clone());
+        Err((504u16, msg))
     } else {
         Err((
             if status == 200 { 400 } else { status },
@@ -916,5 +1254,58 @@ mod tests {
         assert_eq!(st2, 200);
         assert_eq!(bytes, b"drive-bytes");
         server.join().expect("server join");
+    }
+
+    #[test]
+    fn bridge_504_timeout_preserves_endpoint_and_trips_drive_circuit_breaker() {
+        clear_drive_timeout_cache();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let token = "timeout_guard_token_0123456789abcdef0123456789abcdef".to_string();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = serde_json::json!({
+                "ok": false,
+                "timeout": true,
+                "error": "Drive Z:\\ is currently busy or not responding"
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 504 Gateway Timeout\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).expect("write 504");
+            let _ = stream.flush();
+        });
+
+        set_bridge_endpoint(port, token, 1, std::process::id());
+        let z_path = Path::new(r"Z:\My Drive");
+        let err1 = stat_via_bridge_detailed(z_path).expect_err("must return 504");
+        assert_eq!(err1.0, 504);
+        assert!(err1.1.contains("busy"), "unexpected error: {}", err1.1);
+
+        // Endpoint MUST NOT have been cleared/respawned on HTTP 504.
+        assert!(
+            active_bridge_info().is_some_and(|(p, _, _)| p == port),
+            "HTTP 504 on a slow virtual drive must never clear or respawn a healthy bridge"
+        );
+
+        // Circuit breaker must short-circuit repeated probes on Z:\ immediately without hitting TCP.
+        let t0 = Instant::now();
+        let err2 = stat_via_bridge_detailed(z_path).expect_err("must short-circuit 504");
+        assert_eq!(err2.0, 504);
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "circuit breaker should fail-fast without waiting on TCP"
+        );
+        assert!(drive_timeout_message(z_path).is_some());
+
+        server.join().expect("server join");
+        clear_drive_timeout_cache();
+        clear_bridge_endpoint();
     }
 }

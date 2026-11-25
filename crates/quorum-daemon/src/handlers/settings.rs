@@ -901,12 +901,16 @@ async fn pure_rust_browse_directory(
     };
 
     let test_profile_override = crate::handlers::cloud_drives::is_test_profile_override_active();
-    let mut drives_raw = if test_profile_override {
-        Vec::new()
+    let (mut drives_raw, session_drives) = if test_profile_override {
+        (Vec::new(), Vec::new())
     } else {
-        tokio::task::spawn_blocking(quorum_ingest::IngestConfig::discover_browsable_drives)
-            .await
-            .unwrap_or_default()
+        tokio::task::spawn_blocking(|| {
+            let drives = quorum_ingest::IngestConfig::discover_browsable_drives();
+            let sdrives = quorum_types::session_fs_bridge::list_session_drives();
+            (drives, sdrives)
+        })
+        .await
+        .unwrap_or_default()
     };
     drives_raw.sort_by(|a, b| {
         a.to_string_lossy()
@@ -921,11 +925,8 @@ async fn pure_rust_browse_directory(
     // Build concise, deduplicated quick-access folder list from the primary interactive user profile
     // (never system32/systemprofile and never flooding the UI with duplicate secondary profile pills).
     let mut quick_access: Vec<serde_json::Value> = Vec::new();
-    let mut push_quick = |label: String, path_buf: std::path::PathBuf, allow_bridged: bool| {
-        let dir_ok = path_buf.is_dir()
-            || (allow_bridged
-                && !test_profile_override
-                && quorum_types::session_fs_bridge::path_is_dir_or_bridged(&path_buf));
+    let mut push_quick = |label: String, path_buf: std::path::PathBuf, force_include: bool| {
+        let dir_ok = force_include || path_buf.is_dir();
         if !dir_ok || quick_access.len() >= 10 {
             return;
         }
@@ -983,19 +984,48 @@ async fn pure_rust_browse_directory(
 
     if !test_profile_override {
         // Add mounted virtual cloud drives (such as Google Drive G:\My Drive) to Quick Access
-        // so users can select them in one click from any folder picker.
+        // directly from cached Session-1 drive discovery (0 ms, never firing redundant blocking IRPs).
+        for sdrv in &session_drives {
+            let lbl_lower = sdrv.volume_label.to_ascii_lowercase();
+            let nt_lower = sdrv.nt_target.to_ascii_lowercase();
+            if sdrv.has_my_drive
+                || lbl_lower.contains("google drive")
+                || nt_lower.contains("drivefs")
+            {
+                let my_drive = std::path::PathBuf::from(&sdrv.root).join("My Drive");
+                push_quick("Google Drive".to_string(), my_drive, true);
+            } else if lbl_lower.contains("pcloud") || nt_lower.contains("pcloud") {
+                push_quick("pCloud".to_string(), std::path::PathBuf::from(&sdrv.root), true);
+            }
+        }
+        // Also surface local Mirror-mode My Drive folders on non-C fixed drives (instant local stat;
+        // skip virtual drives here so a busy Dokan mount never blocks This PC).
         for drv in &drives_raw {
             let drv_s = drv.to_string_lossy();
             if drv_s.len() >= 2 && !drv_s.to_ascii_lowercase().starts_with("c:") {
-                let my_drive = drv.join("My Drive");
-                let my_drive_exists = tokio::task::spawn_blocking({
-                    let p = my_drive.clone();
-                    move || quorum_types::session_fs_bridge::path_is_dir_or_bridged(&p)
-                })
-                .await
-                .unwrap_or(false);
-                if my_drive_exists {
-                    push_quick("Google Drive".to_string(), my_drive, true);
+                if quorum_types::session_fs_bridge::is_local_virtual_drive_path(drv) {
+                    let my_drive = drv.join("My Drive");
+                    let ok = tokio::task::spawn_blocking({
+                        let p = my_drive.clone();
+                        move || {
+                            quorum_types::session_fs_bridge::local_is_dir_bounded(
+                                &p,
+                                false,
+                                std::time::Duration::from_millis(600),
+                            )
+                            .unwrap_or(false)
+                        }
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if ok {
+                        push_quick("Google Drive".to_string(), my_drive, true);
+                    }
+                } else {
+                    let my_drive = drv.join("My Drive");
+                    if my_drive.is_dir() {
+                        push_quick("Google Drive".to_string(), my_drive, true);
+                    }
                 }
             }
         }
@@ -1037,25 +1067,91 @@ async fn pure_rust_browse_directory(
     }
 
     let mut target_dir_buf = Path::new(req_trimmed).to_path_buf();
-    let use_session_bridge = if target_dir_buf.is_dir() {
-        false
-    } else if !test_profile_override {
-        let check_p = target_dir_buf.clone();
-        let bridged_dir = tokio::task::spawn_blocking(move || {
-            quorum_types::session_fs_bridge::path_is_dir_or_bridged(&check_p)
+    let is_local_virtual_target = !test_profile_override
+        && quorum_types::session_fs_bridge::is_local_virtual_drive_path(&target_dir_buf);
+    let local_dir_check = if is_local_virtual_target {
+        let p_check = target_dir_buf.clone();
+        tokio::task::spawn_blocking(move || {
+            quorum_types::session_fs_bridge::local_is_dir_bounded(
+                &p_check,
+                true,
+                std::time::Duration::from_millis(3500),
+            )
         })
         .await
-        .unwrap_or(false);
-        if !bridged_dir {
+        .unwrap_or(Ok(false))
+    } else {
+        Ok(target_dir_buf.is_dir())
+    };
+    let local_is_dir = match local_dir_check {
+        Ok(v) => v,
+        Err(busy_msg) => {
             return Err((
-                StatusCode::NOT_FOUND,
+                StatusCode::GATEWAY_TIMEOUT,
                 Json(serde_json::json!({
                     "status": "error",
-                    "error": format!("Directory does not exist on disk: {}", req_trimmed),
+                    "error": busy_msg,
                 })),
             ));
         }
+    };
+
+    let is_session_only_drive_target = !test_profile_override && {
+        let req_bytes = req_trimmed.as_bytes();
+        let req_letter = if req_bytes.len() >= 2
+            && req_bytes[0].is_ascii_alphabetic()
+            && req_bytes[1] == b':'
+        {
+            Some((req_bytes[0] as char).to_ascii_uppercase())
+        } else {
+            None
+        };
+        quorum_types::session_fs_bridge::is_known_bridged_drive_path(&target_dir_buf)
+            || req_letter.is_some_and(|ch| {
+                session_drives.iter().any(|sd| {
+                    sd.letter.to_ascii_uppercase() == ch
+                        && !quorum_types::session_fs_bridge::is_local_virtual_drive_path(
+                            Path::new(&sd.root),
+                        )
+                        && !Path::new(&sd.root).is_dir()
+                })
+            })
+    };
+
+    let use_session_bridge = if local_is_dir {
+        false
+    } else if is_session_only_drive_target {
+        // Go straight to /bridge/browse so a slow/virtual Dokan mount is probed once instead of
+        // twice and timeout errors return HTTP 504 instead of false 404.
         true
+    } else if !test_profile_override {
+        let check_p = target_dir_buf.clone();
+        let stat_res = tokio::task::spawn_blocking(move || {
+            quorum_types::session_fs_bridge::stat_via_bridge_detailed(&check_p)
+        })
+        .await
+        .unwrap_or(Ok(None));
+        match stat_res {
+            Ok(Some(st)) if st.exists && st.is_dir => true,
+            Err((504, msg)) | Err((503, msg)) => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "error": msg,
+                    })),
+                ));
+            }
+            _ => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "error": format!("Directory does not exist on disk: {}", req_trimmed),
+                    })),
+                ));
+            }
+        }
     } else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -1150,6 +1246,16 @@ async fn pure_rust_browse_directory(
                     })
                     .collect();
                 (mapped, None)
+            }
+            Err((code, msg)) if matches!(code, 400 | 404 | 503 | 504) => {
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::GATEWAY_TIMEOUT);
+                return Err((
+                    status,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "error": msg,
+                    })),
+                ));
             }
             Err((_, msg)) => (Vec::new(), Some(msg)),
         };

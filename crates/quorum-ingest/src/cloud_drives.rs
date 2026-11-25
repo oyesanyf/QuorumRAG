@@ -299,8 +299,14 @@ impl CloudDiscoveryEnv for LiveCloudDiscoveryEnv {
             }
             return path.is_dir() && std::fs::read_dir(path).is_ok();
         }
-        if path.is_dir() && std::fs::read_dir(path).is_ok() {
-            return true;
+        match quorum_types::session_fs_bridge::local_is_dir_bounded(
+            path,
+            true,
+            std::time::Duration::from_millis(2000),
+        ) {
+            Ok(true) => return true,
+            Err(_) => return false,
+            Ok(false) => {}
         }
         quorum_types::session_fs_bridge::stat_via_bridge(path)
             .is_some_and(|st| st.exists && st.is_dir)
@@ -313,8 +319,13 @@ impl CloudDiscoveryEnv for LiveCloudDiscoveryEnv {
             }
             return path.is_file();
         }
-        if path.is_file() {
-            return true;
+        match quorum_types::session_fs_bridge::local_is_file_bounded(
+            path,
+            std::time::Duration::from_millis(2000),
+        ) {
+            Ok(true) => return true,
+            Err(_) => return false,
+            Ok(false) => {}
         }
         quorum_types::session_fs_bridge::stat_via_bridge(path)
             .is_some_and(|st| st.exists && st.is_file)
@@ -1077,28 +1088,72 @@ fn live_windows_drive_mounts() -> Vec<WindowsDriveMount> {
             String::new()
         };
 
-        let mut vol_name = [0u16; 261];
-        let mut fs_name = [0u16; 261];
-        let ok = unsafe {
-            GetVolumeInformationW(
-                wide.as_ptr(),
-                vol_name.as_mut_ptr(),
-                vol_name.len() as u32,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                fs_name.as_mut_ptr(),
-                fs_name.len() as u32,
-            )
-        };
-        let volume_label = if ok != 0 {
-            let vol_len = vol_name.iter().position(|&c| c == 0).unwrap_or(0);
-            String::from_utf16_lossy(&vol_name[..vol_len])
-        } else {
+        let is_non_harddisk = !nt_target.starts_with(r"\Device\HarddiskVolume");
+        let volume_label = if !is_non_harddisk {
+            let mut vol_name = [0u16; 261];
+            let mut fs_name = [0u16; 261];
+            let ok = unsafe {
+                GetVolumeInformationW(
+                    wide.as_ptr(),
+                    vol_name.as_mut_ptr(),
+                    vol_name.len() as u32,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    fs_name.as_mut_ptr(),
+                    fs_name.len() as u32,
+                )
+            };
+            if ok != 0 {
+                let vol_len = vol_name.iter().position(|&c| c == 0).unwrap_or(0);
+                String::from_utf16_lossy(&vol_name[..vol_len])
+            } else {
+                String::new()
+            }
+        } else if quorum_types::session_fs_bridge::drive_timeout_message(Path::new(&root_str))
+            .is_some()
+        {
             String::new()
+        } else {
+            // Virtual / Dokan / WinFSP / SMB drive: bound GetVolumeInformationW to 1.0 s so a
+            // stalled cloud client (e.g. GoogleDriveFS.exe) can never hang daemon startup.
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let wide_c = wide.clone();
+            std::thread::spawn(move || {
+                let mut vol_name = [0u16; 261];
+                let mut fs_name = [0u16; 261];
+                let ok = unsafe {
+                    GetVolumeInformationW(
+                        wide_c.as_ptr(),
+                        vol_name.as_mut_ptr(),
+                        vol_name.len() as u32,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        fs_name.as_mut_ptr(),
+                        fs_name.len() as u32,
+                    )
+                };
+                let lbl = if ok != 0 {
+                    let vol_len = vol_name.iter().position(|&c| c == 0).unwrap_or(0);
+                    String::from_utf16_lossy(&vol_name[..vol_len])
+                } else {
+                    String::new()
+                };
+                let _ = tx.send(lbl);
+            });
+            match rx.recv_timeout(std::time::Duration::from_millis(1000)) {
+                Ok(lbl) => lbl,
+                Err(_) => {
+                    let _ = quorum_types::session_fs_bridge::record_local_drive_timeout(Path::new(
+                        &root_str,
+                    ));
+                    String::new()
+                }
+            }
         };
 
-        let is_virtual = !nt_target.starts_with(r"\Device\HarddiskVolume")
+        let is_virtual = is_non_harddisk
             || volume_label.to_ascii_lowercase().contains("google drive")
             || volume_label.to_ascii_lowercase().contains("pcloud");
 

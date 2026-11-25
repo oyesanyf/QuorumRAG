@@ -451,26 +451,44 @@ impl IngestConfig {
             const DRIVE_NO_ROOT_DIR: u32 = 1;
             const DRIVE_CDROM: u32 = 5;
 
-            let mut push_unique = |cand: PathBuf| {
+            fn push_unique_drive(list: &mut Vec<PathBuf>, cand: PathBuf) {
                 let key = cand.to_string_lossy().to_ascii_lowercase();
-                if !out
+                if !list
                     .iter()
                     .any(|e| e.to_string_lossy().to_ascii_lowercase() == key)
                 {
-                    out.push(cand);
+                    list.push(cand);
                 }
-            };
+            }
 
             for letter in b'C'..=b'Z' {
                 let root_str = format!("{}:\\", letter as char);
+                let key = root_str.to_ascii_lowercase();
+                if out
+                    .iter()
+                    .any(|e| e.to_string_lossy().to_ascii_lowercase() == key)
+                {
+                    continue;
+                }
                 let wide: Vec<u16> = root_str.encode_utf16().chain(std::iter::once(0)).collect();
                 let dt = unsafe { GetDriveTypeW(wide.as_ptr()) };
                 if dt == DRIVE_UNKNOWN || dt == DRIVE_NO_ROOT_DIR || dt == DRIVE_CDROM {
                     continue;
                 }
                 let p = PathBuf::from(&root_str);
-                if p.is_dir() && std::fs::read_dir(&p).is_ok() {
-                    push_unique(p);
+                if quorum_types::session_fs_bridge::is_local_virtual_drive_path(&p) {
+                    // Virtual cloud mount (Dokan/WinFSP such as G:\): surface in This PC without
+                    // ever blocking indefinitely if the cloud sync client is transiently busy.
+                    match quorum_types::session_fs_bridge::local_is_dir_bounded(
+                        &p,
+                        true,
+                        std::time::Duration::from_millis(800),
+                    ) {
+                        Ok(true) | Err(_) => push_unique_drive(&mut out, p),
+                        Ok(false) => {}
+                    }
+                } else if p.is_dir() && std::fs::read_dir(&p).is_ok() {
+                    push_unique_drive(&mut out, p);
                 }
             }
 
@@ -478,7 +496,7 @@ impl IngestConfig {
             // when QuorumRAGDaemon runs as LocalSystem in Session 0).
             for drv in quorum_types::session_fs_bridge::list_session_drives() {
                 if !drv.root.trim().is_empty() {
-                    push_unique(PathBuf::from(&drv.root));
+                    push_unique_drive(&mut out, PathBuf::from(&drv.root));
                 }
             }
         }

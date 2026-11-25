@@ -572,7 +572,11 @@ fn main() {
         }
         "--session-fs-bridge" => {
             let parent_pid = parse_u64_flag(&args, "--parent-pid", 0) as u32;
-            std::process::exit(session_bridge_server::run_session_fs_bridge(parent_pid));
+            let keepalive_stdin = args.iter().any(|a| a == "--keepalive-stdin");
+            std::process::exit(session_bridge_server::run_session_fs_bridge_with_options(
+                parent_pid,
+                keepalive_stdin,
+            ));
         }
         _ => {
             // Forward explicit CLI flags directly to `quorumrag` without console window allocation.

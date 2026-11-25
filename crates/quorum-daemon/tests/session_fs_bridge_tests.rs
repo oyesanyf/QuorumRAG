@@ -213,3 +213,77 @@ fn quorumrag_binary_fallback_hosts_session_fs_bridge() {
     assert_eq!(raw_http_status(port, token, "GET", "/bridge/health", ""), 200);
     drop(guard);
 }
+
+#[cfg(windows)]
+#[test]
+fn bridge_survives_privileged_local_system_parent_pid_and_exits_on_stdin_eof() {
+    // On Windows, PID 4 is the System kernel process (`NT AUTHORITY\SYSTEM`): calling
+    // `OpenProcess(PROCESS_SYNCHRONIZE, false, 4)` from an unelevated user ALWAYS fails with
+    // `ERROR_ACCESS_DENIED`, faithfully reproducing Session-0 LocalSystem -> Session-1 bridge
+    // startup. The bridge MUST report `READY <port>`, stay alive while stdin stays open, and
+    // exit cleanly as soon as the parent closes stdin.
+    let token = "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";
+    for exe in [
+        env!("CARGO_BIN_EXE_quorumrag"),
+        env!("CARGO_BIN_EXE_quorum-desktop"),
+    ] {
+        let mut child = Command::new(exe)
+            .args([
+                "--session-fs-bridge",
+                "--parent-pid",
+                "4",
+                "--keepalive-stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn --session-fs-bridge --parent-pid 4 --keepalive-stdin");
+
+        let mut stdin = child.stdin.take().expect("bridge stdin");
+        writeln!(stdin, "{token}").expect("write bridge token");
+        stdin.flush().expect("flush bridge token");
+
+        let stdout = child.stdout.take().expect("bridge stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read READY line");
+        let port: u16 = line
+            .trim()
+            .strip_prefix("READY ")
+            .unwrap_or_else(|| panic!("expected READY <port> from {exe}, got '{line}'"))
+            .trim()
+            .parse()
+            .expect("valid port");
+        assert!(port > 0);
+
+        // Give the background watchdog thread plenty of time to run `OpenProcess(SYNCHRONIZE, 4)`
+        // and confirm it falls back to Toolhelp32 rather than exiting.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            raw_http_status(port, token, "GET", "/bridge/health", ""),
+            200,
+            "bridge ({exe}) must remain alive when parent PID 4 denies OpenProcess"
+        );
+
+        // Dropping stdin simulates parent service termination/restart: bridge must exit promptly.
+        drop(stdin);
+        let mut exited = false;
+        for _ in 0..30 {
+            if let Ok(Some(status)) = child.try_wait() {
+                assert!(
+                    status.success(),
+                    "bridge ({exe}) should exit 0 on stdin EOF, got {status:?}"
+                );
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bridge ({exe}) did not exit promptly after stdin keepalive pipe closed");
+        }
+    }
+}
