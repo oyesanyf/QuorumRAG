@@ -356,7 +356,7 @@ pub fn list_session_drives() -> Vec<BridgeDriveInfo> {
     struct Resp {
         drives: Vec<BridgeDriveInfo>,
     }
-    let Ok((200, body)) = call_bridge_with_retry("GET", "/bridge/drives", None, Duration::from_secs(5))
+    let Ok((200, body)) = call_bridge_with_retry("GET", "/bridge/drives", None, Duration::from_secs(8))
     else {
         return Vec::new();
     };
@@ -406,7 +406,7 @@ pub fn stat_via_bridge(path: &Path) -> Option<BridgeStatInfo> {
         "POST",
         "/bridge/stat",
         Some(payload.as_bytes()),
-        Duration::from_secs(5),
+        Duration::from_secs(12),
     ) else {
         return None;
     };

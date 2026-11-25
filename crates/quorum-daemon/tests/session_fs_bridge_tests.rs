@@ -29,8 +29,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn spawn_test_bridge(token: &str) -> (ChildGuard, u16) {
-    let exe = env!("CARGO_BIN_EXE_quorum-desktop");
+fn spawn_test_bridge_with_exe(exe: &str, token: &str) -> (ChildGuard, u16) {
     let mut child = Command::new(exe)
         .args([
             "--session-fs-bridge",
@@ -41,7 +40,7 @@ fn spawn_test_bridge(token: &str) -> (ChildGuard, u16) {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn quorum-desktop --session-fs-bridge");
+        .expect("spawn --session-fs-bridge");
 
     {
         let mut stdin = child.stdin.take().expect("bridge stdin");
@@ -64,6 +63,10 @@ fn spawn_test_bridge(token: &str) -> (ChildGuard, u16) {
     assert!(port > 0, "ephemeral port must be non-zero");
 
     (ChildGuard(child), port)
+}
+
+fn spawn_test_bridge(token: &str) -> (ChildGuard, u16) {
+    spawn_test_bridge_with_exe(env!("CARGO_BIN_EXE_quorum-desktop"), token)
 }
 
 fn raw_http_status(port: u16, token: &str, method: &str, path: &str, body: &str) -> u16 {
@@ -199,5 +202,14 @@ fn session_fs_bridge_end_to_end_auth_browse_walk_read_and_watch() {
         "bridge watcher should emit upsert event for newly added file"
     );
 
+    drop(guard);
+}
+
+#[test]
+fn quorumrag_binary_fallback_hosts_session_fs_bridge() {
+    let token = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    let (guard, port) = spawn_test_bridge_with_exe(env!("CARGO_BIN_EXE_quorumrag"), token);
+    assert_eq!(raw_http_status(port, "bad", "GET", "/bridge/health", ""), 403);
+    assert_eq!(raw_http_status(port, token, "GET", "/bridge/health", ""), 200);
     drop(guard);
 }

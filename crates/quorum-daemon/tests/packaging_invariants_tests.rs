@@ -214,6 +214,14 @@ fn cross_os_packaging_versions_match_workspace_cargo_toml() {
         package_ps1.contains(&format!(r#"[string]$Version = "{ver}""#)),
         "scripts/package.ps1 default $Version does not match Cargo.toml ({ver})"
     );
+    assert!(
+        !package_ps1.contains("-File $SubmitScript -Version $Version -SkipDefenderScan -Files $ReleaseExe, $DesktopExe"),
+        "scripts/package.ps1 must invoke $SubmitScript in-process so $DesktopExe is never dropped by PowerShell -File array parsing"
+    );
+    assert!(
+        package_ps1.contains("quorum-desktop.exe is unsigned"),
+        "scripts/package.ps1 must enforce fail-closed Authenticode parity between quorumrag.exe and quorum-desktop.exe"
+    );
 
     let linux_sh = fs::read_to_string(root.join("packaging/linux/build_packages.sh"))
         .expect("read packaging/linux/build_packages.sh");

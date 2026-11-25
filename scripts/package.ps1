@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.9.2",
+    [string]$Version = "0.9.3",
     [switch]$SkipBuild = $false,
     [switch]$SkipDefenderScan = $false,
     [string]$CertThumbprint = "9A6D3B509500813058EC63183476464FAC8F015B"
@@ -217,10 +217,27 @@ foreach ($targetBin in @($ReleaseExe, $DesktopExe)) {
     }
 }
 
-# Pre-sign target\release\quorumrag.exe and quorum-desktop.exe before embedding into MSI & ZIP so installed binaries carry Authenticode signature
+# Pre-sign target\release\quorumrag.exe and quorum-desktop.exe before embedding into MSI & ZIP so installed binaries carry Authenticode signature.
+# IMPORTANT: invoke directly in-process (& $SubmitScript) rather than via `powershell -File ... -Files $a, $b`,
+# because PowerShell `-File` splits comma-separated arrays across positional parameters and silently skips the second file.
 $SubmitScript = Join-Path $ProjectRoot "scripts\submit_to_microsoft.ps1"
 if (Test-Path $SubmitScript) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $SubmitScript -Version $Version -SkipDefenderScan -Files $ReleaseExe, $DesktopExe
+    $BinariesToSign = @($ReleaseExe)
+    if (Test-Path $DesktopExe) {
+        $BinariesToSign += $DesktopExe
+    }
+    & $SubmitScript -Version $Version -SkipDefenderScan -Files $BinariesToSign
+
+    # Fail-closed Authenticode parity check: if quorumrag.exe was signed, quorum-desktop.exe MUST also be signed
+    # (prevents Windows 11 Smart App Control err=4551 when Session 0 spawns quorum-desktop.exe --session-fs-bridge).
+    if (Test-Path $DesktopExe) {
+        $mainSig = Get-AuthenticodeSignature -FilePath $ReleaseExe
+        $deskSig = Get-AuthenticodeSignature -FilePath $DesktopExe
+        if ($null -ne $mainSig.SignerCertificate -and ($null -eq $deskSig.SignerCertificate -or $deskSig.Status -eq 'NotSigned')) {
+            throw "SECURITY PACKAGING INVARIANT VIOLATION: quorumrag.exe is signed, but quorum-desktop.exe is unsigned ($($deskSig.Status))."
+        }
+        Write-Host "  [Sign Parity] quorumrag.exe & quorum-desktop.exe Authenticode parity verified." -ForegroundColor Green
+    }
 }
 
 # Step 2: Stage deploy\windows Portable Bundle (.zip)

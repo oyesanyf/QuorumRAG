@@ -28,7 +28,16 @@ $DeployMsi = Join-Path $ProjectRoot "deploy\windows\QuorumRAG-$Version-x86_64.ms
 
 $FilesToSign = @()
 if ($Files -and $Files.Count -gt 0) {
-    foreach ($f in $Files) { if ($f -and (Test-Path $f)) { $FilesToSign += (Get-Item $f).FullName } }
+    foreach ($entry in $Files) {
+        if (-not $entry) { continue }
+        foreach ($part in ($entry -split ',')) {
+            $trimmed = $part.Trim().Trim('"')
+            if ($trimmed -and (Test-Path $trimmed)) {
+                $full = (Get-Item $trimmed).FullName
+                if ($FilesToSign -notcontains $full) { $FilesToSign += $full }
+            }
+        }
+    }
 } else {
     if (Test-Path $ReleaseExe) { $FilesToSign += $ReleaseExe }
     if (Test-Path $DesktopExe) { $FilesToSign += $DesktopExe }

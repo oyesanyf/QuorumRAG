@@ -51,6 +51,7 @@ struct WatchState {
 struct BridgeServerState {
     token: String,
     watch: Mutex<WatchState>,
+    drives_cache: Mutex<Option<(std::time::Instant, Vec<BridgeDriveInfo>)>>,
     active_conns: AtomicUsize,
 }
 
@@ -164,6 +165,122 @@ fn is_blocked_open_extension(path: &Path) -> bool {
     )
 }
 
+#[cfg(target_os = "windows")]
+fn read_hkcu_google_drive_letter_fast() -> Option<char> {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            h_key: *mut c_void,
+            lp_sub_key: *const u16,
+            ul_options: u32,
+            sam_desired: u32,
+            phk_result: *mut *mut c_void,
+        ) -> i32;
+        fn RegQueryValueExW(
+            h_key: *mut c_void,
+            lp_value_name: *const u16,
+            lp_reserved: *mut u32,
+            lp_type: *mut u32,
+            lp_data: *mut u8,
+            lpcb_data: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(h_key: *mut c_void) -> i32;
+    }
+
+    const HKEY_CURRENT_USER: *mut c_void = 0x8000_0001usize as *mut c_void;
+    const KEY_READ: u32 = 0x20019;
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const REG_BINARY: u32 = 3;
+
+    let sub: Vec<u16> = "Software\\Google\\DriveFS\\Share"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut h_key: *mut c_void = null_mut();
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ, &mut h_key) } != 0
+        || h_key.is_null()
+    {
+        return None;
+    }
+
+    let mut found: Option<char> = None;
+    for val_name in ["MountPoint", "DefaultMountPoint", "SyncTargets"] {
+        let val_w: Vec<u16> = val_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut reg_type: u32 = 0;
+        let mut buf_len: u32 = 0;
+        if unsafe {
+            RegQueryValueExW(
+                h_key,
+                val_w.as_ptr(),
+                null_mut(),
+                &mut reg_type,
+                null_mut(),
+                &mut buf_len,
+            )
+        } != 0
+            || buf_len == 0
+            || buf_len > 65_536
+        {
+            continue;
+        }
+        let mut buf = vec![0u8; buf_len as usize];
+        if unsafe {
+            RegQueryValueExW(
+                h_key,
+                val_w.as_ptr(),
+                null_mut(),
+                &mut reg_type,
+                buf.as_mut_ptr(),
+                &mut buf_len,
+            )
+        } != 0
+        {
+            continue;
+        }
+        buf.truncate(buf_len as usize);
+        if reg_type == REG_SZ || reg_type == REG_EXPAND_SZ {
+            let u16s: Vec<u16> = buf
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .take_while(|&w| w != 0)
+                .collect();
+            let s = String::from_utf16_lossy(&u16s);
+            let trimmed = s.trim();
+            if let Some(ch) = trimmed.chars().next() {
+                if ch.is_ascii_alphabetic() {
+                    found = Some(ch.to_ascii_uppercase());
+                    break;
+                }
+            }
+        } else if reg_type == REG_BINARY {
+            // Google DriveFS v134 SyncTargets protobuf encodes the mounted drive letter as
+            // length-delimited `[0x02, <letter>, b':']` or `[0x03, <letter>, b':', b'\\']`.
+            for w in buf.windows(3) {
+                if (w[0] == 0x02 || w[0] == 0x03)
+                    && w[1].is_ascii_uppercase()
+                    && w[2] == b':'
+                    && w[1] != b'C'
+                {
+                    found = Some(w[1] as char);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+
+    unsafe {
+        let _ = RegCloseKey(h_key);
+    }
+    found
+}
+
 fn enumerate_session_drives() -> Vec<BridgeDriveInfo> {
     #[cfg(target_os = "windows")]
     {
@@ -191,7 +308,10 @@ fn enumerate_session_drives() -> Vec<BridgeDriveInfo> {
         const DRIVE_NO_ROOT_DIR: u32 = 1;
         const DRIVE_CDROM: u32 = 5;
 
-        let mut drives = Vec::new();
+        let gdrive_hint_letter = read_hkcu_google_drive_letter_fast();
+
+        // Phase 1: Instant (0 ms) kernel DOS-device enumeration (never blocks on Dokan/SMB IRPs).
+        let mut base_drives: Vec<BridgeDriveInfo> = Vec::new();
         for letter in b'C'..=b'Z' {
             let ch = letter as char;
             let root_str = format!("{ch}:\\");
@@ -201,9 +321,6 @@ fn enumerate_session_drives() -> Vec<BridgeDriveInfo> {
                 || drive_type == DRIVE_NO_ROOT_DIR
                 || drive_type == DRIVE_CDROM
             {
-                continue;
-            }
-            if !Path::new(&root_str).is_dir() {
                 continue;
             }
 
@@ -224,48 +341,112 @@ fn enumerate_session_drives() -> Vec<BridgeDriveInfo> {
                 String::new()
             };
 
-            let mut vol_buf = [0u16; 261];
-            let mut fs_buf = [0u16; 261];
-            let ok = unsafe {
-                GetVolumeInformationW(
-                    root_w.as_ptr(),
-                    vol_buf.as_mut_ptr(),
-                    vol_buf.len() as u32,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    fs_buf.as_mut_ptr(),
-                    fs_buf.len() as u32,
-                )
-            };
-            let volume_label = if ok != 0 {
-                let len = vol_buf.iter().position(|&c| c == 0).unwrap_or(0);
-                String::from_utf16_lossy(&vol_buf[..len])
-            } else {
-                String::new()
-            };
-
-            let lbl_lower = volume_label.to_ascii_lowercase();
             let nt_lower = nt_target.to_ascii_lowercase();
+            let is_gdrive_hint = gdrive_hint_letter == Some(ch)
+                && !nt_target.starts_with(r"\Device\HarddiskVolume");
             let is_virtual = !nt_target.starts_with(r"\Device\HarddiskVolume")
-                || lbl_lower.contains("google drive")
-                || lbl_lower.contains("pcloud")
                 || nt_lower.contains("drivefs")
-                || nt_lower.contains("dokan");
+                || nt_lower.contains("dokan")
+                || is_gdrive_hint;
 
-            let has_my_drive = Path::new(&root_str).join("My Drive").is_dir();
-            let has_shared_drives = Path::new(&root_str).join("Shared drives").is_dir();
-
-            drives.push(BridgeDriveInfo {
+            base_drives.push(BridgeDriveInfo {
                 letter: ch,
                 root: root_str,
                 drive_type,
-                volume_label,
+                volume_label: if is_gdrive_hint {
+                    "Google Drive".to_string()
+                } else {
+                    String::new()
+                },
                 nt_target,
                 is_virtual,
-                has_my_drive,
-                has_shared_drives,
+                has_my_drive: is_gdrive_hint,
+                has_shared_drives: false,
             });
+        }
+
+        if base_drives.is_empty() {
+            return base_drives;
+        }
+
+        // Phase 2: Bounded parallel per-drive metadata enrichment (max 1.2s total budget so a
+        // transiently busy Dokan/SMB mount can never stall /bridge/drives or hide C:/D:/G:).
+        let (tx, rx) = std::sync::mpsc::channel::<(char, bool, String, bool, bool)>();
+        let probe_count = base_drives.len();
+        for drv in &base_drives {
+            let tx_c = tx.clone();
+            let ch = drv.letter;
+            let root_str = drv.root.clone();
+            std::thread::spawn(move || {
+                let is_dir = Path::new(&root_str).is_dir();
+                if !is_dir {
+                    let _ = tx_c.send((ch, false, String::new(), false, false));
+                    return;
+                }
+                let root_w: Vec<u16> = root_str.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut vol_buf = [0u16; 261];
+                let mut fs_buf = [0u16; 261];
+                let ok = unsafe {
+                    GetVolumeInformationW(
+                        root_w.as_ptr(),
+                        vol_buf.as_mut_ptr(),
+                        vol_buf.len() as u32,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        fs_buf.as_mut_ptr(),
+                        fs_buf.len() as u32,
+                    )
+                };
+                let volume_label = if ok != 0 {
+                    let len = vol_buf.iter().position(|&c| c == 0).unwrap_or(0);
+                    String::from_utf16_lossy(&vol_buf[..len])
+                } else {
+                    String::new()
+                };
+                let has_my_drive = Path::new(&root_str).join("My Drive").is_dir();
+                let has_shared_drives = Path::new(&root_str).join("Shared drives").is_dir();
+                let _ = tx_c.send((ch, true, volume_label, has_my_drive, has_shared_drives));
+            });
+        }
+        drop(tx);
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(1200);
+        let mut probed: HashMap<char, (bool, String, bool, bool)> = HashMap::new();
+        for _ in 0..probe_count {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                Ok((ch, is_dir, lbl, has_md, has_sd)) => {
+                    probed.insert(ch, (is_dir, lbl, has_md, has_sd));
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut drives = Vec::with_capacity(base_drives.len());
+        for mut drv in base_drives {
+            if let Some((is_dir, lbl, has_md, has_sd)) = probed.remove(&drv.letter) {
+                if !is_dir {
+                    continue;
+                }
+                if !lbl.is_empty() {
+                    drv.volume_label = lbl;
+                }
+                drv.has_my_drive = has_md;
+                drv.has_shared_drives = has_sd;
+                let lbl_lower = drv.volume_label.to_ascii_lowercase();
+                if lbl_lower.contains("google drive") || lbl_lower.contains("pcloud") {
+                    drv.is_virtual = true;
+                }
+                drives.push(drv);
+            } else if drv.is_virtual {
+                // Virtual cloud mount (e.g. Dokan G:\) is present in kernel DOS device table +
+                // DriveFS registry but momentarily slow (>1.2s); keep its instant fast-path entry!
+                drives.push(drv);
+            }
         }
         drives
     }
@@ -566,7 +747,21 @@ fn handle_client(mut stream: TcpStream, state: Arc<BridgeServerState>) {
             );
         }
         ("GET", "/bridge/drives") => {
-            let drives = enumerate_session_drives();
+            let cached = state.drives_cache.lock().ok().and_then(|g| {
+                g.as_ref()
+                    .filter(|(ts, _)| ts.elapsed() < Duration::from_secs(10))
+                    .map(|(_, d)| d.clone())
+            });
+            let drives = match cached {
+                Some(d) => d,
+                None => {
+                    let fresh = enumerate_session_drives();
+                    if let Ok(mut g) = state.drives_cache.lock() {
+                        *g = Some((std::time::Instant::now(), fresh.clone()));
+                    }
+                    fresh
+                }
+            };
             write_json(&mut stream, 200, &serde_json::json!({ "drives": drives }));
         }
         ("POST", "/bridge/stat") => {
@@ -1147,6 +1342,7 @@ pub fn run_session_fs_bridge(parent_pid: u32) -> i32 {
     let state = Arc::new(BridgeServerState {
         token,
         watch: Mutex::new(WatchState::default()),
+        drives_cache: Mutex::new(None),
         active_conns: AtomicUsize::new(0),
     });
     spawn_watch_scanner(Arc::clone(&state));
