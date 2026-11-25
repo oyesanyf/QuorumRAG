@@ -9,8 +9,10 @@ use quorum_coordinator::HardwareTelemetry;
 
 /// Health & Telemetry endpoint: `GET /api/health`.
 pub async fn health_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    let hw = HardwareTelemetry::probe();
-    let total_chunks = state.storage.count().await.unwrap_or(0);
+    let hw = tokio::task::spawn_blocking(HardwareTelemetry::probe)
+        .await
+        .unwrap_or_else(|_| HardwareTelemetry::probe());
+    let total_chunks = state.storage.count_fast().await;
 
     let (connected_peers, listen_addrs) = if let Some(ref swarm) = state.swarm_handle {
         let peers = swarm.connected_peers().await.map(|p| p.len()).unwrap_or(0);

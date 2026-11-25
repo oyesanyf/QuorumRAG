@@ -64,6 +64,15 @@ pub(crate) struct VectorStore {
     _db: Connection,
     config: StorageConfig,
     ivf_index_built: std::sync::atomic::AtomicBool,
+    cached_row_count: std::sync::atomic::AtomicUsize,
+    cached_count_updated_ms: std::sync::atomic::AtomicU64,
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl VectorStore {
@@ -108,11 +117,15 @@ impl VectorStore {
             .map(|ix| ix.iter().any(|i| i.columns.iter().any(|c| c == "vector")))
             .unwrap_or(false);
 
+        let initial_rows = table.count_rows(None).await.unwrap_or(0);
+
         Ok(Self {
             table: Arc::new(RwLock::new(table)),
             _db: db,
             config: config.clone(),
             ivf_index_built: std::sync::atomic::AtomicBool::new(has_vector_index),
+            cached_row_count: std::sync::atomic::AtomicUsize::new(initial_rows),
+            cached_count_updated_ms: std::sync::atomic::AtomicU64::new(now_epoch_ms()),
         })
     }
 
@@ -135,6 +148,10 @@ impl VectorStore {
 
         let count = chunks.len();
         drop(table);
+        self.cached_row_count
+            .fetch_add(count, std::sync::atomic::Ordering::AcqRel);
+        self.cached_count_updated_ms
+            .store(now_epoch_ms(), std::sync::atomic::Ordering::Release);
 
         // Auto-index at most once when crossing threshold (never rebuild IVF_PQ on every batch!)
         if !self
@@ -226,6 +243,7 @@ impl VectorStore {
                 .delete(&filter)
                 .await
                 .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
+            self.record_rows_deleted(before_count);
             return Ok(before_count);
         }
 
@@ -274,6 +292,7 @@ impl VectorStore {
                 .map_err(|e| StorageError::Lance(format!("Normalized file delete error: {}", e)))?;
             deleted_rows = deleted_rows.saturating_add(del.num_deleted_rows as usize);
         }
+        self.record_rows_deleted(deleted_rows);
         Ok(deleted_rows)
     }
 
@@ -321,17 +340,20 @@ impl VectorStore {
 
         let mut matching_paths: Vec<String> = matching_set.into_iter().collect();
         matching_paths.sort();
+        let mut deleted_rows = 0usize;
         for batch in matching_paths.chunks(256) {
             let list = batch
                 .iter()
                 .map(|p| format!("'{}'", p.replace('\'', "''")))
                 .collect::<Vec<_>>()
                 .join(", ");
-            table
+            let del = table
                 .delete(&format!("file_path IN ({list})"))
                 .await
                 .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
+            deleted_rows = deleted_rows.saturating_add(del.num_deleted_rows as usize);
         }
+        self.record_rows_deleted(deleted_rows);
         Ok(())
     }
 
@@ -386,6 +408,7 @@ impl VectorStore {
             deleted_rows = deleted_rows.saturating_add(del.num_deleted_rows as usize);
         }
 
+        self.record_rows_deleted(deleted_rows);
         Ok(deleted_rows)
     }
 
@@ -599,13 +622,59 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Returns the total number of rows in the table.
+    /// Returns the total number of rows in the table and refreshes the lock-free count cache.
     pub(crate) async fn count(&self) -> Result<usize, StorageError> {
         let table = self.table.read().await;
-        table
+        let rows = table
             .count_rows(None)
             .await
-            .map_err(|e| StorageError::Lance(format!("Count rows error: {}", e)))
+            .map_err(|e| StorageError::Lance(format!("Count rows error: {}", e)))?;
+        self.cached_row_count
+            .store(rows, std::sync::atomic::Ordering::Release);
+        self.cached_count_updated_ms
+            .store(now_epoch_ms(), std::sync::atomic::Ordering::Release);
+        Ok(rows)
+    }
+
+    /// Non-blocking / bounded row count for live polling endpoints (`/api/reindex/status`, `/api/health`).
+    ///
+    /// Serves the lock-free atomic count immediately if refreshed within 5 seconds; otherwise
+    /// attempts a 200ms bounded LanceDB refresh and falls back cleanly to the cached count so
+    /// high-frequency UI polling never stalls behind 2M+ row writes or compaction.
+    pub(crate) async fn count_fast(&self) -> usize {
+        const FRESH_WINDOW_MS: u64 = 5_000;
+        let now = now_epoch_ms();
+        let last = self
+            .cached_count_updated_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cached = self
+            .cached_row_count
+            .load(std::sync::atomic::Ordering::Acquire);
+        if last > 0 && now.saturating_sub(last) < FRESH_WINDOW_MS {
+            return cached;
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(200), self.count()).await {
+            Ok(Ok(fresh)) => fresh,
+            _ => {
+                // Avoid re-triggering slow count probes on every tick while writes are busy.
+                self.cached_count_updated_ms
+                    .store(now, std::sync::atomic::Ordering::Release);
+                cached
+            }
+        }
+    }
+
+    fn record_rows_deleted(&self, deleted: usize) {
+        if deleted == 0 {
+            return;
+        }
+        let _ = self.cached_row_count.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| Some(cur.saturating_sub(deleted)),
+        );
+        self.cached_count_updated_ms
+            .store(now_epoch_ms(), std::sync::atomic::Ordering::Release);
     }
 
     /// Scans all chunks from the vector table.
@@ -674,6 +743,7 @@ impl VectorStore {
             .delete(&filter)
             .await
             .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
+        self.record_rows_deleted(before_count);
         Ok(before_count)
     }
 
@@ -764,6 +834,7 @@ impl VectorStore {
                     .delete(&filter)
                     .await
                     .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
+                self.record_rows_deleted(before_count);
                 return Ok(before_count);
             }
         }
@@ -798,6 +869,7 @@ impl VectorStore {
                 .map_err(|e| StorageError::Lance(format!("Delete error: {}", e)))?;
             deleted = deleted.saturating_add(del.num_deleted_rows as usize);
         }
+        self.record_rows_deleted(deleted);
         Ok(deleted)
     }
 }
@@ -888,5 +960,39 @@ mod tests {
             let hits = store.search_vector(&chunks[42].vector, 0, 5).await.unwrap();
             assert!(!hits.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn count_fast_tracks_inserts_and_deletes_without_blocking() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = StorageConfig::new(tmp.path())
+            .with_vector_dimension(8)
+            .with_auto_index_threshold(10_000);
+        let store = VectorStore::open(&cfg).await.unwrap();
+        assert_eq!(store.count_fast().await, 0);
+
+        let chunks: Vec<DocumentChunk> = (0..5usize)
+            .map(|i| {
+                DocumentChunk::new(
+                    format!("fast_doc:{i}"),
+                    "fast_doc".to_string(),
+                    "folder/fast.txt".to_string(),
+                    1,
+                    2,
+                    0,
+                    vec![0.25f32; 8],
+                    format!("fast chunk {i}"),
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        store.insert_chunks(&chunks).await.unwrap();
+        assert_eq!(store.count_fast().await, 5);
+
+        let deleted = store.delete_by_chunk_id("fast_doc:0").await.unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(store.count_fast().await, 4);
+        assert_eq!(store.count().await.unwrap(), 4);
     }
 }

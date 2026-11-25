@@ -197,7 +197,7 @@ pub async fn start_reindex_handler(
 
 /// Retrieve live reindex progress: `GET /api/reindex/status`.
 pub async fn reindex_status_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    let total_stored_chunks = state.storage.count().await.unwrap_or(0);
+    let total_stored_chunks = state.storage.count_fast().await;
     let watched_paths: Vec<String> = state
         .reindex_worker
         .all_watch_paths()

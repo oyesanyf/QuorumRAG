@@ -3391,16 +3391,26 @@ function secureRandomIndex(n) {
   }
 
   let lastMonotonicPct = 0;
+  let reindexStatusInFlight = false;
+  let cacheStatsInFlight = false;
+  let reindexPollIntervalMs = 0;
 
-  function pollReindexProgress() {
+  function pollReindexProgress(intervalMs = 2000) {
+    const targetMs = Number(intervalMs) > 0 ? Number(intervalMs) : 2000;
+    if (reindexPollInterval && reindexPollIntervalMs === targetMs) return;
     if (reindexPollInterval) clearInterval(reindexPollInterval);
-    reindexPollInterval = setInterval(checkReindexStatus, 1000);
+    reindexPollIntervalMs = targetMs;
+    reindexPollInterval = setInterval(() => {
+      if (!reindexStatusInFlight) checkReindexStatus();
+    }, targetMs);
   }
 
   async function checkReindexStatus() {
+    if (reindexStatusInFlight) return;
+    reindexStatusInFlight = true;
     try {
-      const r = await fetch('/api/reindex/status');
-      if (!r.ok) return;
+      const r = await fetchWithTimeout('/api/reindex/status', {}, 5000);
+      if (!r || !r.ok) return;
       const data = await r.json();
       const phase = data.phase || 'scanning_filesystem';
       const scanned = Number(data.files_scanned || 0);
@@ -3426,9 +3436,10 @@ function secureRandomIndex(n) {
 
       if (isRunning && !reindexPollInterval) {
         pollReindexProgress();
-      } else if (!isRunning && reindexPollInterval && (phase === 'completed' || phase === 'failed' || phase === 'cancelled')) {
-        clearInterval(reindexPollInterval);
-        reindexPollInterval = null;
+      } else if (isRunning && reindexPollIntervalMs !== 2000) {
+        pollReindexProgress(2000);
+      } else if (!isRunning && (phase === 'completed' || phase === 'failed' || phase === 'cancelled')) {
+        pollReindexProgress(6000);
       }
 
       if (isRunning && totalEst > 0) {
@@ -3510,12 +3521,15 @@ function secureRandomIndex(n) {
           reindexStatusPill.textContent = pctFormatted;
         }
       }
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      reindexStatusInFlight = false;
+    }
   }
 
-  // Continuously poll live index status every 2 seconds on the UI
+  // Continuously poll live index status with a single guarded interval (prevents HTTP/1.1 pool exhaustion)
   checkReindexStatus();
-  setInterval(checkReindexStatus, 2000);
+  pollReindexProgress();
 
   // 11. DRIFT MODAL LOGIC
   btnOpenDrift.addEventListener('click', () => modalDrift.classList.remove('hidden'));
@@ -3552,9 +3566,11 @@ function secureRandomIndex(n) {
 
   // 12. CACHE & RE-CACHE LOGIC
   async function refreshCacheStats() {
+    if (cacheStatsInFlight) return;
+    cacheStatsInFlight = true;
     try {
-      const resp = await fetch('/api/cache/stats');
-      if (!resp.ok) return;
+      const resp = await fetchWithTimeout('/api/cache/stats', {}, 5000);
+      if (!resp || !resp.ok) return;
       const data = await resp.json();
 
       const pct = (data.hit_rate * 100).toFixed(1);
@@ -3579,7 +3595,10 @@ function secureRandomIndex(n) {
       if (rateEl) rateEl.textContent = `${pct}%`;
       if (qEl) qEl.textContent = data.cached_queries;
       if (eEl) eEl.textContent = data.cached_embeddings;
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      cacheStatsInFlight = false;
+    }
   }
 
   // Poll cache stats on load and every 10 seconds
@@ -3846,7 +3865,7 @@ function secureRandomIndex(n) {
     cloudDrivesLoading = true;
     cloudDrivesError = null;
     try {
-      const resp = await fetch('/api/cloud-drives');
+      const resp = await fetchWithTimeout('/api/cloud-drives', {}, 15000);
       if (seq !== cloudDrivesFetchSeq) return cachedCloudDrivesData;
       if (!resp.ok) {
         const errBody = await resp.json().catch(() => ({}));
@@ -3865,7 +3884,9 @@ function secureRandomIndex(n) {
       return cachedCloudDrivesData;
     } catch (err) {
       if (seq !== cloudDrivesFetchSeq) return cachedCloudDrivesData;
-      cloudDrivesError = (err && err.message) ? err.message : 'Unable to reach QuorumRAG daemon';
+      cloudDrivesError = (err && err.name === 'AbortError')
+        ? 'Cloud drive discovery timed out after 15s (daemon busy indexing or virtual drive stalled). Click Retry.'
+        : ((err && err.message) ? err.message : 'Unable to reach QuorumRAG daemon');
       return cachedCloudDrivesData;
     } finally {
       if (seq === cloudDrivesFetchSeq) {
@@ -4111,6 +4132,8 @@ function secureRandomIndex(n) {
       const tab = btn.dataset.tab || 'general';
       activeSettingsTab = tab;
       highlightSettingsNav(tab);
+      // Paint the selected tab immediately (using cached state or loading card) so sidebar navigation never feels frozen.
+      renderSettingsTabContent(tab, '');
       if (tab === 'general' || tab === 'marketplace' || tab === 'marketplace-ledger') {
         await fetchMarketplaceData();
       }
