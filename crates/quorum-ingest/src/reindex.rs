@@ -67,23 +67,48 @@ pub struct ReindexProgress {
 /// low-priority runtime guarantees that foreground Axum HTTP endpoints (`/`, `/api/health`,
 /// `/api/cache/stats`, `/api/reindex/status`, `/api/fs/browse-folders`, `/api/cloud-drives`,
 /// folder toggles, and interactive RAG chat) are never starved under multi-million-chunk indexing.
-fn background_ingest_runtime() -> &'static tokio::runtime::Runtime {
-    static BG_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    BG_RUNTIME.get_or_init(|| {
-        let workers = std::thread::available_parallelism()
-            .map(|n| (n.get() / 4).clamp(2, 6))
-            .unwrap_or(2);
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
-            .max_blocking_threads(16)
-            .thread_name("quorum-bg-ingest")
-            .on_thread_start(|| {
-                crate::throttling::set_background_thread_priority();
-            })
-            .enable_all()
-            .build()
-            .expect("Failed to initialize background ingest Tokio runtime")
-    })
+/// Returns `None` (falling back to the active Tokio runtime) if OS thread creation is restricted,
+/// ensuring zero panic/abort paths from entry-reachable handlers.
+fn background_ingest_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    static BG_RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+        std::sync::OnceLock::new();
+    BG_RUNTIME
+        .get_or_init(|| {
+            let workers = std::thread::available_parallelism()
+                .map(|n| (n.get() / 4).clamp(2, 6))
+                .unwrap_or(2);
+            match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .max_blocking_threads(16)
+                .thread_name("quorum-bg-ingest")
+                .on_thread_start(|| {
+                    crate::throttling::set_background_thread_priority();
+                })
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => Some(rt),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "Failed to initialize dedicated background ingest Tokio runtime; falling back to ambient runtime"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn spawn_background_ingest<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Some(rt) = background_ingest_runtime() {
+        rt.spawn(future);
+    } else {
+        tokio::spawn(future);
+    }
 }
 
 /// Guard that decrements `in_flight_tasks` and wakes `task_done_notify` on any exit or panic.
@@ -511,7 +536,7 @@ impl ReindexWorker {
         let commit_gate = Arc::clone(&self.commit_gate);
         let pending_priority = Arc::clone(&self.pending_priority_paths);
 
-        background_ingest_runtime().spawn(async move {
+        spawn_background_ingest(async move {
             let _done_guard = done_guard;
             let cancel_rx_check = cancel_tx.subscribe();
 
