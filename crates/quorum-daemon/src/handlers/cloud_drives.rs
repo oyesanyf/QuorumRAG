@@ -6,7 +6,7 @@
 //! - `POST /api/cloud-drives/reindex`
 //! - `POST /api/cloud-drives/relay/register`
 
-use axum::extract::{ConnectInfo, Json, State};
+use axum::extract::{ConnectInfo, Json, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -383,7 +383,7 @@ fn dir_exists_live(path: &Path) -> bool {
     match quorum_types::session_fs_bridge::local_is_dir_bounded(
         path,
         false,
-        Duration::from_millis(2000),
+        Duration::from_millis(4500),
     ) {
         Ok(true) => return true,
         Err(_) => return false,
@@ -1492,7 +1492,16 @@ pub async fn build_cloud_drives_status_response_with_context(
 }
 
 /// `GET /api/cloud-drives`
-pub async fn get_cloud_drives_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+pub async fn get_cloud_drives_handler(
+    State(state): State<Arc<DaemonState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if params
+        .get("refresh")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        quorum_types::session_fs_bridge::clear_drive_timeout_cache();
+    }
     let resp = build_cloud_drives_status_response(&state, None, None).await;
     Json(resp)
 }
@@ -1503,6 +1512,14 @@ pub async fn update_cloud_drives_config_handler(
     Json(payload): Json<CloudDrivesConfigPayload>,
 ) -> Response {
     let _mutation_guard = cloud_drives_config_mutex().lock().await;
+
+    if matches!(
+        payload.action.as_deref().map(|s| s.trim()),
+        Some("toggle_drive" | "add_folder" | "set_root" | "select_root")
+    ) && payload.enabled != Some(false)
+    {
+        quorum_types::session_fs_bridge::clear_drive_timeout_cache();
+    }
 
     let discovered = tokio::task::spawn_blocking(discover_cloud_drives)
         .await
@@ -1609,7 +1626,11 @@ pub async fn update_cloud_drives_config_handler(
                             "Invalid, unsafe, or non-canonical cloud drive root_path",
                         );
                     };
-                    if dir_exists_live(&clean_rp) {
+                    let clean_rp_check = clean_rp.clone();
+                    let rp_exists = tokio::task::spawn_blocking(move || dir_exists_live(&clean_rp_check))
+                        .await
+                        .unwrap_or(false);
+                    if rp_exists {
                         if let Some(conflict_msg) =
                             check_cloud_drive_path_conflict(&clean_rp, &other_disabled)
                         {
@@ -1847,7 +1868,11 @@ pub async fn update_cloud_drives_config_handler(
                     "Invalid, unsafe, or non-canonical folder path",
                 );
             };
-            if !dir_exists_live(&clean_p) {
+            let clean_p_check = clean_p.clone();
+            let add_exists = tokio::task::spawn_blocking(move || dir_exists_live(&clean_p_check))
+                .await
+                .unwrap_or(false);
+            if !add_exists {
                 if let Some(busy_msg) =
                     quorum_types::session_fs_bridge::drive_timeout_message(&clean_p)
                 {

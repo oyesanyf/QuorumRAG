@@ -754,3 +754,101 @@ pub async fn add_documents_handler(
     )
         .into_response()
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UnwatchDocumentsRequest {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    pub path: Option<String>,
+}
+
+/// Remove one or more directories from active filesystem watching and background reindexing:
+/// `POST /api/documents/unwatch`
+pub async fn unwatch_documents_handler(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<UnwatchDocumentsRequest>,
+) -> impl IntoResponse {
+    let mut raw_paths = req.paths;
+    if let Some(single) = req.path {
+        if !single.trim().is_empty() {
+            raw_paths.push(single);
+        }
+    }
+    let mut targets: Vec<PathBuf> = Vec::with_capacity(raw_paths.len());
+    for raw in raw_paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if quorum_types::validate_cloud_drive_path(trimmed).is_err() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid or unsafe path in unwatch request"
+                })),
+            )
+                .into_response();
+        }
+        let pb = PathBuf::from(trimmed);
+        if let Some(clean) = crate::handlers::cloud_drives::canonicalize_for_cloud_filter(&pb) {
+            if !targets.contains(&clean) {
+                targets.push(clean);
+            }
+        }
+        if !targets.contains(&pb) {
+            targets.push(pb);
+        }
+    }
+    if targets.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "No folder paths provided to unwatch" })),
+        )
+            .into_response();
+    }
+
+    let mut removed_labels: Vec<String> = Vec::with_capacity(targets.len());
+    for t in &targets {
+        let s = t.to_string_lossy().to_string();
+        if !removed_labels.contains(&s) {
+            removed_labels.push(s);
+        }
+    }
+
+    if let Some(watcher) = state.fs_watcher() {
+        for t in &targets {
+            let _ = watcher.unwatch_path(t);
+            if let Ok(norm) = quorum_types::normalize_prefix_for_match(&t.to_string_lossy()) {
+                for wp in watcher.watched_paths() {
+                    if quorum_types::normalize_prefix_for_match(&wp.to_string_lossy())
+                        .ok()
+                        .as_deref()
+                        == Some(norm.as_str())
+                    {
+                        let _ = watcher.unwatch_path(&wp);
+                    }
+                }
+            }
+        }
+    }
+
+    state.reindex_worker.remove_watch_paths(&targets).await;
+    state.drift_healer.remove_watch_paths(&targets).await;
+
+    let watched_paths: Vec<String> = state
+        .reindex_worker
+        .all_watch_paths()
+        .into_iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "unwatched",
+            "removed_paths": removed_labels,
+            "watched_paths": watched_paths,
+        })),
+    )
+        .into_response()
+}

@@ -240,9 +240,15 @@ const MAX_LOCAL_BLOCKED_FS_PROBES: usize = 12;
 
 /// Bounded-timeout directory check safe for local Dokan/WinFSP/SMB virtual drives in interactive
 /// Windows sessions. For fixed physical drives (`\Device\HarddiskVolume*`) or non-Windows OSes,
-/// runs directly in 0 overhead; for virtual drives, enforces `timeout` and trips the per-drive
-/// timeout circuit breaker instead of hanging startup or HTTP handlers indefinitely.
-pub fn local_is_dir_bounded(path: &Path, require_readable: bool, timeout: Duration) -> Result<bool, String> {
+/// runs directly in 0 overhead; for virtual drives, enforces `timeout` and optionally trips the
+/// per-drive timeout circuit breaker (`record_timeout_on_miss = true`) instead of hanging startup
+/// or HTTP handlers indefinitely.
+pub fn local_is_dir_bounded_probe(
+    path: &Path,
+    require_readable: bool,
+    timeout: Duration,
+    record_timeout_on_miss: bool,
+) -> Result<bool, String> {
     if !is_local_virtual_drive_path(path) {
         let ok = path.is_dir() && (!require_readable || std::fs::read_dir(path).is_ok());
         return Ok(ok);
@@ -253,7 +259,12 @@ pub fn local_is_dir_bounded(path: &Path, require_readable: bool, timeout: Durati
     let prev = LOCAL_BLOCKED_FS_PROBES.fetch_add(1, Ordering::SeqCst);
     if prev >= MAX_LOCAL_BLOCKED_FS_PROBES {
         LOCAL_BLOCKED_FS_PROBES.fetch_sub(1, Ordering::SeqCst);
-        return Err(record_local_drive_timeout(path));
+        let msg = if record_timeout_on_miss {
+            record_local_drive_timeout(path)
+        } else {
+            format_drive_busy_message(path)
+        };
+        return Err(msg);
     }
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
     let p_owned = path.to_path_buf();
@@ -269,8 +280,21 @@ pub fn local_is_dir_bounded(path: &Path, require_readable: bool, timeout: Durati
             }
             Ok(ok)
         }
-        Err(_) => Err(record_local_drive_timeout(path)),
+        Err(_) => {
+            let msg = if record_timeout_on_miss {
+                record_local_drive_timeout(path)
+            } else {
+                format_drive_busy_message(path)
+            };
+            Err(msg)
+        }
     }
+}
+
+/// Bounded-timeout directory check safe for local Dokan/WinFSP/SMB virtual drives in interactive
+/// Windows sessions. Trips the per-drive timeout circuit breaker on timeout.
+pub fn local_is_dir_bounded(path: &Path, require_readable: bool, timeout: Duration) -> Result<bool, String> {
+    local_is_dir_bounded_probe(path, require_readable, timeout, true)
 }
 
 /// Bounded-timeout file existence check safe for local virtual drives.

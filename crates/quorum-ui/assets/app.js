@@ -3286,6 +3286,7 @@ function secureRandomIndex(n) {
       const action = actionEl.dataset.action;
       const folderPath = actionEl.dataset.folderPath || '';
       if (action === 'browse-dir') {
+        if (e.target.closest('[data-stop-browse]')) return;
         e.preventDefault();
         await window.quorumBrowseDir(folderPath);
       } else if (action === 'browse-up') {
@@ -3865,7 +3866,9 @@ function secureRandomIndex(n) {
     cloudDrivesLoading = true;
     cloudDrivesError = null;
     try {
-      const resp = await fetchWithTimeout('/api/cloud-drives', {}, 15000);
+      const resp = forceRefresh
+        ? await fetchWithTimeout('/api/cloud-drives?refresh=1', {}, 15000)
+        : await fetchWithTimeout('/api/cloud-drives', {}, 15000);
       if (seq !== cloudDrivesFetchSeq) return cachedCloudDrivesData;
       if (!resp.ok) {
         const errBody = await resp.json().catch(() => ({}));
@@ -3896,19 +3899,25 @@ function secureRandomIndex(n) {
   }
 
   async function postCloudDrivesConfig(payload) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
     try {
       const resp = await fetch('/api/cloud-drives/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload || {})
+        body: JSON.stringify(payload || {}),
+        signal: ctrl.signal
       });
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) {
+        const errMsg = body.error || `HTTP ${resp.status} ${resp.statusText}`;
+        lastFolderToggleError = errMsg;
         return {
           ok: false,
-          error: body.error || `HTTP ${resp.status} ${resp.statusText}`
+          error: errMsg
         };
       }
+      lastFolderToggleError = '';
       if (body && Array.isArray(body.drives)) {
         ++cloudDrivesFetchSeq;
         cloudDrivesLoading = false;
@@ -3919,10 +3928,16 @@ function secureRandomIndex(n) {
       }
       return { ok: true, data: body };
     } catch (err) {
+      const errMsg = (err && err.name === 'AbortError')
+        ? 'Cloud drive configuration request timed out after 15s (virtual drive busy or stalled).'
+        : ((err && err.message) ? err.message : 'Network error updating cloud drives configuration');
+      lastFolderToggleError = errMsg;
       return {
         ok: false,
-        error: (err && err.message) ? err.message : 'Network error updating cloud drives configuration'
+        error: errMsg
       };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -4368,15 +4383,23 @@ function secureRandomIndex(n) {
   }
 
   let browseFoldersFetchSeq = 0;
+  let browseFoldersAbortCtrl = null;
   let lastBrowseFoldersError = '';
+  let lastFolderToggleError = '';
 
   async function fetchBrowseFolders(pathStr) {
     const seq = ++browseFoldersFetchSeq;
+    if (browseFoldersAbortCtrl) {
+      try { browseFoldersAbortCtrl.abort(); } catch (_) {}
+    }
+    const ctrl = new AbortController();
+    browseFoldersAbortCtrl = ctrl;
+    const timer = setTimeout(() => ctrl.abort(), 10000);
     lastBrowseFoldersError = '';
     try {
-      let resp = await fetch(`/api/fs/browse-folders?path=${encodeURIComponent(pathStr || '')}`);
+      let resp = await fetch(`/api/fs/browse-folders?path=${encodeURIComponent(pathStr || '')}`, { signal: ctrl.signal });
       if (!resp.ok && resp.status === 404 && !pathStr) {
-        resp = await fetch(`/api/mesh/browse-folders?path=${encodeURIComponent(pathStr || '')}`);
+        resp = await fetch(`/api/mesh/browse-folders?path=${encodeURIComponent(pathStr || '')}`, { signal: ctrl.signal });
       }
       if (seq !== browseFoldersFetchSeq) return false;
       const data = await resp.json().catch(() => ({}));
@@ -4425,9 +4448,16 @@ function secureRandomIndex(n) {
       return true;
     } catch (err) {
       if (seq !== browseFoldersFetchSeq) return false;
-      lastBrowseFoldersError = (err && err.message) ? err.message : 'Unable to reach folder browser';
+      lastBrowseFoldersError = (err && err.name === 'AbortError')
+        ? 'Folder listing timed out after 10s (drive slow or daemon busy).'
+        : ((err && err.message) ? err.message : 'Unable to reach folder browser');
       showSettingsToast('⚠ ' + lastBrowseFoldersError);
       return false;
+    } finally {
+      clearTimeout(timer);
+      if (browseFoldersAbortCtrl === ctrl) {
+        browseFoldersAbortCtrl = null;
+      }
     }
   }
 
@@ -4567,18 +4597,26 @@ function secureRandomIndex(n) {
           ? directories.filter(d => d && (!d.is_quick_access || !isServiceProfilePathJs(d.path)))
           : []);
 
-    const dirRowsHtml = effectiveDirectories.length > 0 ? effectiveDirectories.map(d => {
+    const dirRowsHtml = effectiveDirectories.length > 0 ? effectiveDirectories.map((d, idx) => {
       const p = String(d.path || '');
       const pNorm = p.replace(/[\\/]+$/, '').toLowerCase();
-      const isSelected = selectedSet && (selectedSet.has(p.toLowerCase()) || (pNorm && selectedSet.has(pNorm)));
+      const pCanon = canonicalComparePathJs(p);
+      const isSelected = selectedSet && (
+        selectedSet.has(p.toLowerCase()) ||
+        (pNorm && selectedSet.has(pNorm)) ||
+        (pCanon && selectedSet.has(pCanon))
+      );
       const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
       const subLabel = d.is_drive
-        ? `${p} — Click row or "Open →" to drill down into folders`
+        ? (p === '/' ? 'Root volume' : `Volume ${p}`)
         : (p && p !== d.name ? p : '');
+      const cbId = `inline-row-cb-${contextId}-${idx}`;
       return `
         <div class="folder-browser-item folder-row ${isSelected ? 'selected' : ''}" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Click row to open ${escapeHtml(d.name)}">
           <div class="folder-row-left">
-            <input type="checkbox" class="folder-row-checkbox" ${isSelected ? 'checked' : ''} aria-label="Select folder ${escapeHtml(d.name)}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}" title="${isSelected ? 'Unselect' : 'Select'} ${escapeHtml(d.name)}">
+            <label class="folder-checkbox-hit" for="${cbId}" data-stop-browse="true" title="${isSelected ? 'Unselect' : 'Select'} ${escapeHtml(d.name)}">
+              <input id="${cbId}" type="checkbox" class="folder-row-checkbox" ${isSelected ? 'checked' : ''} aria-label="Select folder ${escapeHtml(d.name)}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}" title="${isSelected ? 'Unselect' : 'Select'} ${escapeHtml(d.name)}">
+            </label>
             <span class="folder-row-icon">${icon}</span>
             <div class="folder-row-details">
               <span class="folder-row-name">${escapeHtml(d.name)}</span>
@@ -4586,11 +4624,11 @@ function secureRandomIndex(n) {
             </div>
           </div>
           <div class="folder-row-actions">
-            <button type="button" class="pill-btn folder-select-btn ${isSelected ? 'selected' : ''}" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${isSelected ? 'Selected — Unselect' : escapeHtml(selectButtonText || '+ Select Folder')} ${escapeHtml(d.name)}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}">
-              ${isSelected ? '✓ Selected — Unselect' : (selectButtonText || '+ Select Folder')}
+            <button type="button" class="pill-btn folder-select-btn ${isSelected ? 'selected' : ''}" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${isSelected ? 'Selected — Unselect' : escapeHtml(selectButtonText || 'Select')} ${escapeHtml(d.name)}" data-action="${selectAction}" data-folder-path="${escapeHtml(p)}" data-context="${contextId}">
+              ${isSelected ? '✓ Selected — Unselect' : 'Select'}
             </button>
-            <button type="button" class="pill-btn folder-open-btn" aria-label="Open ${escapeHtml(d.name)}" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Open and drill down into ${escapeHtml(d.name)}">
-              Open →
+            <button type="button" class="pill-btn folder-open-btn" aria-label="Open ${escapeHtml(d.name)}" data-action="browse-dir" data-folder-path="${escapeHtml(p)}" title="Open ${escapeHtml(d.name)}">
+              Open ›
             </button>
           </div>
         </div>
@@ -4667,6 +4705,7 @@ function secureRandomIndex(n) {
   let pureRustPickerFilterText = '';
   let pureRustPickerListenersBound = false;
   let pureRustPickerFetchSeq = 0;
+  let pureRustPickerAbortCtrl = null;
   let pureRustPickerLoading = false;
   let pureRustPickerError = '';
   let pureRustPickerSessionId = 0;
@@ -4789,14 +4828,7 @@ function secureRandomIndex(n) {
       if (shouldSelect) {
         return await window.quorumIndexFolderImmediate(chosen);
       } else {
-        const key = canonicalComparePathJs(chosen);
-        const isClientCustom = clientWatchedFolders.some(p => canonicalComparePathJs(p) === key);
-        if (isClientCustom) {
-          window.quorumRemoveClientWatchedFolder(chosen);
-          return true;
-        }
-        showSettingsToast('ℹ Default system watch roots can be managed under General → Automatic Physical Drive Indexing.');
-        return false;
+        return await window.quorumUnwatchFolderImmediate(chosen);
       }
     } else if (ctx === 'dlp') {
       if (shouldSelect) {
@@ -4873,10 +4905,16 @@ function secureRandomIndex(n) {
   function closePureRustPickerModal() {
     const modal = document.getElementById('modal-pure-rust-folder-picker');
     if (modal) modal.classList.add('hidden');
+    if (pureRustPickerAbortCtrl) {
+      try { pureRustPickerAbortCtrl.abort(); } catch (_) {}
+      pureRustPickerAbortCtrl = null;
+    }
+    ++pureRustPickerFetchSeq;
     pendingCloudDrivePickerId = '';
     pendingCloudDriveAutoEnableId = '';
     pureRustPickerError = '';
     pureRustPickerLoading = false;
+    pureRustPickerSubmitting = false;
     if (pureRustPickerInvokerEl && typeof pureRustPickerInvokerEl.focus === 'function') {
       try {
         pureRustPickerInvokerEl.focus();
@@ -4985,9 +5023,9 @@ function secureRandomIndex(n) {
             ? pureRustPickerCurrentPath.startsWith('/')
             : pureRustPickerCurrentPath.toLowerCase().startsWith(drv.toLowerCase())
         );
-        return `<button type="button" class="pill-btn folder-drive-pill ${isActive ? 'active' : ''}" data-picker-nav="${escapeHtml(drv)}" title="Open drive ${escapeHtml(drv)}">💽 ${escapeHtml(drv)}</button>`;
+        return `<button type="button" class="picker-sidebar-item ${isActive ? 'active' : ''}" data-picker-nav="${escapeHtml(drv)}" title="Open drive ${escapeHtml(drv)}"><span>💽</span><span>${escapeHtml(drv === '/' ? 'Root (/)' : 'Drive ' + drv)}</span></button>`;
       }).join('');
-      drivesBar.innerHTML = `<span style="font-size:11.5px; font-weight:700; color:var(--text-muted); margin-right:4px;">Drives on this asset:</span>${drvHtml}`;
+      drivesBar.innerHTML = `<div class="picker-sidebar-heading">Drives on this asset:</div>${drvHtml}`;
     }
 
     const quickBar = document.getElementById('pure-rust-picker-quick-bar');
@@ -4996,9 +5034,9 @@ function secureRandomIndex(n) {
         const qaHtml = pureRustPickerQuickAccess.map(qa => {
           const p = String(qa.path || '');
           const isActive = pureRustPickerCurrentPath && pureRustPickerCurrentPath.toLowerCase() === p.toLowerCase();
-          return `<button type="button" class="pill-btn folder-drive-pill ${isActive ? 'active' : ''}" data-picker-nav="${escapeHtml(p)}" title="${escapeHtml(p)}">⭐ ${escapeHtml(qa.name)}</button>`;
+          return `<button type="button" class="picker-sidebar-item ${isActive ? 'active' : ''}" data-picker-nav="${escapeHtml(p)}" title="${escapeHtml(p)}"><span>⭐</span><span>${escapeHtml(qa.name)}</span></button>`;
         }).join('');
-        quickBar.innerHTML = `<span style="font-size:11.5px; font-weight:700; color:var(--text-muted); margin-right:4px;">Quick Access:</span>${qaHtml}`;
+        quickBar.innerHTML = `<div class="picker-sidebar-heading">Quick Access</div>${qaHtml}`;
       } else {
         quickBar.innerHTML = '';
       }
@@ -5010,10 +5048,10 @@ function secureRandomIndex(n) {
       if (selectedPaths.length > 0) {
         const chipsHtml = selectedPaths.map(sp => {
           const leaf = sp === '/' ? '/' : (sp.split(/[\\/]/).filter(Boolean).pop() || sp);
-          return `<button type="button" class="pill-btn picker-selected-chip" data-picker-unselect="${escapeHtml(sp)}" aria-label="Unselect ${escapeHtml(leaf)}" title="Click to unselect ${escapeHtml(sp)}"><span>✓</span> <code>${escapeHtml(sp)}</code> <span aria-hidden="true">✕</span></button>`;
+          return `<button type="button" class="pill-btn picker-selected-chip" data-picker-unselect="${escapeHtml(sp)}" aria-label="Unselect ${escapeHtml(leaf)}" title="Click to unselect ${escapeHtml(sp)}"><span>✓</span> <code>${escapeHtml(leaf)}</code> <span aria-hidden="true">✕</span></button>`;
         }).join('');
         selectedBar.classList.remove('hidden');
-        selectedBar.innerHTML = `<span style="font-weight:700; color:#10a37f; margin-right:4px;">Selected (${selectedPaths.length}):</span>${chipsHtml}`;
+        selectedBar.innerHTML = `<span style="font-weight:600; color:#10a37f; margin-right:4px;">Selected (${selectedPaths.length})</span>${chipsHtml}`;
       } else {
         selectedBar.classList.add('hidden');
         selectedBar.innerHTML = '';
@@ -5023,12 +5061,18 @@ function secureRandomIndex(n) {
     const rootBtn = document.getElementById('btn-pure-rust-picker-root');
     if (rootBtn) {
       rootBtn.textContent = IS_POSIX_CLIENT ? '💽 Computer' : '💽 This PC';
+      rootBtn.classList.toggle('active', !pureRustPickerCurrentPath);
     }
 
     const upBtn = document.getElementById('btn-pure-rust-picker-up');
     if (upBtn) {
       upBtn.disabled = !pureRustPickerCurrentPath;
-      upBtn.style.opacity = pureRustPickerCurrentPath ? '1' : '0.45';
+      upBtn.style.opacity = pureRustPickerCurrentPath ? '1' : '0.4';
+    }
+
+    const newFolderWrap = document.getElementById('pure-rust-picker-new-folder-wrap');
+    if (newFolderWrap) {
+      newFolderWrap.classList.toggle('hidden', !pureRustPickerCurrentPath);
     }
 
     const crumbsEl = document.getElementById('pure-rust-picker-breadcrumbs');
@@ -5047,14 +5091,14 @@ function secureRandomIndex(n) {
 
     const selectedLabel = document.getElementById('pure-rust-picker-selected-label');
     if (selectedLabel) {
-      selectedLabel.textContent = pureRustPickerCurrentPath || (IS_POSIX_CLIENT ? 'Drives & Volumes (Click any drive or folder below to drill down)' : 'Drives on this asset (Click any drive below to drill down into folders)');
+      selectedLabel.textContent = pureRustPickerCurrentPath || (IS_POSIX_CLIENT ? 'Computer' : 'This PC');
     }
 
     const isActiveSelected = pureRustPickerCurrentPath ? isPickerPathSelected(pureRustPickerContext, pureRustPickerCurrentPath) : false;
     const confirmBtn = document.getElementById('btn-confirm-pure-rust-picker');
     if (confirmBtn) {
+      confirmBtn.classList.toggle('hidden', !pureRustPickerCurrentPath);
       confirmBtn.disabled = !pureRustPickerCurrentPath || pureRustPickerSubmitting;
-      confirmBtn.style.opacity = pureRustPickerCurrentPath ? '1' : '0.5';
       confirmBtn.setAttribute('aria-pressed', isActiveSelected ? 'true' : 'false');
       const leafLabel = pureRustPickerCurrentPath
         ? (pureRustPickerCurrentPath === '/' ? '/' : (pureRustPickerCurrentPath.split(/[\\/]/).filter(Boolean).pop() || pureRustPickerCurrentPath))
@@ -5063,22 +5107,20 @@ function secureRandomIndex(n) {
         confirmBtn.style.background = '#dc2626';
         confirmBtn.style.borderColor = '#dc2626';
         confirmBtn.textContent = `✕ Unselect Folder (${leafLabel})`;
-      } else {
+      } else if (pureRustPickerCurrentPath) {
         confirmBtn.style.background = '#10a37f';
         confirmBtn.style.borderColor = '#10a37f';
-        confirmBtn.textContent = pureRustPickerCurrentPath
-          ? `✅ Select Folder (${leafLabel})`
-          : 'Click a Drive to Drill Down or Toggle Any Folder';
+        confirmBtn.textContent = `✓ Select Folder (${leafLabel})`;
       }
     }
 
     const listEl = document.getElementById('pure-rust-picker-dir-list');
     if (listEl) {
       const errBanner = pureRustPickerError
-        ? `<div role="alert" style="padding:8px 12px; margin-bottom:8px; border-radius:8px; background:rgba(220,38,38,0.14); border:1px solid rgba(220,38,38,0.35); color:#fca5a5; font-size:12px;">⚠ ${escapeHtml(pureRustPickerError)}</div>`
+        ? `<div role="alert" style="padding:10px 14px; margin-bottom:8px; border-radius:9px; background:rgba(220,38,38,0.12); border:1px solid rgba(220,38,38,0.35); color:#fca5a5; font-size:12.5px; line-height:1.45;">⚠ ${escapeHtml(pureRustPickerError)}</div>`
         : '';
       if (pureRustPickerLoading && pureRustPickerDirectories.length === 0) {
-        listEl.innerHTML = `${errBanner}<div style="padding:18px; text-align:center; color:var(--text-muted); font-size:12.5px;">⏳ Loading folders...</div>`;
+        listEl.innerHTML = `${errBanner}<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:13px;">⏳ Loading folders...</div>`;
         return;
       }
       const q = (pureRustPickerFilterText || '').trim().toLowerCase();
@@ -5091,8 +5133,8 @@ function secureRandomIndex(n) {
 
       if (filtered.length === 0) {
         listEl.innerHTML = `${errBanner}
-          <div style="padding:18px; text-align:center; color:var(--text-muted); font-size:12.5px;">
-            ${q ? 'No drives or subfolders match filter "' + escapeHtml(pureRustPickerFilterText) + '".' : 'No subdirectories in this folder. Click the button below to select or unselect this directory, or create a new subfolder above.'}
+          <div style="padding:24px; text-align:center; color:var(--text-muted); font-size:12.5px;">
+            ${q ? 'No folders match "' + escapeHtml(pureRustPickerFilterText) + '".' : 'No subfolders here. Use the button below to select this folder or create a new subfolder above.'}
           </div>
         `;
       } else {
@@ -5102,11 +5144,11 @@ function secureRandomIndex(n) {
           const icon = d.is_drive ? '💽' : (d.is_quick_access ? '⭐' : '📁');
           const displayName = d.is_drive ? (p === '/' ? 'Root Filesystem (/)' : `Drive ${p}`) : String(d.name || p);
           const subHint = d.is_drive
-            ? `${p} — Click row or "Open →" to drill down into folders`
+            ? (p === '/' ? 'Root volume' : `Volume ${p}`)
             : (p && p !== d.name ? p : '');
           const cbId = `picker-row-cb-${idx}`;
           return `
-            <div class="folder-browser-item folder-row ${isSelected ? 'selected' : ''}" data-picker-nav="${escapeHtml(p)}" title="Click row to open ${escapeHtml(p)}">
+            <div class="folder-browser-item folder-row ${isSelected ? 'selected' : ''}" data-picker-nav="${escapeHtml(p)}" title="Open ${escapeHtml(p)}">
               <div class="folder-row-left">
                 <label class="folder-checkbox-hit" for="${cbId}" data-picker-stop-nav="true" title="${isSelected ? 'Unselect' : 'Select'} ${escapeHtml(displayName)}">
                   <input id="${cbId}" type="checkbox" class="folder-row-checkbox" ${isSelected ? 'checked' : ''} ${pureRustPickerSubmitting ? 'disabled' : ''} data-picker-toggle="${escapeHtml(p)}" aria-label="Select folder ${escapeHtml(displayName)}">
@@ -5118,11 +5160,11 @@ function secureRandomIndex(n) {
                 </div>
               </div>
               <div class="folder-row-actions">
-                <button type="button" class="pill-btn folder-select-btn ${isSelected ? 'selected' : ''}" ${pureRustPickerSubmitting ? 'disabled' : ''} data-picker-toggle="${escapeHtml(p)}" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${isSelected ? 'Selected — Unselect' : 'Select Folder'} ${escapeHtml(displayName)}" style="${isSelected ? '' : 'border-color:#10a37f; color:#10a37f; font-weight:600;'}">
-                  ${isSelected ? '✓ Selected — Unselect' : '✓ Select Folder'}
+                <button type="button" class="pill-btn folder-select-btn ${isSelected ? 'selected' : ''}" ${pureRustPickerSubmitting ? 'disabled' : ''} data-picker-toggle="${escapeHtml(p)}" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${isSelected ? 'Selected — Unselect' : 'Select'} ${escapeHtml(displayName)}">
+                  ${isSelected ? '✓ Selected — Unselect' : 'Select'}
                 </button>
                 <button type="button" class="pill-btn folder-open-btn" data-picker-nav="${escapeHtml(p)}" aria-label="Open ${escapeHtml(displayName)}">
-                  Open →
+                  Open ›
                 </button>
               </div>
             </div>
@@ -5134,6 +5176,12 @@ function secureRandomIndex(n) {
 
   async function loadPureRustPickerDirectory(targetPath, createSubfolder) {
     const seq = ++pureRustPickerFetchSeq;
+    if (pureRustPickerAbortCtrl) {
+      try { pureRustPickerAbortCtrl.abort(); } catch (_) {}
+    }
+    const ctrl = new AbortController();
+    pureRustPickerAbortCtrl = ctrl;
+    const timer = setTimeout(() => ctrl.abort(), 10000);
     const requested = targetPath !== undefined ? targetPath : pureRustPickerCurrentPath;
     const qs = `path=${encodeURIComponent(requested || '')}` + (createSubfolder ? `&create_subfolder=${encodeURIComponent(createSubfolder)}` : '');
     pureRustPickerLoading = true;
@@ -5147,8 +5195,14 @@ function secureRandomIndex(n) {
         const respPost = await fetch('/api/fs/pick-folder', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: requested, create_subfolder: createSubfolder })
-        }).catch((err) => { lastErrMsg = err.message || 'Network error'; return null; });
+          body: JSON.stringify({ path: requested, create_subfolder: createSubfolder }),
+          signal: ctrl.signal
+        }).catch((err) => {
+          lastErrMsg = (err && err.name === 'AbortError')
+            ? 'Creating subfolder timed out after 10s (drive busy).'
+            : ((err && err.message) || 'Network error');
+          return null;
+        });
         if (seq !== pureRustPickerFetchSeq) return false;
         if (respPost) {
           const candidate = await respPost.json().catch(() => null);
@@ -5164,10 +5218,15 @@ function secureRandomIndex(n) {
       }
 
       if (!data) {
-        let respBrowse = await fetch(`/api/fs/browse-folders?${qs}`).catch((err) => { lastErrMsg = err.message || 'Network error'; return null; });
+        let respBrowse = await fetch(`/api/fs/browse-folders?${qs}`, { signal: ctrl.signal }).catch((err) => {
+          lastErrMsg = (err && err.name === 'AbortError')
+            ? 'Directory listing timed out after 10s (drive slow or daemon busy). You can still select or unselect visible folders.'
+            : ((err && err.message) || 'Network error');
+          return null;
+        });
         if (seq !== pureRustPickerFetchSeq) return false;
         if (respBrowse && !respBrowse.ok && respBrowse.status === 404 && !requested) {
-          respBrowse = await fetch(`/api/mesh/browse-folders?${qs}`).catch(() => null);
+          respBrowse = await fetch(`/api/mesh/browse-folders?${qs}`, { signal: ctrl.signal }).catch(() => null);
         }
         if (seq !== pureRustPickerFetchSeq) return false;
         if (respBrowse) {
@@ -5186,8 +5245,14 @@ function secureRandomIndex(n) {
         const respFallback = await fetch('/api/fs/pick-folder', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: requested })
-        }).catch((err) => { lastErrMsg = err.message || 'Network error'; return null; });
+          body: JSON.stringify({ path: requested }),
+          signal: ctrl.signal
+        }).catch((err) => {
+          lastErrMsg = (err && err.name === 'AbortError')
+            ? 'Directory listing timed out after 10s (drive slow or daemon busy).'
+            : ((err && err.message) || 'Network error');
+          return null;
+        });
         if (seq !== pureRustPickerFetchSeq) return false;
         if (respFallback) {
           const candidate = await respFallback.json().catch(() => null);
@@ -5246,10 +5311,16 @@ function secureRandomIndex(n) {
       return true;
     } catch (err) {
       if (seq !== pureRustPickerFetchSeq) return false;
-      pureRustPickerError = (err && err.message) ? err.message : 'Folder browser error';
+      pureRustPickerError = (err && err.name === 'AbortError')
+        ? 'Directory listing timed out after 10s (drive slow or daemon busy).'
+        : ((err && err.message) ? err.message : 'Folder browser error');
       showSettingsToast('⚠ Folder browser error: ' + pureRustPickerError);
       return false;
     } finally {
+      clearTimeout(timer);
+      if (pureRustPickerAbortCtrl === ctrl) {
+        pureRustPickerAbortCtrl = null;
+      }
       if (seq === pureRustPickerFetchSeq) {
         pureRustPickerLoading = false;
         if (pureRustPickerDirectories.length === 0 && !pureRustPickerCurrentPath) {
@@ -5283,39 +5354,44 @@ function secureRandomIndex(n) {
     modal.setAttribute('aria-labelledby', 'pure-rust-picker-title');
     modal.style.zIndex = '100000';
     modal.innerHTML = `
-      <div class="modal-card" style="max-width: 760px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
-        <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
-          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-            <h3 id="pure-rust-picker-title" style="margin:0; font-size:16px;">📁 Select Folder</h3>
-            <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Drive or Folder</span>
+      <div class="modal-card picker-modal-card">
+        <div class="modal-header picker-modal-header">
+          <div class="picker-header-title-group">
+            <h3 id="pure-rust-picker-title" class="picker-modal-title">📁 Select Folder</h3>
+            <span id="pure-rust-picker-context-badge" class="picker-context-pill">Select Drive or Folder</span>
           </div>
           <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Select Folder" aria-label="Close Select Folder">&times;</button>
         </div>
-        <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
-          <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
-          <div id="pure-rust-picker-quick-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
-          <div id="pure-rust-picker-selected-bar" class="picker-selected-bar hidden" aria-live="polite"></div>
-          <div class="folder-explorer-address-bar" style="display:flex; align-items:center; gap:8px;">
-            <button type="button" class="pill-btn" id="btn-pure-rust-picker-root" style="padding:4px 9px; font-size:11.5px;">💽 This PC</button>
-            <button type="button" class="pill-btn" id="btn-pure-rust-picker-up" style="padding:4px 9px; font-size:11.5px;">⬅ Up</button>
-            <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1; min-inline-size:0;"></div>
-          </div>
-          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-            <input type="search" id="pure-rust-picker-filter-input" class="settings-input" aria-label="Filter folders in current view" placeholder="🔍 Filter drives or folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
-            <div style="display:flex; gap:6px; align-items:center;">
-              <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" aria-label="New subfolder name" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
-              <button type="button" class="pill-btn" id="btn-pure-rust-picker-create-folder" style="padding:5px 10px; font-size:12px; font-weight:600;">+ Create Subfolder</button>
+        <div class="modal-body picker-body-split">
+          <aside class="picker-sidebar custom-scroll" aria-label="Drives and Quick Access">
+            <button type="button" class="picker-sidebar-item picker-sidebar-root" id="btn-pure-rust-picker-root">💽 This PC</button>
+            <div id="pure-rust-picker-drives-bar" class="picker-sidebar-section"></div>
+            <div id="pure-rust-picker-quick-bar" class="picker-sidebar-section"></div>
+          </aside>
+          <div class="picker-main-pane">
+            <div class="picker-nav-bar">
+              <button type="button" class="pill-btn picker-up-btn" id="btn-pure-rust-picker-up" title="Up one folder" aria-label="Up one folder">← Up</button>
+              <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll"></div>
             </div>
+            <div class="picker-toolbar">
+              <input type="search" id="pure-rust-picker-filter-input" class="settings-input picker-filter-input" aria-label="Filter folders in current view" placeholder="Filter folders...">
+              <div id="pure-rust-picker-new-folder-wrap" class="picker-new-folder-wrap hidden">
+                <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input picker-new-folder-input" aria-label="New subfolder name" placeholder="New folder name...">
+                <button type="button" class="pill-btn picker-create-btn" id="btn-pure-rust-picker-create-folder">+ Create</button>
+              </div>
+            </div>
+            <div id="pure-rust-picker-selected-bar" class="picker-selected-bar hidden" aria-live="polite"></div>
+            <div id="pure-rust-picker-dir-list" class="folder-explorer-list picker-dir-list custom-scroll"></div>
           </div>
-          <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:380px; min-height:240px;"></div>
         </div>
-        <div class="modal-footer" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-          <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; min-inline-size:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-            Active Path: <code id="pure-rust-picker-selected-label" style="color:#10a37f; font-weight:600;">This PC</code>
+        <div class="modal-footer picker-modal-footer">
+          <div class="picker-footer-path">
+            <span class="picker-footer-path-label">Location:</span>
+            <code id="pure-rust-picker-selected-label">This PC</code>
           </div>
-          <div style="display:flex; gap:8px;">
+          <div class="picker-footer-actions">
             <button type="button" id="btn-cancel-pure-rust-picker" class="pill-btn">Done</button>
-            <button type="button" id="btn-confirm-pure-rust-picker" class="btn-primary" style="background:#10a37f; border-color:#10a37f; font-weight:700;">✅ Select Current Folder</button>
+            <button type="button" id="btn-confirm-pure-rust-picker" class="btn-primary picker-confirm-btn">Select Current Folder</button>
           </div>
         </div>
       </div>
@@ -5404,22 +5480,36 @@ function secureRandomIndex(n) {
       });
     }
 
+    const executePickerToggle = async (targetPath, forceSelect = null) => {
+      if (pureRustPickerSubmitting) return false;
+      pureRustPickerSubmitting = true;
+      pureRustPickerError = '';
+      lastFolderToggleError = '';
+      renderPureRustPickerModalContent();
+      try {
+        const ok = await window.togglePickedFolderInContext(pureRustPickerContext, targetPath, forceSelect);
+        if (!ok && lastFolderToggleError) {
+          pureRustPickerError = lastFolderToggleError;
+        }
+        return ok;
+      } catch (err) {
+        pureRustPickerError = (err && err.message) ? err.message : 'Folder selection update failed';
+        return false;
+      } finally {
+        pureRustPickerSubmitting = false;
+        renderPureRustPickerModalContent();
+      }
+    };
+
     const btnConfirm = document.getElementById('btn-confirm-pure-rust-picker');
     if (btnConfirm) {
       btnConfirm.addEventListener('click', async () => {
-        if (pureRustPickerSubmitting || pureRustPickerLoading) return;
+        if (pureRustPickerSubmitting) return;
         if (!pureRustPickerCurrentPath) {
           showSettingsToast('Click a drive to drill down into folders or toggle any folder checkbox.');
           return;
         }
-        pureRustPickerSubmitting = true;
-        renderPureRustPickerModalContent();
-        try {
-          await window.togglePickedFolderInContext(pureRustPickerContext, pureRustPickerCurrentPath);
-        } finally {
-          pureRustPickerSubmitting = false;
-          renderPureRustPickerModalContent();
-        }
+        await executePickerToggle(pureRustPickerCurrentPath);
       });
     }
 
@@ -5428,19 +5518,12 @@ function secureRandomIndex(n) {
       if (!cb) return;
       e.stopPropagation();
       const chosen = cb.getAttribute('data-picker-toggle') || '';
-      if (!chosen || pureRustPickerSubmitting || pureRustPickerLoading) {
+      if (!chosen || pureRustPickerSubmitting) {
         cb.checked = !cb.checked;
         return;
       }
       const desired = Boolean(cb.checked);
-      pureRustPickerSubmitting = true;
-      renderPureRustPickerModalContent();
-      try {
-        await window.togglePickedFolderInContext(pureRustPickerContext, chosen, desired);
-      } finally {
-        pureRustPickerSubmitting = false;
-        renderPureRustPickerModalContent();
-      }
+      await executePickerToggle(chosen, desired);
     });
 
     modal.addEventListener('click', async (e) => {
@@ -5456,17 +5539,10 @@ function secureRandomIndex(n) {
       if (unselectChip) {
         e.preventDefault();
         e.stopPropagation();
-        if (pureRustPickerSubmitting || pureRustPickerLoading) return;
+        if (pureRustPickerSubmitting) return;
         const chosen = unselectChip.getAttribute('data-picker-unselect') || '';
         if (chosen) {
-          pureRustPickerSubmitting = true;
-          renderPureRustPickerModalContent();
-          try {
-            await window.togglePickedFolderInContext(pureRustPickerContext, chosen, false);
-          } finally {
-            pureRustPickerSubmitting = false;
-            renderPureRustPickerModalContent();
-          }
+          await executePickerToggle(chosen, false);
         }
         return;
       }
@@ -5474,17 +5550,10 @@ function secureRandomIndex(n) {
       if (toggleBtn) {
         e.preventDefault();
         e.stopPropagation();
-        if (pureRustPickerSubmitting || pureRustPickerLoading) return;
+        if (pureRustPickerSubmitting) return;
         const chosen = toggleBtn.getAttribute('data-picker-toggle') || toggleBtn.getAttribute('data-picker-pick') || '';
         if (chosen) {
-          pureRustPickerSubmitting = true;
-          renderPureRustPickerModalContent();
-          try {
-            await window.togglePickedFolderInContext(pureRustPickerContext, chosen);
-          } finally {
-            pureRustPickerSubmitting = false;
-            renderPureRustPickerModalContent();
-          }
+          await executePickerToggle(chosen);
         }
         return;
       }
@@ -5619,17 +5688,15 @@ function secureRandomIndex(n) {
       return false;
     }
     mktFoldersBusy = true;
+    lastFolderToggleError = '';
     syncPendingMarketplaceInputsFromDom();
     const mkt = cachedMarketplaceStatus || {};
     const curFolders = Array.isArray(mkt.opt_in_folders) ? mkt.opt_in_folders.slice() : [];
-    const normTarget = targetPath.replace(/[\\/]+$/, '').toLowerCase();
-    const existingIdx = curFolders.findIndex(f => {
-      const nf = String(f || '').replace(/[\\/]+$/, '').toLowerCase();
-      return f.toLowerCase() === targetPath.toLowerCase() || (normTarget && nf === normTarget);
-    });
+    const targetCanon = canonicalComparePathJs(targetPath);
+    const existingIdx = curFolders.findIndex(f => canonicalComparePathJs(f) === targetCanon);
     let toastMsg = '';
     if (existingIdx >= 0) {
-      if (forceAdd) {
+      if (forceAdd === true) {
         mktFoldersBusy = false;
         showSettingsToast('✓ Folder already in Opt-In scope: ' + targetPath);
         renderSettingsTabContent(activeSettingsTab, '');
@@ -5638,11 +5705,16 @@ function secureRandomIndex(n) {
       curFolders.splice(existingIdx, 1);
       toastMsg = 'Removed folder from Opt-In scope: ' + targetPath;
     } else {
+      if (forceAdd === false) {
+        mktFoldersBusy = false;
+        renderSettingsTabContent(activeSettingsTab, '');
+        return true;
+      }
       curFolders.push(targetPath);
       toastMsg = '✓ Added folder to Opt-In scope: ' + targetPath;
     }
     try {
-      const resp = await fetch('/api/v1/marketplace/opt-in', {
+      const resp = await fetchWithTimeout('/api/v1/marketplace/opt-in', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -5650,20 +5722,33 @@ function secureRandomIndex(n) {
           user_consent_checked: !!mkt.user_consent_checked,
           opt_in_folders: curFolders
         })
-      });
+      }, 12000);
       const resData = await resp.json().catch(() => ({}));
       if (!resp.ok) {
-        showSettingsToast('⚠ ' + (resData.error || `Failed to update Opt-In folder scope (HTTP ${resp.status})`));
+        const errMsg = resData.error || `Failed to update Opt-In folder scope (HTTP ${resp.status})`;
+        lastFolderToggleError = errMsg;
+        showSettingsToast('⚠ ' + errMsg);
         renderSettingsTabContent(activeSettingsTab, '');
         return false;
       }
-      await fetchMarketplaceData();
+      lastFolderToggleError = '';
+      cachedMarketplaceStatus = Object.assign({}, cachedMarketplaceStatus || {}, {
+        opt_in_enabled: resData.opt_in_enabled !== undefined ? resData.opt_in_enabled : !!mkt.opt_in_enabled,
+        user_consent_checked: resData.user_consent_checked !== undefined ? resData.user_consent_checked : !!mkt.user_consent_checked,
+        opt_in_folders: Array.isArray(resData.opt_in_folders) ? resData.opt_in_folders : curFolders,
+        consent_ledger: Array.isArray(resData.consent_ledger) ? resData.consent_ledger : (mkt.consent_ledger || [])
+      });
+      fetchMarketplaceData().catch(() => {});
       checkReindexStatus();
       renderSettingsTabContent(activeSettingsTab, '');
       if (toastMsg) showSettingsToast(toastMsg);
       return true;
     } catch (err) {
-      showSettingsToast('⚠ Failed to update Opt-In folder scope: ' + err.message);
+      const errMsg = (err && err.name === 'AbortError')
+        ? 'Opt-In folder update timed out after 12s'
+        : ((err && err.message) || 'Network error');
+      lastFolderToggleError = errMsg;
+      showSettingsToast('⚠ Failed to update Opt-In folder scope: ' + errMsg);
       renderSettingsTabContent(activeSettingsTab, '');
       return false;
     } finally {
@@ -5684,13 +5769,15 @@ function secureRandomIndex(n) {
   window.quorumIndexFolderImmediate = async function(folderPath) {
     const clean = (folderPath || '').trim();
     if (!clean) return false;
+    lastFolderToggleError = '';
     syncPendingMarketplaceInputsFromDom();
     const inp = document.getElementById('new-doc-path-input');
     if (inp) inp.value = clean;
     const chkOptIn = document.getElementById('chk-add-doc-optin');
     const includeOptIn = chkOptIn ? Boolean(chkOptIn.checked) : addDocIncludeOptIn;
+    const cleanKey = canonicalComparePathJs(clean);
 
-    const alreadyInClient = clientWatchedFolders.some(p => p.toLowerCase() === clean.toLowerCase());
+    const alreadyInClient = clientWatchedFolders.some(p => canonicalComparePathJs(p) === cleanKey);
     if (!alreadyInClient) {
       clientWatchedFolders.push(clean);
       saveClientWatchedFolders();
@@ -5699,39 +5786,102 @@ function secureRandomIndex(n) {
     showSettingsToast('⏳ Watching & indexing folder in background: ' + clean);
 
     try {
-      const resp = await fetch('/api/documents/add', {
+      const resp = await fetchWithTimeout('/api/documents/add', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           local_paths: [clean],
           add_to_opt_in: includeOptIn
         })
-      });
+      }, 12000);
       const resData = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         if (!alreadyInClient) {
-          clientWatchedFolders = clientWatchedFolders.filter(p => p.toLowerCase() !== clean.toLowerCase());
+          clientWatchedFolders = clientWatchedFolders.filter(p => canonicalComparePathJs(p) !== cleanKey);
           saveClientWatchedFolders();
         }
+        const errMsg = resData.error || 'Failed to index folder';
+        lastFolderToggleError = errMsg;
         renderSettingsTabContent(activeSettingsTab, '');
-        showSettingsToast('⚠ ' + (resData.error || 'Failed to index folder'));
+        showSettingsToast('⚠ ' + errMsg);
         return false;
       }
-      await Promise.all([
+      lastFolderToggleError = '';
+      if (cachedSettingsData && cachedSettingsData.runtime && Array.isArray(cachedSettingsData.runtime.watched_paths)) {
+        const savedList = Array.isArray(resData.saved_paths) && resData.saved_paths.length > 0 ? resData.saved_paths : [clean];
+        for (const sp of savedList) {
+          const sk = canonicalComparePathJs(sp);
+          if (sk && !cachedSettingsData.runtime.watched_paths.some(w => canonicalComparePathJs(w) === sk)) {
+            cachedSettingsData.runtime.watched_paths.push(sp);
+          }
+        }
+      }
+      Promise.all([
         fetchMarketplaceData(),
         loadFullSettings()
-      ]);
+      ]).then(() => {
+        renderSettingsTabContent(activeSettingsTab, '');
+        const modal = document.getElementById('modal-pure-rust-folder-picker');
+        if (modal && !modal.classList.contains('hidden')) renderPureRustPickerModalContent();
+      }).catch(() => {});
       checkReindexStatus();
       renderSettingsTabContent(activeSettingsTab, '');
       showSettingsToast(`✓ Watching & indexing folder: ${clean}`);
       return true;
     } catch (err) {
       if (!alreadyInClient) {
-        clientWatchedFolders = clientWatchedFolders.filter(p => p.toLowerCase() !== clean.toLowerCase());
+        clientWatchedFolders = clientWatchedFolders.filter(p => canonicalComparePathJs(p) !== cleanKey);
         saveClientWatchedFolders();
         renderSettingsTabContent(activeSettingsTab, '');
       }
-      showSettingsToast('⚠ Folder indexing error: ' + err.message);
+      const errMsg = (err && err.name === 'AbortError')
+        ? 'Folder watch request timed out after 12s'
+        : ((err && err.message) || 'Folder indexing error');
+      lastFolderToggleError = errMsg;
+      showSettingsToast('⚠ Folder indexing error: ' + errMsg);
+      return false;
+    }
+  };
+
+  window.quorumUnwatchFolderImmediate = async function(folderPath) {
+    const clean = (folderPath || '').trim();
+    if (!clean) return false;
+    lastFolderToggleError = '';
+    const cleanKey = canonicalComparePathJs(clean);
+    try {
+      const resp = await fetchWithTimeout('/api/documents/unwatch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths: [clean] })
+      }, 12000);
+      const resData = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const errMsg = resData.error || `Failed to unselect watched folder (HTTP ${resp.status})`;
+        lastFolderToggleError = errMsg;
+        showSettingsToast('⚠ ' + errMsg);
+        return false;
+      }
+      lastFolderToggleError = '';
+      clientWatchedFolders = clientWatchedFolders.filter(p => canonicalComparePathJs(p) !== cleanKey);
+      saveClientWatchedFolders();
+      if (cachedSettingsData && cachedSettingsData.runtime) {
+        if (Array.isArray(resData.watched_paths)) {
+          cachedSettingsData.runtime.watched_paths = resData.watched_paths;
+        } else if (Array.isArray(cachedSettingsData.runtime.watched_paths)) {
+          cachedSettingsData.runtime.watched_paths = cachedSettingsData.runtime.watched_paths.filter(
+            w => canonicalComparePathJs(w) !== cleanKey
+          );
+        }
+      }
+      renderSettingsTabContent(activeSettingsTab, '');
+      showSettingsToast('✓ Unselected watched folder: ' + clean);
+      return true;
+    } catch (err) {
+      const errMsg = (err && err.name === 'AbortError')
+        ? 'Unselect folder request timed out after 12s'
+        : ((err && err.message) || 'Network error');
+      lastFolderToggleError = errMsg;
+      showSettingsToast('⚠ Failed to unselect watched folder: ' + errMsg);
       return false;
     }
   };
@@ -5739,10 +5889,10 @@ function secureRandomIndex(n) {
   window.quorumRemoveClientWatchedFolder = function(folderPath) {
     const clean = (folderPath || '').trim();
     if (!clean) return;
-    clientWatchedFolders = clientWatchedFolders.filter(p => p.toLowerCase() !== clean.toLowerCase());
+    const cleanKey = canonicalComparePathJs(clean);
+    clientWatchedFolders = clientWatchedFolders.filter(p => canonicalComparePathJs(p) !== cleanKey);
     saveClientWatchedFolders();
-    renderSettingsTabContent(activeSettingsTab, '');
-    showSettingsToast('Removed from custom watched folder list: ' + clean);
+    window.quorumUnwatchFolderImmediate(clean).catch(() => {});
   };
 
   window.quorumShareFolder = async function(pathStr) {
@@ -5750,51 +5900,80 @@ function secureRandomIndex(n) {
       showSettingsToast('Please enter or select a folder path to share');
       return false;
     }
+    lastFolderToggleError = '';
+    const trimmed = pathStr.trim();
     try {
-      const resp = await fetch('/api/mesh/shared-folders', {
+      const resp = await fetchWithTimeout('/api/mesh/shared-folders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'add', path: pathStr.trim(), enabled: true, access_tier: 0 })
-      });
+        body: JSON.stringify({ action: 'add', path: trimmed, enabled: true, access_tier: 0 })
+      }, 12000);
       const res = await resp.json().catch(() => ({}));
       if (!resp.ok) {
-        showSettingsToast('⚠ ' + (res.error || 'Failed to share folder'));
+        const errMsg = res.error || 'Failed to share folder';
+        lastFolderToggleError = errMsg;
+        showSettingsToast('⚠ ' + errMsg);
         renderSettingsTabContent(activeSettingsTab, '');
         return false;
       }
-      await loadFullSettings();
-      await fetchBrowseFolders(currentBrowsePath);
+      lastFolderToggleError = '';
+      if (Array.isArray(res.shared_folders)) {
+        if (!cachedSettingsData) cachedSettingsData = { ui: {}, mesh: { shared_folders: [] }, dlp: {}, runtime: {} };
+        if (!cachedSettingsData.mesh) cachedSettingsData.mesh = {};
+        cachedSettingsData.mesh.shared_folders = res.shared_folders;
+        updateSidebarMeshAndDlpPills(cachedSettingsData);
+      } else {
+        await loadFullSettings();
+      }
       checkReindexStatus();
-      renderSettingsTabContent('mesh', '');
-      showSettingsToast('✓ Shared & indexing folder: ' + pathStr.trim());
+      renderSettingsTabContent(activeSettingsTab, '');
+      showSettingsToast('✓ Shared & indexing folder: ' + trimmed);
       return true;
     } catch (err) {
-      showSettingsToast('⚠ Failed to share folder: ' + err.message);
+      const errMsg = (err && err.name === 'AbortError')
+        ? 'Share folder request timed out after 12s'
+        : ((err && err.message) || 'Network error');
+      lastFolderToggleError = errMsg;
+      showSettingsToast('⚠ Failed to share folder: ' + errMsg);
       return false;
     }
   };
 
   window.quorumRemoveSharedFolder = async function(pathStr) {
+    lastFolderToggleError = '';
     try {
-      const resp = await fetch('/api/mesh/shared-folders', {
+      const resp = await fetchWithTimeout('/api/mesh/shared-folders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'remove', path: pathStr })
-      });
+      }, 12000);
       const res = await resp.json().catch(() => ({}));
       if (!resp.ok) {
-        showSettingsToast('⚠ ' + (res.error || `Failed to remove shared folder (HTTP ${resp.status})`));
-        renderSettingsTabContent('mesh', '');
+        const errMsg = res.error || `Failed to remove shared folder (HTTP ${resp.status})`;
+        lastFolderToggleError = errMsg;
+        showSettingsToast('⚠ ' + errMsg);
+        renderSettingsTabContent(activeSettingsTab, '');
         return false;
       }
-      await loadFullSettings();
-      await fetchBrowseFolders(currentBrowsePath);
-      renderSettingsTabContent('mesh', '');
+      lastFolderToggleError = '';
+      if (Array.isArray(res.shared_folders)) {
+        if (!cachedSettingsData) cachedSettingsData = { ui: {}, mesh: { shared_folders: [] }, dlp: {}, runtime: {} };
+        if (!cachedSettingsData.mesh) cachedSettingsData.mesh = {};
+        cachedSettingsData.mesh.shared_folders = res.shared_folders;
+        updateSidebarMeshAndDlpPills(cachedSettingsData);
+      } else {
+        await loadFullSettings();
+      }
+      renderSettingsTabContent(activeSettingsTab, '');
       showSettingsToast('Removed folder from Mesh sharing: ' + pathStr);
       return true;
     } catch (err) {
-      showSettingsToast('⚠ Failed to remove shared folder: ' + err.message);
-      renderSettingsTabContent('mesh', '');
+      const errMsg = (err && err.name === 'AbortError')
+        ? 'Remove shared folder request timed out after 12s'
+        : ((err && err.message) || 'Network error');
+      lastFolderToggleError = errMsg;
+      showSettingsToast('⚠ Failed to remove shared folder: ' + errMsg);
+      renderSettingsTabContent(activeSettingsTab, '');
       return false;
     }
   };
@@ -6216,6 +6395,7 @@ function secureRandomIndex(n) {
 
       switch (action) {
         case 'browse-dir':
+          if (e.target.closest('[data-stop-browse]')) return;
           e.preventDefault();
           await window.quorumBrowseDir(folderPath);
           break;
@@ -6284,10 +6464,10 @@ function secureRandomIndex(n) {
             const rtWatched = (cachedSettingsData && cachedSettingsData.runtime && Array.isArray(cachedSettingsData.runtime.watched_paths))
               ? cachedSettingsData.runtime.watched_paths
               : [];
-            const isDaemonRoot = rtWatched.some(p => String(p || '').toLowerCase() === folderPath.toLowerCase());
-            const isClientCustom = clientWatchedFolders.some(p => p.toLowerCase() === folderPath.toLowerCase());
-            if (isRowToggle && isClientCustom && !isDaemonRoot) {
-              window.quorumRemoveClientWatchedFolder(folderPath);
+            const targetKey = canonicalComparePathJs(folderPath);
+            const isWatched = getCombinedWatchedPaths(rtWatched).some(p => canonicalComparePathJs(p) === targetKey);
+            if (isRowToggle && isWatched) {
+              await window.quorumUnwatchFolderImmediate(folderPath);
             } else {
               await window.quorumIndexFolderImmediate(folderPath);
             }
@@ -7360,7 +7540,7 @@ function secureRandomIndex(n) {
           e.stopPropagation();
           const targetPath = (actionEl.dataset.folderPath || '').trim();
           if (!targetPath) return;
-          await toggleMarketplaceFolder(targetPath, false);
+          await toggleMarketplaceFolder(targetPath, null);
           break;
         }
 
@@ -11047,16 +11227,19 @@ function secureRandomIndex(n) {
             const fallbackRootText = customPaths.length > 0
               ? `${customPaths.length} custom folder(s) selected`
               : 'Not mounted on this computer';
-            const unselectRootBtn = (drv.root_path && (drv.mounted || drv.enabled))
-              ? ` <button type="button" class="pill-btn-danger" style="padding:1px 7px; font-size:10.5px; margin-left:6px;" data-action="cloud-drive-remove-folder" data-drive-id="${escapeHtml(drvId)}" data-folder-path="${escapeHtml(drv.root_path)}" aria-label="Unselect ${escapeHtml(drv.root_path)}" ${isBusy ? 'disabled' : ''}>✕ Unselect</button>`
+            const unselectRootBtn = (drv.root_path && drv.enabled)
+              ? ` <button type="button" class="pill-btn-danger" style="padding:2px 8px; font-size:11px;" data-action="cloud-drive-remove-folder" data-drive-id="${escapeHtml(drvId)}" data-folder-path="${escapeHtml(drv.root_path)}" aria-label="Unselect ${escapeHtml(drv.root_path)}" ${isBusy ? 'disabled' : ''}>✕ Unselect</button>`
               : '';
-            rootHtml = `<div class="cloud-drive-path-line">Sync Root: <code>${escapeHtml(drv.root_path || fallbackRootText)}</code>${unselectRootBtn}</div>`;
+            rootHtml = `<div class="cloud-drive-path-line"><span>Root:</span> <code>${escapeHtml(drv.root_path || fallbackRootText)}</code>${unselectRootBtn}</div>`;
           }
 
           let sessionNoticeHtml = '';
           if (drv.session_only || drv.session_guidance) {
             const guidanceText = drv.session_guidance || 'Virtual drive is mounted only inside an interactive user session and is not directly visible to LocalSystem.';
-            sessionNoticeHtml = `<div class="cloud-drive-banner warn" style="margin:0; padding:8px 12px;">${escapeHtml(guidanceText)}</div>`;
+            const retryBtnHtml = status === 'error'
+              ? ` <button type="button" class="pill-btn" data-action="cloud-drive-refresh" style="flex-shrink:0;">🔄 Retry</button>`
+              : '';
+            sessionNoticeHtml = `<div class="cloud-drive-banner warn" style="margin:0; padding:10px 14px; align-items:center;"><div style="flex:1; min-width:200px;">${escapeHtml(guidanceText)}</div>${retryBtnHtml}</div>`;
           }
 
           let customFoldersHtml = '';
@@ -11084,23 +11267,27 @@ function secureRandomIndex(n) {
                   <div class="cloud-drive-title-row">
                     <span class="cloud-drive-name">${meta.icon} ${escapeHtml(drvLabel)}</span>
                     ${statusBadgeHtml}
-                    ${indexedBadgeHtml}
-                    ${meshBadgeHtml}
                   </div>
                   ${rootHtml}
+                </div>
+                <div class="cloud-drive-toggle-wrap">
+                  <span class="cloud-drive-toggle-label">${isEnabled ? 'On' : 'Off'}</span>
+                  <input id="chk-cloud-drive-${escapeHtml(drvId)}" type="checkbox" class="quorum-switch" ${isEnabled ? 'checked' : ''} ${isBusy ? 'disabled' : ''} data-change-action="cloud-drive-toggle" data-drive-id="${escapeHtml(drvId)}" aria-label="Enable ${escapeHtml(drvLabel)}">
+                </div>
+              </div>
+              ${sessionNoticeHtml}
+              ${customFoldersHtml}
+              <div class="cloud-drive-footer-bar">
+                <div class="cloud-drive-stats-group">
+                  ${indexedBadgeHtml}
+                  ${meshBadgeHtml}
                 </div>
                 <div class="cloud-drive-card-actions">
                   <select id="sel-cloud-tier-${escapeHtml(drvId)}" class="settings-select" ${isBusy ? 'disabled' : ''} data-change-action="cloud-drive-set-tier" data-drive-id="${escapeHtml(drvId)}" title="Access Tier">${tierOptions}</select>
                   <button type="button" class="pill-btn" data-action="trigger-native-folder-picker" data-context="cloud-drives" data-drive-id="${escapeHtml(drvId)}" ${isBusy ? 'disabled' : ''}>📁 Select Folder</button>
                   <button type="button" class="pill-btn" data-action="cloud-drive-reindex" data-drive-id="${escapeHtml(drvId)}" ${(!canReindex || isBusy) ? 'disabled' : ''} title="${canReindex ? 'Trigger immediate reindex for this drive' : 'Enable drive with a mounted root or custom folder first'}">🔄 Reindex Now</button>
-                  <input id="chk-cloud-drive-${escapeHtml(drvId)}" type="checkbox" class="quorum-switch" ${isEnabled ? 'checked' : ''} ${isBusy ? 'disabled' : ''} data-change-action="cloud-drive-toggle" data-drive-id="${escapeHtml(drvId)}" aria-label="Enable ${escapeHtml(drvLabel)}">
                 </div>
               </div>
-              <div style="font-size:12px; color:var(--text-muted);">
-                ${isEnabled ? 'Auto-indexing &amp; real-time watch active via the full QuorumRAG indexing stack (OCR, Vision, BM25, Vector, AtlasKV, DriftHealer). ' : ''}Local-only by default — never shared over P2P Mesh unless explicitly added in Mesh &amp; Shared Folders with Tier &lt; 3. Disabling purges this drive's indexed chunks and AtlasKV triples.
-              </div>
-              ${sessionNoticeHtml}
-              ${customFoldersHtml}
             </div>
           `;
         };
@@ -11142,6 +11329,7 @@ function secureRandomIndex(n) {
               <span>☁️ Mounted Cloud Drives on This Computer (${detectedDrives.length})</span>
               <button type="button" class="pill-btn" data-action="cloud-drive-refresh">🔄 Refresh Discovery</button>
             </div>
+            <p class="cloud-drive-section-note">Local-only by default — never shared over P2P Mesh unless explicitly added in Mesh &amp; Shared Folders with Tier &lt; 3. Disabling a drive purges its indexed chunks and AtlasKV triples.</p>
             ${detectedCardsHtml}
             ${unmountedDisclosureHtml}
           </div>

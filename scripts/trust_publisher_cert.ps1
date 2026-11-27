@@ -17,7 +17,7 @@ $inPub = Test-Path "Cert:\LocalMachine\TrustedPublisher\$CertThumbprint"
 
 if ($inRoot -and $inPub) {
     Write-Host "[+] Publisher certificate $CertThumbprint is already trusted in LocalMachine\Root and LocalMachine\TrustedPublisher." -ForegroundColor Green
-    exit 0
+    return
 }
 
 $resolvedCer = $CerFilePath
@@ -28,7 +28,7 @@ if (-not $resolvedCer -or -not (Test-Path $resolvedCer)) {
     }
     if (-not $cert) {
         Write-Warning "Certificate $CertThumbprint not found in CurrentUser\My or LocalMachine\My; skipping LocalMachine trust."
-        exit 0
+        return
     }
     $projectRoot = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { (Get-Location).Path }
     $winDeploy = Join-Path $projectRoot "deploy\windows"
@@ -50,12 +50,12 @@ if ($isAdmin) {
         Import-Certificate -FilePath $resolvedCer -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" | Out-Null
     }
     Write-Host "[+] Installed $CertThumbprint into LocalMachine\Root and LocalMachine\TrustedPublisher (Verified Publisher active)." -ForegroundColor Green
-    exit 0
+    return
 }
 
 if ($NoElevate -or ($env:CI -eq "true") -or (-not [Environment]::UserInteractive)) {
     Write-Host "[i] Non-elevated/CI session: run 'powershell -ExecutionPolicy Bypass -File scripts/trust_publisher_cert.ps1' once to elevate and trust $CertThumbprint in LocalMachine." -ForegroundColor Yellow
-    exit 0
+    return
 }
 
 Write-Host "[*] Requesting one-time Administrator elevation to trust $CertThumbprint in LocalMachine\Root & TrustedPublisher..." -ForegroundColor Cyan

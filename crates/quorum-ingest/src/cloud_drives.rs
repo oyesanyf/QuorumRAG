@@ -302,7 +302,7 @@ impl CloudDiscoveryEnv for LiveCloudDiscoveryEnv {
         match quorum_types::session_fs_bridge::local_is_dir_bounded(
             path,
             true,
-            std::time::Duration::from_millis(2000),
+            std::time::Duration::from_millis(4500),
         ) {
             Ok(true) => return true,
             Err(_) => return false,
@@ -1142,12 +1142,11 @@ fn live_windows_drive_mounts() -> Vec<WindowsDriveMount> {
                 };
                 let _ = tx.send(lbl);
             });
-            match rx.recv_timeout(std::time::Duration::from_millis(1000)) {
+            match rx.recv_timeout(std::time::Duration::from_millis(2000)) {
                 Ok(lbl) => lbl,
                 Err(_) => {
-                    let _ = quorum_types::session_fs_bridge::record_local_drive_timeout(Path::new(
-                        &root_str,
-                    ));
+                    // Volume label lookup is cosmetic; do not poison the per-drive timeout
+                    // circuit breaker before the actual directory probe runs.
                     String::new()
                 }
             }

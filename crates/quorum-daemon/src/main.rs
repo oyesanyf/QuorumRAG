@@ -1374,7 +1374,7 @@ pub async fn run_daemon_and_ui(cli: Cli) -> anyhow::Result<()> {
                     target_paths,
                     full_rebuild: false,
                     force_reembed: false,
-                    batch_size: 64,
+                    batch_size: 256,
                     num_threads: 0,
                     dry_run: false,
                 };
