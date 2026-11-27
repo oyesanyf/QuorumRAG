@@ -163,11 +163,14 @@ if (-not $SignedViaPublicCa) {
         }
 
         # Export public .cer (no private key) and auto-trust in LocalMachine when elevated or requested
+        # Invoke in-process (& $TrustScript) to avoid spawning a nested powershell.exe cold start.
         $TrustScript = Join-Path $ProjectRoot "scripts\trust_publisher_cert.ps1"
         if (Test-Path $TrustScript) {
-            $trustArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $TrustScript, "-CertThumbprint", $Cert.Thumbprint)
-            if (-not $TrustLocalPublisher) { $trustArgs += "-NoElevate" }
-            & powershell @trustArgs
+            if ($TrustLocalPublisher) {
+                & $TrustScript -CertThumbprint $Cert.Thumbprint
+            } else {
+                & $TrustScript -CertThumbprint $Cert.Thumbprint -NoElevate
+            }
         }
     } else {
         Write-Host "  No Authenticode certificate configured (Azure Trusted Signing, PFX, or local Cert store); skipping local code-signing." -ForegroundColor Gray

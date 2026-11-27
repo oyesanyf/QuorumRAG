@@ -63,7 +63,7 @@ impl IngestThreadPool {
     /// to background cores with OS low-priority scheduling.
     pub fn new() -> Result<Self, IngestError> {
         let threads = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).clamp(2, 16))
+            .map(|n| (n.get() / 3).clamp(2, 8))
             .unwrap_or(4);
 
         let pool = rayon::ThreadPoolBuilder::new()

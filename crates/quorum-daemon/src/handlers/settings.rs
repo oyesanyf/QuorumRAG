@@ -119,10 +119,22 @@ pub async fn get_settings_handler(State(state): State<Arc<DaemonState>>) -> impl
     let epoch_sig_preview =
         controller.sign_epoch_token(&local_peer_id, settings.mesh.hmac_epoch, "master_core");
 
-    let physical_drives: Vec<String> = quorum_ingest::IngestConfig::discover_physical_drives()
-        .into_iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
+    let storage_for_counts = Arc::clone(&state.storage);
+    let (physical_drives, total_files) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            let drives: Vec<String> = quorum_ingest::IngestConfig::discover_physical_drives()
+                .into_iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            let files = storage_for_counts.catalog().count_documents().unwrap_or(0);
+            (drives, files)
+        }),
+    )
+    .await
+    .ok()
+    .and_then(|res| res.ok())
+    .unwrap_or_else(|| (Vec::new(), 0));
 
     let watched_paths: Vec<String> = state
         .reindex_worker
@@ -131,8 +143,7 @@ pub async fn get_settings_handler(State(state): State<Arc<DaemonState>>) -> impl
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    let total_chunks = state.storage.count().await.unwrap_or(0);
-    let total_files = state.storage.catalog().count_documents().unwrap_or(0);
+    let total_chunks = state.storage.count_fast().await;
 
     Json(serde_json::json!({
         "status": "ok",
@@ -901,17 +912,152 @@ async fn pure_rust_browse_directory(
     };
 
     let test_profile_override = crate::handlers::cloud_drives::is_test_profile_override_active();
-    let (mut drives_raw, session_drives) = if test_profile_override {
-        (Vec::new(), Vec::new())
-    } else {
-        tokio::task::spawn_blocking(|| {
-            let drives = quorum_ingest::IngestConfig::discover_browsable_drives();
-            let sdrives = quorum_types::session_fs_bridge::list_session_drives();
-            (drives, sdrives)
-        })
-        .await
-        .unwrap_or_default()
-    };
+    let shared_for_quick = shared_folders.clone();
+    let (mut drives_raw, session_drives, quick_access) = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        tokio::task::spawn_blocking(move || {
+            let is_shared_local = |candidate: &str| -> bool {
+                let Some(norm_c) =
+                    quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(candidate)
+                else {
+                    return false;
+                };
+                shared_for_quick.iter().any(|f| {
+                    f.enabled
+                        && quorum_coordinator::OsoosiMeshDlpController::normalize_folder_path(
+                            &f.path,
+                        )
+                        .as_deref()
+                            == Some(norm_c.as_str())
+                })
+            };
+
+            let (drives, sdrives) = if test_profile_override {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    quorum_ingest::IngestConfig::discover_browsable_drives(),
+                    quorum_types::session_fs_bridge::list_session_drives(),
+                )
+            };
+
+            let mut quick_access: Vec<serde_json::Value> = Vec::new();
+            let mut push_quick =
+                |label: String, path_buf: std::path::PathBuf, force_include: bool| {
+                    let dir_ok = force_include || path_buf.is_dir();
+                    if !dir_ok || quick_access.len() >= 10 {
+                        return;
+                    }
+                    let s = path_buf.to_string_lossy().to_string();
+                    if is_service_or_system_profile_path(&s) {
+                        return;
+                    }
+                    let key = canonical_fs_compare_key(&s);
+                    let already = quick_access.iter().any(|item| {
+                        let same_path = item
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .map(|existing| canonical_fs_compare_key(existing) == key)
+                            .unwrap_or(false);
+                        let same_label = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|existing| existing.eq_ignore_ascii_case(&label))
+                            .unwrap_or(false);
+                        same_path || same_label
+                    });
+                    if !already {
+                        quick_access.push(serde_json::json!({
+                            "name": label,
+                            "path": s,
+                            "is_drive": false,
+                            "is_quick_access": true,
+                            "is_shared": is_shared_local(&s)
+                        }));
+                    }
+                };
+
+            let interactive_homes = discover_interactive_user_homes();
+            if let Some(primary_home) = interactive_homes.first() {
+                let quick_folders = [
+                    ("Desktop", "Desktop"),
+                    ("Documents", "Documents"),
+                    ("Downloads", "Downloads"),
+                    ("Pictures", "Pictures"),
+                    ("OneDrive", "OneDrive"),
+                    ("My Drive", "My Drive"),
+                    ("Dropbox", "Dropbox"),
+                ];
+                for (label, sub) in quick_folders {
+                    let candidate = primary_home.join(sub);
+                    if candidate.is_dir() {
+                        push_quick(label.to_string(), candidate, false);
+                    } else if matches!(sub, "Desktop" | "Documents" | "Pictures")
+                        && primary_home.join("OneDrive").join(sub).is_dir()
+                    {
+                        push_quick(
+                            label.to_string(),
+                            primary_home.join("OneDrive").join(sub),
+                            false,
+                        );
+                    }
+                }
+            }
+
+            if !test_profile_override {
+                for sdrv in &sdrives {
+                    let lbl_lower = sdrv.volume_label.to_ascii_lowercase();
+                    let nt_lower = sdrv.nt_target.to_ascii_lowercase();
+                    if sdrv.has_my_drive
+                        || lbl_lower.contains("google drive")
+                        || nt_lower.contains("drivefs")
+                    {
+                        let my_drive = std::path::PathBuf::from(&sdrv.root).join("My Drive");
+                        push_quick("Google Drive".to_string(), my_drive, true);
+                    } else if lbl_lower.contains("pcloud") || nt_lower.contains("pcloud") {
+                        push_quick(
+                            "pCloud".to_string(),
+                            std::path::PathBuf::from(&sdrv.root),
+                            true,
+                        );
+                    }
+                }
+                for drv in &drives {
+                    let drv_s = drv.to_string_lossy();
+                    if drv_s.len() >= 2 && !drv_s.to_ascii_lowercase().starts_with("c:") {
+                        let my_drive = drv.join("My Drive");
+                        if quorum_types::session_fs_bridge::is_local_virtual_drive_path(drv) {
+                            let ok = quorum_types::session_fs_bridge::local_is_dir_bounded_probe(
+                                &my_drive,
+                                false,
+                                std::time::Duration::from_millis(1500),
+                                false,
+                            )
+                            .unwrap_or(false);
+                            if ok {
+                                push_quick("Google Drive".to_string(), my_drive, true);
+                            }
+                        } else if my_drive.is_dir() {
+                            push_quick("Google Drive".to_string(), my_drive, true);
+                        }
+                    }
+                }
+                if let Ok(cwd) = std::env::current_dir() {
+                    let cwd_str = cwd.to_string_lossy().to_string();
+                    if cwd.is_dir() && !is_service_or_system_profile_path(&cwd_str) {
+                        push_quick("Workspace".to_string(), cwd, false);
+                    }
+                }
+            }
+
+            (drives, sdrives, quick_access)
+        }),
+    )
+    .await
+    .ok()
+    .and_then(|res| res.ok())
+    .unwrap_or_default();
+
     drives_raw.sort_by(|a, b| {
         a.to_string_lossy()
             .to_ascii_lowercase()
@@ -921,121 +1067,6 @@ async fn pure_rust_browse_directory(
         .iter()
         .map(|d| d.to_string_lossy().to_string())
         .collect();
-
-    // Build concise, deduplicated quick-access folder list from the primary interactive user profile
-    // (never system32/systemprofile and never flooding the UI with duplicate secondary profile pills).
-    let mut quick_access: Vec<serde_json::Value> = Vec::new();
-    let mut push_quick = |label: String, path_buf: std::path::PathBuf, force_include: bool| {
-        let dir_ok = force_include || path_buf.is_dir();
-        if !dir_ok || quick_access.len() >= 10 {
-            return;
-        }
-        let s = path_buf.to_string_lossy().to_string();
-        if is_service_or_system_profile_path(&s) {
-            return;
-        }
-        let key = canonical_fs_compare_key(&s);
-        let already = quick_access.iter().any(|item| {
-            let same_path = item
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(|existing| canonical_fs_compare_key(existing) == key)
-                .unwrap_or(false);
-            let same_label = item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|existing| existing.eq_ignore_ascii_case(&label))
-                .unwrap_or(false);
-            same_path || same_label
-        });
-        if !already {
-            quick_access.push(serde_json::json!({
-                "name": label,
-                "path": s,
-                "is_drive": false,
-                "is_quick_access": true,
-                "is_shared": is_shared_fn(&s)
-            }));
-        }
-    };
-
-    let interactive_homes = discover_interactive_user_homes();
-    if let Some(primary_home) = interactive_homes.first() {
-        let quick_folders = [
-            ("Desktop", "Desktop"),
-            ("Documents", "Documents"),
-            ("Downloads", "Downloads"),
-            ("Pictures", "Pictures"),
-            ("OneDrive", "OneDrive"),
-            ("My Drive", "My Drive"),
-            ("Dropbox", "Dropbox"),
-        ];
-        for (label, sub) in quick_folders {
-            let candidate = primary_home.join(sub);
-            if candidate.is_dir() {
-                push_quick(label.to_string(), candidate, false);
-            } else if matches!(sub, "Desktop" | "Documents" | "Pictures")
-                && primary_home.join("OneDrive").join(sub).is_dir()
-            {
-                push_quick(label.to_string(), primary_home.join("OneDrive").join(sub), false);
-            }
-        }
-    }
-
-    if !test_profile_override {
-        // Add mounted virtual cloud drives (such as Google Drive G:\My Drive) to Quick Access
-        // directly from cached Session-1 drive discovery (0 ms, never firing redundant blocking IRPs).
-        for sdrv in &session_drives {
-            let lbl_lower = sdrv.volume_label.to_ascii_lowercase();
-            let nt_lower = sdrv.nt_target.to_ascii_lowercase();
-            if sdrv.has_my_drive
-                || lbl_lower.contains("google drive")
-                || nt_lower.contains("drivefs")
-            {
-                let my_drive = std::path::PathBuf::from(&sdrv.root).join("My Drive");
-                push_quick("Google Drive".to_string(), my_drive, true);
-            } else if lbl_lower.contains("pcloud") || nt_lower.contains("pcloud") {
-                push_quick("pCloud".to_string(), std::path::PathBuf::from(&sdrv.root), true);
-            }
-        }
-        // Also surface local Mirror-mode My Drive folders on non-C fixed drives (instant local stat;
-        // skip virtual drives here so a busy Dokan mount never blocks This PC).
-        for drv in &drives_raw {
-            let drv_s = drv.to_string_lossy();
-            if drv_s.len() >= 2 && !drv_s.to_ascii_lowercase().starts_with("c:") {
-                if quorum_types::session_fs_bridge::is_local_virtual_drive_path(drv) {
-                    let my_drive = drv.join("My Drive");
-                    let ok = tokio::task::spawn_blocking({
-                        let p = my_drive.clone();
-                        move || {
-                            quorum_types::session_fs_bridge::local_is_dir_bounded(
-                                &p,
-                                false,
-                                std::time::Duration::from_millis(600),
-                            )
-                            .unwrap_or(false)
-                        }
-                    })
-                    .await
-                    .unwrap_or(false);
-                    if ok {
-                        push_quick("Google Drive".to_string(), my_drive, true);
-                    }
-                } else {
-                    let my_drive = drv.join("My Drive");
-                    if my_drive.is_dir() {
-                        push_quick("Google Drive".to_string(), my_drive, true);
-                    }
-                }
-            }
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            let cwd_str = cwd.to_string_lossy().to_string();
-            if cwd.is_dir() && !is_service_or_system_profile_path(&cwd_str) {
-                push_quick("Workspace".to_string(), cwd, false);
-            }
-        }
-    }
 
     if req_trimmed.is_empty() {
         let mut entries: Vec<serde_json::Value> = drives_raw
@@ -1072,16 +1103,21 @@ async fn pure_rust_browse_directory(
     let local_dir_check = if is_local_virtual_target {
         let p_check = target_dir_buf.clone();
         tokio::task::spawn_blocking(move || {
+            // Explicit user click to open a virtual drive always performs a fresh probe.
+            quorum_types::session_fs_bridge::clear_local_drive_timeout(&p_check);
             quorum_types::session_fs_bridge::local_is_dir_bounded(
                 &p_check,
                 true,
-                std::time::Duration::from_millis(3500),
+                std::time::Duration::from_millis(5500),
             )
         })
         .await
         .unwrap_or(Ok(false))
     } else {
-        Ok(target_dir_buf.is_dir())
+        let p_check = target_dir_buf.clone();
+        tokio::task::spawn_blocking(move || Ok(p_check.is_dir()))
+            .await
+            .unwrap_or(Ok(false))
     };
     let local_is_dir = match local_dir_check {
         Ok(v) => v,
@@ -1279,7 +1315,11 @@ async fn pure_rust_browse_directory(
         let sub_trimmed = sub_name.trim();
         if !sub_trimmed.is_empty() {
             let candidate = target_dir_buf.join(sub_trimmed);
-            match std::fs::create_dir_all(&candidate) {
+            let cand_for_create = candidate.clone();
+            let create_res = tokio::task::spawn_blocking(move || std::fs::create_dir_all(&cand_for_create))
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+            match create_res {
                 Ok(()) => {
                     created_folder_path = Some(candidate.to_string_lossy().to_string());
                     target_dir_buf = candidate;
@@ -1739,8 +1779,10 @@ pub async fn probe_endpoint_handler(
             }
         }
         _ => {
-            let chunks = state.storage.count().await.unwrap_or(0);
-            let hw = quorum_coordinator::HardwareTelemetry::probe();
+            let chunks = state.storage.count_fast().await;
+            let hw = tokio::task::spawn_blocking(quorum_coordinator::HardwareTelemetry::probe)
+                .await
+                .unwrap_or_else(|_| quorum_coordinator::HardwareTelemetry::probe());
             let ms = start.elapsed().as_millis();
             Json(serde_json::json!({
                 "ok": true,

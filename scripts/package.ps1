@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.9.5",
+    [string]$Version = "0.9.6",
     [switch]$SkipBuild = $false,
     [switch]$SkipDefenderScan = $false,
     [string]$CertThumbprint = "9A6D3B509500813058EC63183476464FAC8F015B"
@@ -416,9 +416,12 @@ Write-Host "  -> MSI tables verified ($($TableNames -join ', ')); 'Environment' 
 Write-Host "[5/5] Running Authenticode MSI signing, Defender scan & SHA256SUMS generation..." -ForegroundColor Cyan
 if (Test-Path $SubmitScript) {
     # Sign ONLY the MSI here; the exe was signed exactly once before being embedded.
-    $subArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $SubmitScript, "-Version", $Version, "-Files", $MsiOut)
-    if ($SkipDefenderScan) { $subArgs += "-SkipDefenderScan" }
-    & powershell @subArgs
+    # Invoke in-process (& $SubmitScript) to avoid spawning a nested powershell.exe cold start.
+    if ($SkipDefenderScan) {
+        & $SubmitScript -Version $Version -SkipDefenderScan -Files @($MsiOut)
+    } else {
+        & $SubmitScript -Version $Version -Files @($MsiOut)
+    }
 }
 
 $SumsLines = @()

@@ -61,6 +61,56 @@ pub struct ReindexProgress {
     pub error_message: Option<String>,
 }
 
+/// Dedicated low-priority Tokio runtime for continuous background indexing (`ReindexWorker::start_reindex`).
+///
+/// Isolating background LanceDB/DataFusion/Tantivy/SQLite pipeline futures onto a separate
+/// low-priority runtime guarantees that foreground Axum HTTP endpoints (`/`, `/api/health`,
+/// `/api/cache/stats`, `/api/reindex/status`, `/api/fs/browse-folders`, `/api/cloud-drives`,
+/// folder toggles, and interactive RAG chat) are never starved under multi-million-chunk indexing.
+/// Returns `None` (falling back to the active Tokio runtime) if OS thread creation is restricted,
+/// ensuring zero panic/abort paths from entry-reachable handlers.
+fn background_ingest_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    static BG_RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+        std::sync::OnceLock::new();
+    BG_RUNTIME
+        .get_or_init(|| {
+            let workers = std::thread::available_parallelism()
+                .map(|n| (n.get() / 4).clamp(2, 6))
+                .unwrap_or(2);
+            match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .max_blocking_threads(16)
+                .thread_name("quorum-bg-ingest")
+                .on_thread_start(|| {
+                    crate::throttling::set_background_thread_priority();
+                })
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => Some(rt),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "Failed to initialize dedicated background ingest Tokio runtime; falling back to ambient runtime"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn spawn_background_ingest<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Some(rt) = background_ingest_runtime() {
+        rt.spawn(future);
+    } else {
+        tokio::spawn(future);
+    }
+}
+
 /// Guard that decrements `in_flight_tasks` and wakes `task_done_notify` on any exit or panic.
 struct InFlightTaskGuard {
     in_flight: Arc<AtomicUsize>,
@@ -486,7 +536,7 @@ impl ReindexWorker {
         let commit_gate = Arc::clone(&self.commit_gate);
         let pending_priority = Arc::clone(&self.pending_priority_paths);
 
-        tokio::spawn(async move {
+        spawn_background_ingest(async move {
             let _done_guard = done_guard;
             let cancel_rx_check = cancel_tx.subscribe();
 
@@ -1544,12 +1594,29 @@ impl ReindexWorker {
             return Err(IngestError::Cancelled);
         }
 
-        // Hydrate deduplication state from SQLite document catalog before processing candidates
-        if let Err(e) = dedup.hydrate_from_catalog(&storage) {
-            warn!(
-                "Failed to hydrate dedup catalog from document_catalog.db: {}",
-                e
-            );
+        // Hydrate deduplication state from SQLite document catalog off the async executor
+        {
+            let dedup_h = Arc::clone(&dedup);
+            let storage_h = Arc::clone(&storage);
+            match tokio::task::spawn_blocking(move || {
+                crate::throttling::set_background_thread_priority();
+                let res = dedup_h.hydrate_from_catalog(&storage_h);
+                crate::throttling::end_background_thread_priority();
+                res
+            })
+            .await
+            {
+                Ok(Err(e)) => {
+                    warn!(
+                        "Failed to hydrate dedup catalog from document_catalog.db: {}",
+                        e
+                    );
+                }
+                Err(e) => {
+                    warn!("Dedup catalog hydration join error: {}", e);
+                }
+                Ok(Ok(_)) => {}
+            }
         }
 
         let mut config = config_lock.read().await.clone();
@@ -1594,7 +1661,10 @@ impl ReindexWorker {
             return Ok(());
         }
 
-        let targets = Self::expand_drive_roots(&raw_targets);
+        let targets_raw = raw_targets.clone();
+        let targets = tokio::task::spawn_blocking(move || Self::expand_drive_roots(&targets_raw))
+            .await
+            .unwrap_or(raw_targets);
         let targets: Vec<std::path::PathBuf> = targets
             .into_iter()
             .filter(|t| {
@@ -1672,15 +1742,13 @@ impl ReindexWorker {
             .cloned()
             .unwrap_or_else(|| storage.config().storage_path.join("dedup_catalog.json"));
 
+        let thread_pool = crate::thread_pool::IngestThreadPool::shared();
         let concurrency = if options.num_threads > 0 {
             options.num_threads.clamp(1, 64)
         } else {
-            std::thread::available_parallelism()
-                .map(|n| (n.get() * 2).clamp(8, 32))
-                .unwrap_or(16)
+            thread_pool.thread_count().clamp(2, 8)
         };
         let permit_tiers = crate::thread_pool::IngestPermitTiers::new(concurrency);
-        let thread_pool = crate::thread_pool::IngestThreadPool::shared();
 
         let mut batch_chunks: Vec<DocumentChunk> = Vec::with_capacity(options.batch_size.max(64));
         let mut batch_parents: Vec<(quorum_types::IngestedParentDocument, u8)> =
@@ -1691,6 +1759,7 @@ impl ReindexWorker {
         let mut futures = FuturesUnordered::new();
         let mut last_catalog_save = std::time::Instant::now();
         let mut committed_any_non_blocked = false;
+        let mut unchanged_streak: usize = 0;
 
         loop {
             if Self::is_pipeline_cancelled(
@@ -1720,17 +1789,22 @@ impl ReindexWorker {
                         live_cfg.excluded_paths.push(bp_pb);
                     }
                 }
-                let expanded_priority: Vec<std::path::PathBuf> =
-                    Self::expand_drive_roots(&newly_queued_paths)
-                        .into_iter()
-                        .filter(|t| {
-                            !live_cfg
-                                .excluded_paths
-                                .iter()
-                                .any(|ex| crate::config::path_matches_prefix(t, ex))
-                                && !Self::is_path_str_blocked(&t.to_string_lossy(), &blocked_now)
-                        })
-                        .collect();
+                let newly_queued_for_expand = newly_queued_paths.clone();
+                let expanded_raw = tokio::task::spawn_blocking(move || {
+                    Self::expand_drive_roots(&newly_queued_for_expand)
+                })
+                .await
+                .unwrap_or(newly_queued_paths);
+                let expanded_priority: Vec<std::path::PathBuf> = expanded_raw
+                    .into_iter()
+                    .filter(|t| {
+                        !live_cfg
+                            .excluded_paths
+                            .iter()
+                            .any(|ex| crate::config::path_matches_prefix(t, ex))
+                            && !Self::is_path_str_blocked(&t.to_string_lossy(), &blocked_now)
+                    })
+                    .collect();
                 if !expanded_priority.is_empty() {
                     let crawler_p = Arc::new(FilesystemCrawler::new(live_cfg));
                     if let Ok(Ok(priority_candidates)) = tokio::task::spawn_blocking(move || {
@@ -1775,83 +1849,29 @@ impl ReindexWorker {
                 };
                 let dlp_gate = dlp_gate_lock.read().await.clone();
 
-                // Level-1 Evaluation: skip unmodified unless full_rebuild is forced
-                let mut precomputed_file_b3 = None;
-                if !options.full_rebuild {
-                    if let Ok(action) = dedup.evaluate_file_with_policy(
-                        &path,
-                        candidate.mtime_secs,
-                        candidate.size_bytes,
-                        placeholder_policy,
-                    ) {
-                        match action {
-                            DedupAction::Unchanged { .. } => {
-                                let mut lock = progress.write().await;
-                                if let Some(ref mut p) = *lock {
-                                    p.files_scanned += 1;
-                                    p.files_total_estimated =
-                                        p.files_total_estimated.max(p.files_scanned);
-                                    p.files_skipped_unmodified += 1;
-                                    p.bytes_processed += candidate.size_bytes;
-                                }
-                                if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30)
-                                {
-                                    let _commit_guard = commit_gate.read().await;
-                                    if Self::is_pipeline_cancelled(
-                                        &cancel_flag,
-                                        &cancel_rx,
-                                        cancel_baseline_seq,
-                                        &purge_epoch,
-                                        task_purge_epoch,
-                                    ) {
-                                        return Err(IngestError::Cancelled);
-                                    }
-                                    let _ = dedup.save_catalog_to_file(&catalog_path);
-                                    last_catalog_save = std::time::Instant::now();
-                                }
-                                continue;
-                            }
-                            DedupAction::MovedOrRenamed {
-                                old_path,
-                                new_path,
-                                file_blake3,
-                                ..
-                            } => {
-                                let _commit_guard = commit_gate.read().await;
-                                if Self::is_pipeline_cancelled(
-                                    &cancel_flag,
-                                    &cancel_rx,
-                                    cancel_baseline_seq,
-                                    &purge_epoch,
-                                    task_purge_epoch,
-                                ) {
-                                    return Err(IngestError::Cancelled);
-                                }
-                                let old_key = old_path.to_string_lossy().to_string();
-                                let _ = storage.delete_by_file_path(&old_key).await;
-                                dedup.remove_file(&old_path);
-                                let blocked_now = blocked_prefixes_lock
-                                    .read()
-                                    .map(|g| g.clone())
-                                    .unwrap_or_default();
-                                if Self::is_path_str_blocked(
-                                    &new_path.to_string_lossy(),
-                                    &blocked_now,
-                                ) {
-                                    continue;
-                                }
-                                info!(old = %old_path.display(), new = %new_path.display(), "Detected moved/renamed file during reindex; purging old path and re-indexing under new path/tier (L2 vector cache reused)");
-                                precomputed_file_b3 = Some(file_blake3);
-                                // Fall through to insert chunks under `(new_path, access_tier)` across
-                                // LanceDB, Tantivy, SQLite parent_documents, and AtlasKV.
-                            }
-                            DedupAction::ModifiedOrNew { file_blake3, .. } => {
-                                precomputed_file_b3 = Some(file_blake3);
-                                // Proceed to chunking and vectorization
-                            }
-                        }
+                // Level-1 Zero-I/O Fast Path: skip unmodified files purely from in-memory metadata.
+                // Any fast-path miss (requiring disk read + BLAKE3 streaming) runs off the Tokio
+                // runtime inside the low-priority core-pinned `IngestThreadPool`.
+                if !options.full_rebuild
+                    && dedup
+                        .check_unchanged_fast(&path, candidate.mtime_secs, candidate.size_bytes)
+                        .is_some()
+                {
+                    let mut lock = progress.write().await;
+                    if let Some(ref mut p) = *lock {
+                        p.files_scanned += 1;
+                        p.files_total_estimated = p.files_total_estimated.max(p.files_scanned);
+                        p.files_skipped_unmodified += 1;
+                        p.bytes_processed += candidate.size_bytes;
                     }
+                    drop(lock);
+                    unchanged_streak = unchanged_streak.wrapping_add(1);
+                    if unchanged_streak % 64 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
                 }
+                unchanged_streak = 0;
 
                 let permit = permit_tiers.acquire_extraction().await?;
                 let permit_slot = Arc::new(std::sync::Mutex::new(Some(permit)));
@@ -1872,11 +1892,12 @@ impl ReindexWorker {
                         placeholder_policy,
                         dlp_gate,
                         force_reembed || full_rebuild,
+                        !full_rebuild,
                         storage_c,
                         embedder_c,
                         dedup_c,
                         chunker_c,
-                        precomputed_file_b3,
+                        None,
                     );
                     if let Ok(mut guard) = permit_slot_c.lock() {
                         drop(guard.take());
@@ -1945,6 +1966,16 @@ impl ReindexWorker {
             if let Some(join_res) = next_join_res {
                 match join_res {
                     Ok(outcome) => match outcome {
+                        CandidateOutcome::Unchanged { size_bytes } => {
+                            let mut lock = progress.write().await;
+                            if let Some(ref mut p) = *lock {
+                                p.files_scanned += 1;
+                                p.files_total_estimated =
+                                    p.files_total_estimated.max(p.files_scanned);
+                                p.files_skipped_unmodified += 1;
+                                p.bytes_processed += size_bytes;
+                            }
+                        }
                         CandidateOutcome::AlreadyIndexedInFts {
                             catalog_entry,
                             size_bytes,
@@ -1963,10 +1994,27 @@ impl ReindexWorker {
                             chunks,
                             parent_doc,
                             catalog_entry,
+                            moved_from_path,
                             size_bytes,
                             chunks_reused,
                             chunks_new,
                         } => {
+                            if let Some(old_path) = moved_from_path {
+                                let _commit_guard = commit_gate.read().await;
+                                if Self::is_pipeline_cancelled(
+                                    &cancel_flag,
+                                    &cancel_rx,
+                                    cancel_baseline_seq,
+                                    &purge_epoch,
+                                    task_purge_epoch,
+                                ) {
+                                    return Err(IngestError::Cancelled);
+                                }
+                                let old_key = old_path.to_string_lossy().to_string();
+                                let _ = storage.delete_by_file_path(&old_key).await;
+                                dedup.remove_file(&old_path);
+                                info!(old = %old_path.display(), new = %catalog_entry.file_path.display(), "Detected moved/renamed file during reindex; purging old path and re-indexing under new path/tier (L2 vector cache reused)");
+                            }
                             batch_catalog_entries.push(catalog_entry);
                             if let Some(parent) = parent_doc {
                                 batch_parents.push(parent);
@@ -2046,7 +2094,15 @@ impl ReindexWorker {
                             dedup.register_entry(entry);
                         }
                     }
-                    let _ = dedup.save_catalog_to_file(&catalog_path);
+                    let dedup_save = Arc::clone(&dedup);
+                    let cat_path_save = catalog_path.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::throttling::set_background_thread_priority();
+                        let res = dedup_save.save_catalog_to_file(&cat_path_save);
+                        crate::throttling::end_background_thread_priority();
+                        res
+                    })
+                    .await;
                     last_catalog_save = std::time::Instant::now();
                 }
 
@@ -2094,14 +2150,35 @@ impl ReindexWorker {
                                 let _ = storage.insert_chunks(&batch_chunks).await?;
                                 committed_any_non_blocked = true;
                             }
-                            for (pdoc, ptier) in batch_parents.drain(..) {
-                                let _ = storage.upsert_parent_document(&pdoc, ptier);
+                            if !batch_parents.is_empty() {
+                                let parents_to_save = std::mem::take(&mut batch_parents);
+                                let storage_p = Arc::clone(&storage);
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    crate::throttling::set_background_thread_priority();
+                                    for (pdoc, ptier) in parents_to_save {
+                                        let _ = storage_p.upsert_parent_document(&pdoc, ptier);
+                                    }
+                                    crate::throttling::end_background_thread_priority();
+                                })
+                                .await;
                             }
                             for entry in batch_catalog_entries.drain(..) {
                                 dedup.register_entry(entry);
                             }
-                            let _ = dedup.save_catalog_to_file(&catalog_path);
-                            last_catalog_save = std::time::Instant::now();
+                            // Throttle full dedup_catalog.json serialization to every 30s (plus final flush)
+                            // so 65k+ file catalogs do not thrash disk I/O on every micro-batch.
+                            if last_catalog_save.elapsed() >= std::time::Duration::from_secs(30) {
+                                let dedup_save = Arc::clone(&dedup);
+                                let cat_path_save = catalog_path.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    crate::throttling::set_background_thread_priority();
+                                    let res = dedup_save.save_catalog_to_file(&cat_path_save);
+                                    crate::throttling::end_background_thread_priority();
+                                    res
+                                })
+                                .await;
+                                last_catalog_save = std::time::Instant::now();
+                            }
                             let _ = storage.bump_index_epoch("reindex_micro_batch");
                         }
                     } else {
@@ -2161,13 +2238,30 @@ impl ReindexWorker {
                     batch_chunks.clear();
                     committed_any_non_blocked = true;
                 }
-                for (pdoc, ptier) in batch_parents.drain(..) {
-                    let _ = storage.upsert_parent_document(&pdoc, ptier);
+                if !batch_parents.is_empty() {
+                    let parents_to_save = std::mem::take(&mut batch_parents);
+                    let storage_p = Arc::clone(&storage);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::throttling::set_background_thread_priority();
+                        for (pdoc, ptier) in parents_to_save {
+                            let _ = storage_p.upsert_parent_document(&pdoc, ptier);
+                        }
+                        crate::throttling::end_background_thread_priority();
+                    })
+                    .await;
                 }
                 for entry in batch_catalog_entries.drain(..) {
                     dedup.register_entry(entry);
                 }
-                let _ = dedup.save_catalog_to_file(&catalog_path);
+                let dedup_save = Arc::clone(&dedup);
+                let cat_path_save = catalog_path.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::throttling::set_background_thread_priority();
+                    let res = dedup_save.save_catalog_to_file(&cat_path_save);
+                    crate::throttling::end_background_thread_priority();
+                    res
+                })
+                .await;
                 let _ = storage.bump_index_epoch("reindex_final_flush");
             }
         } else {
@@ -2227,7 +2321,17 @@ impl ReindexWorker {
                     .as_ref()
                     .cloned()
                     .unwrap_or_else(|| storage.config().storage_path.join("dedup_catalog.json"));
-                if let Err(e) = dedup.save_catalog_to_file(&catalog_path) {
+                let dedup_save = Arc::clone(&dedup);
+                let cat_path_save = catalog_path.clone();
+                let save_res = tokio::task::spawn_blocking(move || {
+                    crate::throttling::set_background_thread_priority();
+                    let res = dedup_save.save_catalog_to_file(&cat_path_save);
+                    crate::throttling::end_background_thread_priority();
+                    res
+                })
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+                if let Err(e) = save_res {
                     warn!(
                         "Failed to auto-save dedup catalog after reindex pass: {}",
                         e
@@ -2240,7 +2344,15 @@ impl ReindexWorker {
                     );
                 }
             } else {
-                let _ = dedup.save_catalog_to_file(&catalog_path);
+                let dedup_save = Arc::clone(&dedup);
+                let cat_path_save = catalog_path.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::throttling::set_background_thread_priority();
+                    let res = dedup_save.save_catalog_to_file(&cat_path_save);
+                    crate::throttling::end_background_thread_priority();
+                    res
+                })
+                .await;
             }
         }
 
@@ -2406,6 +2518,9 @@ impl ReindexWorker {
 
 /// Internal candidate outcome from multithreaded processing task.
 enum CandidateOutcome {
+    Unchanged {
+        size_bytes: u64,
+    },
     AlreadyIndexedInFts {
         catalog_entry: FileCatalogEntry,
         size_bytes: u64,
@@ -2414,6 +2529,7 @@ enum CandidateOutcome {
         chunks: Vec<DocumentChunk>,
         parent_doc: Option<(quorum_types::IngestedParentDocument, u8)>,
         catalog_entry: FileCatalogEntry,
+        moved_from_path: Option<std::path::PathBuf>,
         size_bytes: u64,
         chunks_reused: usize,
         chunks_new: usize,
@@ -2435,14 +2551,44 @@ fn process_candidate_sync(
     placeholder_policy: quorum_types::CloudPlaceholderPolicy,
     dlp_gate: Option<Arc<dyn quorum_types::DlpContentGate>>,
     force_reembed: bool,
+    eval_level1_dedup: bool,
     storage: Arc<StorageEngine>,
     embedder: Arc<dyn EmbeddingGenerator>,
     dedup: Arc<TwoLevelDedupEngine>,
     chunker: TextChunker,
-    precomputed_file_b3: Option<String>,
+    mut precomputed_file_b3: Option<String>,
 ) -> CandidateOutcome {
     let path = &candidate.path;
     let path_str = path.to_string_lossy().to_string();
+    let mut moved_from_path: Option<std::path::PathBuf> = None;
+
+    if eval_level1_dedup && precomputed_file_b3.is_none() {
+        if let Ok(action) = dedup.evaluate_file_with_policy(
+            path,
+            candidate.mtime_secs,
+            candidate.size_bytes,
+            placeholder_policy,
+        ) {
+            match action {
+                DedupAction::Unchanged { .. } => {
+                    return CandidateOutcome::Unchanged {
+                        size_bytes: candidate.size_bytes,
+                    };
+                }
+                DedupAction::MovedOrRenamed {
+                    old_path,
+                    file_blake3,
+                    ..
+                } => {
+                    moved_from_path = Some(old_path);
+                    precomputed_file_b3 = Some(file_blake3);
+                }
+                DedupAction::ModifiedOrNew { file_blake3, .. } => {
+                    precomputed_file_b3 = Some(file_blake3);
+                }
+            }
+        }
+    }
     match candidate.kind {
         CandidateKind::Text { .. } => {
             let raw_content = match DocumentExtractor::extract_text_with_policy(
@@ -2621,6 +2767,7 @@ fn process_candidate_sync(
                 chunks,
                 parent_doc,
                 catalog_entry,
+                moved_from_path,
                 size_bytes: candidate.size_bytes,
                 chunks_reused,
                 chunks_new,
@@ -2743,6 +2890,7 @@ fn process_candidate_sync(
                         chunks: vec![doc_chunk],
                         parent_doc,
                         catalog_entry,
+                        moved_from_path,
                         size_bytes: candidate.size_bytes,
                         chunks_reused: 0,
                         chunks_new: 1,
@@ -2832,6 +2980,7 @@ fn process_candidate_sync(
                         chunks: vec![doc_chunk],
                         parent_doc: None,
                         catalog_entry,
+                        moved_from_path,
                         size_bytes: candidate.size_bytes,
                         chunks_reused: 0,
                         chunks_new: 1,

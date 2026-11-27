@@ -7,7 +7,7 @@
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="icon" type="image/png" sizes="64x64" href="/assets/quorumrag-icon.png">
   <link rel="apple-touch-icon" href="/assets/quorumrag-icon.png">
-  <link rel="stylesheet" href="/assets/styles.css?v=20261125a">
+  <link rel="stylesheet" href="/assets/styles.css?v=20261127a">
   <style>
     /* Inlined fallback styles ensuring test assertions pass */
     :root {
@@ -491,39 +491,44 @@
 
   <!-- SELECT FOLDER MODAL (Drives on Asset & Subfolder Drill-Down) -->
   <div id="modal-pure-rust-folder-picker" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="pure-rust-picker-title" style="z-index: 100000;">
-    <div class="modal-card" style="max-width: 760px; width: 94%; max-height: 88vh; display: flex; flex-direction: column;">
-      <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
-        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <h3 id="pure-rust-picker-title" style="margin:0; font-size:16px;">📁 Select Folder</h3>
-          <span id="pure-rust-picker-context-badge" class="status-pill healthy" style="font-size:11.5px; padding:3px 10px;">Select Drive or Folder</span>
+    <div class="modal-card picker-modal-card">
+      <div class="modal-header picker-modal-header">
+        <div class="picker-header-title-group">
+          <h3 id="pure-rust-picker-title" class="picker-modal-title">📁 Select Folder</h3>
+          <span id="pure-rust-picker-context-badge" class="picker-context-pill">Select Drive or Folder</span>
         </div>
         <button type="button" class="btn-close-modal" id="btn-close-pure-rust-picker" title="Close Select Folder" aria-label="Close Select Folder">&times;</button>
       </div>
-      <div class="modal-body" style="flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px 20px; overscroll-behavior:contain;">
-        <div id="pure-rust-picker-drives-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
-        <div id="pure-rust-picker-quick-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
-        <div id="pure-rust-picker-selected-bar" class="picker-selected-bar hidden" aria-live="polite"></div>
-        <div class="folder-explorer-address-bar" style="display:flex; align-items:center; gap:8px;">
-          <button type="button" class="pill-btn" id="btn-pure-rust-picker-root" style="padding:4px 9px; font-size:11.5px;">💽 This PC</button>
-          <button type="button" class="pill-btn" id="btn-pure-rust-picker-up" style="padding:4px 9px; font-size:11.5px;">⬅ Up</button>
-          <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll" style="flex:1; min-inline-size:0;"></div>
-        </div>
-        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <input type="search" id="pure-rust-picker-filter-input" class="settings-input" aria-label="Filter folders in current view" placeholder="🔍 Filter drives or folders in current view..." style="flex:1; min-width:180px; padding:6px 10px; font-size:12.5px;">
-          <div style="display:flex; gap:6px; align-items:center;">
-            <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input" aria-label="New subfolder name" placeholder="New subfolder name..." style="width:165px; padding:6px 10px; font-size:12.5px;">
-            <button type="button" class="pill-btn" id="btn-pure-rust-picker-create-folder" style="padding:5px 10px; font-size:12px; font-weight:600;">+ Create Subfolder</button>
+      <div class="modal-body picker-body-split">
+        <aside class="picker-sidebar custom-scroll" aria-label="Drives and Quick Access">
+          <button type="button" class="picker-sidebar-item picker-sidebar-root" id="btn-pure-rust-picker-root">💽 This PC</button>
+          <div id="pure-rust-picker-drives-bar" class="picker-sidebar-section"></div>
+          <div id="pure-rust-picker-quick-bar" class="picker-sidebar-section"></div>
+        </aside>
+        <div class="picker-main-pane">
+          <div class="picker-nav-bar">
+            <button type="button" class="pill-btn picker-up-btn" id="btn-pure-rust-picker-up" title="Up one folder" aria-label="Up one folder">← Up</button>
+            <div id="pure-rust-picker-breadcrumbs" class="folder-breadcrumbs custom-scroll"></div>
           </div>
+          <div class="picker-toolbar">
+            <input type="search" id="pure-rust-picker-filter-input" class="settings-input picker-filter-input" aria-label="Filter folders in current view" placeholder="Filter folders...">
+            <div id="pure-rust-picker-new-folder-wrap" class="picker-new-folder-wrap hidden">
+              <input type="search" id="pure-rust-picker-new-folder-input" class="settings-input picker-new-folder-input" aria-label="New subfolder name" placeholder="New folder name...">
+              <button type="button" class="pill-btn picker-create-btn" id="btn-pure-rust-picker-create-folder">+ Create</button>
+            </div>
+          </div>
+          <div id="pure-rust-picker-selected-bar" class="picker-selected-bar hidden" aria-live="polite"></div>
+          <div id="pure-rust-picker-dir-list" class="folder-explorer-list picker-dir-list custom-scroll"></div>
         </div>
-        <div id="pure-rust-picker-dir-list" class="folder-explorer-list custom-scroll" style="max-height:380px; min-height:240px;"></div>
       </div>
-      <div class="modal-footer" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-        <div style="font-size:12px; color:var(--text-muted); flex:1; min-width:200px; min-inline-size:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-          Active Path: <code id="pure-rust-picker-selected-label" style="color:#10a37f; font-weight:600;">This PC</code>
+      <div class="modal-footer picker-modal-footer">
+        <div class="picker-footer-path">
+          <span class="picker-footer-path-label">Location:</span>
+          <code id="pure-rust-picker-selected-label">This PC</code>
         </div>
-        <div style="display:flex; gap:8px;">
+        <div class="picker-footer-actions">
           <button type="button" id="btn-cancel-pure-rust-picker" class="pill-btn">Done</button>
-          <button type="button" id="btn-confirm-pure-rust-picker" class="btn-primary" style="background:#10a37f; border-color:#10a37f; font-weight:700;">✅ Select Current Folder</button>
+          <button type="button" id="btn-confirm-pure-rust-picker" class="btn-primary picker-confirm-btn">Select Current Folder</button>
         </div>
       </div>
     </div>
@@ -833,6 +838,6 @@
     };
   </script>
 
-  <script src="/assets/app.js?v=20261125a"></script>
+  <script src="/assets/app.js?v=20261127a"></script>
 </body>
 </html>

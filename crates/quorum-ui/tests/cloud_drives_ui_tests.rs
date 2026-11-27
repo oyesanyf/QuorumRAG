@@ -575,3 +575,36 @@ fn test_single_flight_status_polling_and_bounded_cloud_drives_fetch() {
         "app.js must not run a second unguarded setInterval(checkReindexStatus, 2000) alongside pollReindexProgress"
     );
 }
+
+#[test]
+fn test_folder_picker_never_blocks_toggles_on_loading_and_supports_unwatch() {
+    let (_html, js, _css) = normalized_assets();
+
+    let bind_start = js
+        .find("function bindPureRustPickerModalListeners()")
+        .expect("bindPureRustPickerModalListeners must exist");
+    let open_start = js[bind_start..]
+        .find("window.openPureRustFolderPicker = async function(")
+        .expect("openPureRustFolderPicker must follow bindPureRustPickerModalListeners")
+        + bind_start;
+    let bind_slice = &js[bind_start..open_start];
+
+    assert!(
+        !bind_slice.contains("pureRustPickerSubmitting || pureRustPickerLoading"),
+        "Select Folder modal checkboxes, buttons, and chips must NEVER be blocked by background directory refreshes (pureRustPickerLoading)"
+    );
+    assert!(
+        js.contains("let pureRustPickerAbortCtrl = null;")
+            && js.contains("let browseFoldersAbortCtrl = null;"),
+        "Folder picker and inline explorer must abort superseded fetches with bounded timeouts"
+    );
+    assert!(
+        js.contains("window.quorumUnwatchFolderImmediate = async function(")
+            && js.contains("'/api/documents/unwatch'"),
+        "Storage and Watch folder contexts must support real backend unselect via POST /api/documents/unwatch"
+    );
+    assert!(
+        js.contains(r#"data-stop-browse="true""#),
+        "Inline folder explorer checkboxes must wrap in label[data-stop-browse=true] so toggling never triggers row navigation"
+    );
+}
