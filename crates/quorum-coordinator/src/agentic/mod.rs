@@ -26,6 +26,7 @@ pub struct AgenticStateGraphRunner {
     pub cache_manager: Arc<CacheManager>,
     pub rlm_semaphore: Arc<RlmDepthAwareSemaphore>,
     pub rlm_slice_cache: Arc<RlmParentSliceCache>,
+    pub memo_config: crate::memo_protocol::MemoProtocolConfig,
 }
 
 impl Default for AgenticStateGraphRunner {
@@ -36,6 +37,7 @@ impl Default for AgenticStateGraphRunner {
             cache_manager: Arc::new(CacheManager::default()),
             rlm_semaphore: Arc::new(RlmDepthAwareSemaphore::default_depth_aware()),
             rlm_slice_cache: Arc::new(RlmParentSliceCache::new()),
+            memo_config: crate::memo_protocol::MemoProtocolConfig::default(),
         }
     }
 }
@@ -48,6 +50,7 @@ impl AgenticStateGraphRunner {
             cache_manager: Arc::new(CacheManager::default()),
             rlm_semaphore: Arc::new(RlmDepthAwareSemaphore::default_depth_aware()),
             rlm_slice_cache: Arc::new(RlmParentSliceCache::new()),
+            memo_config: crate::memo_protocol::MemoProtocolConfig::default(),
         }
     }
 
@@ -64,6 +67,189 @@ impl AgenticStateGraphRunner {
     pub fn with_rlm_slice_cache(mut self, rlm_slice_cache: Arc<RlmParentSliceCache>) -> Self {
         self.rlm_slice_cache = rlm_slice_cache;
         self
+    }
+
+    pub fn with_memo_config(mut self, memo_config: crate::memo_protocol::MemoProtocolConfig) -> Self {
+        self.memo_config = memo_config;
+        self
+    }
+
+    fn is_local_non_dfir_chunk(sc: &quorum_types::ScoredChunk) -> bool {
+        !sc.is_remote
+            && (sc.source_peer.is_empty() || sc.source_peer.eq_ignore_ascii_case("local"))
+            && !crate::artemis_airgap::is_artemis_dfir_chunk(&sc.chunk)
+    }
+
+    async fn emit_memo_telemetry(
+        telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
+        state: &AgenticGraphState,
+    ) {
+        if let Some(tx) = telemetry_tx {
+            let (active_candidates, pruned_candidates) = state
+                .entity_streak_tracker
+                .as_ref()
+                .map(|t| (t.active_candidate_count(), t.pruned_candidate_count()))
+                .unwrap_or((0, 0));
+            let _ = tx
+                .send(AgenticTelemetryEvent::MemoStageEvent {
+                    stage: state.memo_stage,
+                    hop: state.hop_count,
+                    active_candidates,
+                    pruned_candidates,
+                    pinned_entities: state.pinned_entities.clone(),
+                })
+                .await;
+        }
+    }
+
+    /// Runs live Stage-3 `SelfRagCritique` verification against a loopback Ollama endpoint,
+    /// performing at most 1 bounded corrective synthesis retry + deterministic grounded repair
+    /// if `!critique.is_grounded || !critique.answers_all_sub_questions`, and returns
+    /// `cache_eligible: bool` (`false` whenever ungroundedness persists so `QueryCache` is never poisoned).
+    pub async fn apply_self_rag_critique_gate(
+        graph_state: &mut AgenticGraphState,
+        ollama_url: &str,
+        telemetry_tx: Option<&Sender<AgenticTelemetryEvent>>,
+    ) -> bool {
+        if graph_state.memo_stage == crate::memo_protocol::MemoStage::Bypassed
+            || graph_state.selected_model_tag.trim().is_empty()
+            || !crate::typed_extractor::is_loopback_endpoint(ollama_url)
+        {
+            return true;
+        }
+        let has_local_chunks = graph_state
+            .retrieved_chunks
+            .iter()
+            .any(Self::is_local_non_dfir_chunk);
+        if !has_local_chunks {
+            return true;
+        }
+        let Some(draft_ans) = graph_state.synthesized_response.clone() else {
+            return true;
+        };
+
+        let local_evidence: String = graph_state
+            .retrieved_chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, sc)| Self::is_local_non_dfir_chunk(sc))
+            .take(3)
+            .map(|(idx, sc)| {
+                format!(
+                    "[{}] {}",
+                    idx + 1,
+                    sc.chunk.text_content.chars().take(350).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let extractor = crate::typed_extractor::TypedStructuredExtractor::<
+            crate::typed_extractor::SelfRagCritique,
+        >::new(
+            ollama_url,
+            graph_state.selected_model_tag.clone(),
+            "Verify whether the draft answer is strictly grounded in retrieved local citations and addresses all sub-questions.",
+        )
+        .with_timeout(std::time::Duration::from_secs(4));
+
+        let critique_prompt = format!(
+            "Question: {}\nLocal Excerpts:\n{}\nDraft Answer:\n{}",
+            graph_state.original_prompt,
+            local_evidence,
+            draft_ans.chars().take(2400).collect::<String>()
+        );
+
+        let Ok(critique) = extractor.extract_ollama_async(&critique_prompt).await else {
+            return true;
+        };
+
+        if critique.is_grounded && critique.answers_all_sub_questions {
+            tracing::debug!(
+                is_grounded = critique.is_grounded,
+                answers_all_sub_questions = critique.answers_all_sub_questions,
+                confidence = critique.confidence,
+                "MeMo Stage-3 SelfRagCritique audit passed"
+            );
+            return true;
+        }
+
+        tracing::warn!(
+            is_grounded = critique.is_grounded,
+            answers_all_sub_questions = critique.answers_all_sub_questions,
+            unsupported = ?critique.unsupported_claims,
+            missing_refs = ?critique.missing_document_refs,
+            confidence = critique.confidence,
+            "MeMo Stage-3 SelfRagCritique flagged ungrounded or incomplete draft; running bounded corrective synthesis"
+        );
+        Self::emit_memo_telemetry(telemetry_tx, graph_state).await;
+
+        let mut note_parts: Vec<String> = Vec::new();
+        if !critique.unsupported_claims.is_empty() {
+            note_parts.push(format!(
+                "Remove or abstain from unsupported claims: {}",
+                critique.unsupported_claims.join("; ")
+            ));
+        }
+        if !critique.missing_document_refs.is_empty() {
+            let ref_list = critique
+                .missing_document_refs
+                .iter()
+                .map(|r| format!("[{r}]"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            note_parts.push(format!(
+                "Include grounded evidence from missing document refs: {ref_list}"
+            ));
+        }
+        let corrective_note = if note_parts.is_empty() {
+            "Strictly cite only facts verbatim-grounded in retrieved local excerpts and answer every sub-question.".to_string()
+        } else {
+            format!("[SelfRagCritique Corrective Directive] {}", note_parts.join(" | "))
+        };
+
+        let is_multi_thread = tokio::runtime::Handle::try_current()
+            .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        if is_multi_thread {
+            tokio::task::block_in_place(|| {
+                SynthesizeWithCitationsNode::execute_draft_with_note(
+                    graph_state,
+                    Some(&corrective_note),
+                    None,
+                );
+            });
+        } else {
+            SynthesizeWithCitationsNode::execute_draft_with_note(
+                graph_state,
+                Some(&corrective_note),
+                None,
+            );
+        }
+
+        let mut final_critique = critique;
+        if let Some(ref revised_ans) = graph_state.synthesized_response {
+            let revised_prompt = format!(
+                "Question: {}\nLocal Excerpts:\n{}\nDraft Answer:\n{}",
+                graph_state.original_prompt,
+                local_evidence,
+                revised_ans.chars().take(2400).collect::<String>()
+            );
+            if let Ok(rev_critique) = extractor.extract_ollama_async(&revised_prompt).await {
+                if rev_critique.is_grounded && rev_critique.answers_all_sub_questions {
+                    tracing::info!("MeMo Stage-3 corrective synthesis passed SelfRagCritique");
+                    return true;
+                }
+                final_critique = rev_critique;
+            }
+        }
+
+        SynthesizeWithCitationsNode::repair_ungrounded_draft_deterministically(
+            graph_state,
+            &final_critique.unsupported_claims,
+            &final_critique.missing_document_refs,
+        );
+        false
     }
 
     /// Executes the LangGraph-style state graph with live SSE telemetry and mathematical termination guarantee.
@@ -378,6 +564,33 @@ impl AgenticStateGraphRunner {
                         }
                     }
 
+                    let is_forensic = crate::offline_engine::ForensicQueryIntent::detect(
+                        &graph_state.original_prompt,
+                    )
+                    .is_some()
+                        || crate::offline_engine::ForensicQueryIntent::detect(
+                            &graph_state.current_query,
+                        )
+                        .is_some()
+                        || crate::artemis_airgap::is_forensic_query_text(
+                            &graph_state.current_query,
+                        );
+                    if let Some(ref plan) = graph_state.adaptive_plan {
+                        if crate::memo_protocol::should_engage_memo_protocol(
+                            &self.memo_config,
+                            graph_state.intent,
+                            plan,
+                            is_forensic,
+                            is_continuation,
+                        ) {
+                            graph_state.memo_stage =
+                                crate::memo_protocol::MemoStage::Stage1Grounding;
+                            Self::emit_memo_telemetry(telemetry_tx.as_ref(), &graph_state).await;
+                        } else {
+                            graph_state.memo_stage = crate::memo_protocol::MemoStage::Bypassed;
+                        }
+                    }
+
                     if let Some(ref tx) = telemetry_tx {
                         let _ = tx
                             .send(AgenticTelemetryEvent::IntentClassified {
@@ -406,7 +619,7 @@ impl AgenticStateGraphRunner {
                     let start = std::time::Instant::now();
                     let effective_vec = rewritten_vector.as_deref().unwrap_or(vector);
 
-                    // Launch AtlasKV 3-level HiKVP pruning concurrently off the async runtime thread
+                    // Launch AtlasKV 3-level HiKVP pruning + MeMo entity surfacing concurrently off the async runtime thread
                     let settings_snapshot =
                         crate::dlp_mesh::global_mesh_dlp_controller().get_settings();
                     let atlaskv_cfg = settings_snapshot.atlaskv.clone();
@@ -416,15 +629,109 @@ impl AgenticStateGraphRunner {
                         &[&graph_state.original_prompt, &graph_state.current_query],
                     );
                     let local_kv_tier = local_policy.local_access_tier;
+                    let is_deep_graph = graph_state
+                        .adaptive_plan
+                        .as_ref()
+                        .map(|p| p.depth == crate::adaptive_rag::RetrievalDepth::DeepGraph)
+                        .unwrap_or(false);
+                    let surface_cap = self.memo_config.stage1_max_subqueries.max(1);
+                    let mut surface_entities: Vec<String> = Vec::new();
+                    if !graph_state.pinned_entities.is_empty() {
+                        for pinned in &graph_state.pinned_entities {
+                            let clean = crate::memo_protocol::UncertainAnswerStreakTracker::entity_lookup_name(pinned).to_string();
+                            if !clean.is_empty()
+                                && !surface_entities.iter().any(|e| e.eq_ignore_ascii_case(&clean))
+                            {
+                                surface_entities.push(clean);
+                            }
+                            if surface_entities.len() >= surface_cap {
+                                break;
+                            }
+                        }
+                    }
+                    if surface_entities.len() < surface_cap {
+                        if let Some(ref tracker) = graph_state.entity_streak_tracker {
+                            for cand in tracker.candidates.values() {
+                                if !cand.pruned && cand.confirmed_hits == 0 {
+                                    let clean = cand.canonical_name.trim();
+                                    if !clean.is_empty()
+                                        && !surface_entities
+                                            .iter()
+                                            .any(|e| e.eq_ignore_ascii_case(clean))
+                                    {
+                                        surface_entities.push(clean.to_string());
+                                    }
+                                    if surface_entities.len() >= surface_cap {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if surface_entities.is_empty() {
+                        if let Some(ref subj) = graph_state
+                            .adaptive_plan
+                            .as_ref()
+                            .and_then(|p| p.primary_subject.clone())
+                        {
+                            if !subj.trim().is_empty() {
+                                surface_entities.push(subj.trim().to_string());
+                            }
+                        }
+                        for ext in &graph_state.extracted_entities {
+                            let clean = ext.extraction_text.trim();
+                            if clean.len() >= 2
+                                && !surface_entities.iter().any(|e| e.eq_ignore_ascii_case(clean))
+                            {
+                                surface_entities.push(clean.to_string());
+                            }
+                            if surface_entities.len() >= surface_cap {
+                                break;
+                            }
+                        }
+                    }
                     let atlaskv_fut = {
                         let store_opt = engine.local_storage.atlaskv();
                         let qvec = effective_vec.to_vec();
-                        let leaf_k = atlaskv_cfg.leaf_top_k_kb.max(1);
+                        let leaf_k = if is_deep_graph {
+                            atlaskv_cfg.leaf_top_k_kb.max(12)
+                        } else {
+                            atlaskv_cfg.leaf_top_k_kb.max(1)
+                        };
                         let enabled = atlaskv_cfg.enabled;
                         async move {
                             let store = if enabled { store_opt? } else { return None };
                             tokio::task::spawn_blocking(move || {
-                                store.hikvp_search(&qvec, local_kv_tier, leaf_k, None).ok()
+                                let hikvp_res =
+                                    store.hikvp_search(&qvec, local_kv_tier, leaf_k, None);
+                                let hikvp_ok = hikvp_res.is_ok();
+                                let (mut triples, trace) = hikvp_res
+                                    .unwrap_or_else(|_| {
+                                        (Vec::new(), quorum_atlaskv::HiKvpPruningTrace::default())
+                                    });
+                                if !surface_entities.is_empty() {
+                                    let mut seen_tid: std::collections::HashSet<u64> =
+                                        triples.iter().map(|t| t.triple.triple_id).collect();
+                                    for ent in &surface_entities {
+                                        if let Ok(surface_hits) = store.query_entity_surface(
+                                            ent,
+                                            local_kv_tier,
+                                            leaf_k,
+                                            None,
+                                        ) {
+                                            for t in surface_hits {
+                                                if seen_tid.insert(t.triple.triple_id) {
+                                                    triples.push(t);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if hikvp_ok || !triples.is_empty() {
+                                    Some((triples, trace))
+                                } else {
+                                    None
+                                }
                             })
                             .await
                             .ok()
@@ -465,6 +772,96 @@ impl AgenticStateGraphRunner {
                         }
                     }
 
+                    if graph_state.hop_count == 0
+                        && graph_state.memo_stage
+                            == crate::memo_protocol::MemoStage::Stage1Grounding
+                    {
+                        let sub_qs: Vec<String> = graph_state
+                            .adaptive_plan
+                            .as_ref()
+                            .map(|p| p.sub_questions.clone())
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| vec![graph_state.current_query.clone()]);
+                        let mut clues = crate::memo_protocol::build_stage1_clue_probes(
+                            &sub_qs,
+                            &graph_state.retrieved_chunks,
+                            &graph_state.atlaskv_triples,
+                            self.memo_config.stage1_max_subqueries,
+                        );
+                        let daemon_active = crate::dlp_mesh::global_mesh_dlp_controller()
+                            .settings_file_path
+                            .read()
+                            .map(|p| p.is_some())
+                            .unwrap_or(false);
+                        let has_local_chunks = graph_state
+                            .retrieved_chunks
+                            .iter()
+                            .any(Self::is_local_non_dfir_chunk);
+                        if daemon_active
+                            && self.memo_config.use_live_llm_probes
+                            && !graph_state.selected_model_tag.is_empty()
+                            && has_local_chunks
+                            && crate::offline_engine::DeterministicOfflineSynthesisEngine::is_ollama_endpoint_reachable()
+                        {
+                            let ollama_url = if settings_snapshot.ui.ollama_url.trim().is_empty() {
+                                "http://127.0.0.1:11434".to_string()
+                            } else {
+                                settings_snapshot.ui.ollama_url.trim().to_string()
+                            };
+                            if crate::typed_extractor::is_loopback_endpoint(&ollama_url) {
+                                let extractor = crate::typed_extractor::TypedStructuredExtractor::<
+                                    crate::memo_protocol::Stage1ClueProbeOutput,
+                                >::new(
+                                    ollama_url,
+                                    graph_state.selected_model_tag.clone(),
+                                    "Extract atomic grounded clues and candidate entity names for a single Stage-1 sub-question.",
+                                )
+                                .with_timeout(std::time::Duration::from_secs(2));
+                                let local_snippet: String = graph_state
+                                    .retrieved_chunks
+                                    .iter()
+                                    .filter(|sc| Self::is_local_non_dfir_chunk(sc))
+                                    .take(2)
+                                    .map(|c| c.chunk.text_content.chars().take(400).collect::<String>())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if let Some(first_uncertain) = clues.iter_mut().find(|p| p.is_uncertain) {
+                                    let probe_prompt = format!(
+                                        "Sub-question: {}\nLocal Excerpts:\n{}",
+                                        first_uncertain.sub_question, local_snippet
+                                    );
+                                    if let Ok(out) = extractor.extract_ollama_async(&probe_prompt).await {
+                                        crate::memo_protocol::apply_live_stage1_probe_output(
+                                            first_uncertain,
+                                            out,
+                                            false,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        let max_s2_turns = self
+                            .memo_config
+                            .stage2_max_turns
+                            .min(graph_state.max_hops.max(1));
+                        let mut tracker =
+                            crate::memo_protocol::UncertainAnswerStreakTracker::new(
+                                max_s2_turns,
+                                self.memo_config.stage2_uncertain_streak_limit,
+                            );
+                        tracker.seed_from_stage1(
+                            &clues,
+                            &graph_state.retrieved_chunks,
+                            &graph_state.atlaskv_triples,
+                        );
+                        graph_state.stage1_clues = clues;
+                        graph_state.pinned_entities = tracker.pinned_entities.clone();
+                        graph_state.entity_streak_tracker = Some(tracker);
+                        graph_state.memo_stage =
+                            crate::memo_protocol::MemoStage::Stage2EntityIdentification;
+                        Self::emit_memo_telemetry(telemetry_tx.as_ref(), &graph_state).await;
+                    }
+
                     if let Some(ref tx) = telemetry_tx {
                         let local_count = graph_state.retrieved_chunks.iter().filter(|c| !c.is_remote).count();
                         let remote_count = graph_state.retrieved_chunks.iter().filter(|c| c.is_remote).count();
@@ -495,7 +892,130 @@ impl AgenticStateGraphRunner {
                 }
 
                 AgenticStateName::GradeRelevance => {
-                    let (grade, will_rewrite) = grader.execute(&mut graph_state);
+                    let (grade, mut will_rewrite) = grader.execute(&mut graph_state);
+
+                    if will_rewrite
+                        && graph_state.memo_stage
+                            == crate::memo_protocol::MemoStage::Stage2EntityIdentification
+                    {
+                        let daemon_active = crate::dlp_mesh::global_mesh_dlp_controller()
+                            .settings_file_path
+                            .read()
+                            .map(|p| p.is_some())
+                            .unwrap_or(false);
+                        let has_local_chunks = graph_state
+                            .retrieved_chunks
+                            .iter()
+                            .any(Self::is_local_non_dfir_chunk);
+                        let live_pin_decision = if daemon_active
+                            && self.memo_config.use_live_llm_probes
+                            && !graph_state.selected_model_tag.is_empty()
+                            && has_local_chunks
+                            && crate::offline_engine::DeterministicOfflineSynthesisEngine::is_ollama_endpoint_reachable()
+                        {
+                            let settings_snapshot =
+                                crate::dlp_mesh::global_mesh_dlp_controller().get_settings();
+                            let ollama_url = if settings_snapshot.ui.ollama_url.trim().is_empty() {
+                                "http://127.0.0.1:11434".to_string()
+                            } else {
+                                settings_snapshot.ui.ollama_url.trim().to_string()
+                            };
+                            if crate::typed_extractor::is_loopback_endpoint(&ollama_url) {
+                                let candidate_summary = graph_state
+                                    .entity_streak_tracker
+                                    .as_ref()
+                                    .map(|t| {
+                                        t.candidates
+                                            .values()
+                                            .filter(|c| !c.pruned)
+                                            .map(|c| {
+                                                format!(
+                                                    "{}[cluster={}, streak={}/{}, hits={}]",
+                                                    c.canonical_name,
+                                                    c.domain_cluster.as_deref().unwrap_or("general"),
+                                                    c.consecutive_uncertain_streak,
+                                                    t.streak_limit,
+                                                    c.confirmed_hits
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("; ")
+                                    })
+                                    .unwrap_or_default();
+                                let local_snippet: String = graph_state
+                                    .retrieved_chunks
+                                    .iter()
+                                    .filter(|sc| Self::is_local_non_dfir_chunk(sc))
+                                    .take(2)
+                                    .map(|c| c.chunk.text_content.chars().take(300).collect::<String>())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let extractor = crate::typed_extractor::TypedStructuredExtractor::<
+                                    crate::memo_protocol::Stage2EntityPinDecision,
+                                >::new(
+                                    ollama_url,
+                                    graph_state.selected_model_tag.clone(),
+                                    "Select Stage-2 candidate entities to pin or probe next based on local evidence.",
+                                )
+                                .with_timeout(std::time::Duration::from_secs(2));
+                                let pin_prompt = format!(
+                                    "Question: {}\nCandidates: {}\nLocal Excerpts:\n{}",
+                                    graph_state.original_prompt, candidate_summary, local_snippet
+                                );
+                                extractor.extract_ollama_async(&pin_prompt).await.ok()
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(ref mut tracker) = graph_state.entity_streak_tracker {
+                            let live_probe_hint = live_pin_decision.and_then(|decision| {
+                                crate::memo_protocol::apply_live_stage2_pin_decision(
+                                    tracker, decision,
+                                )
+                            });
+                            match tracker.begin_stage2_turn() {
+                                crate::memo_protocol::Stage2TurnDirective::SkipToStage3 {
+                                    ..
+                                } => {
+                                    will_rewrite = false;
+                                    graph_state.memo_stage =
+                                        crate::memo_protocol::MemoStage::Stage3AnswerSeeking;
+                                    graph_state.active_stage2_directive = None;
+                                }
+                                mut dir @ crate::memo_protocol::Stage2TurnDirective::ContinueProbe {
+                                    ..
+                                } => {
+                                    if let Some(ref hint) = live_probe_hint {
+                                        if let crate::memo_protocol::Stage2TurnDirective::ContinueProbe {
+                                            ref mut probe_query,
+                                            ..
+                                        } = dir
+                                        {
+                                            if !probe_query
+                                                .to_ascii_lowercase()
+                                                .contains(&hint.to_ascii_lowercase())
+                                            {
+                                                *probe_query = format!("{} {}", probe_query, hint);
+                                            }
+                                        }
+                                    }
+                                    graph_state.active_stage2_directive = Some(dir);
+                                }
+                            }
+                        }
+                        Self::emit_memo_telemetry(telemetry_tx.as_ref(), &graph_state).await;
+                    } else if !will_rewrite
+                        && graph_state.memo_stage
+                            == crate::memo_protocol::MemoStage::Stage2EntityIdentification
+                    {
+                        graph_state.memo_stage =
+                            crate::memo_protocol::MemoStage::Stage3AnswerSeeking;
+                        graph_state.active_stage2_directive = None;
+                        Self::emit_memo_telemetry(telemetry_tx.as_ref(), &graph_state).await;
+                    }
 
                     if let Some(ref tx) = telemetry_tx {
                         let _ = tx
@@ -539,13 +1059,24 @@ impl AgenticStateGraphRunner {
                 AgenticStateName::RewriteQuery => {
                     match RewriteQueryNode::execute(&mut graph_state) {
                         Ok(rewritten) => {
+                            let embedder = quorum_contract::DeterministicOfflineEngine::new();
+                            if let Ok(fresh) = embedder.embed_text(&rewritten) {
+                                rewritten_vector = Some(fresh);
+                            }
+                            let rewrite_strategy = if graph_state.memo_stage
+                                == crate::memo_protocol::MemoStage::Stage2EntityIdentification
+                            {
+                                "memo_stage2_entity_probe".to_string()
+                            } else {
+                                "Context disambiguation hop".to_string()
+                            };
                             if let Some(ref tx) = telemetry_tx {
                                 let _ = tx
                                     .send(AgenticTelemetryEvent::QueryRewritten {
                                         hop: graph_state.hop_count,
                                         original_query: graph_state.original_prompt.clone(),
                                         rewritten_query: rewritten,
-                                        rewrite_strategy: "Context disambiguation hop".to_string(),
+                                        rewrite_strategy,
                                     })
                                     .await;
 
@@ -576,16 +1107,38 @@ impl AgenticStateGraphRunner {
                         &[&graph_state.original_prompt, &graph_state.current_query],
                     );
 
+                    if !matches!(
+                        graph_state.memo_stage,
+                        crate::memo_protocol::MemoStage::Bypassed
+                            | crate::memo_protocol::MemoStage::Stage3AnswerSeeking
+                            | crate::memo_protocol::MemoStage::Complete
+                    ) {
+                        graph_state.memo_stage =
+                            crate::memo_protocol::MemoStage::Stage3AnswerSeeking;
+                        Self::emit_memo_telemetry(telemetry_tx.as_ref(), &graph_state).await;
+                    }
+
+                    if graph_state.memo_stage != crate::memo_protocol::MemoStage::Bypassed {
+                        crate::memo_protocol::prune_distractor_chunks_for_stage3(&mut graph_state);
+                    }
+
                     // Live Concurrent RLM Parent-Document Enrichment: concurrently expand local chunks
                     // into surrounding parent-document byte windows and regex-grep uncovered query terms
-                    // bounded by RlmDepthAwareSemaphore over a JoinSet.
-                    crate::rlm_orchestrator::RlmOrchestrator::enrich_retrieved_chunks_with_parent_rlm_concurrent(
+                    // plus Stage-2 pinned entities bounded by RlmDepthAwareSemaphore over a JoinSet.
+                    let stage3_targets: Vec<String> = graph_state
+                        .pinned_entities
+                        .iter()
+                        .take(self.memo_config.stage3_max_seek_queries.max(1))
+                        .cloned()
+                        .collect();
+                    crate::rlm_orchestrator::RlmOrchestrator::enrich_retrieved_chunks_with_parent_rlm_concurrent_with_targets(
                         &graph_state.current_query,
                         &mut graph_state.retrieved_chunks,
                         Arc::clone(&engine.local_storage),
                         synth_policy.local_access_tier,
                         Arc::clone(&self.rlm_semaphore),
                         Some(Arc::clone(&self.rlm_slice_cache)),
+                        &stage3_targets,
                     )
                     .await;
 
@@ -655,16 +1208,57 @@ impl AgenticStateGraphRunner {
 
                     if is_multi_thread {
                         tokio::task::block_in_place(|| {
-                            SynthesizeWithCitationsNode::execute(
+                            SynthesizeWithCitationsNode::execute_draft(
                                 &mut graph_state,
                                 telemetry_tx.as_ref(),
                             );
                         });
                     } else {
-                        SynthesizeWithCitationsNode::execute(
+                        SynthesizeWithCitationsNode::execute_draft(
                             &mut graph_state,
                             telemetry_tx.as_ref(),
                         );
+                    }
+
+                    let daemon_active = crate::dlp_mesh::global_mesh_dlp_controller()
+                        .settings_file_path
+                        .read()
+                        .map(|p| p.is_some())
+                        .unwrap_or(false);
+                    let has_local_chunks = graph_state
+                        .retrieved_chunks
+                        .iter()
+                        .any(Self::is_local_non_dfir_chunk);
+                    let mut cache_eligible = true;
+                    if daemon_active
+                        && self.memo_config.use_live_llm_probes
+                        && graph_state.memo_stage != crate::memo_protocol::MemoStage::Bypassed
+                        && !installed.is_empty()
+                        && !graph_state.selected_model_tag.is_empty()
+                        && has_local_chunks
+                        && crate::offline_engine::DeterministicOfflineSynthesisEngine::is_ollama_endpoint_reachable()
+                    {
+                        let ollama_url = if settings_snapshot.ui.ollama_url.trim().is_empty() {
+                            "http://127.0.0.1:11434".to_string()
+                        } else {
+                            settings_snapshot.ui.ollama_url.trim().to_string()
+                        };
+                        cache_eligible = Self::apply_self_rag_critique_gate(
+                            &mut graph_state,
+                            &ollama_url,
+                            telemetry_tx.as_ref(),
+                        )
+                        .await;
+                    }
+
+                    SynthesizeWithCitationsNode::emit_final_answer(
+                        &graph_state,
+                        telemetry_tx.as_ref(),
+                    );
+
+                    if graph_state.memo_stage != crate::memo_protocol::MemoStage::Bypassed {
+                        graph_state.memo_stage = crate::memo_protocol::MemoStage::Complete;
+                        Self::emit_memo_telemetry(telemetry_tx.as_ref(), &graph_state).await;
                     }
 
                     if let Ok(mut guard) = last_turn_memory().lock() {
@@ -685,8 +1279,8 @@ impl AgenticStateGraphRunner {
                         }
                     }
 
-                    // Insert into QueryCache (skip caching continuation turns so "tell me more" always generates fresh follow-ups)
-                    if !is_continuation {
+                    // Insert into QueryCache (skip caching continuation turns and ungrounded SelfRagCritique drafts)
+                    if !is_continuation && cache_eligible {
                         let epoch = engine.local_storage.index_epoch();
                         self.cache_manager.query_cache.insert(
                             &cache_key_query,

@@ -8,10 +8,117 @@ impl RewriteQueryNode {
     pub fn execute(state: &mut AgenticGraphState) -> Result<String, CoordinatorError> {
         state.hop_count += 1;
 
-        let rewritten = format!(
-            "{} (disambiguation hop {})",
-            state.original_prompt, state.hop_count
-        );
+        let directive = state.active_stage2_directive.take();
+        let mut rewritten = if state.memo_stage == crate::memo_protocol::MemoStage::Stage2EntityIdentification {
+            let uncovered_subq = state.adaptive_plan.as_ref().and_then(|plan| {
+                plan.sub_questions.iter().find(|sq| {
+                    let clean_sq = sq.trim();
+                    !clean_sq.is_empty()
+                        && !state
+                            .query_history
+                            .iter()
+                            .any(|hist| hist.eq_ignore_ascii_case(clean_sq))
+                })
+            });
+
+            if let Some(crate::memo_protocol::Stage2TurnDirective::ContinueProbe {
+                target_entity,
+                domain_cluster,
+                probe_query,
+                streak_prompt_signal,
+                ..
+            }) = directive
+            {
+                tracing::debug!(
+                    target_entity = %target_entity,
+                    domain_cluster = ?domain_cluster,
+                    streak_signal = %streak_prompt_signal,
+                    "RewriteQueryNode consuming Stage2TurnDirective::ContinueProbe"
+                );
+                let clean_probe = if !probe_query.trim().is_empty() {
+                    probe_query.trim().to_string()
+                } else if let Some(ref cluster) = domain_cluster {
+                    format!("{} {}", target_entity.trim(), cluster.trim())
+                } else {
+                    target_entity.trim().to_string()
+                };
+                match uncovered_subq {
+                    Some(sq) => {
+                        let clean_sq = sq.trim().trim_end_matches('?').trim();
+                        if clean_sq
+                            .to_ascii_lowercase()
+                            .contains(&target_entity.trim().to_ascii_lowercase())
+                        {
+                            if let Some(ref cluster) = domain_cluster {
+                                format!("{} ({})", clean_sq, cluster.trim())
+                            } else {
+                                format!("{} (entity probe hop {})", clean_sq, state.hop_count)
+                            }
+                        } else {
+                            format!("{} {}", clean_probe, clean_sq)
+                        }
+                    }
+                    None => format!(
+                        "{} {} (entity probe hop {})",
+                        state.original_prompt.trim(),
+                        clean_probe,
+                        state.hop_count
+                    ),
+                }
+            } else {
+                let target_entity = state
+                    .entity_streak_tracker
+                    .as_ref()
+                    .and_then(|tracker| {
+                        let mut active: Vec<&crate::memo_protocol::CandidateEntityState> = tracker
+                            .candidates
+                            .values()
+                            .filter(|c| !c.pruned && c.confirmed_hits == 0)
+                            .collect();
+                        if active.is_empty() {
+                            active = tracker.candidates.values().filter(|c| !c.pruned).collect();
+                        }
+                        active.sort_by(|a, b| {
+                            b.confidence
+                                .partial_cmp(&a.confidence)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.consecutive_uncertain_streak.cmp(&b.consecutive_uncertain_streak))
+                                .then_with(|| a.normalized_key.cmp(&b.normalized_key))
+                        });
+                        active.first().map(|c| c.canonical_name.clone())
+                    });
+
+                match (target_entity, uncovered_subq) {
+                    (Some(entity), Some(sq)) => format!(
+                        "{} {}",
+                        entity.trim(),
+                        sq.trim().trim_end_matches('?').trim()
+                    ),
+                    (Some(entity), None) => format!(
+                        "{} {} (entity probe hop {})",
+                        state.original_prompt.trim(),
+                        entity.trim(),
+                        state.hop_count
+                    ),
+                    (None, Some(sq)) => sq.trim().to_string(),
+                    (None, None) => format!(
+                        "{} (disambiguation hop {})",
+                        state.original_prompt, state.hop_count
+                    ),
+                }
+            }
+        } else {
+            format!(
+                "{} (disambiguation hop {})",
+                state.original_prompt, state.hop_count
+            )
+        };
+
+        if state.query_history.contains(&rewritten)
+            && state.memo_stage == crate::memo_protocol::MemoStage::Stage2EntityIdentification
+        {
+            rewritten = format!("{} (stage2 probe hop {})", rewritten, state.hop_count);
+        }
 
         if state.query_history.contains(&rewritten) {
             return Err(CoordinatorError::GraphError(format!(

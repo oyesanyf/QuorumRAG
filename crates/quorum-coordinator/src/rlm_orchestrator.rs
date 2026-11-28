@@ -1337,17 +1337,54 @@ impl RlmOrchestrator {
         semaphore: Arc<RlmDepthAwareSemaphore>,
         slice_cache: Option<Arc<RlmParentSliceCache>>,
     ) {
+        Self::enrich_retrieved_chunks_with_parent_rlm_concurrent_with_targets(
+            prompt,
+            chunks,
+            storage,
+            max_tier,
+            semaphore,
+            slice_cache,
+            &[],
+        )
+        .await;
+    }
+
+    /// Stage-3 entity-pinned companion to `enrich_retrieved_chunks_with_parent_rlm_concurrent`
+    /// that merges MeMo Stage-2 `target_entities` (`pinned_entities`) into `regex_grep` search terms.
+    pub async fn enrich_retrieved_chunks_with_parent_rlm_concurrent_with_targets(
+        prompt: &str,
+        chunks: &mut [quorum_types::ScoredChunk],
+        storage: Arc<dyn crate::scatter_gather::StorageSearcher>,
+        max_tier: u8,
+        semaphore: Arc<RlmDepthAwareSemaphore>,
+        slice_cache: Option<Arc<RlmParentSliceCache>>,
+        target_entities: &[String],
+    ) {
         const STOPWORDS: &[&str] = &[
             "the", "and", "for", "with", "that", "this", "from", "what", "who", "where",
             "when", "which", "how", "tell", "about", "show", "give", "list", "find",
             "does", "have", "has", "his", "her", "their", "details", "information",
         ];
 
-        let query_terms: Vec<String> = prompt
+        let mut query_terms: Vec<String> = prompt
             .split(|c: char| !c.is_alphanumeric())
             .map(|w| w.to_ascii_lowercase())
             .filter(|w| w.len() >= 3 && !STOPWORDS.contains(&w.as_str()))
             .collect();
+        let has_targets = !target_entities.is_empty();
+        for entity in target_entities {
+            let clean_ent =
+                crate::memo_protocol::UncertainAnswerStreakTracker::entity_lookup_name(entity);
+            for tok in clean_ent
+                .split(|c: char| !c.is_alphanumeric())
+                .map(|w| w.to_ascii_lowercase())
+                .filter(|w| w.len() >= 3 && !STOPWORDS.contains(&w.as_str()))
+            {
+                if !query_terms.contains(&tok) {
+                    query_terms.push(tok);
+                }
+            }
+        }
 
         let mut candidate_indices = Vec::new();
         for (idx, scored) in chunks.iter().enumerate() {
@@ -1437,10 +1474,11 @@ impl RlmOrchestrator {
                 }
 
                 let win_low = expanded_text.to_ascii_lowercase();
+                let missing_limit = if has_targets { 6 } else { 4 };
                 let missing_terms: Vec<String> = terms
                     .iter()
                     .filter(|qt| !win_low.contains(qt.as_str()))
-                    .take(4)
+                    .take(missing_limit)
                     .map(|qt| regex::escape(qt))
                     .collect();
 

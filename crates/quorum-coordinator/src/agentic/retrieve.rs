@@ -116,8 +116,15 @@ impl RetrieveMeshNode {
     ) {
         let candidate_k = top_k.max(48);
 
-        // Feature 48: Reuse cached vector hits across rewrite hops to avoid redundant LanceDB scans
-        let cached_hits_opt = if state.hop_count > 0 && !state.cached_vector_hits.is_empty() {
+        // Feature 48: Reuse cached vector hits ONLY when the query/vector has not been rewritten and we are
+        // not executing a Stage-2 entity probe (rewritten queries refresh `rewritten_vector` and must run `search_hybrid`).
+        let query_rewritten =
+            state.current_query != state.original_prompt || state.query_history.len() > 1;
+        let cached_hits_opt = if state.hop_count > 0
+            && !state.cached_vector_hits.is_empty()
+            && !query_rewritten
+            && state.memo_stage != crate::memo_protocol::MemoStage::Stage2EntityIdentification
+        {
             Some(state.cached_vector_hits.as_slice())
         } else {
             None
@@ -166,14 +173,18 @@ impl RetrieveMeshNode {
             state.current_query.clone()
         };
 
-        // Align dense vector with primary extracted question if cleaner than noisy raw prompt
+        // Align dense vector with primary extracted question on hop 0 only (so rewritten_vector on hop > 0 is preserved)
         let aligned_vec_storage;
-        let effective_vector = if let Some(primary_q) = state.extracted_questions.first() {
-            if primary_q != &state.current_query && !primary_q.trim().is_empty() {
-                let embedder = quorum_contract::DeterministicOfflineEngine::new();
-                if let Ok(fresh) = embedder.embed_text(primary_q) {
-                    aligned_vec_storage = fresh;
-                    aligned_vec_storage.as_slice()
+        let effective_vector = if state.hop_count == 0 {
+            if let Some(primary_q) = state.extracted_questions.first() {
+                if primary_q != &state.current_query && !primary_q.trim().is_empty() {
+                    let embedder = quorum_contract::DeterministicOfflineEngine::new();
+                    if let Ok(fresh) = embedder.embed_text(primary_q) {
+                        aligned_vec_storage = fresh;
+                        aligned_vec_storage.as_slice()
+                    } else {
+                        vector
+                    }
                 } else {
                     vector
                 }
@@ -347,7 +358,49 @@ impl RetrieveMeshNode {
         );
         let local_access_tier = local_policy.local_access_tier;
 
-        // Dispatch primary query + supplemental queries concurrently via tokio::join!
+        let is_deep_graph = state
+            .adaptive_plan
+            .as_ref()
+            .map(|p| p.depth == crate::adaptive_rag::RetrievalDepth::DeepGraph)
+            .unwrap_or(false);
+        let stage1_subqueries: Vec<String> =
+            if state.hop_count == 0 && !is_continuation_turn && forensic_intent.is_none() {
+            if let Some(ref plan) = state.adaptive_plan {
+                let mut sqs: Vec<String> = Vec::new();
+                let curr_norm = state.current_query.trim().trim_end_matches('?').trim();
+                for variant in &plan.query_variants {
+                    let v_norm = variant.trim().trim_end_matches('?').trim();
+                    if !v_norm.is_empty()
+                        && !v_norm.eq_ignore_ascii_case(curr_norm)
+                        && !sqs.iter().any(|existing| existing.eq_ignore_ascii_case(v_norm))
+                    {
+                        sqs.push(variant.clone());
+                    }
+                    if sqs.len() >= 4 {
+                        break;
+                    }
+                }
+                if plan.depth == crate::adaptive_rag::RetrievalDepth::ConceptualHyde {
+                    if let Some(ref hyde) = plan.hyde_passage {
+                        if !hyde.trim().is_empty() && sqs.len() < 4 {
+                            sqs.push(hyde.clone());
+                        }
+                    }
+                }
+                sqs
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let stage1_variant_k = if is_deep_graph {
+            (candidate_k / 2).max(24)
+        } else {
+            (candidate_k / 2).max(12)
+        };
+
+        // Dispatch primary query + supplemental queries + stateless MeMo Stage-1 variants concurrently via tokio::join!
         // Send the unbloated query (`state.current_query`) to remote P2P peers so 1.5M+ chunk remote corpora
         // are not diluted by 7 generic BM25 expansion words, while keeping `search_query` for local storage.
         let primary_fut = engine.execute_query_with_p2p_query_and_exclusion(
@@ -394,6 +447,31 @@ impl RetrieveMeshNode {
                 Vec::new()
             }
         };
+        let stage1_variants_fut = async {
+            if stage1_subqueries.is_empty() {
+                return Vec::new();
+            }
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+            let mut futs = FuturesUnordered::new();
+            for subq in stage1_subqueries {
+                let storage = std::sync::Arc::clone(&engine.local_storage);
+                let sem_ref = std::sync::Arc::clone(&sem);
+                futs.push(async move {
+                    let _permit = sem_ref.acquire().await.ok();
+                    let embedder = quorum_contract::DeterministicOfflineEngine::new();
+                    let q_vec = embedder.embed_text(&subq).unwrap_or_else(|_| vec![0.0; 768]);
+                    storage
+                        .search_hybrid(&subq, &q_vec, local_access_tier, stage1_variant_k)
+                        .await
+                });
+            }
+            let mut lists = Vec::new();
+            while let Some(res) = futs.next().await {
+                lists.push(res);
+            }
+            lists
+        };
 
         let (
             (mut chunks, mut volatile, _duration, new_vector_hits),
@@ -401,7 +479,15 @@ impl RetrieveMeshNode {
             prompt_hits,
             cue_hits,
             forensic_hits,
-        ) = tokio::join!(primary_fut, entity_fut, prompt_fut, cue_fut, forensic_fut);
+            stage1_variant_lists,
+        ) = tokio::join!(
+            primary_fut,
+            entity_fut,
+            prompt_fut,
+            cue_fut,
+            forensic_fut,
+            stage1_variants_fut
+        );
 
         let has_entity_matched_remote = !volatile.is_empty()
             && (prelim_entities.is_empty()
@@ -516,6 +602,39 @@ impl RetrieveMeshNode {
                     }
                     hit.score = 1.0 / (supp_denom + idx as f32);
                     if seen_ids.insert((hit.source_peer.clone(), hit.chunk.chunk_id.clone())) {
+                        chunks.push(hit);
+                    }
+                }
+            }
+        }
+
+        if !stage1_variant_lists.is_empty() {
+            let mut seen_ids: std::collections::HashMap<(String, String), usize> = chunks
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ((c.source_peer.clone(), c.chunk.chunk_id.clone()), i))
+                .collect();
+            let mut seen_hashes: std::collections::HashSet<String> = chunks
+                .iter()
+                .filter(|c| !c.chunk.blake3_hash.is_empty())
+                .map(|c| c.chunk.blake3_hash.clone())
+                .collect();
+
+            for list in stage1_variant_lists {
+                for (idx, mut hit) in list.into_iter().enumerate() {
+                    if !local_policy.permits_local_scored_chunk(&hit) {
+                        continue;
+                    }
+                    let rrf = crate::fusion::RrfCombiner::compute_rrf_score(&[idx + 1], 60.0);
+                    let id_key = (hit.source_peer.clone(), hit.chunk.chunk_id.clone());
+                    if let Some(&existing_pos) = seen_ids.get(&id_key) {
+                        chunks[existing_pos].score += rrf * 0.25;
+                    } else if hit.chunk.blake3_hash.is_empty()
+                        || seen_hashes.insert(hit.chunk.blake3_hash.clone())
+                    {
+                        hit.score = rrf;
+                        let new_pos = chunks.len();
+                        seen_ids.insert(id_key, new_pos);
                         chunks.push(hit);
                     }
                 }
@@ -1279,9 +1398,21 @@ impl RetrieveMeshNode {
         // Re-score non-forensic candidates against the clean primary subject and decomposed
         // sub-questions (Stage-2a CrossSignalReranker), then optionally fuse local Stage-2b
         // neural reranking (`/v1/rerank`, Ollama `Qwen3-Reranker`/`bge-reranker`, or `/api/embed`).
-        if forensic_intent.is_none() && chunks.len() > 2 {
-            let adaptive_plan = crate::adaptive_rag::plan_adaptive_query(&state.original_prompt, false);
-            if adaptive_plan.primary_subject.is_some() || adaptive_plan.sub_questions.len() >= 2 {
+        if forensic_intent.is_none() && chunks.len() >= 2 {
+            let adaptive_plan = state
+                .adaptive_plan
+                .clone()
+                .unwrap_or_else(|| crate::adaptive_rag::plan_adaptive_query(&state.original_prompt, false));
+            let allow_two_chunk_rerank = chunks.len() == 2
+                && adaptive_plan.primary_subject.is_some()
+                && matches!(
+                    adaptive_plan.depth,
+                    crate::adaptive_rag::RetrievalDepth::DeepGraph
+                        | crate::adaptive_rag::RetrievalDepth::DecomposedMultiQuery
+                );
+            if (chunks.len() > 2 || allow_two_chunk_rerank)
+                && (adaptive_plan.primary_subject.is_some() || adaptive_plan.sub_questions.len() >= 2)
+            {
                 let stage2a = crate::reranker::CrossSignalReranker::rerank(
                     &state.original_prompt,
                     adaptive_plan.primary_subject.as_deref(),
@@ -1450,6 +1581,11 @@ impl RetrieveMeshNode {
         });
 
         chunks.truncate(top_k);
+        let parent_subj = state
+            .adaptive_plan
+            .as_ref()
+            .and_then(|p| p.primary_subject.as_deref());
+        crate::memo_protocol::annotate_chunks_self_containment(&mut chunks, parent_subj);
         state.retrieved_chunks = chunks;
         state.volatile_chunks = volatile;
     }

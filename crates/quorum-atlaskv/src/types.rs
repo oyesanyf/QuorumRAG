@@ -121,7 +121,7 @@ impl KgTripleRecord {
 }
 
 /// Source chunk input for KG2KV extraction (decoupled from Arrow/LanceDB).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KgSourceChunk {
     pub chunk_id: String,
     pub document_id: String,
@@ -131,6 +131,20 @@ pub struct KgSourceChunk {
     pub access_tier: u8,
     pub text_content: String,
     pub metadata_json: String,
+    /// Optional antecedent/document subject anchor resolved across prior chunks
+    /// of the same `(document_id, access_tier)` without mutating `text_content`.
+    pub resolved_subject: Option<String>,
+}
+
+impl KgSourceChunk {
+    /// Attaches a resolved antecedent subject anchor to this chunk without mutating `text_content`.
+    pub fn with_resolved_subject(mut self, subject: impl Into<String>) -> Self {
+        let trimmed = subject.into().trim().to_string();
+        if !trimmed.is_empty() {
+            self.resolved_subject = Some(trimmed);
+        }
+        self
+    }
 }
 
 /// Configuration for the 3-level `Root -> Inter1 -> Leaf` hierarchy and HiKVP pruner.

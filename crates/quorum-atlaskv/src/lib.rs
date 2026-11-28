@@ -31,7 +31,11 @@ pub use interop::{
     export_atlaskv_dataset, import_atlaskv_dataset, read_npy_2d_as_f32,
     validate_safe_relative_path, write_npy_f32, AtlasKvExportManifest, AtlasKvQkvItem,
 };
-pub use kg2kv::{scrub_sensitive_tokens, Kg2KvExtractor, Kg2KvExtractorConfig};
+pub use kg2kv::{
+    audit_chunk_self_containment, derive_display_title, infer_chunk_subject_anchor,
+    is_generic_heading, parse_chunk_order_key, scrub_sensitive_tokens, Kg2KvExtractor,
+    Kg2KvExtractorConfig, SelfContainmentAudit,
+};
 pub use types::{
     dot_f16_le, dot_f32, encode_f32_to_f16_le, l2_normalize_in_place, normalize_path_key,
     validate_access_tier, AtlasKvSettings, AtlasKvStoreStats, AtlasKvTreeConfig,

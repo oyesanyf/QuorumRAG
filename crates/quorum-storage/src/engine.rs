@@ -361,19 +361,151 @@ impl StorageEngine {
 
         // Extract grounded KG2KV triples off the async runtime thread and align vectors to chunk embedding space
         let atlaskv_for_write = Arc::clone(&self.atlaskv);
+        let catalog_for_kg = Arc::clone(&self.catalog);
         let dim = self.config.vector_dimension;
         let chunks_for_kg = unique_chunks;
         let _ = tokio::task::spawn_blocking(move || {
-            let extractor = quorum_atlaskv::Kg2KvExtractor::new(
-                quorum_atlaskv::Kg2KvExtractorConfig::default(),
-            );
+            let kg_cfg = quorum_atlaskv::Kg2KvExtractorConfig::default();
+            let extractor = quorum_atlaskv::Kg2KvExtractor::new(kg_cfg.clone());
+            let mut ordered_indices: Vec<usize> = (0..chunks_for_kg.len()).collect();
+            ordered_indices.sort_by_key(|&idx| {
+                let ch = &chunks_for_kg[idx];
+                (
+                    ch.document_id.clone(),
+                    ch.access_tier,
+                    quorum_atlaskv::parse_chunk_order_key(
+                        &ch.chunk_id,
+                        &ch.metadata_json,
+                        ch.line_start,
+                        idx,
+                    ),
+                )
+            });
+
+            // Partitioned strictly by `(document_id_or_path, access_tier)` so subjects never leak
+            // across documents or clearance boundaries.
+            let mut doc_active_subjects: HashMap<(String, u8), String> = HashMap::new();
+            let mut doc_lookup_misses: HashSet<(String, u8)> = HashSet::new();
             let mut triples = Vec::new();
             let mut kvecs = Vec::new();
             let mut vvecs = Vec::new();
-            for ch in &chunks_for_kg {
+
+            for idx in ordered_indices {
+                let ch = &chunks_for_kg[idx];
+                if !kg_cfg.forensics_enabled
+                    && quorum_atlaskv::Kg2KvExtractor::is_airgap_forensics_chunk(
+                        &ch.file_path,
+                        &ch.metadata_json,
+                    )
+                {
+                    continue;
+                }
+
+                let doc_key = (
+                    if ch.document_id.is_empty() {
+                        ch.file_path.clone()
+                    } else {
+                        ch.document_id.clone()
+                    },
+                    ch.access_tier,
+                );
+
+                let mut prior_subject = doc_active_subjects.get(&doc_key).cloned();
+                if prior_subject.is_none() && !doc_lookup_misses.contains(&doc_key) {
+                    if let Ok(Some(entry)) = catalog_for_kg.get_by_file_path(&ch.file_path) {
+                        if entry.access_tier == ch.access_tier
+                            && (ch.document_id.is_empty() || entry.document_id == ch.document_id)
+                        {
+                            let stem_title = quorum_atlaskv::derive_display_title(&entry.file_path);
+                            let candidate = if !entry.doc_authors.trim().is_empty()
+                                && !entry.doc_authors.eq_ignore_ascii_case("unknown")
+                            {
+                                Some(entry.doc_authors.trim().to_string())
+                            } else if let Some(anchor) = quorum_atlaskv::infer_chunk_subject_anchor(
+                                &entry.summary_excerpt,
+                                "{}",
+                                &entry.file_path,
+                            ) {
+                                Some(anchor)
+                            } else if !entry.doc_title.trim().is_empty()
+                                && !entry.doc_title.trim().eq_ignore_ascii_case(&stem_title)
+                                && !quorum_atlaskv::is_generic_heading(entry.doc_title.trim())
+                            {
+                                Some(entry.doc_title.trim().to_string())
+                            } else {
+                                None
+                            };
+                            if let Some(cand) = candidate {
+                                doc_active_subjects.insert(doc_key.clone(), cand.clone());
+                                prior_subject = Some(cand);
+                            }
+                        }
+                    }
+                    if prior_subject.is_none() {
+                        if let Ok(Some((parent, parent_tier))) =
+                            catalog_for_kg.get_parent_document(&doc_key.0)
+                        {
+                            if parent_tier == ch.access_tier {
+                                let parent_prefix = utf8_prefix(&parent.full_text, 16_384);
+                                let parent_stem_title =
+                                    quorum_atlaskv::derive_display_title(&parent.source_path);
+                                let chunk_stem_title =
+                                    quorum_atlaskv::derive_display_title(&ch.file_path);
+                                let candidate = parent
+                                    .author
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("unknown"))
+                                    .map(|a| a.to_string())
+                                    .or_else(|| {
+                                        quorum_atlaskv::infer_chunk_subject_anchor(
+                                            parent_prefix,
+                                            "{}",
+                                            &parent.source_path,
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        parent
+                                            .title
+                                            .as_deref()
+                                            .map(str::trim)
+                                            .filter(|t| {
+                                                !t.is_empty()
+                                                    && !t.eq_ignore_ascii_case(&parent_stem_title)
+                                                    && !t.eq_ignore_ascii_case(&chunk_stem_title)
+                                                    && !quorum_atlaskv::is_generic_heading(t)
+                                            })
+                                            .map(|t| t.to_string())
+                                    });
+                                if let Some(cand) = candidate {
+                                    doc_active_subjects.insert(doc_key.clone(), cand.clone());
+                                    prior_subject = Some(cand);
+                                }
+                            }
+                        }
+                    }
+                    if prior_subject.is_none() {
+                        doc_lookup_misses.insert(doc_key.clone());
+                    }
+                }
+
+                let current_anchor = quorum_atlaskv::infer_chunk_subject_anchor(
+                    &ch.text_content,
+                    &ch.metadata_json,
+                    &ch.file_path,
+                );
+                if let Some(ref anchor) = current_anchor {
+                    doc_active_subjects.insert(doc_key.clone(), anchor.clone());
+                }
+
                 if ch.vector.len() != dim {
                     continue;
                 }
+
+                let resolved_subject = current_anchor
+                    .clone()
+                    .or_else(|| doc_active_subjects.get(&doc_key).cloned());
+
                 let src = quorum_atlaskv::KgSourceChunk {
                     chunk_id: ch.chunk_id.clone(),
                     document_id: ch.document_id.clone(),
@@ -383,8 +515,19 @@ impl StorageEngine {
                     access_tier: ch.access_tier,
                     text_content: ch.text_content.clone(),
                     metadata_json: ch.metadata_json.clone(),
+                    resolved_subject,
                 };
                 if let Ok(extracted) = extractor.extract_from_chunk(&src) {
+                    if prior_subject.is_none() && !doc_active_subjects.contains_key(&doc_key) {
+                        let stem_title = quorum_atlaskv::derive_display_title(&ch.file_path);
+                        if let Some(first_ent) = extracted.first().map(|r| r.entity.clone()) {
+                            if !first_ent.eq_ignore_ascii_case(&stem_title)
+                                && !quorum_atlaskv::is_generic_heading(&first_ent)
+                            {
+                                doc_active_subjects.insert(doc_key.clone(), first_ent);
+                            }
+                        }
+                    }
                     for rec in extracted {
                         triples.push(rec);
                         kvecs.push(ch.vector.clone());
@@ -1423,4 +1566,15 @@ pub(crate) fn prioritize_forensic_intent(query: &str, hits: &mut Vec<ScoredChunk
         dns_hits.extend(rest);
         *hits = dns_hits;
     }
+}
+
+fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }

@@ -15,6 +15,7 @@ pub mod fusion;
 pub mod hardware;
 pub mod langextract;
 pub mod marketplace_engine;
+pub mod memo_protocol;
 pub mod mesh;
 pub mod model_router;
 pub mod nimble_client;
@@ -126,7 +127,15 @@ pub use typed_extractor::{
 pub use reranker::{
     CrossSignalReranker, NeuralRerankBackend, NeuralReranker, RerankedCandidate, RerankerConfig,
 };
-pub use rag_eval::{score_markdown_hygiene, RagEvalHarness, RagEvalReport};
+pub use rag_eval::{score_markdown_hygiene, MemoEvalMetrics, RagEvalHarness, RagEvalReport};
+pub use memo_protocol::{
+    annotate_chunks_self_containment, apply_live_stage2_pin_decision, build_stage1_clue_probes,
+    format_memo_synthesis_context, prune_distractor_chunks_for_stage3,
+    should_engage_memo_protocol, verify_and_annotate_chunk_self_containment, AtomicClueProbe,
+    CandidateEntityState, MemoProtocolConfig, MemoStage,
+    Stage1ClueProbeOutput, Stage2EntityPinDecision, Stage2TurnDirective,
+    UncertainAnswerStreakTracker,
+};
 pub use dfir_consensus::{
     DfirConsensusVerdict, DfirTelemetryInput, DfirVoterReport, MultiVoterConsensusEngine,
 };
