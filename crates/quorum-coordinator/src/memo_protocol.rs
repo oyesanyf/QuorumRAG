@@ -1221,17 +1221,15 @@ fn contains_word_boundary(hay: &str, tok: &str) -> bool {
         return false;
     }
     for (idx, _) in hay.match_indices(tok) {
-        let before_ok = hay[..idx]
+        let before_alnum = hay[..idx]
             .chars()
             .next_back()
-            .map(|c| !c.is_alphanumeric())
-            .unwrap_or(true);
-        let after_ok = hay[idx + tok.len()..]
+            .is_some_and(char::is_alphanumeric);
+        let after_alnum = hay[idx + tok.len()..]
             .chars()
             .next()
-            .map(|c| !c.is_alphanumeric())
-            .unwrap_or(true);
-        if before_ok && after_ok {
+            .is_some_and(char::is_alphanumeric);
+        if !before_alnum && !after_alnum {
             return true;
         }
     }
