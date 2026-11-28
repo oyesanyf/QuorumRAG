@@ -116,7 +116,84 @@ impl GradeRelevanceNode {
                 || distinct_docs >= 2
                 || (distinct_docs >= 1 && (max_score >= 0.70 || has_content_match))))
             || is_early_sufficient;
-        let will_rewrite = !satisfactory && state.hop_count < state.max_hops;
+        let mut will_rewrite = !satisfactory && state.hop_count < state.max_hops;
+
+        if state.memo_stage == crate::memo_protocol::MemoStage::Stage2EntityIdentification {
+            if let Some(ref mut tracker) = state.entity_streak_tracker {
+                if state.hop_count > 0 {
+                    let active_targets: Vec<(String, String)> = tracker
+                        .candidates
+                        .values()
+                        .filter(|c| !c.pruned && c.confirmed_hits == 0)
+                        .map(|c| {
+                            (
+                                c.normalized_key.clone(),
+                                crate::memo_protocol::UncertainAnswerStreakTracker::normalize_entity_name(
+                                    &c.canonical_name,
+                                ),
+                            )
+                        })
+                        .collect();
+
+                    let curr_q_low = state.current_query.to_ascii_lowercase();
+                    let target_count = active_targets.len();
+                    for (cand_key, norm_name) in active_targets {
+                        let matched_chunk_ids: Vec<String> = state
+                            .retrieved_chunks
+                            .iter()
+                            .filter(|sc| {
+                                !crate::artemis_airgap::is_artemis_dfir_chunk(&sc.chunk)
+                                    && crate::memo_protocol::chunk_matches_entity_name(sc, &norm_name)
+                            })
+                            .map(|sc| sc.chunk.chunk_id.clone())
+                            .collect();
+
+                        let matched_triple_ids: Vec<u64> = state
+                            .atlaskv_triples
+                            .iter()
+                            .filter(|t| {
+                                let triple_norm = crate::memo_protocol::UncertainAnswerStreakTracker::normalize_entity_name(
+                                    &t.triple.entity,
+                                );
+                                triple_norm == norm_name
+                                    || crate::memo_protocol::entity_text_matches(&triple_norm, &norm_name)
+                            })
+                            .map(|t| t.triple.triple_id)
+                            .collect();
+
+                        let is_uncertain =
+                            matched_chunk_ids.is_empty() && matched_triple_ids.is_empty();
+                        let should_record = !is_uncertain
+                            || target_count == 1
+                            || crate::memo_protocol::entity_text_matches(&curr_q_low, &norm_name)
+                            || state.hop_count >= state.max_hops;
+                        if should_record {
+                            tracker.record_probe_outcome(
+                                &cand_key,
+                                is_uncertain,
+                                &matched_chunk_ids,
+                                &matched_triple_ids,
+                            );
+                        }
+                    }
+                    state.pinned_entities = tracker.pinned_entities.clone();
+                }
+
+                if tracker.all_candidates_pruned() {
+                    will_rewrite = false;
+                } else if requires_named_entity_match
+                    && !satisfactory
+                    && state.hop_count < state.max_hops
+                    && tracker.turn < tracker.max_turns
+                    && tracker
+                        .candidates
+                        .values()
+                        .any(|c| !c.pruned && c.confirmed_hits == 0)
+                {
+                    will_rewrite = true;
+                }
+            }
+        }
 
         let reasoning = if is_empty {
             "Empty chunks retrieved. Scheduling query rewrite or fallback.".to_string()

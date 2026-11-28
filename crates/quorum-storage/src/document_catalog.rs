@@ -3,7 +3,7 @@
 //! Provides single-row-per-document persistence, instant $O(1)$ work enumeration,
 //! near-duplicate revision clustering (`work_cluster_id`), and full-text author/title search.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -712,7 +712,8 @@ impl DocumentCatalog {
         Ok(count.max(0) as usize)
     }
 
-    /// Retrieves an entry by its exact file path.
+    /// Retrieves an entry by its exact file path, falling back to `file_path_compare_key`
+    /// normalization if slash style or platform casing differs.
     pub fn get_by_file_path(
         &self,
         file_path: &str,
@@ -727,10 +728,43 @@ impl DocumentCatalog {
 
         let mut rows = stmt.query(params![file_path])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(Self::row_to_entry(row)?))
-        } else {
-            Ok(None)
+            return Ok(Some(Self::row_to_entry(row)?));
         }
+        drop(rows);
+        drop(stmt);
+
+        let target_key = crate::file_path_compare_key(file_path);
+        if target_key.is_empty() {
+            return Ok(None);
+        }
+        let matched_fp: Option<String> = {
+            let mut scan = conn.prepare("SELECT file_path FROM document_catalog")?;
+            let paths = scan.query_map([], |r| r.get::<_, String>(0))?;
+            let mut found = None;
+            for p_res in paths {
+                let fp = p_res?;
+                if crate::file_path_compare_key(&fp) == target_key {
+                    found = Some(fp);
+                    break;
+                }
+            }
+            found
+        };
+
+        if let Some(exact_fp) = matched_fp {
+            let mut by_fp = conn.prepare(
+                "SELECT file_path, document_id, work_cluster_id, doc_title, doc_authors, doc_kind,
+                        file_name, file_extension, folder, normalized_stem, author_confidence,
+                        access_tier, mtime_secs, size_bytes, chunk_count, summary_excerpt, created_at
+                 FROM document_catalog WHERE file_path = ?1 LIMIT 1",
+            )?;
+            let mut fp_rows = by_fp.query(params![exact_fp])?;
+            if let Some(row) = fp_rows.next()? {
+                return Ok(Some(Self::row_to_entry(row)?));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Returns the total number of documents in the catalog.
@@ -917,6 +951,20 @@ impl DocumentCatalog {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
 
+        let mut existing_keys: HashSet<String> = {
+            let mut stmt = tx.prepare("SELECT file_path FROM document_catalog")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut set = HashSet::new();
+            for row in rows {
+                let fp = row?;
+                let key = crate::file_path_compare_key(&fp);
+                if !key.is_empty() {
+                    set.insert(key);
+                }
+            }
+            set
+        };
+
         // Group chunks by file_path
         let mut doc_map: HashMap<String, Vec<&quorum_types::DocumentChunk>> = HashMap::new();
         for chunk in chunks {
@@ -928,6 +976,10 @@ impl DocumentCatalog {
 
         let mut count = 0;
         for (file_path, file_chunks) in doc_map {
+            let compare_key = crate::file_path_compare_key(&file_path);
+            if !compare_key.is_empty() && existing_keys.contains(&compare_key) {
+                continue;
+            }
             // Find chunk 0 or first chunk
             let primary = file_chunks
                 .iter()
@@ -999,6 +1051,9 @@ impl DocumentCatalog {
                     chrono::Utc::now().timestamp(),
                 ],
             )?;
+            if !compare_key.is_empty() {
+                existing_keys.insert(compare_key);
+            }
             count += 1;
         }
 

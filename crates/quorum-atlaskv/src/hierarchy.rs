@@ -13,7 +13,7 @@
 //! - On Windows, active `Mmap` handles are deterministically dropped under the write lock
 //!   before any file append or truncation so OS Error 32 never occurs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ use crate::error::AtlasKvError;
 use crate::types::{
     dot_f16_le, dot_f32, encode_f32_to_f16_le, l2_normalize_in_place, normalize_path_key,
     validate_access_tier, AtlasKvStoreStats, AtlasKvTreeConfig, KgTripleRecord,
-    PeerCentroidSummary,
+    PeerCentroidSummary, ScoredKgTriple,
 };
 
 const HIERARCHY_MAGIC: &[u8; 8] = b"ATKVH001";
@@ -247,7 +247,8 @@ impl AtlasKvStore {
              CREATE INDEX IF NOT EXISTS idx_triples_blake3 ON triples(blake3_hash);
              CREATE INDEX IF NOT EXISTS idx_triples_file_norm ON triples(file_path_norm);
              CREATE INDEX IF NOT EXISTS idx_triples_doc_id ON triples(document_id);
-             CREATE INDEX IF NOT EXISTS idx_triples_tier_active ON triples(deleted, access_tier);",
+             CREATE INDEX IF NOT EXISTS idx_triples_tier_active ON triples(deleted, access_tier);
+             CREATE INDEX IF NOT EXISTS idx_triples_tier_entity_lower ON triples(access_tier, lower(entity));",
         )?;
 
         // Backfill any legacy `file_path_norm` rows (Unix mixed-case, Windows roots, UNC,
@@ -1099,6 +1100,289 @@ impl AtlasKvStore {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// Queries SQLite `triples` directly by normalized entity name with fail-closed `access_tier <= max_tier`,
+    /// pre-truncation `allowed_folders` enforcement, escaped `LIKE` compound-entity fallback, and
+    /// round-robin `work_cluster_id` preservation (MeMo Pipeline Step 4).
+    pub fn query_entity_surface(
+        &self,
+        entity: &str,
+        max_tier: u8,
+        top_k: usize,
+        allowed_folders: Option<&[String]>,
+    ) -> Result<Vec<ScoredKgTriple>, AtlasKvError> {
+        validate_access_tier(max_tier)?;
+
+        let norm_entity = normalize_entity_query(entity);
+        if top_k == 0 || norm_entity.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let normalized_folders: Option<Vec<String>> = allowed_folders.map(|folders| {
+            folders
+                .iter()
+                .map(|f| normalize_path_key(f))
+                .filter(|f| !f.is_empty())
+                .collect()
+        });
+
+        let per_cluster_cap = top_k.max(16);
+        let global_safety_cap = top_k.saturating_mul(64).max(4096);
+        let is_short_single_token = !norm_entity.contains(' ') && norm_entity.chars().count() < 4;
+        let mut candidates: Vec<ScoredKgTriple> = Vec::new();
+        {
+            let db = self.db.lock();
+            let mut seen_ids: HashSet<u64> = HashSet::new();
+
+            // Phase 1: Indexed exact normalized match (`idx_triples_tier_entity_lower`)
+            // Cap per `work_cluster_id` (not globally at 512) so a single dominant cluster
+            // cannot starve minority homonym clusters.
+            let mut phase1_cluster_counts: HashMap<String, usize> = HashMap::new();
+            let mut phase1_added = 0usize;
+            let mut exact_stmt = db.prepare_cached(
+                "SELECT triple_id, blake3_hash, entity, relation, key_string, value,
+                        document_id, chunk_id, file_path, line_start, line_end,
+                        work_cluster_id, access_tier, source_peer
+                 FROM triples
+                 WHERE deleted = 0 AND access_tier <= ?1 AND lower(entity) = ?2
+                 ORDER BY triple_id ASC",
+            )?;
+            let mut exact_rows = exact_stmt.query(params![max_tier as i64, &norm_entity])?;
+            while let Some(row) = exact_rows.next()? {
+                let rec = row_to_triple(row)?;
+                if seen_ids.contains(&rec.triple_id) || rec.access_tier > max_tier {
+                    continue;
+                }
+                if let Some(ref allowed) = normalized_folders {
+                    if !crate::hikvp::is_path_inside_allowed_folders(&rec.file_path, allowed) {
+                        continue;
+                    }
+                }
+                let cluster_key = cluster_key_for(&rec.work_cluster_id);
+                if phase1_cluster_counts
+                    .get(&cluster_key)
+                    .copied()
+                    .unwrap_or(0)
+                    >= per_cluster_cap
+                {
+                    continue;
+                }
+                seen_ids.insert(rec.triple_id);
+                *phase1_cluster_counts.entry(cluster_key).or_insert(0) += 1;
+                candidates.push(ScoredKgTriple {
+                    triple: rec,
+                    score: 1.0,
+                });
+                phase1_added += 1;
+                if phase1_added >= global_safety_cap {
+                    break;
+                }
+            }
+
+            // Phase 2: Always run escaped LIKE fallback for compound, punctuation/whitespace-variant,
+            // and non-ASCII case-folded entity names with its own per-cluster cap.
+            let mut phase2_cluster_counts: HashMap<String, usize> = HashMap::new();
+            let mut phase2_added = 0usize;
+            let token_pattern: String = norm_entity
+                .split_whitespace()
+                .map(escape_sqlite_like_folded)
+                .collect::<Vec<_>>()
+                .join("%");
+            let pattern = format!("%{}%", token_pattern);
+            let mut like_stmt = db.prepare_cached(
+                "SELECT triple_id, blake3_hash, entity, relation, key_string, value,
+                        document_id, chunk_id, file_path, line_start, line_end,
+                        work_cluster_id, access_tier, source_peer
+                 FROM triples
+                 WHERE deleted = 0 AND access_tier <= ?1 AND lower(entity) LIKE ?2 ESCAPE '\\'
+                 ORDER BY triple_id ASC",
+            )?;
+            let mut like_rows = like_stmt.query(params![max_tier as i64, &pattern])?;
+            while let Some(row) = like_rows.next()? {
+                let rec = row_to_triple(row)?;
+                if seen_ids.contains(&rec.triple_id) || rec.access_tier > max_tier {
+                    continue;
+                }
+                let norm_rec = normalize_entity_query(&rec.entity);
+                if !norm_rec.contains(&norm_entity) {
+                    continue;
+                }
+                if is_short_single_token && !has_word_boundary_match(&norm_rec, &norm_entity) {
+                    continue;
+                }
+                if let Some(ref allowed) = normalized_folders {
+                    if !crate::hikvp::is_path_inside_allowed_folders(&rec.file_path, allowed) {
+                        continue;
+                    }
+                }
+                let cluster_key = cluster_key_for(&rec.work_cluster_id);
+                if phase2_cluster_counts
+                    .get(&cluster_key)
+                    .copied()
+                    .unwrap_or(0)
+                    >= per_cluster_cap
+                {
+                    continue;
+                }
+                let score = score_entity_match_norm(&norm_rec, &norm_entity);
+                seen_ids.insert(rec.triple_id);
+                *phase2_cluster_counts.entry(cluster_key).or_insert(0) += 1;
+                candidates.push(ScoredKgTriple { triple: rec, score });
+                phase2_added += 1;
+                if phase2_added >= global_safety_cap {
+                    break;
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Preserve homonym clusters (`work_cluster_id`) via deterministic round-robin selection
+        let mut by_cluster: BTreeMap<String, Vec<ScoredKgTriple>> = BTreeMap::new();
+        for item in candidates {
+            let cluster_key = cluster_key_for(&item.triple.work_cluster_id);
+            by_cluster.entry(cluster_key).or_default().push(item);
+        }
+
+        let mut cluster_queues: Vec<(f32, String, Vec<ScoredKgTriple>)> = by_cluster
+            .into_iter()
+            .map(|(cluster_key, mut items)| {
+                items.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.triple.triple_id.cmp(&b.triple.triple_id))
+                });
+                let best = items.first().map(|x| x.score).unwrap_or(0.0);
+                (best, cluster_key, items)
+            })
+            .collect();
+
+        cluster_queues.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        let mut selected = Vec::with_capacity(
+            top_k.min(cluster_queues.iter().map(|c| c.2.len()).sum::<usize>()),
+        );
+        let mut cursors = vec![0usize; cluster_queues.len()];
+        while selected.len() < top_k {
+            let mut advanced = false;
+            for (idx, (_, _, items)) in cluster_queues.iter().enumerate() {
+                if selected.len() >= top_k {
+                    break;
+                }
+                let pos = cursors[idx];
+                if pos < items.len() {
+                    selected.push(items[pos].clone());
+                    cursors[idx] = pos + 1;
+                    advanced = true;
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+
+        selected.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.triple.work_cluster_id.cmp(&b.triple.work_cluster_id))
+                .then_with(|| a.triple.triple_id.cmp(&b.triple.triple_id))
+        });
+
+        Ok(selected)
+    }
+}
+
+fn cluster_key_for(work_cluster_id: &str) -> String {
+    let trimmed = work_cluster_id.trim();
+    if trimmed.is_empty() {
+        "general".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_entity_query(entity: &str) -> String {
+    let mut out = String::with_capacity(entity.len());
+    for ch in entity.chars() {
+        if matches!(
+            ch,
+            '"' | '\'' | '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}' | ';' | ',' | '.'
+        ) {
+            out.push(' ');
+        } else {
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn escape_sqlite_like_folded(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if !ch.is_ascii() {
+            // SQLite `lower()` only folds ASCII; use single-char wildcard `_` so non-ASCII
+            // uppercase/lowercase variants (e.g., `É` vs `é`) are still fetched and matched in Rust.
+            out.push('_');
+        } else {
+            match ch {
+                '\\' => out.push_str(r"\\"),
+                '%' => out.push_str(r"\%"),
+                '_' => out.push_str(r"\_"),
+                _ => out.push(ch),
+            }
+        }
+    }
+    out
+}
+
+fn has_word_boundary_match(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    let mut search_start = 0usize;
+    while let Some(rel_idx) = haystack[search_start..].find(needle) {
+        let start = search_start + rel_idx;
+        let end = start + needle.len();
+        let before_ok = start == 0
+            || haystack[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = end == haystack.len()
+            || haystack[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        if let Some(next_ch) = haystack[start..].chars().next() {
+            search_start = start + next_ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+fn score_entity_match_norm(norm_record: &str, norm_query: &str) -> f32 {
+    if norm_record == norm_query {
+        1.0
+    } else if has_word_boundary_match(norm_record, norm_query) {
+        0.90
+    } else {
+        0.75
+    }
 }
 
 fn row_to_triple(row: &rusqlite::Row<'_>) -> rusqlite::Result<KgTripleRecord> {
@@ -1744,5 +2028,48 @@ mod tests {
             1
         );
         assert_eq!(reopened.stats().active_triples, 0);
+    }
+
+    #[test]
+    fn t6_query_entity_surface_tier_upgrade_and_index_presence() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = AtlasKvTreeConfig {
+            embedding_dim: 16,
+            min_triples_for_hierarchy: 8,
+            ..Default::default()
+        };
+        let q = unit_vec(16, 1);
+        let store = AtlasKvStore::open(tmp.path(), cfg).unwrap();
+        let rec = KgTripleRecord::new(
+            "Angela Davis",
+            "role",
+            "author",
+            "d1",
+            "c1",
+            "/shared/public/doc.md",
+            1,
+            3,
+            "doc",
+            0,
+            "local",
+        )
+        .unwrap();
+        store.insert_triples(&[rec], &[q.clone()], &[q]).unwrap();
+
+        assert_eq!(
+            store.query_entity_surface("Angela Davis", 0, 10, None).unwrap().len(),
+            1
+        );
+
+        // Upgrade chunk from Tier 0 -> Tier 3; Tier 0 query must immediately exclude it
+        assert_eq!(store.update_chunk_access_tier("c1", 3).unwrap(), 1);
+        assert!(store
+            .query_entity_surface("Angela Davis", 0, 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.query_entity_surface("Angela Davis", 3, 10, None).unwrap().len(),
+            1
+        );
     }
 }

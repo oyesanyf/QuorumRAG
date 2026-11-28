@@ -120,6 +120,17 @@ impl ClassifyIntentNode {
             state.query_metadata_filters = Some(combined_filters);
         }
 
+        let is_forensic =
+            crate::offline_engine::ForensicQueryIntent::detect(&state.original_prompt).is_some()
+                || crate::offline_engine::ForensicQueryIntent::detect(&state.current_query)
+                    .is_some()
+                || crate::artemis_airgap::is_forensic_query_text(&state.current_query);
+        let plan = crate::adaptive_rag::plan_adaptive_query(&state.current_query, is_forensic);
+        if state.extracted_questions.len() <= 1 && plan.sub_questions.len() >= 2 {
+            state.extracted_questions = plan.sub_questions.clone();
+        }
+        state.adaptive_plan = Some(plan);
+
         let requested_family = state.model_family;
         let installed_models = crate::offline_engine::DeterministicOfflineSynthesisEngine::probe_installed_ollama_models_default();
         let (family, tag, rationale) = AutoFusionRouter::select_model_calibrated(

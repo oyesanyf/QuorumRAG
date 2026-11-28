@@ -188,6 +188,7 @@ jobs:
           cargo test -p quorum-ui
           cargo test -p quorum-daemon --lib nimble_provisioner -- --nocapture
           cargo test -p quorum-coordinator --test m17_hardware_calibration_tests -- --nocapture
+          cargo test -p quorum-coordinator --test memo_protocol_tests -- --nocapture
           cargo test -p quorum-coordinator --test regression_angela_davis_disambiguation -- --nocapture
           cargo test -p quorum-daemon --test regression_dns_forensic_routing -- --nocapture
           cargo test -p quorum-daemon --test atlaskv_daemon_e2e_tests -- --nocapture

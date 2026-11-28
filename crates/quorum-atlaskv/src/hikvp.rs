@@ -290,7 +290,10 @@ pub fn format_grounded_kg_context(triples: &[ScoredKgTriple]) -> String {
     out
 }
 
-fn is_path_inside_allowed_folders(file_path: &str, allowed_norm_folders: &[String]) -> bool {
+pub(crate) fn is_path_inside_allowed_folders(
+    file_path: &str,
+    allowed_norm_folders: &[String],
+) -> bool {
     if allowed_norm_folders.is_empty() {
         return false;
     }

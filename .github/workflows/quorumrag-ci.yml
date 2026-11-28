@@ -1,0 +1,106 @@
+name: QuorumRAG Rust CI & MeMo Verification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - '.github/workflows/quorumrag-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - '.github/workflows/quorumrag-ci.yml'
+  workflow_dispatch:
+
+permissions: read-all
+
+concurrency:
+  group: quorumrag-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  rust-workspace-tests:
+    name: Rust Workspace Check & Test Suites (Linux x64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout commit
+        shell: bash
+        env:
+          REPO_URL: https://github.com/${{ github.repository }}.git
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "$REPO_URL"
+          git -c protocol.version=2 fetch --no-tags --depth 1 origin "$SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Install System Build Dependencies
+        run: |
+          set -euo pipefail
+          MISSING_APT=()
+          command -v pkg-config >/dev/null 2>&1 || MISSING_APT+=(pkg-config)
+          pkg-config --exists openssl || MISSING_APT+=(libssl-dev)
+          if [ "${#MISSING_APT[@]}" -gt 0 ]; then
+            sudo apt-get update -o Acquire::Retries=3 || true
+            sudo apt-get install -y --fix-missing "${MISSING_APT[@]}"
+          fi
+          if ! command -v cmake >/dev/null 2>&1; then
+            curl -fsSL "https://github.com/Kitware/CMake/releases/download/v3.31.5/cmake-3.31.5-linux-x86_64.tar.gz" -o /tmp/cmake.tar.gz
+            echo "2984e70515ff60c5e4a41922b5d715a8168a696a89721e3b114e36f453244f72  /tmp/cmake.tar.gz" | sha256sum -c -
+            sudo tar -xzf /tmp/cmake.tar.gz -C /usr/local --strip-components=1
+            rm -f /tmp/cmake.tar.gz
+          fi
+          if ! command -v protoc >/dev/null 2>&1; then
+            curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip" -o /tmp/protoc.zip
+            echo "3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a  /tmp/protoc.zip" | sha256sum -c -
+            sudo python3 -m zipfile -e /tmp/protoc.zip /usr/local
+            sudo chmod 755 /usr/local/bin/protoc
+            rm -f /tmp/protoc.zip
+          fi
+          if ! command -v clang >/dev/null 2>&1; then
+            CAND_CLANG=$(ls -1 /usr/bin/clang-[0-9]* /usr/lib/llvm-*/bin/clang 2>/dev/null | head -n 1 || true)
+            if [ -n "${CAND_CLANG}" ]; then
+              sudo ln -sf "${CAND_CLANG}" /usr/local/bin/clang
+            fi
+          fi
+          echo "Verified build tools: $(cmake --version | head -n1), $(protoc --version)"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      - name: Cache Cargo registry & target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.7.5
+        with:
+          workspaces: .
+          key: quorumrag-linux-x64
+
+      - name: Run Workspace Check & Full Test Suites
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets
+          cargo test -p quorum-types --lib
+          cargo test -p quorum-atlaskv
+          cargo test -p quorum-storage --lib
+          cargo test -p quorum-storage --test storage_tests -- --nocapture
+          cargo test -p quorum-ui
+          cargo test -p quorum-coordinator --lib
+          cargo test -p quorum-coordinator --test memo_protocol_tests -- --nocapture
+          cargo test -p quorum-coordinator --test regression_angela_davis_disambiguation -- --nocapture
+          cargo test -p quorum-daemon --lib nimble_provisioner -- --nocapture
+          cargo test -p quorum-daemon --test atlaskv_daemon_e2e_tests -- --nocapture
+          cargo test -p quorum-daemon --test regression_dns_forensic_routing -- --nocapture
+          cargo test -p quorum-daemon --test packaging_invariants_tests -- --nocapture

@@ -23,7 +23,8 @@ impl QueryCoordinator {
     pub fn new(engine: Arc<ScatterGatherEngine>, config: CoordinatorConfig) -> Self {
         let cache_manager = Arc::new(CacheManager::default());
         let agentic_runner = AgenticStateGraphRunner::new(3, 0.60)
-            .with_cache_manager(Arc::clone(&cache_manager));
+            .with_cache_manager(Arc::clone(&cache_manager))
+            .with_memo_config(config.memo.clone());
         Self {
             engine,
             config,
@@ -38,7 +39,8 @@ impl QueryCoordinator {
         cache_manager: Arc<CacheManager>,
     ) -> Self {
         let agentic_runner = AgenticStateGraphRunner::new(3, 0.60)
-            .with_cache_manager(Arc::clone(&cache_manager));
+            .with_cache_manager(Arc::clone(&cache_manager))
+            .with_memo_config(config.memo.clone());
         Self {
             engine,
             config,

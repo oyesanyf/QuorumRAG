@@ -9,6 +9,7 @@
 //! - `POST /api/v1/atlaskv/import`: Import native AtlasKV `.npy` / `qkv.json` files (path-contained).
 //! - `POST /api/v1/atlaskv/import-json`: Direct JSON triple batch upload from native WebUI `<input type="file">`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,7 +19,8 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use quorum_atlaskv::{
-    export_atlaskv_dataset, format_grounded_kg_context, import_atlaskv_dataset,
+    derive_display_title, export_atlaskv_dataset, format_grounded_kg_context,
+    import_atlaskv_dataset, infer_chunk_subject_anchor, is_generic_heading, parse_chunk_order_key,
     validate_access_tier, validate_safe_relative_path, AtlasKvError, AtlasKvQkvItem,
     AtlasKvSettings, Kg2KvExtractor, Kg2KvExtractorConfig, KgSourceChunk, KgTripleRecord,
 };
@@ -149,14 +151,47 @@ pub async fn atlaskv_build_handler(State(state): State<Arc<DaemonState>>) -> imp
             ..Default::default()
         });
         let embedder = DeterministicOfflineEngine::new();
+        let mut ordered_indices: Vec<usize> = (0..chunks.len()).collect();
+        ordered_indices.sort_by_key(|&idx| {
+            let ch = &chunks[idx];
+            (
+                ch.document_id.clone(),
+                ch.access_tier,
+                parse_chunk_order_key(&ch.chunk_id, &ch.metadata_json, ch.line_start, idx),
+            )
+        });
+
+        let mut doc_active_subjects: HashMap<(String, u8), String> = HashMap::new();
         let mut triples = Vec::new();
         let mut key_vecs = Vec::new();
         let mut val_vecs = Vec::new();
 
-        for ch in &chunks {
+        for idx in ordered_indices {
+            let ch = &chunks[idx];
             if reindex_worker_for_filter.is_path_blocked(std::path::Path::new(&ch.file_path)) {
                 continue;
             }
+            if !forensics_enabled
+                && Kg2KvExtractor::is_airgap_forensics_chunk(&ch.file_path, &ch.metadata_json)
+            {
+                continue;
+            }
+            let doc_key = (
+                if ch.document_id.is_empty() {
+                    ch.file_path.clone()
+                } else {
+                    ch.document_id.clone()
+                },
+                ch.access_tier,
+            );
+            let prior_subject = doc_active_subjects.get(&doc_key).cloned();
+            let current_anchor =
+                infer_chunk_subject_anchor(&ch.text_content, &ch.metadata_json, &ch.file_path);
+            if let Some(ref anchor) = current_anchor {
+                doc_active_subjects.insert(doc_key.clone(), anchor.clone());
+            }
+            let resolved_subject = current_anchor.or(prior_subject.clone());
+
             let src = KgSourceChunk {
                 chunk_id: ch.chunk_id.clone(),
                 document_id: ch.document_id.clone(),
@@ -166,8 +201,19 @@ pub async fn atlaskv_build_handler(State(state): State<Arc<DaemonState>>) -> imp
                 access_tier: ch.access_tier,
                 text_content: ch.text_content.clone(),
                 metadata_json: ch.metadata_json.clone(),
+                resolved_subject,
             };
             if let Ok(extracted) = extractor.extract_from_chunk(&src) {
+                if prior_subject.is_none() && !doc_active_subjects.contains_key(&doc_key) {
+                    let stem_title = derive_display_title(&ch.file_path);
+                    if let Some(first_ent) = extracted.first().map(|r| r.entity.clone()) {
+                        if !first_ent.eq_ignore_ascii_case(&stem_title)
+                            && !is_generic_heading(&first_ent)
+                        {
+                            doc_active_subjects.insert(doc_key.clone(), first_ent);
+                        }
+                    }
+                }
                 for rec in extracted {
                     let kv = if ch.vector.len() == dim {
                         ch.vector.clone()

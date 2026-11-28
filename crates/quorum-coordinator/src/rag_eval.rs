@@ -28,6 +28,14 @@ pub struct RagEvalReport {
     pub hygiene_violations: Vec<String>,
 }
 
+/// Additive MeMo (`arXiv:2605.15156`) evaluation metrics paired with the base RAGAS report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoEvalMetrics {
+    pub base: RagEvalReport,
+    pub distractor_pruning_rate: f32,
+    pub entity_coverage: f32,
+}
+
 /// Deterministic local RAGAS-style evaluation harness (#20).
 pub struct RagEvalHarness;
 
@@ -68,6 +76,78 @@ impl RagEvalHarness {
             hygiene_violations,
         }
     }
+
+    /// Evaluates MeMo Stage-2 distractor pruning rate and expected entity coverage
+    /// alongside the standard `RagEvalReport`.
+    pub fn evaluate_with_memo(
+        query: &str,
+        retrieved_chunks: &[&ScoredChunk],
+        synthesized_answer: &str,
+        tracker: Option<&crate::memo_protocol::UncertainAnswerStreakTracker>,
+        expected_entities: &[&str],
+    ) -> MemoEvalMetrics {
+        let base = Self::evaluate(query, retrieved_chunks, synthesized_answer);
+        let distractor_pruning_rate = tracker
+            .map(Self::evaluate_memo_distractor_pruning)
+            .unwrap_or(1.0);
+        let entity_coverage = score_expected_entity_coverage(
+            retrieved_chunks,
+            synthesized_answer,
+            expected_entities,
+        );
+
+        MemoEvalMetrics {
+            base,
+            distractor_pruning_rate,
+            entity_coverage,
+        }
+    }
+
+    /// Computes the fraction of uncorroborated candidate entities pruned by `UncertainAnswerStreakTracker`.
+    pub fn evaluate_memo_distractor_pruning(
+        tracker: &crate::memo_protocol::UncertainAnswerStreakTracker,
+    ) -> f32 {
+        let uncorroborated: Vec<_> = tracker
+            .candidates
+            .values()
+            .filter(|c| c.confirmed_hits == 0)
+            .collect();
+        if uncorroborated.is_empty() {
+            return 1.0;
+        }
+        let pruned = uncorroborated.iter().filter(|c| c.pruned).count();
+        (pruned as f32 / uncorroborated.len() as f32).clamp(0.0, 1.0)
+    }
+}
+
+fn score_expected_entity_coverage(
+    retrieved_chunks: &[&ScoredChunk],
+    synthesized_answer: &str,
+    expected_entities: &[&str],
+) -> f32 {
+    if expected_entities.is_empty() {
+        return 1.0;
+    }
+    let ans_low = synthesized_answer.to_ascii_lowercase();
+    let chunk_hay: String = retrieved_chunks
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {}",
+                c.chunk.file_path.to_ascii_lowercase(),
+                c.chunk.text_content.to_ascii_lowercase()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let covered = expected_entities
+        .iter()
+        .filter(|ent| {
+            let low = ent.trim().to_ascii_lowercase();
+            !low.is_empty() && (ans_low.contains(&low) || chunk_hay.contains(&low))
+        })
+        .count();
+    (covered as f32 / expected_entities.len() as f32).clamp(0.0, 1.0)
 }
 
 fn tokenize_content(s: &str) -> BTreeSet<String> {

@@ -364,3 +364,278 @@ async fn test_storage_index_epoch_persistence_and_atomic_bump() {
         assert_eq!(meta.last_bump_reason, "explicit_reset");
     }
 }
+
+#[tokio::test]
+async fn test_insert_chunks_tracks_active_subject_across_document_without_mutating_text() {
+    let tmp = tempdir().unwrap();
+    let config = StorageConfig::new(tmp.path()).with_vector_dimension(768);
+    let engine = StorageEngine::open(config).await.unwrap();
+
+    let text_a0 = "Angela Davis is an American political activist and scholar.";
+    let text_a1 = "She later published Women, Race & Class in 1981.";
+    let text_b0 = "He wrote Sample Manual in 2020.";
+    let text_artemis = "She later published Airgap Event in 2025.";
+
+    let chunk_a0 = sample_chunk(
+        "doc-angela:0",
+        "doc-angela",
+        "D:/Docs/bio_notes.txt",
+        1,
+        5,
+        0,
+        0.5,
+        text_a0,
+    );
+    let chunk_a1 = sample_chunk(
+        "doc-angela:1",
+        "doc-angela",
+        "D:/Docs/bio_notes.txt",
+        6,
+        10,
+        0,
+        0.5,
+        text_a1,
+    );
+    let chunk_b0 = sample_chunk(
+        "doc-other:0",
+        "doc-other",
+        "D:/Docs/other_notes.txt",
+        1,
+        5,
+        2,
+        0.5,
+        text_b0,
+    );
+    let chunk_artemis = sample_chunk(
+        "artemis-doc:0",
+        "artemis-doc",
+        "artemis://host-01/forensics.jsonl",
+        1,
+        5,
+        0,
+        0.5,
+        text_artemis,
+    );
+
+    // Intentionally insert out-of-order (`chunk_a1` before `chunk_a0`)
+    let inserted = engine
+        .insert_chunks(&[chunk_a1, chunk_b0, chunk_artemis, chunk_a0])
+        .await
+        .unwrap();
+    assert_eq!(inserted, 4);
+
+    // 1. Source `text_content` and BLAKE3 hashes must remain completely untouched
+    let stored = engine.scan_all_chunks().await.unwrap();
+    let stored_a1 = stored
+        .iter()
+        .find(|c| c.chunk_id == "doc-angela:1")
+        .expect("doc-angela:1 present");
+    assert_eq!(stored_a1.text_content, text_a1);
+    assert!(stored_a1.verify_hash());
+
+    // 2. AtlasKV `query_entity_surface` at Tier 0 finds the resolved triple from Chunk 1
+    let surfaced_t0 = engine
+        .atlaskv()
+        .query_entity_surface("Angela Davis", 0, 10, None)
+        .unwrap();
+    assert!(
+        surfaced_t0.iter().any(|h| {
+            h.triple.entity == "Angela Davis"
+                && h.triple.relation == "published work"
+                && h.triple.value == "Women, Race & Class"
+                && text_a1.contains(&h.triple.value)
+        }),
+        "Expected resolved triple for Angela Davis from anaphoric chunk 1, got {surfaced_t0:#?}"
+    );
+    assert!(
+        surfaced_t0.iter().all(|h| h.triple.access_tier == 0),
+        "Tier > 0 must never leak into max_tier = 0 query"
+    );
+    assert!(
+        !surfaced_t0
+            .iter()
+            .any(|h| h.triple.value.contains("Sample Manual") || h.triple.value.contains("Airgap Event")),
+        "Cross-doc, Tier 2, and artemis:// chunks must not leak"
+    );
+
+    // 3. Even at Tier 3, `doc-other` (no antecedent) and `artemis://` must not inherit Angela Davis
+    let surfaced_t3 = engine
+        .atlaskv()
+        .query_entity_surface("Angela Davis", 3, 20, None)
+        .unwrap();
+    assert!(
+        !surfaced_t3
+            .iter()
+            .any(|h| h.triple.document_id == "doc-other" || h.triple.file_path.starts_with("artemis://")),
+        "Cross-document or air-gap chunk leaked into Angela Davis entity surface: {surfaced_t3:#?}"
+    );
+}
+
+#[tokio::test]
+async fn test_insert_chunks_partial_batch_resolves_subject_from_catalog() {
+    let tmp = tempdir().unwrap();
+    let config = StorageConfig::new(tmp.path()).with_vector_dimension(768);
+    let engine = StorageEngine::open(config).await.unwrap();
+
+    let chunk_0 = sample_chunk(
+        "doc-partial:0",
+        "doc-partial",
+        "D:/Docs/partial_bio.txt",
+        1,
+        5,
+        0,
+        0.5,
+        "Angela Davis taught at UCLA during her academic career.",
+    );
+    engine.insert_chunks(&[chunk_0]).await.unwrap();
+
+    // Second separate insert_chunks call containing only anaphoric chunk 1
+    let chunk_1 = sample_chunk(
+        "doc-partial:1",
+        "doc-partial",
+        "D:/Docs/partial_bio.txt",
+        6,
+        10,
+        0,
+        0.5,
+        "She later published Women, Race & Class in 1981.",
+    );
+    engine.insert_chunks(&[chunk_1]).await.unwrap();
+
+    let surfaced = engine
+        .atlaskv()
+        .query_entity_surface("Angela Davis", 0, 10, None)
+        .unwrap();
+    assert!(
+        surfaced.iter().any(|h| {
+            h.triple.chunk_id == "doc-partial:1"
+                && h.triple.relation == "published work"
+                && h.triple.value == "Women, Race & Class"
+        }),
+        "Partial batch should resolve antecedent from DocumentCatalog: {surfaced:#?}"
+    );
+}
+
+#[tokio::test]
+async fn test_insert_chunks_subject_shift_slash_parity_and_no_stem_contamination() {
+    let tmp = tempdir().unwrap();
+    let config = StorageConfig::new(tmp.path()).with_vector_dimension(768);
+    let engine = StorageEngine::open(config).await.unwrap();
+
+    // Challenge 4: Intra-document subject shift from Angela Davis -> [Document: "Memo" | Author: Bob Smith ...]
+    let shift_0 = sample_chunk(
+        "doc-shift:0",
+        "doc-shift",
+        "D:/Docs/notes.txt",
+        1,
+        3,
+        0,
+        0.5,
+        "Angela Davis is an activist.",
+    );
+    let shift_1 = sample_chunk(
+        "doc-shift:1",
+        "doc-shift",
+        "D:/Docs/notes.txt",
+        4,
+        7,
+        0,
+        0.5,
+        "[Document: \"Memo\" | Author: Bob Smith | Kind: report | File: notes.txt]\nIt requires annual audits.",
+    );
+    engine.insert_chunks(&[shift_0, shift_1]).await.unwrap();
+
+    let memo_hits = engine
+        .atlaskv()
+        .query_entity_surface("Memo", 0, 10, None)
+        .unwrap();
+    assert!(
+        memo_hits.iter().any(|h| {
+            h.triple.entity == "Memo"
+                && h.triple.relation == "provision"
+                && h.triple.value == "annual audits"
+        }),
+        "Expected Memo provision triple after subject shift, got {memo_hits:#?}"
+    );
+    let angela_hits = engine
+        .atlaskv()
+        .query_entity_surface("Angela Davis", 0, 10, None)
+        .unwrap();
+    assert!(
+        !angela_hits
+            .iter()
+            .any(|h| h.triple.chunk_id == "doc-shift:1" && h.triple.value == "annual audits"),
+        "Prior subject Angela Davis must not hijack Memo provision: {angela_hits:#?}"
+    );
+
+    // Challenge 4b: Mixed slash style partial-batch lookup via DocumentCatalog::get_by_file_path
+    let slash_0 = sample_chunk(
+        "doc-slash:0",
+        "doc-slash",
+        "D:/Docs/slash_bio.txt",
+        1,
+        3,
+        0,
+        0.5,
+        "Angela Davis taught at UCLA during her career.",
+    );
+    engine.insert_chunks(&[slash_0]).await.unwrap();
+    let slash_1 = sample_chunk(
+        "doc-slash:1",
+        "doc-slash",
+        r"D:\Docs\slash_bio.txt",
+        4,
+        7,
+        0,
+        0.5,
+        "She later published Women, Race & Class in 1981.",
+    );
+    engine.insert_chunks(&[slash_1]).await.unwrap();
+
+    let slash_hits = engine
+        .atlaskv()
+        .query_entity_surface("Angela Davis", 0, 10, None)
+        .unwrap();
+    assert!(
+        slash_hits.iter().any(|h| {
+            h.triple.chunk_id == "doc-slash:1"
+                && h.triple.relation == "published work"
+                && h.triple.value == "Women, Race & Class"
+        }),
+        "Mixed-slash partial batch should resolve antecedent from catalog: {slash_hits:#?}"
+    );
+
+    // Reviewer Finding 2: filename-stem KV triple on chunk 0 must NOT seed active subject for personal pronoun
+    let stem_0 = sample_chunk(
+        "doc-stem:0",
+        "doc-stem",
+        "D:/Docs/my_private_notes.txt",
+        1,
+        3,
+        0,
+        0.5,
+        "Property Address: 412 Oakwood Lane",
+    );
+    let stem_1 = sample_chunk(
+        "doc-stem:1",
+        "doc-stem",
+        "D:/Docs/my_private_notes.txt",
+        4,
+        7,
+        0,
+        0.5,
+        "She later published Secret Treatise in 2024.",
+    );
+    engine.insert_chunks(&[stem_0, stem_1]).await.unwrap();
+
+    let stem_hits = engine
+        .atlaskv()
+        .query_entity_surface("my private notes", 0, 10, None)
+        .unwrap();
+    assert!(
+        !stem_hits
+            .iter()
+            .any(|h| h.triple.relation == "published work" && h.triple.value == "Secret Treatise"),
+        "Filename stem must not be bound to personal pronoun: {stem_hits:#?}"
+    );
+}

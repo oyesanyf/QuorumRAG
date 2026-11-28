@@ -128,6 +128,15 @@ pub enum AgenticTelemetryEvent {
         used_hierarchy: bool,
         elapsed_ms: u64,
     },
+    /// MeMo 3-stage decoupled inference & streak-tracker telemetry
+    #[serde(rename = "memo_stage_event")]
+    MemoStageEvent {
+        stage: crate::memo_protocol::MemoStage,
+        hop: usize,
+        active_candidates: usize,
+        pruned_candidates: usize,
+        pinned_entities: Vec<String>,
+    },
 }
 
 impl AgenticTelemetryEvent {

@@ -90,6 +90,12 @@ pub struct AgenticGraphState {
     pub peer_diagnostics: Option<quorum_types::FederatedPeerDiagnostics>,
     pub atlaskv_triples: Vec<quorum_atlaskv::ScoredKgTriple>,
     pub atlaskv_context: String,
+    pub adaptive_plan: Option<crate::adaptive_rag::AdaptiveQueryPlan>,
+    pub memo_stage: crate::memo_protocol::MemoStage,
+    pub stage1_clues: Vec<crate::memo_protocol::AtomicClueProbe>,
+    pub entity_streak_tracker: Option<crate::memo_protocol::UncertainAnswerStreakTracker>,
+    pub pinned_entities: Vec<String>,
+    pub active_stage2_directive: Option<crate::memo_protocol::Stage2TurnDirective>,
 }
 
 impl AgenticGraphState {
@@ -123,6 +129,12 @@ impl AgenticGraphState {
             peer_diagnostics: None,
             atlaskv_triples: Vec::new(),
             atlaskv_context: String::new(),
+            adaptive_plan: None,
+            memo_stage: crate::memo_protocol::MemoStage::Bypassed,
+            stage1_clues: Vec::new(),
+            entity_streak_tracker: None,
+            pinned_entities: Vec::new(),
+            active_stage2_directive: None,
         }
     }
 

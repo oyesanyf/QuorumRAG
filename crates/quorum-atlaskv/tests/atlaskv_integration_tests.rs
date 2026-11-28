@@ -92,6 +92,7 @@ fn kg2kv_real_documents_and_homonym_disambiguation() {
                            Accidental token AKIAIOSFODNN7EXAMPLE and SSN 123-45-6789 must be redacted."
                 .into(),
             metadata_json: "{}".into(),
+            ..Default::default()
         },
         KgSourceChunk {
             chunk_id: "doc2:0".into(),
@@ -109,6 +110,7 @@ fn kg2kv_real_documents_and_homonym_disambiguation() {
                            Adjourned with prayer by Anthony Davis"
                 .into(),
             metadata_json: "{}".into(),
+            ..Default::default()
         },
         KgSourceChunk {
             chunk_id: "doc3:0".into(),
@@ -121,6 +123,7 @@ fn kg2kv_real_documents_and_homonym_disambiguation() {
                            Here is your version, told as Angela Davis, the yarn spinner."
                 .into(),
             metadata_json: "{}".into(),
+            ..Default::default()
         },
         KgSourceChunk {
             chunk_id: "doc4:0".into(),
@@ -137,6 +140,7 @@ fn kg2kv_real_documents_and_homonym_disambiguation() {
                            | Suite B | Marcus Reed | Active |"
                 .into(),
             metadata_json: "{}".into(),
+            ..Default::default()
         },
     ];
 
@@ -416,6 +420,7 @@ fn hikvp_access_tier_folder_and_forensics_airgap_fail_closed() {
         access_tier: 0,
         text_content: "Host: prod-dc-01\nProcess: lsass.exe\nStatus: suspicious".into(),
         metadata_json: r#"{"artemis_dfir":true}"#.into(),
+        ..Default::default()
     };
     assert!(
         default_extractor
@@ -881,4 +886,563 @@ fn mesh_root_centroid_summary_routing() {
         assert_eq!(ranked[0].0, expected_peer);
         assert!(ranked[0].1 > 0.80);
     }
+}
+
+#[test]
+fn query_entity_surface_reversal_curse_like_escaping_and_tier_cluster_isolation() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = AtlasKvTreeConfig {
+        embedding_dim: 16,
+        min_triples_for_hierarchy: 8,
+        ..Default::default()
+    };
+    let dummy_vec = vec![0.25f32; 16];
+    let store = AtlasKvStore::open(tmp.path(), cfg.clone()).unwrap();
+
+    let mut recs = vec![
+        // Reversal-curse exact & punctuation/whitespace-normalized variants (Tier 0, distinct clusters)
+        KgTripleRecord::new(
+            "Angela Davis",
+            "published work",
+            "Women, Race & Class",
+            "d_acad",
+            "d_acad:0",
+            "/shared/public/women_race_class.md",
+            1,
+            2,
+            "women race class",
+            0,
+            "local",
+        )
+        .unwrap(),
+        KgTripleRecord::new(
+            "  angela   davis  ",
+            "role in lease",
+            "Landlord",
+            "d_lease",
+            "d_lease:0",
+            "/shared/public/lease.md",
+            1,
+            2,
+            "lease agreement",
+            0,
+            "local",
+        )
+        .unwrap(),
+        KgTripleRecord::new(
+            "\"Angela Davis,\"",
+            "storyteller persona",
+            "yarn spinner",
+            "d_story",
+            "d_story:0",
+            "/shared/public/story.md",
+            1,
+            2,
+            "back to work",
+            0,
+            "local",
+        )
+        .unwrap(),
+        // Compound entity (word-boundary match -> score 0.90)
+        KgTripleRecord::new(
+            "Angela Davis Breure",
+            "board role",
+            "steward",
+            "d_board",
+            "d_board:0",
+            "/shared/public/board.md",
+            1,
+            2,
+            "board minutes",
+            0,
+            "local",
+        )
+        .unwrap(),
+        // Higher-tier restricted records that must NEVER leak into max_tier=0 or max_tier=1
+        KgTripleRecord::new(
+            "Angela Davis",
+            "confidential note",
+            "Tier 2 private investigation",
+            "d_t2",
+            "d_t2:0",
+            "/shared/public/t2_secret.md",
+            1,
+            2,
+            "confidential",
+            2,
+            "local",
+        )
+        .unwrap(),
+        KgTripleRecord::new(
+            "Angela Davis",
+            "restricted note",
+            "Tier 3 vault secret",
+            "d_t3",
+            "d_t3:0",
+            "/shared/public/t3_vault.md",
+            1,
+            2,
+            "vault",
+            3,
+            "local",
+        )
+        .unwrap(),
+        // LIKE wildcard escape test records
+        KgTripleRecord::new(
+            "Entity_1_0",
+            "tag",
+            "exact underscore entity",
+            "d_u1",
+            "d_u1:0",
+            "/shared/public/u1.md",
+            1,
+            2,
+            "underscores",
+            0,
+            "local",
+        )
+        .unwrap(),
+        KgTripleRecord::new(
+            "EntityX1Y0",
+            "tag",
+            "wildcard impostor",
+            "d_u2",
+            "d_u2:0",
+            "/shared/public/u2.md",
+            1,
+            2,
+            "underscores",
+            0,
+            "local",
+        )
+        .unwrap(),
+        KgTripleRecord::new(
+            "100% Verified",
+            "status",
+            "literal percent",
+            "d_pct",
+            "d_pct:0",
+            "/shared/public/pct.md",
+            1,
+            2,
+            "percent",
+            0,
+            "local",
+        )
+        .unwrap(),
+        KgTripleRecord::new(
+            "1000 Verified",
+            "status",
+            "non-percent impostor",
+            "d_pct2",
+            "d_pct2:0",
+            "/shared/public/pct2.md",
+            1,
+            2,
+            "percent",
+            0,
+            "local",
+        )
+        .unwrap(),
+        // Folder boundary test records (`/shared/public` vs `/shared/public2`)
+        KgTripleRecord::new(
+            "SharedEnt",
+            "scope",
+            "allowed public folder",
+            "d_f1",
+            "d_f1:0",
+            "/shared/public/allowed.md",
+            1,
+            2,
+            "folders",
+            0,
+            "local",
+        )
+        .unwrap(),
+        KgTripleRecord::new(
+            "SharedEnt",
+            "scope",
+            "sibling prefix leak",
+            "d_f2",
+            "d_f2:0",
+            "/shared/public2/leak.md",
+            1,
+            2,
+            "folders",
+            0,
+            "local",
+        )
+        .unwrap(),
+    ];
+
+    // Add 15 triples in dominant cluster "dominant" + 2 in minority cluster "minority" to test round-robin
+    for i in 0..15usize {
+        recs.push(
+            KgTripleRecord::new(
+                "ClusterTestEntity",
+                format!("fact_{i}"),
+                format!("Dominant val {i}"),
+                format!("d_dom_{i}"),
+                format!("d_dom_{i}:0"),
+                format!("/shared/public/dom_{i}.md"),
+                1,
+                2,
+                "dominant",
+                0,
+                "local",
+            )
+            .unwrap(),
+        );
+    }
+    for i in 0..2usize {
+        recs.push(
+            KgTripleRecord::new(
+                "ClusterTestEntity",
+                format!("rare_{i}"),
+                format!("Minority val {i}"),
+                format!("d_min_{i}"),
+                format!("d_min_{i}:0"),
+                format!("/shared/public/min_{i}.md"),
+                1,
+                2,
+                "minority",
+                0,
+                "local",
+            )
+            .unwrap(),
+        );
+    }
+
+    let kvs = vec![dummy_vec.clone(); recs.len()];
+    let vvs = vec![dummy_vec.clone(); recs.len()];
+    store.insert_triples(&recs, &kvs, &vvs).unwrap();
+
+    // 1. Exact & normalized matching + reversal-curse lookup + fail-closed tier isolation
+    let hits = store
+        .query_entity_surface("  ANGELA   davis ", 1, 10, None)
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        4,
+        "Expected 4 Tier<=1 hits (3 exact-normalized + 1 compound), got {hits:#?}"
+    );
+    assert!(hits.iter().all(|h| h.triple.access_tier <= 1));
+    assert_eq!(
+        hits.iter().filter(|h| (h.score - 1.0).abs() < 1e-6).count(),
+        3
+    );
+    assert!(hits
+        .iter()
+        .any(|h| h.triple.entity == "Angela Davis Breure" && (h.score - 0.90).abs() < 1e-6));
+
+    // Invalid tier 4 fails closed even with top_k=0 and empty entity
+    assert!(matches!(
+        store.query_entity_surface("", 4, 0, None),
+        Err(AtlasKvError::InvalidAccessTier(4))
+    ));
+
+    // 2. LIKE wildcard escaping (`_` and `%` must be literal, not SQLite wildcards)
+    let u_hits = store
+        .query_entity_surface("Entity_1_0", 0, 10, None)
+        .unwrap();
+    assert_eq!(u_hits.len(), 1);
+    assert_eq!(u_hits[0].triple.entity, "Entity_1_0");
+
+    let pct_hits = store.query_entity_surface("100%", 0, 10, None).unwrap();
+    assert_eq!(pct_hits.len(), 1);
+    assert_eq!(pct_hits[0].triple.entity, "100% Verified");
+
+    // 3. Component-boundary folder filtering + empty allowed_folders fail-closed
+    let folder_hits = store
+        .query_entity_surface("SharedEnt", 0, 10, Some(&["/shared/public".to_string()]))
+        .unwrap();
+    assert_eq!(folder_hits.len(), 1);
+    assert_eq!(folder_hits[0].triple.file_path, "/shared/public/allowed.md");
+
+    let empty_folder_hits = store
+        .query_entity_surface("SharedEnt", 0, 10, Some(&[]))
+        .unwrap();
+    assert!(empty_folder_hits.is_empty());
+
+    // 4. Round-robin work_cluster_id preservation under tight top_k
+    let cluster_hits = store
+        .query_entity_surface("ClusterTestEntity", 0, 4, None)
+        .unwrap();
+    assert_eq!(cluster_hits.len(), 4);
+    let hit_clusters: HashSet<&str> = cluster_hits
+        .iter()
+        .map(|h| h.triple.work_cluster_id.as_str())
+        .collect();
+    assert!(
+        hit_clusters.contains("dominant") && hit_clusters.contains("minority"),
+        "Both dominant and minority work_cluster_ids must be preserved: {hit_clusters:?}"
+    );
+
+    // 5. Soft-delete excludes deleted triples immediately
+    assert_eq!(
+        store
+            .delete_by_file_path("/shared/public/allowed.md")
+            .unwrap(),
+        1
+    );
+    let post_del = store
+        .query_entity_surface("SharedEnt", 0, 10, Some(&["/shared/public".to_string()]))
+        .unwrap();
+    assert!(post_del.is_empty());
+
+    // 6. Reopen creates `idx_triples_tier_entity_lower` idempotently even if dropped
+    drop(store);
+    {
+        let conn = rusqlite::Connection::open(tmp.path().join("triples_meta.sqlite")).unwrap();
+        conn.execute("DROP INDEX IF EXISTS idx_triples_tier_entity_lower", [])
+            .unwrap();
+    }
+    let reopened = AtlasKvStore::open(tmp.path(), cfg).unwrap();
+    let check_hits = reopened
+        .query_entity_surface("Angela Davis", 0, 10, None)
+        .unwrap();
+    assert!(!check_hits.is_empty());
+    let conn = rusqlite::Connection::open(tmp.path().join("triples_meta.sqlite")).unwrap();
+    let idx_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_triples_tier_entity_lower'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx_count, 1);
+}
+
+#[test]
+fn query_entity_surface_pre_limit_folder_filtering_over_600_disallowed_rows() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = AtlasKvTreeConfig {
+        embedding_dim: 16,
+        min_triples_for_hierarchy: 1024,
+        ..Default::default()
+    };
+    let dummy_vec = vec![0.25f32; 16];
+    let store = AtlasKvStore::open(tmp.path(), cfg).unwrap();
+
+    let mut recs = Vec::with_capacity(602);
+    for i in 0..600usize {
+        recs.push(
+            KgTripleRecord::new(
+                "PreLimitTarget",
+                format!("priv_rel_{i}"),
+                format!("Private value {i}"),
+                format!("p_{i}"),
+                format!("p_{i}:0"),
+                format!("/private/vault/file_{i}.md"),
+                1,
+                2,
+                "private",
+                0,
+                "local",
+            )
+            .unwrap(),
+        );
+    }
+    for i in 0..2usize {
+        recs.push(
+            KgTripleRecord::new(
+                "PreLimitTarget",
+                format!("pub_rel_{i}"),
+                format!("Public value {i}"),
+                format!("pub_{i}"),
+                format!("pub_{i}:0"),
+                format!("/shared/public/pub_{i}.md"),
+                1,
+                2,
+                "public",
+                0,
+                "local",
+            )
+            .unwrap(),
+        );
+    }
+    let kvs = vec![dummy_vec.clone(); recs.len()];
+    let vvs = vec![dummy_vec.clone(); recs.len()];
+    store.insert_triples(&recs, &kvs, &vvs).unwrap();
+
+    let hits = store
+        .query_entity_surface("PreLimitTarget", 0, 5, Some(&["/shared/public".to_string()]))
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(hits
+        .iter()
+        .all(|h| h.triple.file_path.starts_with("/shared/public/")));
+}
+
+#[test]
+fn query_entity_surface_prevents_cluster_starvation_handles_punctuation_unicode_and_short_tokens() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = AtlasKvTreeConfig {
+        embedding_dim: 16,
+        min_triples_for_hierarchy: 2048,
+        ..Default::default()
+    };
+    let dummy_vec = vec![0.25f32; 16];
+    let store = AtlasKvStore::open(tmp.path(), cfg).unwrap();
+
+    // Challenge 1: 520 "dominant" exact triples + 2 "minority" exact triples + 1 "board" compound triple
+    let mut recs = Vec::with_capacity(530);
+    for i in 0..520usize {
+        recs.push(
+            KgTripleRecord::new(
+                "Angela Davis",
+                format!("fact_{i}"),
+                format!("Dominant career note {i}"),
+                format!("d_dom_{i}"),
+                format!("d_dom_{i}:0"),
+                format!("/shared/public/dom_{i}.md"),
+                1,
+                2,
+                "dominant",
+                0,
+                "local",
+            )
+            .unwrap(),
+        );
+    }
+    for i in 0..2usize {
+        recs.push(
+            KgTripleRecord::new(
+                "Angela Davis",
+                format!("min_rel_{i}"),
+                format!("Minority record {i}"),
+                format!("d_min_{i}"),
+                format!("d_min_{i}:0"),
+                format!("/shared/public/min_{i}.md"),
+                1,
+                2,
+                "minority",
+                0,
+                "local",
+            )
+            .unwrap(),
+        );
+    }
+    recs.push(
+        KgTripleRecord::new(
+            "Angela Davis Breure",
+            "board role",
+            "steward",
+            "d_board",
+            "d_board:0",
+            "/shared/public/board.md",
+            1,
+            2,
+            "board",
+            0,
+            "local",
+        )
+        .unwrap(),
+    );
+
+    // Challenge 2: Internal punctuation & non-ASCII case folding
+    recs.push(
+        KgTripleRecord::new(
+            "Women, Race & Class",
+            "author",
+            "Angela Davis",
+            "d_wrc",
+            "d_wrc:0",
+            "/shared/public/wrc.md",
+            1,
+            2,
+            "works",
+            0,
+            "local",
+        )
+        .unwrap(),
+    );
+    recs.push(
+        KgTripleRecord::new(
+            "Élodie Laurent",
+            "published work",
+            "Éloge",
+            "d_elodie",
+            "d_elodie:0",
+            "/shared/public/elodie.md",
+            1,
+            2,
+            "research",
+            0,
+            "local",
+        )
+        .unwrap(),
+    );
+
+    // Reviewer Challenge 3: short single-token word-boundary guard ("ada" must not match "Canada")
+    recs.push(
+        KgTripleRecord::new(
+            "Canada",
+            "capital",
+            "Ottawa",
+            "d_can",
+            "d_can:0",
+            "/shared/public/canada.md",
+            1,
+            2,
+            "geo",
+            0,
+            "local",
+        )
+        .unwrap(),
+    );
+    recs.push(
+        KgTripleRecord::new(
+            "Ada Lovelace",
+            "field",
+            "computing",
+            "d_ada",
+            "d_ada:0",
+            "/shared/public/ada.md",
+            1,
+            2,
+            "pioneers",
+            0,
+            "local",
+        )
+        .unwrap(),
+    );
+
+    let kvs = vec![dummy_vec.clone(); recs.len()];
+    let vvs = vec![dummy_vec; recs.len()];
+    store.insert_triples(&recs, &kvs, &vvs).unwrap();
+
+    // 1. Challenge 1 verification: minority & board clusters must not be starved by 520 dominant rows
+    let angela_hits = store
+        .query_entity_surface("Angela Davis", 0, 10, None)
+        .unwrap();
+    let clusters: HashSet<&str> = angela_hits
+        .iter()
+        .map(|h| h.triple.work_cluster_id.as_str())
+        .collect();
+    assert!(
+        clusters.contains("dominant")
+            && clusters.contains("minority")
+            && clusters.contains("board"),
+        "All three clusters (dominant, minority, board) must appear: {clusters:?}"
+    );
+
+    // 2. Challenge 2 verification: internal punctuation & non-ASCII case folding
+    let wrc_hits = store
+        .query_entity_surface("Women Race & Class", 0, 10, None)
+        .unwrap();
+    assert_eq!(wrc_hits.len(), 1, "Expected Women, Race & Class match");
+    assert!((wrc_hits[0].score - 1.0).abs() < 1e-6);
+
+    let elodie_hits = store
+        .query_entity_surface("élodie laurent", 0, 10, None)
+        .unwrap();
+    assert_eq!(elodie_hits.len(), 1, "Expected Élodie Laurent match");
+    assert_eq!(elodie_hits[0].triple.entity, "Élodie Laurent");
+    assert!((elodie_hits[0].score - 1.0).abs() < 1e-6);
+
+    // 3. Reviewer Challenge 3 verification: short token "ada" matches "Ada Lovelace", not "Canada"
+    let ada_hits = store.query_entity_surface("ada", 0, 10, None).unwrap();
+    assert_eq!(ada_hits.len(), 1);
+    assert_eq!(ada_hits[0].triple.entity, "Ada Lovelace");
 }
